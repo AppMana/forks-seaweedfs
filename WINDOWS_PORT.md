@@ -74,3 +74,33 @@ New files:
 ```
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags 5BytesOffset -o weed.exe ./weed
 ```
+
+## Container consumption: network-FS mode (added after lab e2e, 2026-06-11)
+
+Local WinFsp volumes cannot serve Windows containers: HCS refuses to
+attach the container filters (bindflt/wcifs) to them
+("Do not attach the filter to the volume at this time",
+[winfsp/winfsp#498](https://github.com/winfsp/winfsp/issues/498)).
+Host processes are unaffected; pods are.
+
+`WEED_WINFSP_VOLUME_PREFIX` (e.g. `\seaweedfs`) switches the mount to a
+WinFsp NETWORK file system: weed serves UNC `\\<prefix>\<hash(dir)>`,
+mounts FUSE at an auto-assigned drive letter, and symlinks `-dir` to the
+UNC path. Containers then consume the UNC like SMB CSI volumes. The CSI
+mount supervisor defaults this mode on Windows.
+
+Related fixes in this mode:
+- Directory mount points are registered with the Windows mount manager
+  (`\\.\C:\dir` syntax) so containerd's CRI `parseMount` can resolve them.
+- `--VolumePrefix=` must be the standalone argv form; `-o VolumePrefix=`
+  fails FspFileSystemCreate with STATUS_INVALID_PARAMETER.
+- Share names hash the lowercased absolute mount dir (kubelet passes
+  drive-less rooted paths; containers freeze their UNC mapping at
+  creation, so remounts must reproduce the share name exactly).
+- `-o FileSecurity=D:P(A;;FA;;;WD)` (Everyone full access) mirrors the
+  Linux `-umask=000`; without it pod users cannot reopen their own files
+  for write.
+
+Limitation: auto drive letters cap at ~22 concurrent volumes per node.
+A cgofuse patch to skip the local mount point for network file systems
+is the long-term cleanup.

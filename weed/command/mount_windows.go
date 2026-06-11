@@ -235,7 +235,18 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		cacheDirForWrite = cacheDirForRead
 	}
 
+	// The host is created after the filesystem, so the notifier closure
+	// captures a pointer assigned below (before StartBackgroundTasks
+	// subscribes to filer events, so there is no race).
+	var winFspHost *mount.WinFspHost
+	onRemoteMetadataEvent := func(resp *filer_pb.SubscribeMetadataResponse) {
+		if winFspHost != nil {
+			notifyWinFspFromEvent(winFspHost, mountRoot, resp)
+		}
+	}
+
 	seaweedFileSystem := mount.NewSeaweedFileSystem(&mount.Option{
+		OnRemoteMetadataEvent:       onRemoteMetadataEvent,
 		MountDirectory:              dir,
 		FilerAddresses:              filerAddresses,
 		GrpcDialOption:              grpcDialOption,
@@ -301,6 +312,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 	}
 
 	host := mount.NewWinFspHost(seaweedFileSystem)
+	winFspHost = host
 	// Both CTRL_C_EVENT and CTRL_BREAK_EVENT are delivered as
 	// os.Interrupt by the Go runtime; the CSI mount supervisor stops this
 	// process with a console ctrl event for a clean unmount.
@@ -329,6 +341,16 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 	var extraOptions []string
 	for _, opt := range option.extraOptions {
 		extraOptions = append(extraOptions, "-o", opt)
+	}
+	// -winfspOptions=k=v[,k=v...] appends raw WinFsp options; WinFsp's
+	// option parser lets these later -o values override the host
+	// defaults (FileInfoTimeout etc.), enabling live A/B tuning.
+	if *option.winfspOptions != "" {
+		for _, opt := range strings.Split(*option.winfspOptions, ",") {
+			if opt = strings.TrimSpace(opt); opt != "" {
+				extraOptions = append(extraOptions, "-o", opt)
+			}
+		}
 	}
 	if *option.readOnly {
 		// WinFsp cannot enforce read-only at the volume level for FUSE
@@ -423,4 +445,87 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 	return true
+}
+
+// winfspNotification is one kernel cache invalidation derived from a
+// filer metadata event.
+type winfspNotification struct {
+	path   string
+	action uint32
+}
+
+// notifyWinFspFromEvent translates a filer metadata event into WinFsp
+// kernel cache invalidations.
+func notifyWinFspFromEvent(host *mount.WinFspHost, mountRoot string, resp *filer_pb.SubscribeMetadataResponse) {
+	for _, n := range winfspNotifications(mountRoot, resp) {
+		host.Notify(n.path, n.action)
+	}
+}
+
+// winfspNotifications computes the invalidations for an event. mountRoot
+// is the filer-side mount root; notification paths are '/'-separated and
+// volume-relative.
+func winfspNotifications(mountRoot string, resp *filer_pb.SubscribeMetadataResponse) (out []winfspNotification) {
+	en := resp.EventNotification
+	if en == nil {
+		return nil
+	}
+	toVolumePath := func(dir, name string) (string, bool) {
+		full := string(util.NewFullPath(dir, name))
+		if mountRoot != "/" {
+			if !strings.HasPrefix(full, mountRoot) {
+				return "", false
+			}
+			full = full[len(mountRoot):]
+		}
+		if !strings.HasPrefix(full, "/") {
+			full = "/" + full
+		}
+		return full, true
+	}
+	oldEntry, newEntry := en.OldEntry, en.NewEntry
+	switch {
+	case oldEntry != nil && newEntry == nil: // delete
+		if p, ok := toVolumePath(resp.Directory, oldEntry.Name); ok {
+			action := uint32(mount.NotifyUnlink)
+			if oldEntry.IsDirectory {
+				action = mount.NotifyRmdir
+			}
+			out = append(out, winfspNotification{p, action})
+		}
+	case newEntry != nil && oldEntry == nil: // create
+		dir := resp.Directory
+		if en.NewParentPath != "" {
+			dir = en.NewParentPath
+		}
+		if p, ok := toVolumePath(dir, newEntry.Name); ok {
+			action := uint32(mount.NotifyCreate)
+			if newEntry.IsDirectory {
+				action = mount.NotifyMkdir
+			}
+			out = append(out, winfspNotification{p, action})
+		}
+	case newEntry != nil && oldEntry != nil: // update or rename
+		newDir := resp.Directory
+		if en.NewParentPath != "" {
+			newDir = en.NewParentPath
+		}
+		oldPath, okOld := toVolumePath(resp.Directory, oldEntry.Name)
+		newPath, okNew := toVolumePath(newDir, newEntry.Name)
+		if okOld && okNew && oldPath != newPath { // rename
+			action := uint32(mount.NotifyUnlink)
+			if oldEntry.IsDirectory {
+				action = mount.NotifyRmdir
+			}
+			out = append(out, winfspNotification{oldPath, action})
+			action = uint32(mount.NotifyCreate)
+			if newEntry.IsDirectory {
+				action = mount.NotifyMkdir
+			}
+			out = append(out, winfspNotification{newPath, action})
+		} else if okNew {
+			out = append(out, winfspNotification{newPath, uint32(mount.NotifyTruncate | mount.NotifyUtime)})
+		}
+	}
+	return out
 }

@@ -28,7 +28,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
-
 )
 
 type Option struct {
@@ -104,6 +103,12 @@ type Option struct {
 	// When true, Flush() returns immediately and data upload + metadata flush happen in background.
 	WritebackCache bool
 
+	// OnRemoteMetadataEvent, when set, is invoked for every metadata
+	// event received from the filer subscription (after self-event
+	// filtering). Used by the Windows mount to invalidate WinFsp kernel
+	// caches; nil elsewhere.
+	OnRemoteMetadataEvent func(resp *filer_pb.SubscribeMetadataResponse)
+
 	// PosixDirNlink enables POSIX-compliant directory nlink counting
 	// (nlink = 2 + number_of_subdirectories). This requires listing
 	// cached directory entries on every stat, which has a performance cost.
@@ -119,43 +124,43 @@ type WFS struct {
 	// follow https://github.com/hanwen/go-fuse/blob/master/fuse/api.go
 	fuse.RawFileSystem
 	mount_pb.UnimplementedSeaweedMountServer
-	option               *Option
-	metaCache            *meta_cache.MetaCache
-	stats                statsCache
-	chunkCache           *chunk_cache.TieredChunkCache
+	option                *Option
+	metaCache             *meta_cache.MetaCache
+	stats                 statsCache
+	chunkCache            *chunk_cache.TieredChunkCache
 	writeBufferAccountant *page_writer.WriteBufferAccountant
-	signature            int32
-	concurrentWriters    *util.LimitedConcurrentExecutor
-	copyBufferPool       sync.Pool
-	concurrentCopiersSem chan struct{}
-	inodeToPath          *InodeToPath
-	fhMap                *FileHandleToInode
-	dhMap                *DirectoryHandleToInode
-	fuseServer           *fuse.Server
-	IsOverQuota          bool
-	fhLockTable          *util.LockTable[FileHandleId]
-	hardLinkLockTable    *util.LockTable[string]
-	posixLocks           *PosixLockTable
-	rdmaClient           *RDMAMountClient
-	peerRegistrar        *PeerRegistrar
-	peerDirectory        *PeerDirectory
-	peerGrpcServer       *PeerGrpcServer
-	peerAnnouncer        *PeerAnnouncer
-	peerConnPool         *PeerConnPool
-	peerDirectoryStop    chan struct{} // closed on unmount to stop the sweeper goroutine
-	FilerConf            *filer.FilerConf
-	filerClient          *wdclient.FilerClient // Cached volume location client
-	refreshMu            sync.Mutex
-	refreshingDirs       map[util.FullPath]struct{}
-	atimeMu              sync.Mutex
-	atimeMap             map[uint64]time.Time // inode -> atime, in-memory only, bounded
-	dirMtimeMu           sync.Mutex
-	dirMtimeMap          map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
-	entryValidSec        uint64 // kernel FUSE entry cache TTL in seconds
-	attrValidSec         uint64 // kernel FUSE attr cache TTL in seconds
-	dirHotWindow         time.Duration
-	dirHotThreshold      int
-	dirIdleEvict         time.Duration
+	signature             int32
+	concurrentWriters     *util.LimitedConcurrentExecutor
+	copyBufferPool        sync.Pool
+	concurrentCopiersSem  chan struct{}
+	inodeToPath           *InodeToPath
+	fhMap                 *FileHandleToInode
+	dhMap                 *DirectoryHandleToInode
+	fuseServer            *fuse.Server
+	IsOverQuota           bool
+	fhLockTable           *util.LockTable[FileHandleId]
+	hardLinkLockTable     *util.LockTable[string]
+	posixLocks            *PosixLockTable
+	rdmaClient            *RDMAMountClient
+	peerRegistrar         *PeerRegistrar
+	peerDirectory         *PeerDirectory
+	peerGrpcServer        *PeerGrpcServer
+	peerAnnouncer         *PeerAnnouncer
+	peerConnPool          *PeerConnPool
+	peerDirectoryStop     chan struct{} // closed on unmount to stop the sweeper goroutine
+	FilerConf             *filer.FilerConf
+	filerClient           *wdclient.FilerClient // Cached volume location client
+	refreshMu             sync.Mutex
+	refreshingDirs        map[util.FullPath]struct{}
+	atimeMu               sync.Mutex
+	atimeMap              map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	dirMtimeMu            sync.Mutex
+	dirMtimeMap           map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	entryValidSec         uint64               // kernel FUSE entry cache TTL in seconds
+	attrValidSec          uint64               // kernel FUSE attr cache TTL in seconds
+	dirHotWindow          time.Duration
+	dirHotThreshold       int
+	dirIdleEvict          time.Duration
 
 	// openMtimeCache maps inode -> [mtime_sec, mtime_ns] from the last Open.
 	// Used to decide whether to set FOPEN_KEEP_CACHE on subsequent opens.
@@ -244,8 +249,8 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		atimeMap:          make(map[uint64]time.Time, 8192),
 		openMtimeCache:    make(map[uint64][2]int64, 8192),
 		dirMtimeMap:       make(map[uint64]time.Time, 1024),
-		entryValidSec:    1,
-		attrValidSec:     1,
+		entryValidSec:     1,
+		attrValidSec:      1,
 		dirHotWindow:      dirHotWindow,
 		dirHotThreshold:   dirHotThreshold,
 		dirIdleEvict:      dirIdleEvict,
@@ -491,6 +496,24 @@ func (wfs *WFS) StartBackgroundTasks() error {
 		return err
 	}
 
+	followers := []*meta_cache.MetadataFollower{follower}
+	if wfs.option.OnRemoteMetadataEvent != nil {
+		followers = append(followers, &meta_cache.MetadataFollower{
+			PathPrefixToWatch: wfs.option.FilerMountRootPath,
+			ProcessEventFn: func(resp *filer_pb.SubscribeMetadataResponse) error {
+				if resp.EventNotification != nil {
+					for _, sig := range resp.EventNotification.Signatures {
+						if sig == wfs.signature {
+							return nil // local change; kernel caches are already coherent
+						}
+					}
+				}
+				wfs.option.OnRemoteMetadataEvent(resp)
+				return nil
+			},
+		})
+	}
+
 	startTime := time.Now()
 	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano(), wfs.option.WritebackCache, func(lastTsNs int64, err error) {
 		glog.Warningf("meta events follow retry from %v: %v", time.Unix(0, lastTsNs), err)
@@ -498,7 +521,7 @@ func (wfs *WFS) StartBackgroundTasks() error {
 			glog.Warningf("meta cache cleanup failed: %v", deleteErr)
 		}
 		wfs.inodeToPath.InvalidateAllChildrenCache()
-	}, follower)
+	}, followers...)
 	go wfs.loopCheckQuota()
 	go wfs.loopFlushDirtyMetadata()
 	go wfs.loopEvictIdleDirCache()

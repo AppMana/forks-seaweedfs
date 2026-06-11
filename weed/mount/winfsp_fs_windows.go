@@ -128,6 +128,7 @@ func (a *winfspFS) Init() {}
 func (a *winfspFS) Destroy() {}
 
 func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
+	defer track(opStatfs)()
 	var out fuse.StatfsOut
 	if st := a.wfs.StatFs(nil, &fuse.InHeader{NodeId: 1}, &out); st != fuse.OK {
 		return toWinErrno(st)
@@ -147,6 +148,7 @@ func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
 }
 
 func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
+	defer track(opGetattr)()
 	in := fuse.GetAttrIn{}
 	if ino, ok := a.inodeFromFh(fh); ok {
 		in.InHeader = a.header(ino)
@@ -166,6 +168,7 @@ func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 }
 
 func (a *winfspFS) Mkdir(path string, mode uint32) int {
+	defer track(opMkdir)()
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -176,6 +179,7 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 }
 
 func (a *winfspFS) Rmdir(path string) int {
+	defer track(opRmdir)()
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -185,6 +189,7 @@ func (a *winfspFS) Rmdir(path string) int {
 }
 
 func (a *winfspFS) Unlink(path string) int {
+	defer track(opUnlink)()
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -194,6 +199,7 @@ func (a *winfspFS) Unlink(path string) int {
 }
 
 func (a *winfspFS) Rename(oldpath string, newpath string) int {
+	defer track(opRename)()
 	oldParent, oldName, st := a.resolveParent(oldpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -314,6 +320,7 @@ func (a *winfspFS) Access(path string, mask uint32) int {
 }
 
 func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	defer track(opCreate)()
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st), invalidFh
@@ -331,6 +338,7 @@ func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
 }
 
 func (a *winfspFS) Open(path string, flags int) (int, uint64) {
+	defer track(opOpen)()
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st), invalidFh
@@ -344,6 +352,7 @@ func (a *winfspFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (a *winfspFS) Truncate(path string, size int64, fh uint64) int {
+	defer track(opTruncate)()
 	common := fuse.SetAttrInCommon{
 		Valid: fuse.FATTR_SIZE,
 		Size:  uint64(size),
@@ -364,6 +373,7 @@ func (a *winfspFS) Truncate(path string, size int64, fh uint64) int {
 }
 
 func (a *winfspFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	defer track(opRead)()
 	ino, ok := a.inodeFromFh(fh)
 	if !ok {
 		return -cgofuse.EBADF
@@ -392,6 +402,7 @@ func (a *winfspFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (a *winfspFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	defer track(opWrite)()
 	ino, ok := a.inodeFromFh(fh)
 	if !ok {
 		return -cgofuse.EBADF
@@ -410,6 +421,7 @@ func (a *winfspFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (a *winfspFS) Flush(path string, fh uint64) int {
+	defer track(opFlush)()
 	ino, ok := a.inodeFromFh(fh)
 	if !ok {
 		return 0
@@ -419,6 +431,7 @@ func (a *winfspFS) Flush(path string, fh uint64) int {
 }
 
 func (a *winfspFS) Release(path string, fh uint64) int {
+	defer track(opRelease)()
 	ino, ok := a.inodeFromFh(fh)
 	if !ok {
 		return 0
@@ -441,6 +454,7 @@ func (a *winfspFS) Fsync(path string, datasync bool, fh uint64) int {
 }
 
 func (a *winfspFS) Opendir(path string) (int, uint64) {
+	defer track(opOpendir)()
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st), invalidFh
@@ -457,6 +471,7 @@ func (a *winfspFS) Readdir(path string,
 	fill func(name string, stat *cgofuse.Stat_t, ofst int64) bool,
 	ofst int64,
 	fh uint64) int {
+	defer track(opReaddir)()
 
 	dirPath := a.fullPath(path)
 	ino, st := a.resolveInode(path)
@@ -496,6 +511,7 @@ func (a *winfspFS) Readdir(path string,
 }
 
 func (a *winfspFS) Releasedir(path string, fh uint64) int {
+	defer track(opReleasedir)()
 	if fh != invalidFh {
 		a.wfs.ReleaseDir(&fuse.ReleaseIn{Fh: fh})
 	}

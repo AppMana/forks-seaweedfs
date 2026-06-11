@@ -1,0 +1,130 @@
+name: AppMana weed.exe (WinFsp) build and test
+
+on:
+  push:
+    branches: [appmana-4.23-large-disk-winfsp]
+  pull_request:
+    branches: [appmana-4.23-large-disk-winfsp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_FUSE_REPO: https://github.com/AppMana/forks-go-fuse
+  GO_FUSE_BRANCH: appmana/windows-compile
+  # Pinned WinFsp release; keep in sync with the MSI vendored into the
+  # seaweedfs-mount Windows image in forks-seaweedfs-csi-driver.
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: forks-seaweedfs
+      - name: Clone forks-go-fuse sibling (go.mod replace target)
+        run: git clone --depth 1 -b "$GO_FUSE_BRANCH" "$GO_FUSE_REPO" forks-go-fuse
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: forks-seaweedfs/go.mod
+          cache-dependency-path: forks-seaweedfs/go.sum
+      - name: Vet (linux)
+        working-directory: forks-seaweedfs
+        run: go vet -tags 5BytesOffset ./weed/mount/... ./weed/command/
+      - name: Cross-compile gate (windows/amd64, large disk)
+        working-directory: forks-seaweedfs
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags 5BytesOffset ./weed/...
+          GOOS=windows GOARCH=amd64 go vet -tags 5BytesOffset ./weed/command/ ./weed/mount/
+      - name: Linux unit tests (regression gate for shared-file edits)
+        working-directory: forks-seaweedfs
+        run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/...
+
+  test-windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: forks-seaweedfs
+      - name: Clone forks-go-fuse sibling (go.mod replace target)
+        run: git clone --depth 1 -b "$env:GO_FUSE_BRANCH" "$env:GO_FUSE_REPO" forks-go-fuse
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: forks-seaweedfs/go.mod
+          cache-dependency-path: forks-seaweedfs/go.sum
+      - name: Install WinFsp (pinned MSI)
+        run: |
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile winfsp.msi
+          Start-Process -NoNewWindow -Wait msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000'
+          if (-not (Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)) {
+            throw "WinFsp service not present after install"
+          }
+      - name: Build weed.exe
+        working-directory: forks-seaweedfs
+        run: |
+          $env:CGO_ENABLED = '0'
+          $commit = (git rev-parse --short HEAD)
+          go build -tags 5BytesOffset -ldflags "-s -w -X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$commit" -o weed.exe ./weed
+          .\weed.exe version
+      - name: Native windows unit tests (winfsp adapter, mount, command)
+        working-directory: forks-seaweedfs
+        run: go test -count=1 -tags 5BytesOffset ./weed/mount/ ./weed/command/
+      - name: Upload weed.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: weed-windows-amd64-large-disk
+          path: forks-seaweedfs/weed.exe
+          if-no-files-found: error
+
+  mount-smoke:
+    runs-on: windows-2022
+    needs: [test-windows]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WinFsp (pinned MSI)
+        run: |
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile winfsp.msi
+          Start-Process -NoNewWindow -Wait msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000'
+      - uses: actions/download-artifact@v4
+        with:
+          name: weed-windows-amd64-large-disk
+      - name: Run mount smoke test
+        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe)
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-smoke-logs
+          path: |
+            ${{ runner.temp }}/sw-logs/**
+          if-no-files-found: ignore
+
+  winfsp-compat:
+    runs-on: windows-2022
+    needs: [test-windows]
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WinFsp with tests (pinned)
+        run: |
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile winfsp.msi
+          Start-Process -NoNewWindow -Wait msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000'
+          $testsUrl = $env:WINFSP_MSI_URL -replace 'winfsp-([0-9.]+)\.msi','winfsp-tests-$1.zip'
+          Invoke-WebRequest -Uri $testsUrl -OutFile winfsp-tests.zip
+          Expand-Archive winfsp-tests.zip -DestinationPath winfsp-tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: weed-windows-amd64-large-disk
+      - name: Run winfsp-tests (advisory)
+        run: ./hack/appmana/winfsp-compat.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestsExe (Resolve-Path ./winfsp-tests/winfsp-tests-x64.exe)

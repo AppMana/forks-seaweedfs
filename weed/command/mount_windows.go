@@ -343,9 +343,15 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 	// staged on this mount. Requires Administrator/SYSTEM, which the
 	// mount supervisor always has. WEED_WINFSP_NO_MOUNTMGR=1 opts out
 	// (non-elevated interactive use).
+	// Note: kubelet may hand out rooted but drive-less paths
+	// (\var\lib\kubelet\...); filepath.Abs resolves them against the
+	// current drive so the mount point satisfies WinFsp's
+	// FspPathIsMountmgrMountPoint syntax (\\.\C:\dir).
 	mountPoint := dir
-	if os.Getenv("WEED_WINFSP_NO_MOUNTMGR") != "1" && filepath.IsAbs(dir) && !strings.HasPrefix(dir, `\\`) {
-		mountPoint = `\\.\` + dir
+	if os.Getenv("WEED_WINFSP_NO_MOUNTMGR") != "1" && !strings.HasPrefix(dir, `\\`) {
+		if abs, err := filepath.Abs(dir); err == nil && len(abs) >= 2 && abs[1] == ':' {
+			mountPoint = `\\.\` + abs
+		}
 	}
 	if err := host.Mount(mountPoint, *option.volumeLabel, extraOptions); err != nil {
 		glog.Errorf("mount: %v", err)

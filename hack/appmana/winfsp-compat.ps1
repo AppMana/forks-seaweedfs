@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 $mnt = Join-Path $WorkRoot 'mnt'
 
 $server = Start-Process -FilePath $WeedExe -PassThru -NoNewWindow -ArgumentList @(
-    'server', "-dir=$dataDir", '-master.volumeSizeLimitMB=64', '-volume.max=5', '-filer'
+    '-ip=127.0.0.1', 'server', "-dir=$dataDir", '-master.volumeSizeLimitMB=64', '-volume.max=5', '-filer'
 )
 $mount = $null
 try {
@@ -27,7 +27,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     $mount = Start-Process -FilePath $WeedExe -PassThru -NoNewWindow -ArgumentList @(
-        'mount', '-filer=localhost:8888', "-dir=$mnt", "-cacheDir=$(Join-Path $WorkRoot 'cache')"
+        'mount', '-filer=127.0.0.1:8888', "-dir=$mnt", "-cacheDir=$(Join-Path $WorkRoot 'cache')"
     )
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline -and -not (Test-Path $mnt)) { Start-Sleep -Milliseconds 250 }

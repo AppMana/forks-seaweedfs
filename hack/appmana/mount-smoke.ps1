@@ -51,7 +51,7 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     # event reaches only the mount process. Logs go to -logdir.
     $proc = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
         "-logdir=$(Join-Path $logDir $name)", 'mount',
-        '-filer=localhost:8888',
+        '-filer=127.0.0.1:8888',
         "-dir=$mnt",
         "-cacheDir=$cacheDir",
         '-cacheCapacityMB=512',
@@ -118,7 +118,7 @@ $mnt = Join-Path $WorkRoot 'mnt'   # must NOT pre-exist; WinFsp creates it
 Write-Host '== starting weed server'
 New-Item -ItemType Directory -Force -Path (Join-Path $logDir 'server') | Out-Null
 $server = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
-    "-logdir=$(Join-Path $logDir 'server')", 'server',
+    "-logdir=$(Join-Path $logDir 'server')", '-ip=127.0.0.1', 'server',
     "-dir=$dataDir",
     '-master.volumeSizeLimitMB=64',
     '-volume.max=5',

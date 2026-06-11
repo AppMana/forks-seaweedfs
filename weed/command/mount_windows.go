@@ -367,7 +367,17 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		// cannot use directory mount points (STATUS 0xc00000ca), so the
 		// FUSE mount point is an auto-assigned drive letter ('*') and
 		// the -dir symlink is created here once the share is live.
-		h := util.HashToInt32([]byte(dir))
+		// The share name must be deterministic for a given mount
+		// directory regardless of how the path is spelled: kubelet
+		// passes drive-less rooted paths (\var\lib\kubelet\...) while
+		// recovery paths may carry the drive letter. Containers resolve
+		// their volume mappings to the UNC path once at creation, so a
+		// re-mount must reproduce the exact same share name.
+		hashSrc := dir
+		if abs, err := filepath.Abs(dir); err == nil {
+			hashSrc = abs
+		}
+		h := util.HashToInt32([]byte(strings.ToLower(hashSrc)))
 		if h < 0 {
 			h = -h
 		}

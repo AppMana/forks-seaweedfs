@@ -35,6 +35,12 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		// instead of translating uid/gid to SIDs.
 		"-o", "uid=-1,gid=-1",
 		"-o", "umask=000",
+		// Present an Everyone-full-access DACL for every file. Without
+		// this, files created by a pod user get mode-derived DACLs owned
+		// by the mounting user (SYSTEM), and reopening them for write
+		// from the pod fails with access denied. Mirrors the Linux CSI
+		// mount's -umask=000 (any pod uid can use the volume).
+		"-o", "FileSecurity=D:P(A;;FA;;;WD)",
 		"-o", fmt.Sprintf("volname=%s", volumeLabel),
 		// Bound attribute/directory staleness like the Linux mount's
 		// attrValidSec (milliseconds).

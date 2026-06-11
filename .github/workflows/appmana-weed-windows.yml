@@ -44,6 +44,8 @@ jobs:
 
   test-windows:
     runs-on: windows-2022
+    env:
+      CGO_ENABLED: "0"
     defaults:
       run:
         shell: pwsh

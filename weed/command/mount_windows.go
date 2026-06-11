@@ -187,9 +187,12 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		fmt.Printf("Please specify the mount directory via \"-dir\"")
 		return false
 	}
-	if err := prepareWinFspMountPoint(dir, *option.dirAutoCreate); err != nil {
-		glog.Errorf("prepare mount point: %v", err)
-		return false
+	isDriveMountPoint := len(dir) == 2 && dir[1] == ':'
+	if !isDriveMountPoint {
+		if err := prepareWinFspMountPoint(dir, *option.dirAutoCreate); err != nil {
+			glog.Errorf("prepare mount point: %v", err)
+			return false
+		}
 	}
 
 	// start on local unix socket (AF_UNIX is supported on Windows Server
@@ -348,13 +351,65 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 	// current drive so the mount point satisfies WinFsp's
 	// FspPathIsMountmgrMountPoint syntax (\\.\C:\dir).
 	mountPoint := dir
-	if os.Getenv("WEED_WINFSP_NO_MOUNTMGR") != "1" && !strings.HasPrefix(dir, `\\`) {
+	cleanupSymlink := false
+	if prefix := os.Getenv("WEED_WINFSP_VOLUME_PREFIX"); prefix != "" {
+		// Experimental: serve the filesystem as a WinFsp NETWORK file
+		// system (UNC \\prefix\share) instead of a local volume, and
+		// expose it at -dir through a directory symlink to the UNC path.
+		// Rationale: HCS cannot attach the container filters (bindflt/
+		// wcifs) to local WinFsp volumes ("Do not attach the filter to
+		// the volume at this time", winfsp/winfsp#498), so pods cannot
+		// consume them; UNC-backed mounts take the network path in HCS,
+		// which works (same mechanism as SMB CSI drivers).
+		//
+		// Each FUSE instance needs a unique prefix; derive the share
+		// name from the mount directory. WinFsp network file systems
+		// cannot use directory mount points (STATUS 0xc00000ca), so the
+		// FUSE mount point is an auto-assigned drive letter ('*') and
+		// the -dir symlink is created here once the share is live.
+		h := util.HashToInt32([]byte(dir))
+		if h < 0 {
+			h = -h
+		}
+		share := fmt.Sprintf("%s\\%08x", strings.TrimRight(prefix, "\\"), h)
+		// Must be the standalone --VolumePrefix= argv form: the
+		// "-o VolumePrefix=" form fails FspFileSystemCreate with
+		// STATUS_INVALID_PARAMETER through the cgofuse option path.
+		extraOptions = append(extraOptions, "--VolumePrefix="+share)
+		mountPoint = "*"
+		uncPath := `\` + share
+		cleanupSymlink = true
+		glog.V(0).Infof("winfsp network volume %s, symlink at %s", uncPath, dir)
+		go func() {
+			// Wait for the share to come up so os.Symlink creates a
+			// DIRECTORY symlink (Go picks the flag from the live target).
+			for i := 0; i < 600; i++ {
+				if _, err := os.Stat(uncPath); err == nil {
+					if err := os.Symlink(uncPath, dir); err != nil {
+						glog.Errorf("create staging symlink %s -> %s: %v", dir, uncPath, err)
+					}
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			glog.Errorf("share %s never became available; staging symlink not created", uncPath)
+		}()
+	} else if os.Getenv("WEED_WINFSP_NO_MOUNTMGR") != "1" && !strings.HasPrefix(dir, `\\`) {
 		if abs, err := filepath.Abs(dir); err == nil && len(abs) >= 2 && abs[1] == ':' {
 			mountPoint = `\\.\` + abs
 		}
 	}
-	if err := host.Mount(mountPoint, *option.volumeLabel, extraOptions); err != nil {
-		glog.Errorf("mount: %v", err)
+	mountErr := host.Mount(mountPoint, *option.volumeLabel, extraOptions)
+	if cleanupSymlink {
+		// host.Mount blocks until unmount; remove the staging symlink so
+		// a clean unmount leaves nothing behind (mirrors WinFsp removing
+		// its own directory mount points).
+		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+			glog.Warningf("remove staging symlink %s: %v", dir, err)
+		}
+	}
+	if mountErr != nil {
+		glog.Errorf("mount: %v", mountErr)
 		return false
 	}
 	return true

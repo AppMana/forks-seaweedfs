@@ -118,7 +118,7 @@ $mnt = Join-Path $WorkRoot 'mnt'   # must NOT pre-exist; WinFsp creates it
 Write-Host '== starting weed server'
 New-Item -ItemType Directory -Force -Path (Join-Path $logDir 'server') | Out-Null
 $server = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
-    "-logdir=$(Join-Path $logDir 'server')", '-ip=127.0.0.1', 'server',
+    "-logdir=$(Join-Path $logDir 'server')", 'server', '-ip=127.0.0.1',
     "-dir=$dataDir",
     '-master.volumeSizeLimitMB=64',
     '-volume.max=5',

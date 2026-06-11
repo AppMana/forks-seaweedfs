@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 $mnt = Join-Path $WorkRoot 'mnt'
 
 $server = Start-Process -FilePath $WeedExe -PassThru -NoNewWindow -ArgumentList @(
-    '-ip=127.0.0.1', 'server', "-dir=$dataDir", '-master.volumeSizeLimitMB=64', '-volume.max=5', '-filer'
+    'server', '-ip=127.0.0.1', "-dir=$dataDir", '-master.volumeSizeLimitMB=64', '-volume.max=5', '-filer'
 )
 $mount = $null
 try {

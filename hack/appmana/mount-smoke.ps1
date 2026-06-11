@@ -204,6 +204,32 @@ try {
     Assert ((Get-Content "$mnt\append.txt").Count -eq 2) 'append.txt survives remount'
     Assert ((Get-Item "$mnt\large.bin").Length -eq 1MB) 'large.bin truncation survives remount'
     Assert (-not (Test-Path "$mnt\victim.txt")) 'deleted file stays deleted after remount'
+
+    # --- close-to-open consistency across two concurrent mounts:
+    # with FileInfoTimeout=-1 the kernel caches data, so a change made
+    # through a second mount must become visible to a fresh open here
+    # (filer-event Notify invalidation + close-to-open purge).
+    Write-Host '== cross-mount close-to-open check'
+    $mntB = Join-Path $WorkRoot 'mntB'
+    $cacheB = Join-Path $WorkRoot 'cacheB'
+    New-Item -ItemType Directory -Force -Path $cacheB | Out-Null
+    $mountB = Start-Mount $mntB $cacheB $logDir 'mountB'
+    Set-Content -Path "$mnt\c2o.txt" -Value 'version-one' -NoNewline
+    $deadline = (Get-Date).AddSeconds(10); $seen = $false
+    while ((Get-Date) -lt $deadline) {
+        if ((Test-Path "$mntB\c2o.txt") -and ((Get-Content "$mntB\c2o.txt" -Raw -ErrorAction SilentlyContinue) -eq 'version-one')) { $seen = $true; break }
+        Start-Sleep -Milliseconds 500
+    }
+    Assert $seen 'mount-A write visible on mount-B within 10s'
+    Set-Content -Path "$mntB\c2o.txt" -Value 'version-two!' -NoNewline
+    $deadline = (Get-Date).AddSeconds(10); $seen = $false
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-Content "$mnt\c2o.txt" -Raw -ErrorAction SilentlyContinue) -eq 'version-two!') { $seen = $true; break }
+        Start-Sleep -Milliseconds 500
+    }
+    Assert $seen 'mount-B overwrite visible on mount-A within 10s (cache invalidation)'
+    Stop-Mount $mountB $mntB
+
     Stop-Mount $mount2 $mnt
 } finally {
     if (-not $server.HasExited) { $server.Kill() }

@@ -24,6 +24,7 @@ func NewWinFspHost(wfs *WFS) *WinFspHost {
 	// case-insensitive would require fold-on-lookup which the adapter
 	// does not implement.
 	host.SetCapCaseInsensitive(false)
+	go logWinfspStatsLoop()
 	return &WinFspHost{host: host}
 }
 
@@ -42,10 +43,20 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		// mount's -umask=000 (any pod uid can use the volume).
 		"-o", "FileSecurity=D:P(A;;FA;;;WD)",
 		"-o", fmt.Sprintf("volname=%s", volumeLabel),
-		// Bound attribute/directory staleness like the Linux mount's
-		// attrValidSec (milliseconds).
-		"-o", "FileInfoTimeout=1000",
-		"-o", "DirInfoTimeout=1000",
+		// FileInfoTimeout=-1 engages the NT cache manager for file DATA
+		// (page cache, read-ahead, lazy write) in addition to infinite
+		// metadata caching. Consistency stays close-to-open: every
+		// CreateFile round-trips to user mode, and the WinFsp FUSE
+		// layer's default FlushAndPurgeOnCleanup purges cached data on
+		// last close. Remote changes are invalidated eagerly through
+		// filer metadata events (see Notify). Never add KeepFileCache
+		// here: it would keep stale data across closes on shared RWX
+		// volumes.
+		"-o", "FileInfoTimeout=-1",
+		// Directory listings: bounded staleness, mirrors the Linux
+		// mount's entryValidSec (milliseconds).
+		"-o", "DirInfoTimeout=2000",
+		"-o", "VolumeInfoTimeout=5000",
 		"-o", "FileSystemName=seaweedfs",
 	}
 	options = append(options, extraOptions...)
@@ -60,3 +71,24 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 func (h *WinFspHost) Unmount() bool {
 	return h.host.Unmount()
 }
+
+// Notify invalidates kernel caches for path ('/'-separated, relative to
+// the mount root) after an externally observed change. action is a
+// cgofuse NOTIFY_* bitmask. Safe to call before the filesystem is
+// mounted (returns false).
+func (h *WinFspHost) Notify(path string, action uint32) bool {
+	return h.host.Notify(path, action)
+}
+
+// cgofuse NOTIFY_* re-exports so callers outside this file do not need
+// a cgofuse import.
+const (
+	NotifyMkdir    = cgofuse.NOTIFY_MKDIR
+	NotifyRmdir    = cgofuse.NOTIFY_RMDIR
+	NotifyCreate   = cgofuse.NOTIFY_CREATE
+	NotifyUnlink   = cgofuse.NOTIFY_UNLINK
+	NotifyChmod    = cgofuse.NOTIFY_CHMOD
+	NotifyChown    = cgofuse.NOTIFY_CHOWN
+	NotifyUtime    = cgofuse.NOTIFY_UTIME
+	NotifyTruncate = cgofuse.NOTIFY_TRUNCATE
+)

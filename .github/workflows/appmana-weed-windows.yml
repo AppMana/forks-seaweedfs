@@ -44,8 +44,15 @@ jobs:
 
   test-windows:
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        cgo: ["0", "1"]
     env:
-      CGO_ENABLED: "0"
+      CGO_ENABLED: ${{ matrix.cgo }}
+      # cgo builds compile against the WinFsp FUSE headers (installed by
+      # the MSI); the DLL is still loaded at runtime in both variants.
+      CPATH: C:\Program Files (x86)\WinFsp\inc\fuse
     defaults:
       run:
         shell: pwsh
@@ -79,7 +86,7 @@ jobs:
       - name: Upload weed.exe
         uses: actions/upload-artifact@v4
         with:
-          name: weed-windows-amd64-large-disk
+          name: weed-windows-amd64-large-disk-cgo${{ matrix.cgo }}
           path: forks-seaweedfs/weed.exe
           if-no-files-found: error
 
@@ -97,7 +104,7 @@ jobs:
           Start-Process -NoNewWindow -Wait msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000'
       - uses: actions/download-artifact@v4
         with:
-          name: weed-windows-amd64-large-disk
+          name: weed-windows-amd64-large-disk-cgo0
       - name: Run mount smoke test
         run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe)
       - name: Upload server logs on failure
@@ -127,6 +134,35 @@ jobs:
           Expand-Archive winfsp-tests.zip -DestinationPath winfsp-tests
       - uses: actions/download-artifact@v4
         with:
-          name: weed-windows-amd64-large-disk
+          name: weed-windows-amd64-large-disk-cgo0
       - name: Run winfsp-tests (advisory)
         run: ./hack/appmana/winfsp-compat.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestsExe (Resolve-Path ./winfsp-tests/winfsp-tests-x64.exe)
+
+  mount-bench:
+    runs-on: windows-2022
+    needs: [test-windows]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WinFsp (pinned MSI)
+        run: |
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile winfsp.msi
+          Start-Process -NoNewWindow -Wait msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000'
+      - uses: actions/download-artifact@v4
+        with:
+          name: weed-windows-amd64-large-disk-cgo0
+          path: cgo0
+      - uses: actions/download-artifact@v4
+        with:
+          name: weed-windows-amd64-large-disk-cgo1
+          path: cgo1
+      - name: Bench nocgo, new options (production defaults)
+        run: ./hack/appmana/mount-bench.ps1 -WeedExe (Resolve-Path ./cgo0/weed.exe) -Label nocgo-cached
+      - name: Bench nocgo, legacy options (pre-caching baseline)
+        run: ./hack/appmana/mount-bench.ps1 -WeedExe (Resolve-Path ./cgo0/weed.exe) -Label nocgo-legacy -WinfspOptions 'FileInfoTimeout=1000,DirInfoTimeout=1000'
+      - name: Bench cgo, new options
+        run: ./hack/appmana/mount-bench.ps1 -WeedExe (Resolve-Path ./cgo1/weed.exe) -Label cgo-cached
+      - name: Bench cgo, legacy options
+        run: ./hack/appmana/mount-bench.ps1 -WeedExe (Resolve-Path ./cgo1/weed.exe) -Label cgo-legacy -WinfspOptions 'FileInfoTimeout=1000,DirInfoTimeout=1000'

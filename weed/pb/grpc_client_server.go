@@ -98,6 +98,16 @@ func RegisterLocalGrpcSocket(host string, grpcPort int, socketPath string) {
 	}
 }
 
+// UnregisterLocalGrpcSocket removes a previously registered local socket
+// so that local dials fall back to TCP (used when the socket cannot be
+// bound, e.g. an unsupported platform or path).
+func UnregisterLocalGrpcSocket(grpcPort int) {
+	localGrpcSocketsLock.Lock()
+	defer localGrpcSocketsLock.Unlock()
+	delete(localGrpcSockets, grpcPort)
+	delete(localGrpcHosts, grpcPort)
+}
+
 // GetLocalGrpcSocket returns the Unix socket path for a gRPC port, or empty if not registered.
 func GetLocalGrpcSocket(grpcPort int) string {
 	localGrpcSocketsLock.RLock()
@@ -138,7 +148,8 @@ func ServeGrpcOnLocalSocket(grpcServer *grpc.Server, grpcPort int) {
 	}
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		glog.Errorf("Failed to listen on gRPC Unix socket %s: %v", socketPath, err)
+		glog.Errorf("Failed to listen on gRPC Unix socket %s: %v, falling back to TCP for local dials", socketPath, err)
+		UnregisterLocalGrpcSocket(grpcPort)
 		return
 	}
 	glog.V(0).Infof("gRPC also listening on Unix socket %s", socketPath)
@@ -302,7 +313,9 @@ func InvalidateGrpcConnection(address string) {
 
 // grpcMarshalErrorPrefix is the library-owned prefix gRPC prepends to every
 // client-side proto marshal failure; see grpc-go rpc_util.go encode():
-//   status.Errorf(codes.Internal, "grpc: error while marshaling: %v", ...)
+//
+//	status.Errorf(codes.Internal, "grpc: error while marshaling: %v", ...)
+//
 // The "grpc:" token is reserved for gRPC internal diagnostics and will not
 // collide with user-produced Internal statuses.
 const grpcMarshalErrorPrefix = "grpc: error while marshaling"

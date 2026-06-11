@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -358,7 +359,7 @@ func runServer(cmd *Command, args []string) bool {
 			if *svc.portGrpc == 0 {
 				*svc.portGrpc = 10000 + *svc.port
 			}
-			pb.RegisterLocalGrpcSocket(*serverIp, *svc.portGrpc, fmt.Sprintf("/tmp/seaweedfs-%s-grpc-%d.sock", svc.name, *svc.portGrpc))
+			pb.RegisterLocalGrpcSocket(*serverIp, *svc.portGrpc, filepath.Join(os.TempDir(), fmt.Sprintf("seaweedfs-%s-grpc-%d.sock", svc.name, *svc.portGrpc)))
 		}
 	}
 

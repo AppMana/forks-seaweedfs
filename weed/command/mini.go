@@ -976,7 +976,7 @@ func runMini(cmd *Command, args []string) bool {
 	pb.RegisterLocalGrpcSocket(*miniIp, *miniOptions.v.portGrpc, filepath.Join(os.TempDir(), fmt.Sprintf("seaweedfs-volume-grpc-%d.sock", *miniOptions.v.portGrpc)))
 	pb.RegisterLocalGrpcSocket(*miniIp, *miniFilerOptions.portGrpc, filepath.Join(os.TempDir(), fmt.Sprintf("seaweedfs-filer-grpc-%d.sock", *miniFilerOptions.portGrpc)))
 	if *miniS3Options.portGrpc > 0 {
-		pb.RegisterLocalGrpcSocket(*miniIp, *miniS3Options.portGrpc, fmt.Sprintf("/tmp/seaweedfs-s3-grpc-%d.sock", *miniS3Options.portGrpc))
+		pb.RegisterLocalGrpcSocket(*miniIp, *miniS3Options.portGrpc, filepath.Join(os.TempDir(), fmt.Sprintf("seaweedfs-s3-grpc-%d.sock", *miniS3Options.portGrpc)))
 	}
 	pb.RegisterLocalGrpcSocket(*miniIp, *miniAdminOptions.grpcPort, filepath.Join(os.TempDir(), fmt.Sprintf("seaweedfs-admin-grpc-%d.sock", *miniAdminOptions.grpcPort)))
 

@@ -29,7 +29,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
-	"github.com/seaweedfs/go-fuse/v2/fs"
 )
 
 type Option struct {
@@ -120,7 +119,6 @@ type WFS struct {
 	// follow https://github.com/hanwen/go-fuse/blob/master/fuse/api.go
 	fuse.RawFileSystem
 	mount_pb.UnimplementedSeaweedMountServer
-	fs.Inode
 	option               *Option
 	metaCache            *meta_cache.MetaCache
 	stats                statsCache

@@ -519,3 +519,5 @@ require (
 )
 
 // replace github.com/seaweedfs/raft => /Users/chrislu/go/src/github.com/seaweedfs/raft
+
+replace github.com/seaweedfs/go-fuse/v2 => ../forks-go-fuse

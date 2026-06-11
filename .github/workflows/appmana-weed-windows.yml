@@ -32,12 +32,12 @@ jobs:
           cache-dependency-path: forks-seaweedfs/go.sum
       - name: Vet (linux)
         working-directory: forks-seaweedfs
-        run: go vet -tags 5BytesOffset ./weed/mount/... ./weed/command/
+        run: go vet -copylocks=false -tags 5BytesOffset ./weed/mount/... ./weed/command/
       - name: Cross-compile gate (windows/amd64, large disk)
         working-directory: forks-seaweedfs
         run: |
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags 5BytesOffset ./weed/...
-          GOOS=windows GOARCH=amd64 go vet -tags 5BytesOffset ./weed/command/ ./weed/mount/
+          GOOS=windows GOARCH=amd64 go vet -copylocks=false -tags 5BytesOffset ./weed/command/ ./weed/mount/
       - name: Linux unit tests (regression gate for shared-file edits)
         working-directory: forks-seaweedfs
         run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/...

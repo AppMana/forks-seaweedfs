@@ -334,7 +334,20 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		extraOptions = append(extraOptions, "-o", "ro")
 	}
 
-	if err := host.Mount(dir, *option.volumeLabel, extraOptions); err != nil {
+	// Register the directory mount point with the Windows mount manager
+	// (WinFsp "\\.\C:\dir" mount point syntax). Without this the volume
+	// is invisible to the mount manager and GetFinalPathNameByHandle
+	// fails with ERROR_UNRECOGNIZED_VOLUME (1005), which breaks any
+	// consumer that resolves paths through the mount, most notably
+	// containerd's CRI parseMount when a pod consumes a CSI volume
+	// staged on this mount. Requires Administrator/SYSTEM, which the
+	// mount supervisor always has. WEED_WINFSP_NO_MOUNTMGR=1 opts out
+	// (non-elevated interactive use).
+	mountPoint := dir
+	if os.Getenv("WEED_WINFSP_NO_MOUNTMGR") != "1" && filepath.IsAbs(dir) && !strings.HasPrefix(dir, `\\`) {
+		mountPoint = `\\.\` + dir
+	}
+	if err := host.Mount(mountPoint, *option.volumeLabel, extraOptions); err != nil {
 		glog.Errorf("mount: %v", err)
 		return false
 	}

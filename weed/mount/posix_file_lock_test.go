@@ -5,7 +5,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -16,11 +15,11 @@ func TestNonOverlappingLocksFromDifferentOwners(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	s1 := plt.SetLk(inode, lockRange{Start: 0, End: 49, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	s1 := plt.SetLk(inode, lockRange{Start: 0, End: 49, Typ: fWrlck, Owner: 1, Pid: 10})
 	if s1 != fuse.OK {
 		t.Fatalf("expected OK, got %v", s1)
 	}
-	s2 := plt.SetLk(inode, lockRange{Start: 50, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20})
+	s2 := plt.SetLk(inode, lockRange{Start: 50, End: 99, Typ: fWrlck, Owner: 2, Pid: 20})
 	if s2 != fuse.OK {
 		t.Fatalf("expected OK, got %v", s2)
 	}
@@ -30,11 +29,11 @@ func TestOverlappingReadLocksFromDifferentOwners(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	s1 := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_RDLCK, Owner: 1, Pid: 10})
+	s1 := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fRdlck, Owner: 1, Pid: 10})
 	if s1 != fuse.OK {
 		t.Fatalf("expected OK, got %v", s1)
 	}
-	s2 := plt.SetLk(inode, lockRange{Start: 50, End: 149, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20})
+	s2 := plt.SetLk(inode, lockRange{Start: 50, End: 149, Typ: fRdlck, Owner: 2, Pid: 20})
 	if s2 != fuse.OK {
 		t.Fatalf("expected OK, got %v", s2)
 	}
@@ -44,8 +43,8 @@ func TestOverlappingWriteReadConflict(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	s := plt.SetLk(inode, lockRange{Start: 50, End: 149, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	s := plt.SetLk(inode, lockRange{Start: 50, End: 149, Typ: fRdlck, Owner: 2, Pid: 20})
 	if s != fuse.EAGAIN {
 		t.Fatalf("expected EAGAIN, got %v", s)
 	}
@@ -55,8 +54,8 @@ func TestOverlappingWriteWriteConflict(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	s := plt.SetLk(inode, lockRange{Start: 50, End: 149, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	s := plt.SetLk(inode, lockRange{Start: 50, End: 149, Typ: fWrlck, Owner: 2, Pid: 20})
 	if s != fuse.EAGAIN {
 		t.Fatalf("expected EAGAIN, got %v", s)
 	}
@@ -66,16 +65,16 @@ func TestSameOwnerUpgradeReadToWrite(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_RDLCK, Owner: 1, Pid: 10})
-	s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fRdlck, Owner: 1, Pid: 10})
+	s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 	if s != fuse.OK {
 		t.Fatalf("expected OK for same-owner upgrade, got %v", s)
 	}
 
 	// Verify the lock is now a write lock.
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20}, &out)
-	if out.Lk.Typ != syscall.F_WRLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20}, &out)
+	if out.Lk.Typ != fWrlck {
 		t.Fatalf("expected conflicting write lock, got type %d", out.Lk.Typ)
 	}
 }
@@ -84,14 +83,14 @@ func TestSameOwnerDowngradeWriteToRead(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_RDLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fRdlck, Owner: 1, Pid: 10})
 	if s != fuse.OK {
 		t.Fatalf("expected OK for same-owner downgrade, got %v", s)
 	}
 
 	// Another owner should now be able to get a read lock.
-	s2 := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20})
+	s2 := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fRdlck, Owner: 2, Pid: 20})
 	if s2 != fuse.OK {
 		t.Fatalf("expected OK for shared read lock, got %v", s2)
 	}
@@ -101,8 +100,8 @@ func TestLockCoalescing(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 9, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	plt.SetLk(inode, lockRange{Start: 10, End: 19, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 9, Typ: fWrlck, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 10, End: 19, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	il := plt.getInodeLocks(inode)
 	il.mu.Lock()
@@ -125,9 +124,9 @@ func TestLockSplitting(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 	// Unlock the middle portion.
-	plt.SetLk(inode, lockRange{Start: 40, End: 59, Typ: syscall.F_UNLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 40, End: 59, Typ: fUnlck, Owner: 1, Pid: 10})
 
 	il := plt.getInodeLocks(inode)
 	il.mu.Lock()
@@ -155,11 +154,11 @@ func TestGetLkConflict(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 10, End: 50, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 10, End: 50, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 30, End: 70, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20}, &out)
-	if out.Lk.Typ != syscall.F_WRLCK {
+	plt.GetLk(inode, lockRange{Start: 30, End: 70, Typ: fRdlck, Owner: 2, Pid: 20}, &out)
+	if out.Lk.Typ != fWrlck {
 		t.Fatalf("expected conflicting write lock, got type %d", out.Lk.Typ)
 	}
 	if out.Lk.Pid != 10 {
@@ -174,11 +173,11 @@ func TestGetLkNoConflict(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 10, End: 50, Typ: syscall.F_RDLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 10, End: 50, Typ: fRdlck, Owner: 1, Pid: 10})
 
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 30, End: 70, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20}, &out)
-	if out.Lk.Typ != syscall.F_UNLCK {
+	plt.GetLk(inode, lockRange{Start: 30, End: 70, Typ: fRdlck, Owner: 2, Pid: 20}, &out)
+	if out.Lk.Typ != fUnlck {
 		t.Fatalf("expected F_UNLCK (no conflict), got type %d", out.Lk.Typ)
 	}
 }
@@ -187,11 +186,11 @@ func TestGetLkSameOwnerNoConflict(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10}, &out)
-	if out.Lk.Typ != syscall.F_UNLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10}, &out)
+	if out.Lk.Typ != fUnlck {
 		t.Fatalf("same owner should not conflict with itself, got type %d", out.Lk.Typ)
 	}
 }
@@ -200,22 +199,22 @@ func TestReleaseOwner(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 49, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	plt.SetLk(inode, lockRange{Start: 50, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	plt.SetLk(inode, lockRange{Start: 200, End: 299, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20})
+	plt.SetLk(inode, lockRange{Start: 0, End: 49, Typ: fWrlck, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 50, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 200, End: 299, Typ: fRdlck, Owner: 2, Pid: 20})
 
 	plt.ReleaseOwner(inode, 1)
 
 	// Owner 1's locks should be gone.
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 3, Pid: 30}, &out)
-	if out.Lk.Typ != syscall.F_UNLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 3, Pid: 30}, &out)
+	if out.Lk.Typ != fUnlck {
 		t.Fatalf("expected no conflict after ReleaseOwner, got type %d", out.Lk.Typ)
 	}
 
 	// Owner 2's lock should still exist.
-	plt.GetLk(inode, lockRange{Start: 200, End: 299, Typ: syscall.F_WRLCK, Owner: 3, Pid: 30}, &out)
-	if out.Lk.Typ != syscall.F_RDLCK {
+	plt.GetLk(inode, lockRange{Start: 200, End: 299, Typ: fWrlck, Owner: 3, Pid: 30}, &out)
+	if out.Lk.Typ != fRdlck {
 		t.Fatalf("expected owner 2's read lock to remain, got type %d", out.Lk.Typ)
 	}
 }
@@ -224,12 +223,12 @@ func TestDifferentLockKindsDoNotConflict(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	s1 := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	s1 := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 	if s1 != fuse.OK {
 		t.Fatalf("expected POSIX lock OK, got %v", s1)
 	}
 
-	s2 := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20, IsFlock: true})
+	s2 := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 2, Pid: 20, IsFlock: true})
 	if s2 != fuse.OK {
 		t.Fatalf("expected flock lock OK in separate namespace, got %v", s2)
 	}
@@ -239,12 +238,12 @@ func TestReleasePosixOwnerReleasesPosixLocksAndWakesWaiters(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	done := make(chan fuse.Status, 1)
 	go func() {
 		cancel := make(chan struct{})
-		done <- plt.SetLkw(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20}, cancel)
+		done <- plt.SetLkw(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20}, cancel)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -264,12 +263,12 @@ func TestReleasePosixOwnerDoesNotReleaseFlockLocks(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10, IsFlock: true})
+	plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 1, Pid: 10, IsFlock: true})
 	plt.ReleasePosixOwner(inode, 1)
 
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20, IsFlock: true}, &out)
-	if out.Lk.Typ != syscall.F_WRLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 2, Pid: 20, IsFlock: true}, &out)
+	if out.Lk.Typ != fWrlck {
 		t.Fatalf("expected flock lock to remain after ReleasePosixOwner, got type %d", out.Lk.Typ)
 	}
 }
@@ -282,14 +281,14 @@ func TestHasPosixOwnerIgnoresMissingOwnerAndFlock(t *testing.T) {
 		t.Fatal("missing owner should not be reported as holding POSIX locks")
 	}
 
-	if s := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10, IsFlock: true}); s != fuse.OK {
+	if s := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 1, Pid: 10, IsFlock: true}); s != fuse.OK {
 		t.Fatalf("set flock: %v", s)
 	}
 	if plt.HasPosixOwner(inode, 1) {
 		t.Fatal("flock owner should not be reported as a POSIX lock owner")
 	}
 
-	if s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20}); s != fuse.OK {
+	if s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20}); s != fuse.OK {
 		t.Fatalf("set POSIX lock: %v", s)
 	}
 	if !plt.HasPosixOwner(inode, 2) {
@@ -305,7 +304,7 @@ func TestWakeEligibleWaitersKeepsInodeUntilWakeRefReleased(t *testing.T) {
 	inode := uint64(1)
 	il := plt.getOrCreateInodeLocks(inode)
 	waiter := &lockWaiter{
-		requested: lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20},
+		requested: lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20},
 		ch:        make(chan struct{}),
 	}
 
@@ -346,19 +345,19 @@ func TestReleaseFlockOwnerDoesNotReleasePosixLocks(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 2, Pid: 10, IsFlock: true})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 2, Pid: 10, IsFlock: true})
 
 	plt.ReleaseFlockOwner(inode, 2)
 
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 3, Pid: 30}, &out)
-	if out.Lk.Typ != syscall.F_WRLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 3, Pid: 30}, &out)
+	if out.Lk.Typ != fWrlck {
 		t.Fatalf("expected POSIX lock to remain after ReleaseFlockOwner, got type %d", out.Lk.Typ)
 	}
 
-	plt.GetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 4, Pid: 40, IsFlock: true}, &out)
-	if out.Lk.Typ != syscall.F_UNLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 4, Pid: 40, IsFlock: true}, &out)
+	if out.Lk.Typ != fUnlck {
 		t.Fatalf("expected flock lock to be removed after ReleaseFlockOwner, got type %d", out.Lk.Typ)
 	}
 }
@@ -367,12 +366,12 @@ func TestReleaseOwnerWakesWaiters(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	done := make(chan fuse.Status, 1)
 	go func() {
 		cancel := make(chan struct{})
-		s := plt.SetLkw(inode, lockRange{Start: 50, End: 60, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20}, cancel)
+		s := plt.SetLkw(inode, lockRange{Start: 50, End: 60, Typ: fWrlck, Owner: 2, Pid: 20}, cancel)
 		done <- s
 	}()
 
@@ -395,12 +394,12 @@ func TestSetLkwBlocksAndSucceeds(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	done := make(chan fuse.Status, 1)
 	go func() {
 		cancel := make(chan struct{})
-		s := plt.SetLkw(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20}, cancel)
+		s := plt.SetLkw(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20}, cancel)
 		done <- s
 	}()
 
@@ -408,7 +407,7 @@ func TestSetLkwBlocksAndSucceeds(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Release the conflicting lock.
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_UNLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fUnlck, Owner: 1, Pid: 10})
 
 	select {
 	case s := <-done:
@@ -424,12 +423,12 @@ func TestSetLkwCancellation(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	cancel := make(chan struct{})
 	done := make(chan fuse.Status, 1)
 	go func() {
-		s := plt.SetLkw(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20}, cancel)
+		s := plt.SetLkw(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20}, cancel)
 		done <- s
 	}()
 
@@ -453,19 +452,19 @@ func TestWholeFileLock(t *testing.T) {
 	inode := uint64(1)
 
 	// Simulate flock() — whole-file exclusive lock.
-	s1 := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	s1 := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 1, Pid: 10})
 	if s1 != fuse.OK {
 		t.Fatalf("expected OK, got %v", s1)
 	}
 
 	// Second owner should be blocked.
-	s2 := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20})
+	s2 := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 2, Pid: 20})
 	if s2 != fuse.EAGAIN {
 		t.Fatalf("expected EAGAIN, got %v", s2)
 	}
 
 	// Even a partial overlap should fail.
-	s3 := plt.SetLk(inode, lockRange{Start: 100, End: 200, Typ: syscall.F_RDLCK, Owner: 2, Pid: 20})
+	s3 := plt.SetLk(inode, lockRange{Start: 100, End: 200, Typ: fRdlck, Owner: 2, Pid: 20})
 	if s3 != fuse.EAGAIN {
 		t.Fatalf("expected EAGAIN for partial overlap with whole-file lock, got %v", s3)
 	}
@@ -476,7 +475,7 @@ func TestUnlockNoExistingLocks(t *testing.T) {
 	inode := uint64(1)
 
 	// Unlock on an inode with no locks should succeed silently.
-	s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_UNLCK, Owner: 1, Pid: 10})
+	s := plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fUnlck, Owner: 1, Pid: 10})
 	if s != fuse.OK {
 		t.Fatalf("expected OK for unlock with no existing locks, got %v", s)
 	}
@@ -486,8 +485,8 @@ func TestMultipleInodesIndependent(t *testing.T) {
 	plt := NewPosixLockTable()
 
 	// Write lock on inode 1 should not affect inode 2.
-	plt.SetLk(1, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	s := plt.SetLk(2, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20})
+	plt.SetLk(1, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	s := plt.SetLk(2, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 2, Pid: 20})
 	if s != fuse.OK {
 		t.Fatalf("locks on different inodes should be independent, got %v", s)
 	}
@@ -497,7 +496,7 @@ func TestMemoryCleanup(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(1)
 
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 	plt.ReleaseOwner(inode, 1)
 
 	plt.mu.Lock()
@@ -513,28 +512,28 @@ func TestSelectiveWaking(t *testing.T) {
 	inode := uint64(1)
 
 	// Owner 1 holds write lock on [0, 99], owner 2 holds write lock on [200, 299].
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	plt.SetLk(inode, lockRange{Start: 200, End: 299, Typ: syscall.F_WRLCK, Owner: 2, Pid: 20})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 200, End: 299, Typ: fWrlck, Owner: 2, Pid: 20})
 
 	// Owner 3 waits for [50, 60] (blocked by owner 1).
 	done3 := make(chan fuse.Status, 1)
 	go func() {
 		cancel := make(chan struct{})
-		s := plt.SetLkw(inode, lockRange{Start: 50, End: 60, Typ: syscall.F_WRLCK, Owner: 3, Pid: 30}, cancel)
+		s := plt.SetLkw(inode, lockRange{Start: 50, End: 60, Typ: fWrlck, Owner: 3, Pid: 30}, cancel)
 		done3 <- s
 	}()
 	// Owner 4 waits for [250, 260] (blocked by owner 2).
 	done4 := make(chan fuse.Status, 1)
 	go func() {
 		cancel := make(chan struct{})
-		s := plt.SetLkw(inode, lockRange{Start: 250, End: 260, Typ: syscall.F_WRLCK, Owner: 4, Pid: 40}, cancel)
+		s := plt.SetLkw(inode, lockRange{Start: 250, End: 260, Typ: fWrlck, Owner: 4, Pid: 40}, cancel)
 		done4 <- s
 	}()
 
 	time.Sleep(50 * time.Millisecond)
 
 	// Release owner 1's lock. Only owner 3 should be woken; owner 4 is still blocked.
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_UNLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fUnlck, Owner: 1, Pid: 10})
 
 	select {
 	case s := <-done3:
@@ -554,7 +553,7 @@ func TestSelectiveWaking(t *testing.T) {
 	}
 
 	// Now release owner 2's lock. Owner 4 should wake.
-	plt.SetLk(inode, lockRange{Start: 200, End: 299, Typ: syscall.F_UNLCK, Owner: 2, Pid: 20})
+	plt.SetLk(inode, lockRange{Start: 200, End: 299, Typ: fUnlck, Owner: 2, Pid: 20})
 
 	select {
 	case s := <-done4:
@@ -571,9 +570,9 @@ func TestSameOwnerReplaceDifferentType(t *testing.T) {
 	inode := uint64(1)
 
 	// Lock [0, 99] as write.
-	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 99, Typ: fWrlck, Owner: 1, Pid: 10})
 	// Replace middle portion [30, 60] with read lock.
-	plt.SetLk(inode, lockRange{Start: 30, End: 60, Typ: syscall.F_RDLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 30, End: 60, Typ: fRdlck, Owner: 1, Pid: 10})
 
 	il := plt.getInodeLocks(inode)
 	il.mu.Lock()
@@ -583,13 +582,13 @@ func TestSameOwnerReplaceDifferentType(t *testing.T) {
 	if len(il.locks) != 3 {
 		t.Fatalf("expected 3 locks after partial type change, got %d", len(il.locks))
 	}
-	if il.locks[0].Typ != syscall.F_WRLCK || il.locks[0].Start != 0 || il.locks[0].End != 29 {
+	if il.locks[0].Typ != fWrlck || il.locks[0].Start != 0 || il.locks[0].End != 29 {
 		t.Errorf("expected write [0,29], got type=%d [%d,%d]", il.locks[0].Typ, il.locks[0].Start, il.locks[0].End)
 	}
-	if il.locks[1].Typ != syscall.F_RDLCK || il.locks[1].Start != 30 || il.locks[1].End != 60 {
+	if il.locks[1].Typ != fRdlck || il.locks[1].Start != 30 || il.locks[1].End != 60 {
 		t.Errorf("expected read [30,60], got type=%d [%d,%d]", il.locks[1].Typ, il.locks[1].Start, il.locks[1].End)
 	}
-	if il.locks[2].Typ != syscall.F_WRLCK || il.locks[2].Start != 61 || il.locks[2].End != 99 {
+	if il.locks[2].Typ != fWrlck || il.locks[2].Start != 61 || il.locks[2].End != 99 {
 		t.Errorf("expected write [61,99], got type=%d [%d,%d]", il.locks[2].Typ, il.locks[2].Start, il.locks[2].End)
 	}
 }
@@ -599,8 +598,8 @@ func TestNonAdjacentRangesNotCoalesced(t *testing.T) {
 	inode := uint64(1)
 
 	// Lock [5, MaxUint64] then [0, 2] — gap at [3,4] must prevent coalescing.
-	plt.SetLk(inode, lockRange{Start: 5, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	s := plt.SetLk(inode, lockRange{Start: 0, End: 2, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 5, End: math.MaxUint64, Typ: fWrlck, Owner: 1, Pid: 10})
+	s := plt.SetLk(inode, lockRange{Start: 0, End: 2, Typ: fWrlck, Owner: 1, Pid: 10})
 	if s != fuse.OK {
 		t.Fatalf("expected OK, got %v", s)
 	}
@@ -626,8 +625,8 @@ func TestAdjacencyNoOverflowAtMaxUint64(t *testing.T) {
 
 	// Lock to EOF (End = MaxUint64), then lock [0, 0] same type.
 	// Without the overflow guard, MaxUint64+1 wraps to 0, falsely merging.
-	plt.SetLk(inode, lockRange{Start: 100, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
-	plt.SetLk(inode, lockRange{Start: 0, End: 0, Typ: syscall.F_WRLCK, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 100, End: math.MaxUint64, Typ: fWrlck, Owner: 1, Pid: 10})
+	plt.SetLk(inode, lockRange{Start: 0, End: 0, Typ: fWrlck, Owner: 1, Pid: 10})
 
 	il := plt.getInodeLocks(inode)
 	il.mu.Lock()
@@ -658,13 +657,13 @@ func TestSetLkRetriesPastDeadInodeLocks(t *testing.T) {
 
 	// Acquire and release a lock so maybeCleanupInode marks the il dead and
 	// removes it from the map.
-	lock := lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, IsFlock: true}
+	lock := lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 1, IsFlock: true}
 	if s := plt.SetLk(inode, lock); s != fuse.OK {
 		t.Fatalf("prime SetLk: got %v", s)
 	}
 	dead := plt.getInodeLocks(inode)
 	unlock := lock
-	unlock.Typ = syscall.F_UNLCK
+	unlock.Typ = fUnlck
 	if s := plt.SetLk(inode, unlock); s != fuse.OK {
 		t.Fatalf("prime unlock: got %v", s)
 	}
@@ -686,7 +685,7 @@ func TestSetLkRetriesPastDeadInodeLocks(t *testing.T) {
 	plt.mu.Unlock()
 
 	// SetLk must notice dead, refetch, and install the new lock in a fresh il.
-	if s := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 2, IsFlock: true}); s != fuse.OK {
+	if s := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 2, IsFlock: true}); s != fuse.OK {
 		t.Fatalf("SetLk after dead: got %v", s)
 	}
 
@@ -704,15 +703,15 @@ func TestSetLkRetriesPastDeadInodeLocks(t *testing.T) {
 	}
 
 	// A conflicting owner must see the new lock and be rejected.
-	if s := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 3, IsFlock: true}); s != fuse.EAGAIN {
+	if s := plt.SetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 3, IsFlock: true}); s != fuse.EAGAIN {
 		t.Fatalf("second owner should conflict with owner 2, got %v", s)
 	}
 
 	// GetLk must report the conflict as well: without the dead-recheck the
 	// GetLk path would answer F_UNLCK off the orphaned il.
 	var out fuse.LkOut
-	plt.GetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 4, IsFlock: true}, &out)
-	if out.Lk.Typ != syscall.F_WRLCK {
+	plt.GetLk(inode, lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 4, IsFlock: true}, &out)
+	if out.Lk.Typ != fWrlck {
 		t.Fatalf("GetLk should report the live conflict, got Typ=%d", out.Lk.Typ)
 	}
 }
@@ -725,13 +724,13 @@ func TestGetInodeLocksEvictsDeadEntry(t *testing.T) {
 	plt := NewPosixLockTable()
 	inode := uint64(42)
 
-	lock := lockRange{Start: 0, End: math.MaxUint64, Typ: syscall.F_WRLCK, Owner: 1, IsFlock: true}
+	lock := lockRange{Start: 0, End: math.MaxUint64, Typ: fWrlck, Owner: 1, IsFlock: true}
 	if s := plt.SetLk(inode, lock); s != fuse.OK {
 		t.Fatalf("prime SetLk: got %v", s)
 	}
 	dead := plt.getInodeLocks(inode)
 	unlock := lock
-	unlock.Typ = syscall.F_UNLCK
+	unlock.Typ = fUnlck
 	if s := plt.SetLk(inode, unlock); s != fuse.OK {
 		t.Fatalf("prime unlock: got %v", s)
 	}
@@ -797,13 +796,13 @@ func TestConcurrentFlockChurnPreservesMutualExclusion(t *testing.T) {
 			lock := lockRange{
 				Start:   0,
 				End:     math.MaxUint64,
-				Typ:     syscall.F_WRLCK,
+				Typ:     fWrlck,
 				Owner:   owner,
 				Pid:     uint32(id + 1),
 				IsFlock: true,
 			}
 			unlock := lock
-			unlock.Typ = syscall.F_UNLCK
+			unlock.Typ = fUnlck
 			token := int64(id + 1)
 			for i := 0; i < iterations; i++ {
 				// SetLk(WRLCK) may only return OK (granted) or EAGAIN

@@ -1,0 +1,76 @@
+# AppMana Windows mount port (WinFsp)
+
+Branch `appmana-4.23-large-disk-winfsp`, based on upstream tag `4.23`.
+Adds a WinFsp-backed `weed mount` for GOOS=windows via
+`github.com/winfsp/cgofuse` (no-cgo mode: `winfsp-x64.dll` is loaded at
+runtime, so `CGO_ENABLED=0 GOOS=windows` cross-compilation works).
+
+Runtime prerequisite on the host: the WinFsp MSI (https://winfsp.dev/rel/).
+`weed mount` preflights the `HKLM\SOFTWARE\WOW6432Node\WinFsp` registry key
+and fails with an actionable error when missing.
+
+## go-fuse fork dependency
+
+`go.mod` replaces `github.com/seaweedfs/go-fuse/v2` with a local sibling
+checkout of https://github.com/AppMana/forks-go-fuse (branch
+`appmana/windows-compile`, a compile-only Windows port of the `fuse`
+package). CI and image builds must clone it next to this repo:
+
+```
+git clone -b appmana/windows-compile https://github.com/AppMana/forks-go-fuse ../forks-go-fuse
+```
+
+The repo-path of the replacement cannot be pointed at GitHub directly
+because the fork keeps the upstream module path (intentionally, to keep
+the rebase diff additive).
+
+## Touched upstream files (keep this list current for rebases)
+
+New files are all `*_windows.go` (or suffix-tagged) and do not affect
+other platforms.
+
+| File | Change |
+|---|---|
+| `go.mod` | `replace` for forks-go-fuse; add `github.com/winfsp/cgofuse` |
+| `weed/mount/weedfs.go` | removed vestigial `fs.Inode` embed + `go-fuse/v2/fs` import |
+| `weed/mount/weedfs_rename.go` | `fs.RENAME_EXCHANGE` constant inlined (0x2), `fs` import dropped |
+| `weed/mount/weedfs_xattr.go` | build tag `!freebsd` → `!freebsd && !windows` |
+| `weed/mount/posix_file_lock.go` | `syscall.F_{RD,WR,UN}LCK` → platform consts `fRdlck/fWrlck/fUnlck` |
+| `weed/mount/weedfs_file_lock.go` | same lock-constant swap |
+| `weed/mount/weedfs_access.go` | `syscall.O_ACCMODE` → platform const `oAccmode` |
+| `weed/command/mount.go` | new `-volumeLabel` flag (all platforms, used by windows only) |
+| `weed/command/mount_std.go` | moved `ensureBucketAllowEmptyFolders`, `bucketPathForMountRoot`, `peerStringOrEmpty` to `mount_helpers.go` (shared) |
+| `weed/command/mount_notsupported.go` | build tag excludes windows |
+
+New files:
+
+- `weed/mount/syscall_constants_{unix,windows}.go`
+- `weed/mount/weedfs_attr_windows.go`, `weed/mount/weedfs_xattr_windows.go`
+- `weed/mount/winfsp_fs_windows.go` — cgofuse adapter over the WFS raw handlers
+- `weed/mount/winfsp_errno_windows.go` — go-fuse Status → cgofuse errno map
+- `weed/mount/winfsp_flags_windows.go` — cgofuse O_* → Go os.O_* translation
+- `weed/mount/winfsp_host_windows.go` — WinFsp host wrapper (ReaddirPlus, case-sensitive)
+- `weed/command/mount_windows.go` — `RunMountWindows` (WinFsp mountpoint prep, AF_UNIX localSocket, ctrl-event unmount)
+- `weed/command/mount_helpers.go` — shared helpers extracted from mount_std.go
+
+## Behavior notes / limitations
+
+- The volume is declared case-sensitive (`SetCapCaseInsensitive(false)`);
+  apps that rely on case-folding will see ENOENT for wrong-case names.
+- xattrs return ENOTSUP / ENOSYS (freebsd precedent).
+- POSIX byte-range locks are serviced locally by the WinFsp FSD;
+  `-distributedLock` has no effect on windows.
+- Files are presented as owned by the mounting user (`uid=-1,gid=-1`).
+- The WinFsp directory mount point must NOT pre-exist; `weed mount`
+  removes an empty directory or dangling reparse point at the target
+  (kubelet pre-creates the CSI globalmount dir).
+- Graceful unmount: send a console ctrl event (CTRL_BREAK_EVENT to the
+  process group); the Go runtime delivers it as os.Interrupt and the
+  mount unmounts cleanly. SIGKILL leaves a dangling reparse point that
+  the next mount (or the CSI mount supervisor) removes.
+
+## Build
+
+```
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags 5BytesOffset -o weed.exe ./weed
+```

@@ -38,6 +38,7 @@ type MountOptions struct {
 	debugFuse            *bool
 	localSocket          *string
 	disableXAttr         *bool
+	volumeLabel          *string
 	extraOptions         []string
 	fuseCommandPid       int
 
@@ -53,11 +54,11 @@ type MountOptions struct {
 	rdmaTimeoutMs     *int
 
 	// Peer chunk sharing options (design-weed-mount-peer-chunk-sharing.md).
-	peerEnabled      *bool
-	peerListen       *string
-	peerAdvertise    *string
-	peerDataCenter   *string
-	peerRack         *string
+	peerEnabled    *bool
+	peerListen     *string
+	peerAdvertise  *string
+	peerDataCenter *string
+	peerRack       *string
 
 	dirIdleEvictSec *int
 
@@ -124,6 +125,7 @@ func init() {
 	mountOptions.debugFuse = cmdMount.Flag.Bool("debug.fuse", false, "log raw FUSE protocol requests and responses")
 	mountOptions.localSocket = cmdMount.Flag.String("localSocket", "", "default to /tmp/seaweedfs-mount-<mount_dir_hash>.sock")
 	mountOptions.disableXAttr = cmdMount.Flag.Bool("disableXAttr", false, "disable xattr")
+	mountOptions.volumeLabel = cmdMount.Flag.String("volumeLabel", "SeaweedFS", "volume label shown by Windows (winfsp mounts only)")
 	mountOptions.hasAutofs = cmdMount.Flag.Bool("autofs", false, "ignore autofs mounted on the same mountpoint (useful when systemd.automount and autofs is used)")
 	mountOptions.fuseCommandPid = 0
 

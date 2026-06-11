@@ -1,5 +1,3 @@
-//go:build linux || darwin || freebsd
-
 package command
 
 import (
@@ -8,29 +6,28 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/seaweedfs/seaweedfs/weed/util/version"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+	"google.golang.org/grpc/reflection"
 
-	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
-	"github.com/seaweedfs/seaweedfs/weed/mount/unmount"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mount_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"google.golang.org/grpc/reflection"
-
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 func runMount(cmd *Command, args []string) bool {
@@ -57,15 +54,97 @@ func runMount(cmd *Command, args []string) bool {
 		return false
 	}
 
-	return RunMount(&mountOptions, os.FileMode(umask))
+	return RunMountWindows(&mountOptions, os.FileMode(umask))
 }
 
-func RunMount(option *MountOptions, umask os.FileMode) bool {
+// checkWinFspInstalled verifies the WinFsp FSD is installed before
+// cgofuse tries (and panics) to load winfsp-x64.dll.
+func checkWinFspInstalled() error {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\WOW6432Node\WinFsp`, registry.QUERY_VALUE)
+	if err != nil {
+		key, err = registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\WinFsp`, registry.QUERY_VALUE)
+	}
+	if err != nil {
+		return fmt.Errorf("WinFsp is not installed (registry key SOFTWARE\\WOW6432Node\\WinFsp not found): install the WinFsp MSI from https://winfsp.dev/rel/ first: %w", err)
+	}
+	defer key.Close()
+	installDir, _, err := key.GetStringValue("InstallDir")
+	if err != nil {
+		return fmt.Errorf("WinFsp registry key exists but InstallDir is unreadable: %w", err)
+	}
+	dll := filepath.Join(installDir, "bin", "winfsp-x64.dll")
+	if _, err := os.Stat(dll); err != nil {
+		return fmt.Errorf("WinFsp DLL %s not found: %w", dll, err)
+	}
+	return nil
+}
+
+// prepareWinFspMountPoint makes dir usable as a WinFsp directory mount
+// point: the parent must exist and dir itself must NOT exist (WinFsp
+// creates a reparse point there). An empty leftover directory (e.g.
+// pre-created by kubelet) or a dangling reparse point from a killed
+// prior mount is removed.
+func prepareWinFspMountPoint(dir string, dirAutoCreate bool) error {
+	parent := filepath.Dir(dir)
+	if dirAutoCreate {
+		if err := os.MkdirAll(parent, 0777); err != nil {
+			return fmt.Errorf("create parent directory %s: %w", parent, err)
+		}
+	}
+	if _, err := os.Stat(parent); err != nil {
+		return fmt.Errorf("mount point parent %s not accessible: %w", parent, err)
+	}
+
+	fi, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		// A dangling reparse point from a killed mount can fail Lstat in
+		// odd ways; try removing it regardless.
+		if rmErr := os.Remove(dir); rmErr != nil {
+			return fmt.Errorf("mount point %s not statable (%v) and not removable: %w", dir, err, rmErr)
+		}
+		return nil
+	}
+
+	if isReparsePoint(fi) {
+		// leftover WinFsp mount point or symlink: remove the link only
+		if err := os.Remove(dir); err != nil {
+			return fmt.Errorf("remove stale reparse point %s: %w", dir, err)
+		}
+		return nil
+	}
+
+	if !fi.IsDir() {
+		return fmt.Errorf("mount point %s exists and is not a directory", dir)
+	}
+	// plain directory: only remove if empty (os.Remove == RemoveDirectory,
+	// which never recurses)
+	if err := os.Remove(dir); err != nil {
+		return fmt.Errorf("mount point %s exists and is not an empty directory: %w", dir, err)
+	}
+	return nil
+}
+
+func isReparsePoint(fi os.FileInfo) bool {
+	if sys, ok := fi.Sys().(*syscall.Win32FileAttributeData); ok {
+		return sys.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0
+	}
+	return fi.Mode()&os.ModeSymlink != 0
+}
+
+func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 
 	// basic checks
 	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
 	if chunkSizeLimitMB <= 0 {
 		fmt.Printf("Please specify a reasonable buffer size.\n")
+		return false
+	}
+
+	if err := checkWinFspInstalled(); err != nil {
+		glog.Errorf("%v", err)
 		return false
 	}
 
@@ -102,24 +181,25 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 
 	filerMountRootPath := *option.filerMountRootPath
 
-	// clean up mount point
+	// prepare mount point (WinFsp requires it to NOT exist)
 	dir := util.ResolvePath(*option.dir)
 	if dir == "" {
 		fmt.Printf("Please specify the mount directory via \"-dir\"")
 		return false
 	}
-
-	if err := unmount.Unmount(dir); err != nil {
-		glog.V(1).Infof("pre-mount cleanup unmount %s: %v", dir, err)
+	if err := prepareWinFspMountPoint(dir, *option.dirAutoCreate); err != nil {
+		glog.Errorf("prepare mount point: %v", err)
+		return false
 	}
 
-	// start on local unix socket
+	// start on local unix socket (AF_UNIX is supported on Windows Server
+	// 2019+; keep paths short for the 108-byte sockaddr_un limit)
 	if *option.localSocket == "" {
 		mountDirHash := util.HashToInt32([]byte(dir))
 		if mountDirHash < 0 {
 			mountDirHash = -mountDirHash
 		}
-		*option.localSocket = fmt.Sprintf("/tmp/seaweedfs-mount-%d.sock", mountDirHash)
+		*option.localSocket = filepath.Join(os.TempDir(), fmt.Sprintf("seaweedfs-mount-%d.sock", mountDirHash))
 	}
 	if err := os.Remove(*option.localSocket); err != nil && !os.IsNotExist(err) {
 		glog.Fatalf("Failed to remove %s, error: %s", *option.localSocket, err.Error())
@@ -129,132 +209,15 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		glog.Fatalf("Failed to listen on %s: %v", *option.localSocket, err)
 	}
 
-	// detect mount folder mode
-	if *option.dirAutoCreate {
-		if err := os.MkdirAll(dir, os.FileMode(0777)&^umask); err != nil {
-			glog.Fatalf("failed to create directory %s:%v", dir, err)
-		}
-	}
-	fileInfo, err := os.Stat(dir)
-
-	// collect uid, gid
+	// uid/gid have no Windows equivalents; files are owned by the mount
+	// identity unless -map.uid/-map.gid translate filer-side ids.
 	uid, gid := uint32(0), uint32(0)
-	mountMode := os.ModeDir | 0777
-	if err == nil {
-		mountMode = os.ModeDir | os.FileMode(0777)&^umask
-		uid, gid = util.GetFileUidGid(fileInfo)
-		fmt.Printf("mount point owner uid=%d gid=%d mode=%s\n", uid, gid, mountMode)
-	} else {
-		fmt.Printf("can not stat %s\n", dir)
-		return false
-	}
+	mountMode := os.ModeDir | os.FileMode(0777)&^umask
 
-	// detect uid, gid
-	if uid == 0 {
-		if u, err := user.Current(); err == nil {
-			if parsedId, pe := strconv.ParseUint(u.Uid, 10, 32); pe == nil {
-				uid = uint32(parsedId)
-			}
-			if parsedId, pe := strconv.ParseUint(u.Gid, 10, 32); pe == nil {
-				gid = uint32(parsedId)
-			}
-			fmt.Printf("current uid=%d gid=%d\n", uid, gid)
-		}
-	}
-
-	// mapping uid, gid
 	uidGidMapper, err := meta_cache.NewUidGidMapper(*option.uidMap, *option.gidMap)
 	if err != nil {
 		fmt.Printf("failed to parse %s %s: %v\n", *option.uidMap, *option.gidMap, err)
 		return false
-	}
-
-	// Ensure target mount point availability
-	skipAutofs := option.hasAutofs != nil && *option.hasAutofs
-	if isValid := checkMountPointAvailable(dir, skipAutofs); !isValid {
-		glog.Fatalf("Target mount point is not available: %s, please check!", dir)
-		return true
-	}
-
-	serverFriendlyName := strings.ReplaceAll(*option.filer, ",", "+")
-
-	// When autofs/systemd-mount is used, FsName must be "fuse" so util-linux/mount can recognize
-	// it as a pseudo filesystem. Otherwise, preserve the descriptive name for mount/df output.
-	fsName := serverFriendlyName + ":" + filerMountRootPath
-	if skipAutofs {
-		fsName = "fuse"
-	}
-
-	maxBackground := 128
-	if option.fuseMaxBackground != nil && *option.fuseMaxBackground > 0 {
-		maxBackground = *option.fuseMaxBackground
-	}
-	congestionThreshold := 0
-	if option.fuseCongestionThreshold != nil && *option.fuseCongestionThreshold > 0 {
-		congestionThreshold = *option.fuseCongestionThreshold
-	}
-
-	// mount fuse
-	fuseMountOptions := &fuse.MountOptions{
-		AllowOther:               *option.allowOthers,
-		Options:                  option.extraOptions,
-		MaxBackground:            maxBackground,
-		CongestionThreshold:      congestionThreshold,
-		MaxWrite:                 1024 * 1024 * 2,
-		MaxReadAhead:             1024 * 1024 * 2,
-		IgnoreSecurityLabels:     false,
-		RememberInodes:           false,
-		FsName:                   fsName,
-		Name:                     "seaweedfs",
-		SingleThreaded:           false,
-		DisableXAttrs:            *option.disableXAttr,
-		Debug:                    *option.debugFuse,
-		EnableLocks:              true,
-		ExplicitDataCacheControl: false,
-		DirectMount:              true,
-		DirectMountFlags:         0,
-		//SyncRead:                 false, // set to false to enable the FUSE_CAP_ASYNC_READ capability
-		EnableAcl: true,
-	}
-	if *option.defaultPermissions {
-		fuseMountOptions.Options = append(fuseMountOptions.Options, "default_permissions")
-	}
-	if *option.nonempty {
-		fuseMountOptions.Options = append(fuseMountOptions.Options, "nonempty")
-	}
-	if *option.readOnly {
-		if runtime.GOOS == "darwin" {
-			fuseMountOptions.Options = append(fuseMountOptions.Options, "rdonly")
-		} else {
-			fuseMountOptions.Options = append(fuseMountOptions.Options, "ro")
-		}
-	}
-	if runtime.GOOS == "darwin" {
-		// https://github-wiki-see.page/m/macfuse/macfuse/wiki/Mount-Options
-		ioSizeMB := 1
-		for ioSizeMB*2 <= *option.chunkSizeLimitMB && ioSizeMB*2 <= 32 {
-			ioSizeMB *= 2
-		}
-		fuseMountOptions.Options = append(fuseMountOptions.Options, "daemon_timeout=600")
-		if runtime.GOARCH == "amd64" {
-			fuseMountOptions.Options = append(fuseMountOptions.Options, "noapplexattr")
-		}
-		if option.novncache != nil && *option.novncache {
-			fuseMountOptions.Options = append(fuseMountOptions.Options, "novncache")
-		}
-		fuseMountOptions.Options = append(fuseMountOptions.Options, "slow_statfs")
-		fuseMountOptions.Options = append(fuseMountOptions.Options, "volname="+serverFriendlyName)
-		fuseMountOptions.Options = append(fuseMountOptions.Options, fmt.Sprintf("iosize=%d", ioSizeMB*1024*1024))
-	}
-
-	if option.writebackCache != nil {
-		fuseMountOptions.EnableWriteback = *option.writebackCache
-	}
-	if option.asyncDio != nil {
-		fuseMountOptions.EnableAsyncDio = *option.asyncDio
-	}
-	if option.cacheSymlink != nil && *option.cacheSymlink {
-		fuseMountOptions.EnableSymlinkCaching = true
 	}
 
 	// find mount point
@@ -293,7 +256,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		MountUid:                    uid,
 		MountGid:                    gid,
 		MountMode:                   mountMode,
-		MountCtime:                  fileInfo.ModTime(),
+		MountCtime:                  time.Now(),
 		MountMtime:                  time.Now(),
 		Umask:                       umask,
 		VolumeServerAccess:          *mountOptions.volumeServerAccess,
@@ -301,7 +264,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		UidGidMapper:                uidGidMapper,
 		IncludeSystemEntries:        *option.includeSystemEntries,
 		DisableXAttr:                *option.disableXAttr,
-		IsMacOs:                     runtime.GOOS == "darwin",
+		IsMacOs:                     false,
 		MetadataFlushSeconds:        *option.metadataFlushSeconds,
 		// RDMA acceleration options
 		RdmaEnabled:           *option.rdmaEnabled,
@@ -334,24 +297,17 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
-	server, err := fuse.NewServer(seaweedFileSystem, dir, fuseMountOptions)
-	if err != nil {
-		glog.Fatalf("Mount fail: %v", err)
-	}
+	host := mount.NewWinFspHost(seaweedFileSystem)
+	// Both CTRL_C_EVENT and CTRL_BREAK_EVENT are delivered as
+	// os.Interrupt by the Go runtime; the CSI mount supervisor stops this
+	// process with a console ctrl event for a clean unmount.
 	grace.OnInterrupt(func() {
-		if err := unmount.Unmount(dir); err != nil {
-			glog.Errorf("failed to unmount %s: %v", dir, err)
+		if !host.Unmount() {
+			glog.Errorf("failed to unmount %s", dir)
 		}
 	})
 
-	if mountOptions.fuseCommandPid != 0 {
-		// send a signal to the parent process to notify that the mount is ready
-		err = syscall.Kill(mountOptions.fuseCommandPid, syscall.SIGTERM)
-		if err != nil {
-			fmt.Printf("failed to notify parent process: %v\n", err)
-			return false
-		}
-	}
+	seaweedFileSystem.Init(nil)
 
 	grpcS := pb.NewGrpcServer()
 	mount_pb.RegisterSeaweedMountServer(grpcS, seaweedFileSystem)
@@ -364,16 +320,23 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
-	glog.V(0).Infof("mounted %s%s to %v", *option.filer, mountRoot, dir)
+	glog.V(0).Infof("mounting %s%s to %v via WinFsp", *option.filer, mountRoot, dir)
 	glog.V(0).Infof("This is SeaweedFS version %s %s %s", version.Version(), runtime.GOOS, runtime.GOARCH)
 
-	server.Serve()
+	var extraOptions []string
+	for _, opt := range option.extraOptions {
+		extraOptions = append(extraOptions, "-o", opt)
+	}
+	if *option.readOnly {
+		// WinFsp cannot enforce read-only at the volume level for FUSE
+		// filesystems in all paths; the WFS handlers reject writes when
+		// the kernel does not. Surface intent via the FUSE option.
+		extraOptions = append(extraOptions, "-o", "ro")
+	}
 
-	// Wait for any pending background flushes (writebackCache async mode)
-	// before clearing caches, to prevent data loss during clean unmount.
-	seaweedFileSystem.WaitForAsyncFlush()
-
-	seaweedFileSystem.ClearCacheDir()
-
+	if err := host.Mount(dir, *option.volumeLabel, extraOptions); err != nil {
+		glog.Errorf("mount: %v", err)
+		return false
+	}
 	return true
 }

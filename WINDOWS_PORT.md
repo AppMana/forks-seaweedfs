@@ -129,3 +129,9 @@ volumes that see delete-then-recreate patterns (build outputs).
 cgo vs no-cgo cgofuse: benched within 9% of each other across all
 dimensions; no-cgo remains the default (the CI mount-bench job tracks
 both).
+
+Update (2026-06-12): per-handle sequential read-ahead in the adapter
+lifted 4KB buffered reads from ~15 to ~86 MB/s in CI with no caching
+semantics change. WinFsp 2.2B1 retested for the -1 deferred-unlink
+hazard: improved (2/20 vs 10/20 collisions) but not fixed; the finite
+default stands.

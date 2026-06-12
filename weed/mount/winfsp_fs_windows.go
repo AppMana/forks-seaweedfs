@@ -24,11 +24,12 @@ const invalidFh = ^uint64(0)
 // and cgofuse structs to go-fuse structs.
 type winfspFS struct {
 	cgofuse.FileSystemBase
-	wfs *WFS
+	wfs       *WFS
+	readAhead *readAheadCache
 }
 
 func newWinfspFS(wfs *WFS) *winfspFS {
-	return &winfspFS{wfs: wfs}
+	return &winfspFS{wfs: wfs, readAhead: newReadAheadCache()}
 }
 
 // fullPath converts a cgofuse path ('/'-separated, relative to the
@@ -369,7 +370,15 @@ func (a *winfspFS) Truncate(path string, size int64, fh uint64) int {
 		common.InHeader = a.header(ino)
 	}
 	var out fuse.AttrOut
-	return toWinErrno(a.wfs.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: common}, &out))
+	code := toWinErrno(a.wfs.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: common}, &out))
+	if code == 0 {
+		if ino, ok := a.inodeFromFh(fh); ok {
+			a.readAhead.Invalidate(ino)
+		} else if ino, st := a.resolveInode(path); st == fuse.OK {
+			a.readAhead.Invalidate(ino)
+		}
+	}
+	return code
 }
 
 func (a *winfspFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
@@ -378,6 +387,13 @@ func (a *winfspFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	if !ok {
 		return -cgofuse.EBADF
 	}
+	return a.readAhead.Read(fh, ino, buff, ofst, func(dst []byte, off int64) int {
+		return a.readDirect(ino, fh, dst, off)
+	})
+}
+
+// readDirect is the unbuffered WFS read used by the read-ahead cache.
+func (a *winfspFS) readDirect(ino, fh uint64, buff []byte, ofst int64) int {
 	in := fuse.ReadIn{
 		InHeader: a.header(ino),
 		Fh:       fh,
@@ -417,6 +433,7 @@ func (a *winfspFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 	if status != fuse.OK {
 		return toWinErrno(status)
 	}
+	a.readAhead.Invalidate(ino)
 	return int(written)
 }
 
@@ -438,6 +455,7 @@ func (a *winfspFS) Release(path string, fh uint64) int {
 	}
 	in := fuse.ReleaseIn{InHeader: a.header(ino), Fh: fh}
 	a.wfs.Release(nil, &in)
+	a.readAhead.Release(fh)
 	return 0
 }
 

@@ -105,8 +105,12 @@ type Option struct {
 
 	// OnRemoteMetadataEvent, when set, is invoked for every metadata
 	// event received from the filer subscription (after self-event
-	// filtering). Used by the Windows mount to invalidate WinFsp kernel
-	// caches; nil elsewhere.
+	// filtering). The Windows mount uses it to emit directory change
+	// notifications (FindFirstChangeNotification watchers) for changes
+	// made by other nodes; nil elsewhere. Note: WinFsp's notify API
+	// fires watcher notifications, it does NOT invalidate FSD metadata
+	// caches (verified empirically) — staleness is bounded by the
+	// finite FileInfoTimeout/DirInfoTimeout instead.
 	OnRemoteMetadataEvent func(resp *filer_pb.SubscribeMetadataResponse)
 
 	// PosixDirNlink enables POSIX-compliant directory nlink counting

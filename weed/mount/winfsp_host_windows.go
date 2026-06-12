@@ -43,16 +43,19 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		// mount's -umask=000 (any pod uid can use the volume).
 		"-o", "FileSecurity=D:P(A;;FA;;;WD)",
 		"-o", fmt.Sprintf("volname=%s", volumeLabel),
-		// FileInfoTimeout=-1 engages the NT cache manager for file DATA
-		// (page cache, read-ahead, lazy write) in addition to infinite
-		// metadata caching. Consistency stays close-to-open: every
-		// CreateFile round-trips to user mode, and the WinFsp FUSE
-		// layer's default FlushAndPurgeOnCleanup purges cached data on
-		// last close. Remote changes are invalidated eagerly through
-		// filer metadata events (see Notify). Never add KeepFileCache
-		// here: it would keep stale data across closes on shared RWX
-		// volumes.
-		"-o", "FileInfoTimeout=-1",
+		// FileInfoTimeout=-1 would engage the NT cache manager for file
+		// DATA (40-90x on warm/small reads, measured), but it also
+		// DEFERS the FUSE unlink past DeleteFile() return for files
+		// whose data the cache holds: a delete-then-recreate of the
+		// same name (pwsh7 Move-Item -Force, compilers, any replace
+		// pattern) then races a real "file exists" collision ~50% of
+		// the time (verified: at the failure instant the backend still
+		// has the file, so this is deferred delete, not stale cache;
+		// FspFileSystemNotify does not help). Default to the safe
+		// finite timeout; read-mostly volumes can opt into -1 via
+		// -winfspOptions=FileInfoTimeout=-1 (SEAWEEDFS_WINFSP_OPTIONS
+		// on the CSI DaemonSet).
+		"-o", "FileInfoTimeout=1000",
 		// Directory listings: bounded staleness, mirrors the Linux
 		// mount's entryValidSec (milliseconds).
 		"-o", "DirInfoTimeout=2000",

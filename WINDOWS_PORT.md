@@ -104,3 +104,28 @@ Related fixes in this mode:
 Limitation: auto drive letters cap at ~22 concurrent volumes per node.
 A cgofuse patch to skip the local mount point for network file systems
 is the long-term cleanup.
+
+## Kernel data caching investigation (2026-06-12)
+
+`FileInfoTimeout=-1` engages the NT cache manager for file data and was
+measured at 40-90x on warm/small reads (CI bench: warm 4KB reads
+14.8 → 585 MB/s). It is NOT the default because of a verified
+correctness hazard: for a file whose data the cache holds, the FSD
+completes `DeleteFile()` while deferring the FUSE unlink, so an
+immediate recreate/rename of the same name collides with the
+still-existing backend file (~50% failure rate for pwsh7
+`Move-Item -Force`; probe confirmed the backend still has the file at
+the failure instant). `FspFileSystemNotify` fires watcher notifications
+but does not invalidate FSD caches, so no adapter-side mitigation
+exists.
+
+Defaults stay finite (`FileInfoTimeout=1000,DirInfoTimeout=2000,
+VolumeInfoTimeout=5000`). Read-mostly volumes (model caches, asset
+distribution) can opt into full data caching per mount:
+`-winfspOptions=FileInfoTimeout=-1`, or on the CSI DaemonSet via
+`SEAWEEDFS_WINFSP_OPTIONS=FileInfoTimeout=-1`. Do not enable it for
+volumes that see delete-then-recreate patterns (build outputs).
+
+cgo vs no-cgo cgofuse: benched within 9% of each other across all
+dimensions; no-cgo remains the default (the CI mount-bench job tracks
+both).

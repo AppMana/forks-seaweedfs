@@ -119,8 +119,8 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
-	// Resolve and remember the path under the same lock. Overlapping close
-	// callbacks otherwise race while updating the saved fallback path.
+	// Capture the path after acquiring the handle lock so the path, dirty-state
+	// check, data flush, and metadata commit form one serialized transaction.
 	fileFullPath := fh.FullPath()
 	fh.RememberPath(fileFullPath)
 	dir, name := fileFullPath.DirAndName()

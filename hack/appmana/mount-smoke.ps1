@@ -9,15 +9,19 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
-    [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-smoke'),
+    [string]$ServerWeedExe,
+    [string]$WorkRoot,
     [int]$LargeFileMB = 100,
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
     [switch]$Trace,
-    [ValidateSet('All', 'GitAtomicRename')][string]$TestCase = 'All'
+    [ValidateSet('All', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
 $failures = 0
+$tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+if (-not $ServerWeedExe) { $ServerWeedExe = $WeedExe }
+if (-not $WorkRoot) { $WorkRoot = Join-Path $tempRoot 'sw-smoke' }
 
 function Assert([bool]$cond, [string]$what) {
     if ($cond) {
@@ -53,6 +57,30 @@ function Invoke-GitAtomicRenameTest([string]$mnt) {
         Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) "git init iteration $iteration leaves no stale config.lock"
         if ($script:failures -ne $failuresBefore) { break }
     }
+}
+
+function Invoke-GitAtomicRenamePrelude([string]$mnt) {
+    # Preserve the exact metadata sequence that makes the subsequent Git
+    # lockfile replacement fail on a fresh WinFsp mount.
+    Set-Content -Path "$mnt\hello.txt" -Value 'seaweedfs on windows' -NoNewline
+    Assert ((Get-Content "$mnt\hello.txt" -Raw) -eq 'seaweedfs on windows') 'write/read round trip'
+
+    $item = Get-Item "$mnt\hello.txt"
+    Assert ($item.Length -eq 20) "stat size ($($item.Length))"
+    Assert ($item.LastWriteTime -gt (Get-Date).AddMinutes(-10)) 'stat mtime sane'
+
+    New-Item -ItemType Directory -Path "$mnt\subdir" | Out-Null
+    Set-Content -Path "$mnt\subdir\nested.txt" -Value 'nested'
+    $names = (Get-ChildItem $mnt | Select-Object -ExpandProperty Name) -join ','
+    Assert ($names -match 'hello.txt' -and $names -match 'subdir') "directory listing ($names)"
+    Assert ((Get-ChildItem "$mnt\subdir").Count -eq 1) 'nested directory listing'
+
+    Rename-Item "$mnt\hello.txt" 'renamed.txt'
+    Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
+    Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'
+    Set-Content -Path "$mnt\victim.txt" -Value 'overwrite me'
+    Move-Item "$mnt\renamed.txt" "$mnt\victim.txt" -Force
+    Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
 }
 
 function Wait-Tcp([int]$port, [int]$timeoutSec = 120) {
@@ -147,8 +175,11 @@ function Stop-Mount($proc, [string]$mnt) {
     }
 }
 
+if (Test-Path $WorkRoot) {
+    Remove-Item -Recurse -Force $WorkRoot
+}
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
-$logDir = Join-Path $env:RUNNER_TEMP 'sw-logs'
+$logDir = Join-Path $tempRoot 'sw-logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $dataDir = Join-Path $WorkRoot 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
@@ -158,7 +189,7 @@ $mnt = Join-Path $WorkRoot 'mnt'   # must NOT pre-exist; WinFsp creates it
 
 Write-Host '== starting weed server'
 New-Item -ItemType Directory -Force -Path (Join-Path $logDir 'server') | Out-Null
-$server = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
+$server = Start-Process -FilePath $ServerWeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
     "-logdir=$(Join-Path $logDir 'server')", 'server', '-ip=127.0.0.1',
     "-dir=$dataDir",
     '-master.volumeSizeLimitMB=64',
@@ -179,30 +210,15 @@ try {
         exit 0
     }
 
-    # --- basic write/read
-    Set-Content -Path "$mnt\hello.txt" -Value 'seaweedfs on windows' -NoNewline
-    Assert ((Get-Content "$mnt\hello.txt" -Raw) -eq 'seaweedfs on windows') 'write/read round trip'
+    if ($TestCase -eq 'GitAtomicRenamePrimed') {
+        Invoke-GitAtomicRenamePrelude $mnt
+        Invoke-GitAtomicRenameTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
 
-    # --- stat
-    $item = Get-Item "$mnt\hello.txt"
-    Assert ($item.Length -eq 20) "stat size ($($item.Length))"
-    Assert ($item.LastWriteTime -gt (Get-Date).AddMinutes(-10)) 'stat mtime sane'
-
-    # --- mkdir/list
-    New-Item -ItemType Directory -Path "$mnt\subdir" | Out-Null
-    Set-Content -Path "$mnt\subdir\nested.txt" -Value 'nested'
-    $names = (Get-ChildItem $mnt | Select-Object -ExpandProperty Name) -join ','
-    Assert ($names -match 'hello.txt' -and $names -match 'subdir') "directory listing ($names)"
-    Assert ((Get-ChildItem "$mnt\subdir").Count -eq 1) 'nested directory listing'
-
-    # --- rename (including over an existing file)
-    Rename-Item "$mnt\hello.txt" 'renamed.txt'
-    Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
-    Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'
-    Set-Content -Path "$mnt\victim.txt" -Value 'overwrite me'
-    Move-Item "$mnt\renamed.txt" "$mnt\victim.txt" -Force
-    Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
-
+    Invoke-GitAtomicRenamePrelude $mnt
     Invoke-GitAtomicRenameTest $mnt
 
     # --- append

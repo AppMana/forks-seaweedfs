@@ -72,6 +72,9 @@ func TestHandleRenameResponseLeavesUncachedTargetOutOfCache(t *testing.T) {
 	if err := wfs.handleRenameResponse(context.Background(), resp); err != nil {
 		t.Fatalf("handle rename response: %v", err)
 	}
+	if _, found := inodeToPath.GetInode(sourcePath); found {
+		t.Fatalf("source path %s still has an inode mapping after rename", sourcePath)
+	}
 
 	entry, findErr := mc.FindEntry(context.Background(), targetPath)
 	if findErr != filer_pb.ErrNotFound {

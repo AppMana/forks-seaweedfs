@@ -9,12 +9,22 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
-    [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-smoke'),
-    [int]$LargeFileMB = 100
+    [string]$ServerWeedExe,
+    [string]$WorkRoot,
+    [int]$LargeFileMB = 100,
+    [ValidateRange(1, 1000)][int]$GitIterations = 1,
+    [switch]$Trace,
+    [switch]$TraceSummary,
+    [string]$WinFspOptions,
+    [ValidateRange(0, 4)][int]$Verbosity = 0,
+    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
 $failures = 0
+$tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+if (-not $ServerWeedExe) { $ServerWeedExe = $WeedExe }
+if (-not $WorkRoot) { $WorkRoot = Join-Path $tempRoot 'sw-smoke' }
 
 function Assert([bool]$cond, [string]$what) {
     if ($cond) {
@@ -23,6 +33,64 @@ function Assert([bool]$cond, [string]$what) {
         Write-Host "FAIL: $what" -ForegroundColor Red
         $script:failures++
     }
+}
+
+function Invoke-GitAtomicRenameTest([string]$mnt) {
+    # Git performs several config.lock -> config atomic replacements during
+    # one init. A stale source name after the first rename makes the second
+    # exclusive config.lock create fail with ERROR_FILE_EXISTS.
+    for ($iteration = 1; $iteration -le $GitIterations; $iteration++) {
+        $repoName = if ($GitIterations -eq 1) { 'git-atomic-rename' } else { "git-atomic-rename-$iteration" }
+        $gitRepo = Join-Path $mnt $repoName
+        New-Item -ItemType Directory -Path $gitRepo | Out-Null
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $gitOutputLines = & git -C $gitRepo init 2>&1
+            $gitExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        $gitOutput = $gitOutputLines | Out-String
+        if ($gitExitCode -ne 0) { Write-Host $gitOutput -ForegroundColor Red }
+
+        $failuresBefore = $script:failures
+        Assert ($gitExitCode -eq 0) "git init iteration $iteration supports repeated config.lock atomic replacements"
+        Assert ((Test-Path (Join-Path $gitRepo '.git\config'))) "git init iteration $iteration publishes config"
+        Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) "git init iteration $iteration leaves no stale config.lock"
+        if ($script:failures -ne $failuresBefore) { break }
+    }
+}
+
+function Invoke-NamespaceCoherenceTest([string]$mnt) {
+    # This is the minimal sequence captured in the failing Procmon trace:
+    # the file remains directly openable, but a parent enumeration omits it
+    # and the following SetRenameInformationFile returns NAME NOT FOUND.
+    Set-Content -Path "$mnt\hello.txt" -Value 'seaweedfs on windows' -NoNewline
+    Assert ((Get-Content "$mnt\hello.txt" -Raw) -eq 'seaweedfs on windows') 'write/read round trip'
+
+    $item = Get-Item "$mnt\hello.txt"
+    Assert ($item.Length -eq 20) "stat size ($($item.Length))"
+    Assert ($item.LastWriteTime -gt (Get-Date).AddMinutes(-10)) 'stat mtime sane'
+
+    New-Item -ItemType Directory -Path "$mnt\subdir" | Out-Null
+    Set-Content -Path "$mnt\subdir\nested.txt" -Value 'nested'
+    $names = (Get-ChildItem $mnt | Select-Object -ExpandProperty Name) -join ','
+    Assert ($names -match 'hello.txt' -and $names -match 'subdir') "directory listing ($names)"
+    Assert ((Get-ChildItem "$mnt\subdir").Count -eq 1) 'nested directory listing'
+
+    Rename-Item "$mnt\hello.txt" 'renamed.txt'
+    Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
+    Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'
+}
+
+function Invoke-GitAtomicRenamePrelude([string]$mnt) {
+    # Preserve the full metadata sequence that makes the subsequent Git
+    # lockfile replacement fail on a fresh WinFsp mount.
+    Invoke-NamespaceCoherenceTest $mnt
+    Set-Content -Path "$mnt\victim.txt" -Value 'overwrite me'
+    Move-Item "$mnt\renamed.txt" "$mnt\victim.txt" -Force
+    Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
 }
 
 function Wait-Tcp([int]$port, [int]$timeoutSec = 120) {
@@ -49,14 +117,35 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     New-Item -ItemType Directory -Force -Path (Join-Path $logDir $name) | Out-Null
     # New console (no -NoNewWindow): required so Stop-Mount's CTRL_C
     # event reaches only the mount process. Logs go to -logdir.
-    $proc = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
-        "-logdir=$(Join-Path $logDir $name)", 'mount',
+    $mountArgs = @(
+        "-logdir=$(Join-Path $logDir $name)", "-v=$Verbosity", 'mount',
         '-filer=127.0.0.1:8888',
         "-dir=$mnt",
         "-cacheDir=$cacheDir",
         '-cacheCapacityMB=512',
         '-volumeLabel=SmokeTest'
     )
+    if ($Trace) { $mountArgs += '-winfspOptions=debug' }
+    if ($WinFspOptions) { $mountArgs += "-winfspOptions=$WinFspOptions" }
+    $startArgs = @{
+        FilePath = $WeedExe
+        PassThru = $true
+        WindowStyle = 'Hidden'
+        ArgumentList = $mountArgs
+    }
+    if ($Trace -or $Verbosity -gt 0) {
+        $startArgs.RedirectStandardOutput = Join-Path $logDir "$name-stdout.log"
+        $startArgs.RedirectStandardError = Join-Path $logDir "$name-winfsp-trace.log"
+    }
+    $savedTraceSummary = $env:WEED_WINFSP_TRACE_SUMMARY
+    try {
+        if ($TraceSummary) {
+            $env:WEED_WINFSP_TRACE_SUMMARY = Join-Path $logDir "$name-operation-summary.log"
+        }
+        $proc = Start-Process @startArgs
+    } finally {
+        $env:WEED_WINFSP_TRACE_SUMMARY = $savedTraceSummary
+    }
     if (-not (Wait-PathExists $mnt 60)) {
         throw "mount point $mnt did not appear (see $logDir\$name)"
     }
@@ -106,8 +195,11 @@ function Stop-Mount($proc, [string]$mnt) {
     }
 }
 
+if (Test-Path $WorkRoot) {
+    Remove-Item -Recurse -Force $WorkRoot
+}
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
-$logDir = Join-Path $env:RUNNER_TEMP 'sw-logs'
+$logDir = Join-Path $WorkRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $dataDir = Join-Path $WorkRoot 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
@@ -117,13 +209,26 @@ $mnt = Join-Path $WorkRoot 'mnt'   # must NOT pre-exist; WinFsp creates it
 
 Write-Host '== starting weed server'
 New-Item -ItemType Directory -Force -Path (Join-Path $logDir 'server') | Out-Null
-$server = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
-    "-logdir=$(Join-Path $logDir 'server')", 'server', '-ip=127.0.0.1',
-    "-dir=$dataDir",
-    '-master.volumeSizeLimitMB=64',
-    '-volume.max=5',
-    '-filer'
-)
+$serverStartArgs = @{
+    FilePath = $ServerWeedExe
+    PassThru = $true
+    WindowStyle = 'Hidden'
+    ArgumentList = @(
+        "-logdir=$(Join-Path $logDir 'server')", "-v=$Verbosity", 'server', '-ip=127.0.0.1',
+        "-dir=$dataDir",
+        '-master.volumeSizeLimitMB=64',
+        '-volume.max=5',
+        '-filer'
+    )
+}
+if ($Verbosity -gt 0) {
+    $serverStartArgs.RedirectStandardOutput = Join-Path $logDir 'server-stdout.log'
+    $serverStartArgs.RedirectStandardError = Join-Path $logDir 'server-stderr.log'
+}
+$server = Start-Process @serverStartArgs
+$mount = $null
+$mount2 = $null
+$mountB = $null
 try {
     foreach ($port in 9333, 8080, 8888) {
         if (-not (Wait-Tcp $port)) { throw "weed server port $port never came up" }
@@ -131,29 +236,30 @@ try {
     Write-Host '== server up; mounting'
     $mount = Start-Mount $mnt $cacheDir $logDir 'mount1'
 
-    # --- basic write/read
-    Set-Content -Path "$mnt\hello.txt" -Value 'seaweedfs on windows' -NoNewline
-    Assert ((Get-Content "$mnt\hello.txt" -Raw) -eq 'seaweedfs on windows') 'write/read round trip'
+    if ($TestCase -eq 'NamespaceCoherence') {
+        Invoke-NamespaceCoherenceTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
 
-    # --- stat
-    $item = Get-Item "$mnt\hello.txt"
-    Assert ($item.Length -eq 20) "stat size ($($item.Length))"
-    Assert ($item.LastWriteTime -gt (Get-Date).AddMinutes(-10)) 'stat mtime sane'
+    if ($TestCase -eq 'GitAtomicRename') {
+        Invoke-GitAtomicRenameTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
 
-    # --- mkdir/list
-    New-Item -ItemType Directory -Path "$mnt\subdir" | Out-Null
-    Set-Content -Path "$mnt\subdir\nested.txt" -Value 'nested'
-    $names = (Get-ChildItem $mnt | Select-Object -ExpandProperty Name) -join ','
-    Assert ($names -match 'hello.txt' -and $names -match 'subdir') "directory listing ($names)"
-    Assert ((Get-ChildItem "$mnt\subdir").Count -eq 1) 'nested directory listing'
+    if ($TestCase -eq 'GitAtomicRenamePrimed') {
+        Invoke-GitAtomicRenamePrelude $mnt
+        Invoke-GitAtomicRenameTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
 
-    # --- rename (including over an existing file)
-    Rename-Item "$mnt\hello.txt" 'renamed.txt'
-    Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
-    Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'
-    Set-Content -Path "$mnt\victim.txt" -Value 'overwrite me'
-    Move-Item "$mnt\renamed.txt" "$mnt\victim.txt" -Force
-    Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
+    Invoke-GitAtomicRenamePrelude $mnt
+    Invoke-GitAtomicRenameTest $mnt
 
     # --- append
     Add-Content -Path "$mnt\append.txt" -Value 'line1'
@@ -232,7 +338,28 @@ try {
 
     Stop-Mount $mount2 $mnt
 } finally {
-    if (-not $server.HasExited) { $server.Kill() }
+    foreach ($activeMount in @($mountB, $mount2, $mount)) {
+        if ($null -ne $activeMount -and -not $activeMount.HasExited) {
+            try {
+                if (-not (Stop-MountGracefully $activeMount 5)) {
+                    $activeMount.Kill()
+                    $activeMount.WaitForExit(5000) | Out-Null
+                }
+            } catch {
+                try { $activeMount.Kill(); $activeMount.WaitForExit(5000) | Out-Null } catch {}
+            }
+        }
+    }
+    if (-not $server.HasExited) {
+        try {
+            if (-not (Stop-MountGracefully $server 5)) {
+                $server.Kill()
+                $server.WaitForExit(5000) | Out-Null
+            }
+        } catch {
+            try { $server.Kill(); $server.WaitForExit(5000) | Out-Null } catch {}
+        }
+    }
 }
 
 if ($failures -gt 0) {

@@ -106,7 +106,7 @@ jobs:
         with:
           name: weed-windows-amd64-large-disk-cgo0
       - name: Run mount smoke test
-        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe)
+        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -Trace
       - name: Upload server logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [ValidateRange(1, 4)][int]$FuzzingLevel = 4,
     [ValidateRange(0, [int]::MaxValue)][int]$RandomSeed = 1,
-    [ValidateSet('All', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'GitAtomicRenamePrimed',
+    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'GitAtomicRenamePrimed',
     [switch]$Trace,
     [switch]$TraceSummary,
     [string]$WorkRoot

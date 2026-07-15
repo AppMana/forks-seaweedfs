@@ -111,11 +111,19 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 
 func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
 
-	// flush works at fh level
+	// WinFsp may issue overlapping Flush/Cleanup callbacks for several
+	// Windows handles that cgofuse maps to the same FUSE file handle. The
+	// dirty check and the complete commit must be one transaction; locking
+	// only inside flushMetadataToFiler lets every callback observe dirty data
+	// and queue a duplicate commit before the first one clears the flag.
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+	// Resolve and remember the path under the same lock. Overlapping close
+	// callbacks otherwise race while updating the saved fallback path.
 	fileFullPath := fh.FullPath()
 	fh.RememberPath(fileFullPath)
 	dir, name := fileFullPath.DirAndName()
-	// send the data to the OS
 	glog.V(4).Infof("doFlush %s fh %d", fileFullPath, fh.fh)
 
 	// When writebackCache is enabled and this is a close()-triggered Flush (not fsync),
@@ -161,7 +169,7 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 	}
 
 	if err := retryMetadataFlush(func() error {
-		return wfs.flushMetadataToFiler(fh, dir, name, uid, gid)
+		return wfs.flushMetadataToFilerLocked(fh, dir, name, uid, gid)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
@@ -177,18 +185,16 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 	return fuse.OK
 }
 
-// flushMetadataToFiler sends the file's chunk references and attributes to the filer.
-// This is shared between the synchronous doFlush path and the async flush completion.
+// flushMetadataToFilerLocked sends the file's chunk references and attributes to the filer.
+// The caller must hold fhLockTable exclusively across its dirty-state check and
+// this commit. This is shared between synchronous and async flush completion.
 //
 // When -dlm is enabled, the distributed lock is already held by the FileHandle
 // from open-for-write through close, so no additional distributed lock is
-// needed here. The local fhLockTable lock below serializes within this mount.
-func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid uint32) error {
+// needed here.
+func (wfs *WFS) flushMetadataToFilerLocked(fh *FileHandle, dir, name string, uid, gid uint32) error {
 	fileFullPath := fh.FullPath()
 	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
-
-	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
-	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
 	entry := fh.GetEntry()
 	entry.Name = name // this flush may be just after a rename operation

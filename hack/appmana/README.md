@@ -6,8 +6,11 @@ contract failures before changing mount implementation code.
 
 ## Git atomic rename regression
 
-`mount-smoke.ps1` supports two focused cases:
+`mount-smoke.ps1` supports three focused cases:
 
+- `NamespaceCoherence` reproduces the traced WinFsp failure: a file remains
+  directly readable while its parent enumeration omits it and rename returns
+  `NAME NOT FOUND`.
 - `GitAtomicRename` runs `git init` on a fresh mount.
 - `GitAtomicRenamePrimed` first runs the metadata and rename-over-existing
   sequence from the full smoke test, then runs `git init`. This is the exact
@@ -20,7 +23,9 @@ contract failures before changing mount implementation code.
 ```
 
 Every invocation removes and recreates `WorkRoot` so schedule comparisons
-start with the same filer, mount, and metadata-cache state.
+start with the same filer, mount, and metadata-cache state. Logs are retained
+under `WorkRoot\logs`; use `-Verbosity 4` for SeaweedFS callback/filer ordering
+and `-WinFspOptions` for explicit WinFsp cache-option A/B runs.
 
 ## Schedule fuzzing and replay
 

@@ -11,6 +11,7 @@ param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-smoke'),
     [int]$LargeFileMB = 100,
+    [ValidateRange(1, 1000)][int]$GitIterations = 1,
     [switch]$Trace,
     [ValidateSet('All', 'GitAtomicRename')][string]$TestCase = 'All'
 )
@@ -31,21 +32,27 @@ function Invoke-GitAtomicRenameTest([string]$mnt) {
     # Git performs several config.lock -> config atomic replacements during
     # one init. A stale source name after the first rename makes the second
     # exclusive config.lock create fail with ERROR_FILE_EXISTS.
-    $gitRepo = Join-Path $mnt 'git-atomic-rename'
-    New-Item -ItemType Directory -Path $gitRepo | Out-Null
-    $savedErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $gitOutputLines = & git -C $gitRepo init 2>&1
-        $gitExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $savedErrorActionPreference
+    for ($iteration = 1; $iteration -le $GitIterations; $iteration++) {
+        $repoName = if ($GitIterations -eq 1) { 'git-atomic-rename' } else { "git-atomic-rename-$iteration" }
+        $gitRepo = Join-Path $mnt $repoName
+        New-Item -ItemType Directory -Path $gitRepo | Out-Null
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $gitOutputLines = & git -C $gitRepo init 2>&1
+            $gitExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        $gitOutput = $gitOutputLines | Out-String
+        if ($gitExitCode -ne 0) { Write-Host $gitOutput -ForegroundColor Red }
+
+        $failuresBefore = $script:failures
+        Assert ($gitExitCode -eq 0) "git init iteration $iteration supports repeated config.lock atomic replacements"
+        Assert ((Test-Path (Join-Path $gitRepo '.git\config'))) "git init iteration $iteration publishes config"
+        Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) "git init iteration $iteration leaves no stale config.lock"
+        if ($script:failures -ne $failuresBefore) { break }
     }
-    $gitOutput = $gitOutputLines | Out-String
-    if ($gitExitCode -ne 0) { Write-Host $gitOutput -ForegroundColor Red }
-    Assert ($gitExitCode -eq 0) 'git init supports repeated config.lock atomic replacements'
-    Assert ((Test-Path (Join-Path $gitRepo '.git\config'))) 'git init publishes config'
-    Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) 'git init leaves no stale config.lock'
 }
 
 function Wait-Tcp([int]$port, [int]$timeoutSec = 120) {

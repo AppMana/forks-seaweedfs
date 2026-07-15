@@ -10,7 +10,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-smoke'),
-    [int]$LargeFileMB = 100
+    [int]$LargeFileMB = 100,
+    [switch]$Trace
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,7 +50,7 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     New-Item -ItemType Directory -Force -Path (Join-Path $logDir $name) | Out-Null
     # New console (no -NoNewWindow): required so Stop-Mount's CTRL_C
     # event reaches only the mount process. Logs go to -logdir.
-    $proc = Start-Process -FilePath $WeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
+    $mountArgs = @(
         "-logdir=$(Join-Path $logDir $name)", 'mount',
         '-filer=127.0.0.1:8888',
         "-dir=$mnt",
@@ -57,6 +58,17 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
         '-cacheCapacityMB=512',
         '-volumeLabel=SmokeTest'
     )
+    if ($Trace) { $mountArgs += '-winfspOptions=debug' }
+    $startArgs = @{
+        FilePath = $WeedExe
+        PassThru = $true
+        WindowStyle = 'Hidden'
+        ArgumentList = $mountArgs
+    }
+    if ($Trace) {
+        $startArgs.RedirectStandardError = Join-Path $logDir "$name-winfsp-trace.log"
+    }
+    $proc = Start-Process @startArgs
     if (-not (Wait-PathExists $mnt 60)) {
         throw "mount point $mnt did not appear (see $logDir\$name)"
     }

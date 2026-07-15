@@ -14,6 +14,7 @@ param(
     [int]$LargeFileMB = 100,
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
     [switch]$Trace,
+    [switch]$TraceSummary,
     [ValidateSet('All', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
 )
 
@@ -125,7 +126,15 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     if ($Trace) {
         $startArgs.RedirectStandardError = Join-Path $logDir "$name-winfsp-trace.log"
     }
-    $proc = Start-Process @startArgs
+    $savedTraceSummary = $env:WEED_WINFSP_TRACE_SUMMARY
+    try {
+        if ($TraceSummary) {
+            $env:WEED_WINFSP_TRACE_SUMMARY = Join-Path $logDir "$name-operation-summary.log"
+        }
+        $proc = Start-Process @startArgs
+    } finally {
+        $env:WEED_WINFSP_TRACE_SUMMARY = $savedTraceSummary
+    }
     if (-not (Wait-PathExists $mnt 60)) {
         throw "mount point $mnt did not appear (see $logDir\$name)"
     }

@@ -126,7 +126,7 @@ func attrToStat(attr *fuse.Attr, st *cgofuse.Stat_t) {
 
 func (a *winfspFS) Init() {}
 
-func (a *winfspFS) Destroy() {}
+func (a *winfspFS) Destroy() { writeWinfspStatsTrace() }
 
 func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
 	defer track(opStatfs)()

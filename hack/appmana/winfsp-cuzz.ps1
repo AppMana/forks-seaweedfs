@@ -8,6 +8,7 @@ param(
     [ValidateRange(0, [int]::MaxValue)][int]$RandomSeed = 1,
     [ValidateSet('All', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'GitAtomicRenamePrimed',
     [switch]$Trace,
+    [switch]$TraceSummary,
     [string]$WorkRoot
 )
 
@@ -43,6 +44,7 @@ try {
         '-WorkRoot', $WorkRoot, '-TestCase', $TestCase
     )
     if ($Trace) { $smokeArgs += '-Trace' }
+    if ($TraceSummary) { $smokeArgs += '-TraceSummary' }
     & $pwsh @smokeArgs
     $testExitCode = $LASTEXITCODE
 } finally {

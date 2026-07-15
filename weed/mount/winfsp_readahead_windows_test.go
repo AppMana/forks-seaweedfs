@@ -7,12 +7,14 @@ import (
 
 // fakeFile backs the fetch callback with a byte slice and counts calls.
 type fakeFile struct {
-	data    []byte
-	fetches int
+	data         []byte
+	fetches      int
+	lastFetchLen int // len(dst) passed to the most recent fetch call
 }
 
 func (f *fakeFile) fetch(dst []byte, ofst int64) int {
 	f.fetches++
+	f.lastFetchLen = len(dst)
 	if ofst >= int64(len(f.data)) {
 		return 0
 	}
@@ -63,6 +65,72 @@ func TestReadAheadRandomAccessBypasses(t *testing.T) {
 	// first read refills (sequential from 0 by default seqEnd=0), rest random direct
 	if f.fetches < 3 {
 		t.Fatalf("expected mostly direct fetches, got %d", f.fetches)
+	}
+}
+
+// TestReadAheadToleratesNearbyOutOfOrderOffset is a regression test mirroring
+// reader_pattern.go's concurrency fix: WinFsp's default multi-threaded
+// dispatcher can complete Read calls on the same handle out of order, so a
+// request landing slightly behind the tracked frontier (b.seqEnd) but still
+// close to it and outside the current window must still refill the window
+// (treated as sequential-ish), not fall back to an unbuffered per-request
+// fetch the way a bare ofst == b.seqEnd check would.
+func TestReadAheadToleratesNearbyOutOfOrderOffset(t *testing.T) {
+	c := newReadAheadCache()
+	f := &fakeFile{data: mkData(4 << 20)}
+	got := make([]byte, 4096)
+
+	b := c.buffer(6, 105)
+	b.mu.Lock()
+	b.off = 2 << 20
+	b.buf = append([]byte(nil), f.data[2<<20:3<<20]...)
+	b.seqEnd = (2 << 20) + 8192
+	b.mu.Unlock()
+
+	// 100KB behind the frontier, outside [b.off, b.off+len(buf)) since it's
+	// before b.off -- within readAheadOffsetTolerance (256KB).
+	off := int64(2<<20) - 100000
+	n := c.Read(6, 105, got, off, f.fetch)
+	if n != 4096 {
+		t.Fatalf("off %d: n=%d", off, n)
+	}
+	if !bytes.Equal(got, f.data[off:off+4096]) {
+		t.Fatalf("off %d: data mismatch", off)
+	}
+	if f.fetches != 1 {
+		t.Fatalf("fetches = %d, want 1", f.fetches)
+	}
+	if f.lastFetchLen != readAheadSize {
+		t.Fatalf("lastFetchLen = %d, want %d (should refill the window, not bypass to a small direct fetch)", f.lastFetchLen, readAheadSize)
+	}
+}
+
+// TestReadAheadStillBypassesFarOutOfOrderOffset guards against the
+// tolerance fix over-widening: an offset far from the frontier (beyond
+// readAheadOffsetTolerance) must still be treated as genuinely random and
+// bypass the window, exactly like TestReadAheadRandomAccessBypasses.
+func TestReadAheadStillBypassesFarOutOfOrderOffset(t *testing.T) {
+	c := newReadAheadCache()
+	f := &fakeFile{data: mkData(4 << 20)}
+	got := make([]byte, 4096)
+
+	b := c.buffer(7, 106)
+	b.mu.Lock()
+	b.off = 2 << 20
+	b.buf = append([]byte(nil), f.data[2<<20:3<<20]...)
+	b.seqEnd = (2 << 20) + 8192
+	b.mu.Unlock()
+
+	off := int64(0) // far beyond readAheadOffsetTolerance from the frontier
+	n := c.Read(7, 106, got, off, f.fetch)
+	if n != 4096 {
+		t.Fatalf("off %d: n=%d", off, n)
+	}
+	if !bytes.Equal(got, f.data[off:off+4096]) {
+		t.Fatalf("off %d: data mismatch", off)
+	}
+	if f.lastFetchLen != len(got) {
+		t.Fatalf("lastFetchLen = %d, want %d (genuinely random offset should bypass, not refill a 1MB window)", f.lastFetchLen, len(got))
 	}
 }
 

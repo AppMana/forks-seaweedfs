@@ -7,6 +7,7 @@ param(
     [ValidateRange(1, 4)][int]$FuzzingLevel = 4,
     [ValidateRange(0, [int]::MaxValue)][int]$RandomSeed = 1,
     [ValidateSet('All', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'GitAtomicRenamePrimed',
+    [switch]$Trace,
     [string]$WorkRoot
 )
 
@@ -41,6 +42,7 @@ try {
         '-WeedExe', $WeedExe, '-ServerWeedExe', $serverWeedExe,
         '-WorkRoot', $WorkRoot, '-TestCase', $TestCase
     )
+    if ($Trace) { $smokeArgs += '-Trace' }
     & $pwsh @smokeArgs
     $testExitCode = $LASTEXITCODE
 } finally {

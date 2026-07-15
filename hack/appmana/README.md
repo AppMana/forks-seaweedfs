@@ -31,7 +31,8 @@ Verifier Cuzz layer:
 ./hack/appmana/winfsp-cuzz.ps1 `
   -WeedExe (Resolve-Path ./weed.exe) `
   -FuzzingLevel 4 `
-  -RandomSeed 1
+  -RandomSeed 1 `
+  -Trace
 ```
 
 Cuzz inserts delays at Win32 synchronization calls. Keep a failing seed and
@@ -39,7 +40,8 @@ rerun the same command to increase the probability of recreating the same
 interleaving. The wrapper always removes AppVerifier settings when the test
 finishes. It runs the filer server from an identical binary with a different
 image name, so Cuzz perturbs only the WinFsp mount process. Application
-Verifier is installed through the Windows SDK.
+Verifier is installed through the Windows SDK. `-Trace` also enables WinFsp's
+request/response log; use it only after a seed reproduces without tracing.
 
 Use the tools according to what they control:
 

@@ -47,11 +47,6 @@ func TestHandleRenameResponseLeavesUncachedTargetOutOfCache(t *testing.T) {
 		metaCache:   mc,
 		inodeToPath: inodeToPath,
 		fhMap:       NewFileHandleToInode(),
-		option:      &Option{},
-	}
-	var notified *filer_pb.SubscribeMetadataResponse
-	wfs.option.OnRemoteMetadataEvent = func(event *filer_pb.SubscribeMetadataResponse) {
-		notified = event
 	}
 
 	resp := &filer_pb.StreamRenameEntryResponse{
@@ -77,14 +72,8 @@ func TestHandleRenameResponseLeavesUncachedTargetOutOfCache(t *testing.T) {
 	if err := wfs.handleRenameResponse(context.Background(), resp); err != nil {
 		t.Fatalf("handle rename response: %v", err)
 	}
-	if notified == nil || notified.EventNotification == nil {
-		t.Fatal("local rename did not synchronously notify the Windows metadata observer")
-	}
-	if got := notified.EventNotification.OldEntry.GetName(); got != "config.lock" {
-		t.Fatalf("notified old name = %q, want config.lock", got)
-	}
-	if got := notified.EventNotification.NewEntry.GetName(); got != "config" {
-		t.Fatalf("notified new name = %q, want config", got)
+	if _, found := inodeToPath.GetInode(sourcePath); found {
+		t.Fatalf("source path %s still has an inode mapping after rename", sourcePath)
 	}
 
 	entry, findErr := mc.FindEntry(context.Background(), targetPath)

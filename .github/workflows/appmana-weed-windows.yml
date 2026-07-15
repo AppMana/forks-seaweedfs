@@ -105,8 +105,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: weed-windows-amd64-large-disk-cgo0
-      - name: Prove repeatable Git atomic rename regression
-        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestCase GitAtomicRename -GitIterations 100
+      - name: Reproduce primed Git atomic rename regression
+        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestCase GitAtomicRenamePrimed
       - name: Upload mount test logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -114,6 +114,34 @@ jobs:
           name: git-atomic-rename-logs
           path: |
             ${{ runner.temp }}/sw-logs/**
+          if-no-files-found: ignore
+
+  mount-cuzz:
+    runs-on: windows-2022
+    needs: [test-windows]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WinFsp (pinned MSI)
+        run: |
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile winfsp.msi
+          Start-Process -NoNewWindow -Wait msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000'
+      - uses: actions/download-artifact@v4
+        with:
+          name: weed-windows-amd64-large-disk-cgo0
+      - name: Reproduce with AppVerifier Cuzz seed 1
+        run: ./hack/appmana/winfsp-cuzz.ps1 -WeedExe (Resolve-Path ./weed.exe) -RandomSeed 1
+      - name: Upload Cuzz mount logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-atomic-rename-cuzz-seed-1
+          path: |
+            ${{ runner.temp }}/sw-logs/**
+            ${{ runner.temp }}/sw-cuzz-1/**
+            ${{ env.USERPROFILE }}/AppVerifierLogs/**
           if-no-files-found: ignore
 
   winfsp-compat:

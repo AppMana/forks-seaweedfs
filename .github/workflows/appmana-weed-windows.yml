@@ -105,15 +105,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: weed-windows-amd64-large-disk-cgo0
-      - name: Reproduce primed Git atomic rename regression
-        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestCase GitAtomicRenamePrimed
+      - name: Verify traced namespace and Git atomic rename regression
+        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestCase GitAtomicRenamePrimed -GitIterations 20
       - name: Upload mount test logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: git-atomic-rename-logs
           path: |
-            ${{ runner.temp }}/sw-logs/**
+            ${{ runner.temp }}/sw-smoke/logs/**
           if-no-files-found: ignore
 
   mount-cuzz:
@@ -139,7 +139,7 @@ jobs:
         with:
           name: git-atomic-rename-cuzz-seed-1
           path: |
-            ${{ runner.temp }}/sw-logs/**
+            ${{ runner.temp }}/sw-cuzz-1/logs/**
           if-no-files-found: ignore
       - name: Upload failed Cuzz workroot
         if: failure()

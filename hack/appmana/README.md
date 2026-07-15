@@ -6,8 +6,11 @@ contract failures before changing mount implementation code.
 
 ## Git atomic rename regression
 
-`mount-smoke.ps1` supports two focused cases:
+`mount-smoke.ps1` supports three focused cases:
 
+- `NamespaceCoherence` reproduces the traced WinFsp failure: a file remains
+  directly readable while its parent enumeration omits it and rename returns
+  `NAME NOT FOUND`.
 - `GitAtomicRename` runs `git init` on a fresh mount.
 - `GitAtomicRenamePrimed` first runs the metadata and rename-over-existing
   sequence from the full smoke test, then runs `git init`. This is the exact
@@ -20,7 +23,25 @@ contract failures before changing mount implementation code.
 ```
 
 Every invocation removes and recreates `WorkRoot` so schedule comparisons
-start with the same filer, mount, and metadata-cache state.
+start with the same filer, mount, and metadata-cache state. Logs are retained
+under `WorkRoot\logs`; use `-Verbosity 4` for SeaweedFS callback/filer ordering
+and `-WinFspOptions` for explicit WinFsp cache-option A/B runs.
+
+### Recorded failure signature
+
+The authoritative RED capture used Procmon's native PML recording without
+WinFsp debug logging. Windows successfully created, wrote, closed, reopened,
+and read `hello.txt`; after `subdir/nested.txt` was created, root
+`QueryDirectory` returned only `subdir`, and `SetRenameInformationFile` for
+`hello.txt` returned `NAME NOT FOUND`.
+
+Correlated SeaweedFS logs showed the parent `ListEntries` snapshot beginning
+before the deferred `CreateEntry /hello.txt`. Overlapping WinFsp close/flush
+callbacks all shared one FUSE handle and entered `doFlush`; the old transaction
+boundary allowed every callback to observe dirty metadata before the first
+commit cleared it. `TestConcurrentFlushCommitsDeferredCreateOnce` holds the
+first filer commit open and asserts that concurrent flush callbacks emit one
+authoritative create.
 
 ## Schedule fuzzing and replay
 

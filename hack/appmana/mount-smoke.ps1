@@ -15,7 +15,9 @@ param(
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
     [switch]$Trace,
     [switch]$TraceSummary,
-    [ValidateSet('All', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
+    [string]$WinFspOptions,
+    [ValidateRange(0, 4)][int]$Verbosity = 0,
+    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,9 +62,10 @@ function Invoke-GitAtomicRenameTest([string]$mnt) {
     }
 }
 
-function Invoke-GitAtomicRenamePrelude([string]$mnt) {
-    # Preserve the exact metadata sequence that makes the subsequent Git
-    # lockfile replacement fail on a fresh WinFsp mount.
+function Invoke-NamespaceCoherenceTest([string]$mnt) {
+    # This is the minimal sequence captured in the failing Procmon trace:
+    # the file remains directly openable, but a parent enumeration omits it
+    # and the following SetRenameInformationFile returns NAME NOT FOUND.
     Set-Content -Path "$mnt\hello.txt" -Value 'seaweedfs on windows' -NoNewline
     Assert ((Get-Content "$mnt\hello.txt" -Raw) -eq 'seaweedfs on windows') 'write/read round trip'
 
@@ -79,6 +82,12 @@ function Invoke-GitAtomicRenamePrelude([string]$mnt) {
     Rename-Item "$mnt\hello.txt" 'renamed.txt'
     Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
     Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'
+}
+
+function Invoke-GitAtomicRenamePrelude([string]$mnt) {
+    # Preserve the full metadata sequence that makes the subsequent Git
+    # lockfile replacement fail on a fresh WinFsp mount.
+    Invoke-NamespaceCoherenceTest $mnt
     Set-Content -Path "$mnt\victim.txt" -Value 'overwrite me'
     Move-Item "$mnt\renamed.txt" "$mnt\victim.txt" -Force
     Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
@@ -109,7 +118,7 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     # New console (no -NoNewWindow): required so Stop-Mount's CTRL_C
     # event reaches only the mount process. Logs go to -logdir.
     $mountArgs = @(
-        "-logdir=$(Join-Path $logDir $name)", 'mount',
+        "-logdir=$(Join-Path $logDir $name)", "-v=$Verbosity", 'mount',
         '-filer=127.0.0.1:8888',
         "-dir=$mnt",
         "-cacheDir=$cacheDir",
@@ -117,13 +126,15 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
         '-volumeLabel=SmokeTest'
     )
     if ($Trace) { $mountArgs += '-winfspOptions=debug' }
+    if ($WinFspOptions) { $mountArgs += "-winfspOptions=$WinFspOptions" }
     $startArgs = @{
         FilePath = $WeedExe
         PassThru = $true
         WindowStyle = 'Hidden'
         ArgumentList = $mountArgs
     }
-    if ($Trace) {
+    if ($Trace -or $Verbosity -gt 0) {
+        $startArgs.RedirectStandardOutput = Join-Path $logDir "$name-stdout.log"
         $startArgs.RedirectStandardError = Join-Path $logDir "$name-winfsp-trace.log"
     }
     $savedTraceSummary = $env:WEED_WINFSP_TRACE_SUMMARY
@@ -188,7 +199,7 @@ if (Test-Path $WorkRoot) {
     Remove-Item -Recurse -Force $WorkRoot
 }
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
-$logDir = Join-Path $tempRoot 'sw-logs'
+$logDir = Join-Path $WorkRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $dataDir = Join-Path $WorkRoot 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
@@ -198,19 +209,39 @@ $mnt = Join-Path $WorkRoot 'mnt'   # must NOT pre-exist; WinFsp creates it
 
 Write-Host '== starting weed server'
 New-Item -ItemType Directory -Force -Path (Join-Path $logDir 'server') | Out-Null
-$server = Start-Process -FilePath $ServerWeedExe -PassThru -WindowStyle Hidden -ArgumentList @(
-    "-logdir=$(Join-Path $logDir 'server')", 'server', '-ip=127.0.0.1',
-    "-dir=$dataDir",
-    '-master.volumeSizeLimitMB=64',
-    '-volume.max=5',
-    '-filer'
-)
+$serverStartArgs = @{
+    FilePath = $ServerWeedExe
+    PassThru = $true
+    WindowStyle = 'Hidden'
+    ArgumentList = @(
+        "-logdir=$(Join-Path $logDir 'server')", "-v=$Verbosity", 'server', '-ip=127.0.0.1',
+        "-dir=$dataDir",
+        '-master.volumeSizeLimitMB=64',
+        '-volume.max=5',
+        '-filer'
+    )
+}
+if ($Verbosity -gt 0) {
+    $serverStartArgs.RedirectStandardOutput = Join-Path $logDir 'server-stdout.log'
+    $serverStartArgs.RedirectStandardError = Join-Path $logDir 'server-stderr.log'
+}
+$server = Start-Process @serverStartArgs
+$mount = $null
+$mount2 = $null
+$mountB = $null
 try {
     foreach ($port in 9333, 8080, 8888) {
         if (-not (Wait-Tcp $port)) { throw "weed server port $port never came up" }
     }
     Write-Host '== server up; mounting'
     $mount = Start-Mount $mnt $cacheDir $logDir 'mount1'
+
+    if ($TestCase -eq 'NamespaceCoherence') {
+        Invoke-NamespaceCoherenceTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
 
     if ($TestCase -eq 'GitAtomicRename') {
         Invoke-GitAtomicRenameTest $mnt
@@ -307,7 +338,28 @@ try {
 
     Stop-Mount $mount2 $mnt
 } finally {
-    if (-not $server.HasExited) { $server.Kill() }
+    foreach ($activeMount in @($mountB, $mount2, $mount)) {
+        if ($null -ne $activeMount -and -not $activeMount.HasExited) {
+            try {
+                if (-not (Stop-MountGracefully $activeMount 5)) {
+                    $activeMount.Kill()
+                    $activeMount.WaitForExit(5000) | Out-Null
+                }
+            } catch {
+                try { $activeMount.Kill(); $activeMount.WaitForExit(5000) | Out-Null } catch {}
+            }
+        }
+    }
+    if (-not $server.HasExited) {
+        try {
+            if (-not (Stop-MountGracefully $server 5)) {
+                $server.Kill()
+                $server.WaitForExit(5000) | Out-Null
+            }
+        } catch {
+            try { $server.Kill(); $server.WaitForExit(5000) | Out-Null } catch {}
+        }
+    }
 }
 
 if ($failures -gt 0) {

@@ -22,11 +22,15 @@ import (
 type createEntryTestServer struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	mu            sync.Mutex
+	createCount   int
 	lastDirectory string
 	lastName      string
 	lastUID       uint32
 	lastGID       uint32
 	lastMode      uint32
+	createStarted chan struct{}
+	allowCreate   chan struct{}
+	startOnce     sync.Once
 }
 
 type createEntrySnapshot struct {
@@ -39,7 +43,7 @@ type createEntrySnapshot struct {
 
 func (s *createEntryTestServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.createCount++
 	s.lastDirectory = req.GetDirectory()
 	if req.GetEntry() != nil {
 		s.lastName = req.GetEntry().GetName()
@@ -47,6 +51,17 @@ func (s *createEntryTestServer) CreateEntry(ctx context.Context, req *filer_pb.C
 			s.lastUID = req.GetEntry().GetAttributes().GetUid()
 			s.lastGID = req.GetEntry().GetAttributes().GetGid()
 			s.lastMode = req.GetEntry().GetAttributes().GetFileMode()
+		}
+	}
+	s.mu.Unlock()
+	if s.createStarted != nil {
+		s.startOnce.Do(func() { close(s.createStarted) })
+	}
+	if s.allowCreate != nil {
+		select {
+		case <-s.allowCreate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	return &filer_pb.CreateEntryResponse{}, nil
@@ -66,6 +81,12 @@ func (s *createEntryTestServer) snapshot() createEntrySnapshot {
 		gid:       s.lastGID,
 		mode:      s.lastMode,
 	}
+}
+
+func (s *createEntryTestServer) creates() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createCount
 }
 
 func newCreateTestWFS(t *testing.T) (*WFS, *createEntryTestServer) {
@@ -248,6 +269,67 @@ func TestReleaseFlushesDirtyCreateIfFlushWasSkipped(t *testing.T) {
 	}
 	if fh := wfs.GetHandle(FileHandleId(out.Fh)); fh != nil {
 		t.Fatal("Release should remove the file handle after fallback flush")
+	}
+}
+
+func TestConcurrentFlushCommitsDeferredCreateOnce(t *testing.T) {
+	wfs, testServer := newCreateTestWFS(t)
+	testServer.createStarted = make(chan struct{})
+	testServer.allowCreate = make(chan struct{})
+
+	out := &fuse.CreateOut{}
+	status := wfs.Create(make(chan struct{}), &fuse.CreateIn{
+		InHeader: fuse.InHeader{
+			NodeId: 1,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: 123, Gid: 456}},
+		},
+		Flags: syscall.O_WRONLY | syscall.O_CREAT,
+		Mode:  0o640,
+	}, "concurrent_flush.txt", out)
+	if status != fuse.OK {
+		t.Fatalf("Create status = %v, want OK", status)
+	}
+
+	const flushers = 32
+	start := make(chan struct{})
+	results := make(chan fuse.Status, flushers)
+	for range flushers {
+		go func() {
+			<-start
+			results <- wfs.Flush(make(chan struct{}), &fuse.FlushIn{
+				InHeader: fuse.InHeader{
+					NodeId: out.NodeId,
+					Caller: fuse.Caller{Owner: fuse.Owner{Uid: 123, Gid: 456}},
+				},
+				Fh: out.Fh,
+			})
+		}()
+	}
+	close(start)
+
+	select {
+	case <-testServer.createStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first CreateEntry did not start")
+	}
+	// Hold the first commit long enough for the other callbacks to reach the
+	// same dirty handle, matching the overlap observed in the WinFsp trace.
+	time.Sleep(100 * time.Millisecond)
+	close(testServer.allowCreate)
+
+	for range flushers {
+		select {
+		case flushStatus := <-results:
+			if flushStatus != fuse.OK {
+				t.Fatalf("Flush status = %v, want OK", flushStatus)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent Flush did not complete")
+		}
+	}
+
+	if got := testServer.creates(); got != 1 {
+		t.Fatalf("CreateEntry calls = %d, want exactly 1", got)
 	}
 }
 

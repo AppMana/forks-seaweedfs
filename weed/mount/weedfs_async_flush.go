@@ -54,6 +54,11 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 	glog.V(4).Infof("completeAsyncFlush inode %d fh %d saved=%s/%s dirtyMetadata=%v isDeleted=%v isRenamed=%v",
 		fh.inode, fh.fh, fh.savedDir, fh.savedName, fh.dirtyMetadata, fh.isDeleted, fh.isRenamed)
 
+	// Match doFlush's transaction boundary. Writes, periodic metadata flushes,
+	// and duplicate close callbacks must not observe or commit a half-drained
+	// handle while the background worker seals data and publishes metadata.
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("completeAsyncFlush", fh.fh, util.ExclusiveLock)
+
 	// Phase 1: Flush dirty pages — seals writable chunks, uploads to volume servers, and waits.
 	// The underlying UploadWithRetry already retries transient HTTP/gRPC errors internally,
 	// so a failure here indicates a persistent issue; the chunk data has been freed.
@@ -105,6 +110,7 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 	}
 
 	glog.V(3).Infof("completeAsyncFlush done inode %d fh %d", fh.inode, fh.fh)
+	fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
 	// Phase 3: Destroy the upload pipeline and free resources.
 	fh.ReleaseHandle()
@@ -115,7 +121,7 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 // volume servers at this point; only the filer metadata reference needs persisting.
 func (wfs *WFS) flushMetadataWithRetry(fh *FileHandle, dir, name string, fileFullPath util.FullPath) {
 	err := retryMetadataFlush(func() error {
-		return wfs.flushMetadataToFiler(fh, dir, name, fh.asyncFlushUid, fh.asyncFlushGid)
+		return wfs.flushMetadataToFilerLocked(fh, dir, name, fh.asyncFlushUid, fh.asyncFlushGid)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("completeAsyncFlush %s: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, nextAttempt, totalAttempts, backoff, err)

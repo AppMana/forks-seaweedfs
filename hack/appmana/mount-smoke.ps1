@@ -11,7 +11,8 @@ param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-smoke'),
     [int]$LargeFileMB = 100,
-    [switch]$Trace
+    [switch]$Trace,
+    [ValidateSet('All', 'GitAtomicRename')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,27 @@ function Assert([bool]$cond, [string]$what) {
         Write-Host "FAIL: $what" -ForegroundColor Red
         $script:failures++
     }
+}
+
+function Invoke-GitAtomicRenameTest([string]$mnt) {
+    # Git performs several config.lock -> config atomic replacements during
+    # one init. A stale source name after the first rename makes the second
+    # exclusive config.lock create fail with ERROR_FILE_EXISTS.
+    $gitRepo = Join-Path $mnt 'git-atomic-rename'
+    New-Item -ItemType Directory -Path $gitRepo | Out-Null
+    $savedErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $gitOutputLines = & git -C $gitRepo init 2>&1
+        $gitExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    $gitOutput = $gitOutputLines | Out-String
+    if ($gitExitCode -ne 0) { Write-Host $gitOutput -ForegroundColor Red }
+    Assert ($gitExitCode -eq 0) 'git init supports repeated config.lock atomic replacements'
+    Assert ((Test-Path (Join-Path $gitRepo '.git\config'))) 'git init publishes config'
+    Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) 'git init leaves no stale config.lock'
 }
 
 function Wait-Tcp([int]$port, [int]$timeoutSec = 120) {
@@ -143,6 +165,13 @@ try {
     Write-Host '== server up; mounting'
     $mount = Start-Mount $mnt $cacheDir $logDir 'mount1'
 
+    if ($TestCase -eq 'GitAtomicRename') {
+        Invoke-GitAtomicRenameTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
+
     # --- basic write/read
     Set-Content -Path "$mnt\hello.txt" -Value 'seaweedfs on windows' -NoNewline
     Assert ((Get-Content "$mnt\hello.txt" -Raw) -eq 'seaweedfs on windows') 'write/read round trip'
@@ -167,17 +196,7 @@ try {
     Move-Item "$mnt\renamed.txt" "$mnt\victim.txt" -Force
     Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
 
-    # --- Git performs several config.lock -> config atomic replacements during
-    # one init. A stale source name after the first rename makes the second
-    # exclusive config.lock create fail with ERROR_FILE_EXISTS.
-    $gitRepo = Join-Path $mnt 'git-atomic-rename'
-    New-Item -ItemType Directory -Path $gitRepo | Out-Null
-    $gitOutput = (& git -C $gitRepo init 2>&1 | Out-String)
-    $gitExitCode = $LASTEXITCODE
-    if ($gitExitCode -ne 0) { Write-Host $gitOutput -ForegroundColor Red }
-    Assert ($gitExitCode -eq 0) 'git init supports repeated config.lock atomic replacements'
-    Assert ((Test-Path (Join-Path $gitRepo '.git\config'))) 'git init publishes config'
-    Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) 'git init leaves no stale config.lock'
+    Invoke-GitAtomicRenameTest $mnt
 
     # --- append
     Add-Content -Path "$mnt\append.txt" -Value 'line1'

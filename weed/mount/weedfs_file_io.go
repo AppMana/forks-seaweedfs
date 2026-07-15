@@ -107,31 +107,74 @@ func (wfs *WFS) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut)
  */
 const openMtimeCacheMaxSize = 8192
 
-// applyKeepCacheFlag compares the entry's mtime (seconds + nanoseconds) against
-// the last-seen value and sets FOPEN_KEEP_CACHE when unchanged.
+// invalidatedMtime is a sentinel stored in openMtimeCache by
+// invalidateOpenMtimeCache to mark an inode as "known dirty" -- distinct
+// from an inode that was never recorded at all. No real FuseAttributes ever
+// produces this pair (MtimeNs is a wall-clock nanosecond-of-second value,
+// always >= 0), so it can never equal a genuine currentMtime.
+var invalidatedMtime = [2]int64{-1, -1}
+
+// applyKeepCacheFlag compares the entry's mtime (seconds + nanoseconds)
+// against the last-seen value recorded by this WFS process and sets
+// FOPEN_KEEP_CACHE unless we have positive evidence the file changed since
+// we last saw it.
+//
+// Two cases set the flag: mtime unchanged since a previous open we recorded
+// (the original, narrow case), and -- the fix here -- an inode this process
+// has never opened before (!loaded). The latter matters because a one-shot
+// workload (open once, mmap, read, close -- e.g. loading an ML checkpoint)
+// never gets a "previous open" to compare against under the old logic, so
+// FOPEN_KEEP_CACHE was never set for it, and FUSE's default (no keep_cache)
+// means the kernel discards page-cache state for that inode across separate
+// opens.
+//
+// A *changed* mtime, or an inode explicitly marked dirty by
+// invalidateOpenMtimeCache (loaded && prev != currentMtime, which includes
+// prev == invalidatedMtime), withholds the flag -- that's the case the
+// mechanism actually exists to guard: a write (local, via
+// invalidateOpenMtimeCache in weedfs_file_write.go / weedfs_file_mkrm.go /
+// weedfs_attr.go, or external, reflected in a fresh entry.Attributes.Mtime
+// fetched at this open) since we last recorded this inode's mtime. The
+// sentinel matters because a plain delete-on-invalidate would make the next
+// open indistinguishable from "never opened," which would incorrectly set
+// keep_cache right after a write we just flagged as unsafe to cache.
+//
+// Accepted tradeoff: if this weed mount process restarts, openMtimeCache
+// resets to empty, so the immediately-following open of an inode the kernel
+// still has stale cached pages for (from before the restart) will look like
+// "never seen" and get keep_cache set optimistically. This is a narrow
+// window (requires an external modification during the restart itself) and
+// was already an accepted risk class for any keep_cache-based scheme; it is
+// not made worse by treating first-open as safe rather than unsafe.
 func (wfs *WFS) applyKeepCacheFlag(inode uint64, entry *LockedEntry, out *fuse.OpenOut) {
 	currentMtime := [2]int64{entry.Attributes.Mtime, int64(entry.Attributes.MtimeNs)}
 	wfs.openMtimeMu.Lock()
-	prev, loaded := wfs.openMtimeCache[inode]
-	if loaded && prev == currentMtime {
-		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
-	} else {
-		if len(wfs.openMtimeCache) >= openMtimeCacheMaxSize {
-			for k := range wfs.openMtimeCache {
-				delete(wfs.openMtimeCache, k)
-				break
-			}
-		}
-		wfs.openMtimeCache[inode] = currentMtime
+	if wfs.openMtimeCache == nil {
+		wfs.openMtimeCache = make(map[uint64][2]int64, 8192)
 	}
+	prev, loaded := wfs.openMtimeCache[inode]
+	if !loaded || prev == currentMtime {
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	}
+	if len(wfs.openMtimeCache) >= openMtimeCacheMaxSize {
+		for k := range wfs.openMtimeCache {
+			delete(wfs.openMtimeCache, k)
+			break
+		}
+	}
+	wfs.openMtimeCache[inode] = currentMtime
 	wfs.openMtimeMu.Unlock()
 }
 
-// invalidateOpenMtimeCache removes an inode's cached mtime so the next Open
-// does not set FOPEN_KEEP_CACHE with stale kernel page cache data.
+// invalidateOpenMtimeCache marks an inode's cached mtime as dirty so the
+// next Open does not set FOPEN_KEEP_CACHE with stale kernel page cache data.
+// It stores a sentinel rather than deleting the entry -- see invalidatedMtime.
 func (wfs *WFS) invalidateOpenMtimeCache(inode uint64) {
 	wfs.openMtimeMu.Lock()
-	delete(wfs.openMtimeCache, inode)
+	if wfs.openMtimeCache == nil {
+		wfs.openMtimeCache = make(map[uint64][2]int64, 8192)
+	}
+	wfs.openMtimeCache[inode] = invalidatedMtime
 	wfs.openMtimeMu.Unlock()
 }
 

@@ -111,8 +111,8 @@ jobs:
           $csv = Join-Path $env:RUNNER_TEMP 'git-atomic-rename.csv'
           wpr.exe -cancel 2>$null | Out-Null
           wpr.exe -start FileIO -filemode
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./hack/appmana/mount-smoke.ps1 `
-            -WeedExe (Resolve-Path ./weed.exe) -TestCase GitAtomicRename
+          & pwsh.exe -NoProfile -File ./hack/appmana/mount-smoke.ps1 `
+            -WeedExe (Resolve-Path ./weed.exe) -LargeFileMB 1
           $testExitCode = $LASTEXITCODE
           wpr.exe -stop $trace
           tracerpt.exe $trace -o $csv -of CSV -y

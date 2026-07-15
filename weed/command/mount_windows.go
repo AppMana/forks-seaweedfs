@@ -142,6 +142,11 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		fmt.Printf("Please specify a reasonable buffer size.\n")
 		return false
 	}
+	readerCacheMode, err := parseReaderCacheMode(*mountOptions.readerCacheMode)
+	if err != nil {
+		fmt.Println(err.Error())
+		return false
+	}
 
 	if err := checkWinFspInstalled(); err != nil {
 		glog.Errorf("%v", err)
@@ -154,7 +159,6 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 	var cipher bool
 	var bucketRootPath string
-	var err error
 	for i := 0; i < 10; i++ {
 		err = pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
@@ -260,6 +264,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		ChunkSizeLimit:              int64(chunkSizeLimitMB) * 1024 * 1024,
 		ConcurrentWriters:           *option.concurrentWriters,
 		ConcurrentReaders:           *option.concurrentReaders,
+		ReaderCacheMode:             readerCacheMode,
 		CacheDirForRead:             cacheDirForRead,
 		CacheSizeMBForRead:          *option.cacheSizeMBForRead,
 		CacheDirForWrite:            cacheDirForWrite,

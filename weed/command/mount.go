@@ -1,8 +1,11 @@
 package command
 
 import (
+	"fmt"
 	"os"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 )
 
 type MountOptions struct {
@@ -18,6 +21,7 @@ type MountOptions struct {
 	chunkSizeLimitMB     *int
 	concurrentWriters    *int
 	concurrentReaders    *int
+	readerCacheMode      *string
 	cacheMetaTtlSec      *int
 	cacheDirForRead      *string
 	cacheDirForWrite     *string
@@ -106,6 +110,7 @@ func init() {
 	mountOptions.chunkSizeLimitMB = cmdMount.Flag.Int("chunkSizeLimitMB", 2, "local write buffer size, also chunk large files")
 	mountOptions.concurrentWriters = cmdMount.Flag.Int("concurrentWriters", 128, "limit concurrent goroutine writers")
 	mountOptions.concurrentReaders = cmdMount.Flag.Int("concurrentReaders", 128, "limit concurrent chunk fetches for read operations")
+	mountOptions.readerCacheMode = cmdMount.Flag.String("readerCacheMode", "auto", "[auto|sequential|random] override the inferred sequential/random read-pattern classification that controls whole-chunk caching. auto infers from access order (can misclassify concurrent or mmap-driven reads as random, see reader_pattern.go); sequential forces whole-chunk caching always -- recommended for mmap-heavy workloads such as ML checkpoint loading; random disables it always")
 	mountOptions.cacheDirForRead = cmdMount.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks and meta data")
 	mountOptions.cacheSizeMBForRead = cmdMount.Flag.Int64("cacheCapacityMB", 128, "file chunk read cache capacity in MB")
 	mountOptions.cacheDirForWrite = cmdMount.Flag.String("cacheDirWrite", "", "buffer writes mostly for large files")
@@ -201,4 +206,18 @@ var cmdMount = &Command{
     -rdma.timeoutMs=5000         RDMA operation timeout in milliseconds
 
   `,
+}
+
+// parseReaderCacheMode validates -readerCacheMode and converts it to
+// filer.ReaderCacheMode. Fails closed on an unrecognized value rather than
+// silently falling back to auto, so a typo in a StorageClass parameter or
+// CLI flag surfaces immediately instead of quietly reverting to inferred
+// behavior.
+func parseReaderCacheMode(value string) (filer.ReaderCacheMode, error) {
+	switch filer.ReaderCacheMode(value) {
+	case filer.ReaderCacheModeAuto, filer.ReaderCacheModeSequential, filer.ReaderCacheModeRandom:
+		return filer.ReaderCacheMode(value), nil
+	default:
+		return "", fmt.Errorf("invalid -readerCacheMode %q: expected auto, sequential, or random", value)
+	}
 }

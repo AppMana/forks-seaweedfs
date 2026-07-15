@@ -132,14 +132,21 @@ jobs:
         with:
           name: weed-windows-amd64-large-disk-cgo0
       - name: Reproduce with AppVerifier Cuzz seed 1
-        run: ./hack/appmana/winfsp-cuzz.ps1 -WeedExe (Resolve-Path ./weed.exe) -RandomSeed 1 -Trace
+        run: ./hack/appmana/winfsp-cuzz.ps1 -WeedExe (Resolve-Path ./weed.exe) -RandomSeed 1 -TraceSummary
       - name: Upload Cuzz mount logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: git-atomic-rename-cuzz-seed-1
           path: |
             ${{ runner.temp }}/sw-logs/**
+          if-no-files-found: ignore
+      - name: Upload failed Cuzz workroot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-atomic-rename-cuzz-seed-1-workroot
+          path: |
             ${{ runner.temp }}/sw-cuzz-1/**
           if-no-files-found: ignore
 

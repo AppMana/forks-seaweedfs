@@ -1,6 +1,8 @@
 package mount
 
 import (
+	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -70,6 +72,35 @@ func logWinfspStatsLoop() {
 		if line != "" {
 			glog.V(1).Infof("winfsp ops (1m):%s", line)
 		}
+	}
+}
+
+// writeWinfspStatsTrace writes one end-of-mount summary when explicitly
+// requested by the test harness. The counters are already maintained for the
+// production latency log, so enabling this adds no work to filesystem calls.
+func writeWinfspStatsTrace() {
+	path := os.Getenv("WEED_WINFSP_TRACE_SUMMARY")
+	if path == "" {
+		return
+	}
+	var b strings.Builder
+	for op := 0; op < opMax; op++ {
+		count := winfspStats[op].count.Load()
+		if count == 0 {
+			continue
+		}
+		totalUs := winfspStats[op].totalUs.Load()
+		b.WriteString(winfspOpNames[op])
+		b.WriteByte(' ')
+		b.WriteString(itoa(count))
+		b.WriteByte(' ')
+		b.WriteString(itoa(totalUs))
+		b.WriteByte(' ')
+		b.WriteString(itoa(totalUs / count))
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0600); err != nil {
+		glog.Errorf("write WinFsp operation summary %s: %v", path, err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -32,7 +33,15 @@ type ChunkReadAt struct {
 	fileSize      int64
 	readerCache   *ReaderCache
 	readerPattern *ReaderPattern
-	lastChunkFid  string
+	// lastChunkFid is read/written by readChunkSliceAt on every read, which
+	// is called concurrently under WFS.Read's shared (not exclusive)
+	// per-handle lock -- see reader_pattern.go's package doc for the same
+	// concurrency source. atomic.Pointer avoids a data race on a plain
+	// string field; see readChunkSliceAt for why an approximate value here
+	// is fine (it only ever gates a harmless, idempotent prefetch trigger,
+	// never a destructive action -- see the removed UnCache-on-transition
+	// call this replaced).
+	lastChunkFid  atomic.Pointer[string]
 	prefetchCount int             // Number of chunks to prefetch ahead during sequential reads
 	ctx           context.Context // Context used for cancellation during chunk read operations
 }
@@ -145,6 +154,24 @@ func NewChunkReaderAtFromClient(ctx context.Context, readerCache *ReaderCache, c
 		fileSize:      fileSize,
 		readerCache:   readerCache,
 		readerPattern: NewReaderPattern(),
+		prefetchCount: prefetchCount,
+		ctx:           ctx,
+	}
+}
+
+// NewChunkReaderAtFromClientWithMode is like NewChunkReaderAtFromClient but
+// lets the caller explicitly override the sequential/random read-pattern
+// classification instead of relying on it being inferred (see
+// ReaderCacheMode in reader_pattern.go). Used by the weed mount FUSE path
+// so a known-mmap-heavy workload can be configured to always cache whole
+// chunks rather than depend on the heuristic classifying it correctly.
+func NewChunkReaderAtFromClientWithMode(ctx context.Context, readerCache *ReaderCache, chunkViews *IntervalList[*ChunkView], fileSize int64, prefetchCount int, readerCacheMode ReaderCacheMode) *ChunkReadAt {
+
+	return &ChunkReadAt{
+		chunkViews:    chunkViews,
+		fileSize:      fileSize,
+		readerCache:   readerCache,
+		readerPattern: NewReaderPatternWithMode(readerCacheMode),
 		prefetchCount: prefetchCount,
 		ctx:           ctx,
 	}
@@ -319,29 +346,49 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 
 func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunkView *ChunkView, nextChunkViews *Interval[*ChunkView], offset uint64) (n int, err error) {
 
-	if c.readerPattern.IsRandomMode() {
-		n, err := c.readerCache.chunkCache.ReadChunkAt(buffer, chunkView.FileId, offset)
-		if n > 0 {
-			return n, err
-		}
-		return fetchChunkRange(ctx, buffer, c.readerCache.lookupFileIdFn, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset))
-	}
-
+	// Every read -- random-mode or not -- goes through the shared,
+	// single-flight-coalesced whole-chunk cache. Bypassing it in random
+	// mode (as the old code did, falling through to an uncached, uncoalesced
+	// fetchChunkRange on a cache miss) meant that repeated or concurrent
+	// requests landing in the same chunk each paid their own full network
+	// round-trip instead of sharing one cached chunk fetch -- for a
+	// multi-chunk file accessed in a pattern the sequential/random detector
+	// misclassifies (see reader_pattern.go), this turns what should be one
+	// fetch per chunk into one fetch per request. Random vs. sequential
+	// should only affect whether we speculatively prefetch chunks that
+	// haven't been requested yet, not whether we cache what was requested.
 	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	n, err = c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
-	if c.lastChunkFid != chunkView.FileId {
+	fid := chunkView.FileId
+	prevFid := c.lastChunkFid.Load()
+	if prevFid == nil || *prevFid != fid {
 		if chunkView.OffsetInChunk == 0 { // start of a new chunk
-			if c.lastChunkFid != "" {
-				c.readerCache.UnCache(c.lastChunkFid)
-			}
-			if nextChunkViews != nil && c.prefetchCount > 0 {
+			// Deliberately NOT calling c.readerCache.UnCache(*prevFid) here:
+			// under WFS.Read's shared per-handle lock, readChunkSliceAt can
+			// run concurrently for genuinely different chunks (e.g. mmap
+			// page faults resolving on separate goroutines touching
+			// different tensors at once). lastChunkFid is then only an
+			// approximation of "the chunk some other concurrent call last
+			// saw," not "the chunk this logical stream just finished with" --
+			// evicting on that basis previously destroyed a DIFFERENT,
+			// still-in-use chunk's downloader out from under the concurrent
+			// reader that owned it, forcing a full chunk re-fetch. Capacity-
+			// based eviction in ReaderCache.ReadChunkAt (oldest completed
+			// downloader, once len(downloaders) >= limit) is the safe
+			// cleanup mechanism; this transition is only used to decide
+			// whether to opportunistically prefetch ahead.
+			//
+			// Only prefetch chunks ahead of what's actually been requested
+			// when access looks sequential -- fetching unrequested chunks
+			// speculatively is wasted bandwidth for genuinely random access.
+			if nextChunkViews != nil && c.prefetchCount > 0 && !c.readerPattern.IsRandomMode() {
 				// Prefetch multiple chunks ahead for better sequential read throughput
 				// This keeps the network pipeline full with parallel chunk fetches
 				c.readerCache.MaybeCache(nextChunkViews, c.prefetchCount)
 			}
 		}
 	}
-	c.lastChunkFid = chunkView.FileId
+	c.lastChunkFid.Store(&fid)
 	return
 }
 

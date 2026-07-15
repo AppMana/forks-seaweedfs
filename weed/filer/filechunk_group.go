@@ -18,6 +18,7 @@ type ChunkGroup struct {
 	sectionsLock      sync.RWMutex
 	readerCache       *ReaderCache
 	concurrentReaders int
+	readerCacheMode   ReaderCacheMode
 }
 
 // NewChunkGroup creates a ChunkGroup with configurable concurrency.
@@ -27,6 +28,14 @@ type ChunkGroup struct {
 // - Number of concurrent section reads for large files
 // If concurrentReaders <= 0, defaults to 16.
 func NewChunkGroup(lookupFn wdclient.LookupFileIdFunctionType, chunkCache chunk_cache.ChunkCache, chunks []*filer_pb.FileChunk, concurrentReaders int) (*ChunkGroup, error) {
+	return NewChunkGroupWithMode(lookupFn, chunkCache, chunks, concurrentReaders, ReaderCacheModeAuto)
+}
+
+// NewChunkGroupWithMode is like NewChunkGroup but lets the caller explicitly
+// override the sequential/random read-pattern classification for every
+// section's ChunkReadAt, instead of relying on it being inferred (see
+// ReaderCacheMode in reader_pattern.go).
+func NewChunkGroupWithMode(lookupFn wdclient.LookupFileIdFunctionType, chunkCache chunk_cache.ChunkCache, chunks []*filer_pb.FileChunk, concurrentReaders int, readerCacheMode ReaderCacheMode) (*ChunkGroup, error) {
 	if concurrentReaders <= 0 {
 		concurrentReaders = 16
 	}
@@ -43,6 +52,7 @@ func NewChunkGroup(lookupFn wdclient.LookupFileIdFunctionType, chunkCache chunk_
 		sections:          make(map[SectionIndex]*FileChunkSection),
 		readerCache:       NewReaderCache(readerCacheLimit, chunkCache, lookupFn),
 		concurrentReaders: concurrentReaders,
+		readerCacheMode:   readerCacheMode,
 	}
 
 	err := group.SetChunks(chunks)

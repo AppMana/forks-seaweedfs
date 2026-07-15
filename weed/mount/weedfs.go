@@ -45,6 +45,7 @@ type Option struct {
 	ChunkSizeLimit              int64
 	ConcurrentWriters           int
 	ConcurrentReaders           int
+	ReaderCacheMode             filer.ReaderCacheMode
 	CacheDirForRead             string
 	CacheSizeMBForRead          int64
 	CacheDirForWrite            string

@@ -14,8 +14,11 @@ func newTestWFS() *WFS {
 }
 
 func TestOpenKeepCache_FirstOpen(t *testing.T) {
-	// First open of a file should NOT set FOPEN_KEEP_CACHE because there
-	// is no previously cached mtime to compare against.
+	// First open of a file (no previously cached mtime to compare against)
+	// SHOULD set FOPEN_KEEP_CACHE: there is nothing prior to be stale
+	// relative to, and a one-shot workload (open once, mmap, read, close --
+	// e.g. loading an ML checkpoint) never gets a second open to benefit
+	// from the old, narrower behavior.
 	wfs := newTestWFS()
 
 	var out fuse.OpenOut
@@ -29,8 +32,8 @@ func TestOpenKeepCache_FirstOpen(t *testing.T) {
 
 	wfs.applyKeepCacheFlag(inode, entry, &out)
 
-	if out.OpenFlags&fuse.FOPEN_KEEP_CACHE != 0 {
-		t.Error("first open should not set FOPEN_KEEP_CACHE")
+	if out.OpenFlags&fuse.FOPEN_KEEP_CACHE == 0 {
+		t.Error("first open should set FOPEN_KEEP_CACHE")
 	}
 }
 

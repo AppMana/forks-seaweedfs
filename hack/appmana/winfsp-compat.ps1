@@ -11,6 +11,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$winFspBin = Join-Path ${env:ProgramFiles(x86)} 'WinFsp\bin'
+if (-not (Test-Path (Join-Path $winFspBin 'winfsp-x64.dll'))) {
+    throw "WinFsp runtime DLL not found under $winFspBin"
+}
+$env:PATH = "$winFspBin;$env:PATH"
+
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
 $dataDir = Join-Path $WorkRoot 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
@@ -50,6 +56,6 @@ try {
         Pop-Location
     }
 } finally {
-    if ($mount -and -not $mount.HasExited) { & taskkill /PID $mount.Id | Out-Null; Start-Sleep 2 }
+    if ($mount -and -not $mount.HasExited) { & taskkill /PID $mount.Id /T /F | Out-Null; Start-Sleep 2 }
     if (-not $server.HasExited) { $server.Kill() }
 }

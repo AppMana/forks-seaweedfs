@@ -24,12 +24,13 @@ const invalidFh = ^uint64(0)
 // and cgofuse structs to go-fuse structs.
 type winfspFS struct {
 	cgofuse.FileSystemBase
-	wfs       *WFS
-	readAhead *readAheadCache
+	wfs           *WFS
+	readAhead     *readAheadCache
+	caseSensitive bool
 }
 
-func newWinfspFS(wfs *WFS) *winfspFS {
-	return &winfspFS{wfs: wfs, readAhead: newReadAheadCache()}
+func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
+	return &winfspFS{wfs: wfs, readAhead: newReadAheadCache(), caseSensitive: caseSensitive}
 }
 
 // fullPath converts a cgofuse path ('/'-separated, relative to the
@@ -57,13 +58,56 @@ func (a *winfspFS) resolveInode(path string) (uint64, fuse.Status) {
 		return ino, fuse.OK
 	}
 	for _, comp := range strings.Split(strings.Trim(path, "/"), "/") {
-		var out fuse.EntryOut
-		if st := a.wfs.Lookup(nil, &fuse.InHeader{NodeId: ino}, comp, &out); st != fuse.OK {
+		child, _, st := a.lookupChild(ino, comp)
+		if st != fuse.OK {
 			return 0, st
 		}
-		ino = out.NodeId
+		ino = child
 	}
 	return ino, fuse.OK
+}
+
+// lookupChild resolves a child exactly first. Case-folded directory scans are
+// only used for mismatched Windows paths, keeping the normal lookup fast.
+func (a *winfspFS) lookupChild(parent uint64, requested string) (uint64, string, fuse.Status) {
+	var out fuse.EntryOut
+	status := a.wfs.Lookup(nil, &fuse.InHeader{NodeId: parent}, requested, &out)
+	if status == fuse.OK {
+		return out.NodeId, requested, fuse.OK
+	}
+	if a.caseSensitive || status != fuse.ENOENT {
+		return 0, "", status
+	}
+
+	parentPath, status := a.wfs.inodeToPath.GetPath(parent)
+	if status != fuse.OK {
+		return 0, "", status
+	}
+	if err := meta_cache.EnsureVisited(a.wfs.metaCache, a.wfs, parentPath); err != nil {
+		glog.Errorf("winfsp case-fold cache fill %s: %v", parentPath, err)
+		return 0, "", fuse.EIO
+	}
+
+	var actual string
+	if err := a.wfs.metaCache.ListDirectoryEntries(context.Background(), parentPath, "", false, math.MaxInt64, func(entry *filer.Entry) (bool, error) {
+		if winFspNameEqual(requested, entry.Name(), false) {
+			actual = entry.Name()
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		glog.Errorf("winfsp case-fold listing %s: %v", parentPath, err)
+		return 0, "", fuse.EIO
+	}
+	if actual == "" {
+		return 0, "", fuse.ENOENT
+	}
+
+	out = fuse.EntryOut{}
+	if status = a.wfs.Lookup(nil, &fuse.InHeader{NodeId: parent}, actual, &out); status != fuse.OK {
+		return 0, "", status
+	}
+	return out.NodeId, actual, fuse.OK
 }
 
 // resolveParent splits a cgofuse path into the parent inode and the
@@ -82,6 +126,18 @@ func (a *winfspFS) resolveParent(path string) (uint64, string, fuse.Status) {
 		return 0, "", st
 	}
 	return parent, name, fuse.OK
+}
+
+func (a *winfspFS) resolveExistingParent(path string) (uint64, string, fuse.Status) {
+	parent, name, status := a.resolveParent(path)
+	if status != fuse.OK || a.caseSensitive {
+		return parent, name, status
+	}
+	_, actual, status := a.lookupChild(parent, name)
+	if status != fuse.OK {
+		return parent, name, status
+	}
+	return parent, actual, fuse.OK
 }
 
 func (a *winfspFS) header(ino uint64) fuse.InHeader {
@@ -181,7 +237,7 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 
 func (a *winfspFS) Rmdir(path string) int {
 	defer track(opRmdir)()
-	parent, name, st := a.resolveParent(path)
+	parent, name, st := a.resolveExistingParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
@@ -191,7 +247,7 @@ func (a *winfspFS) Rmdir(path string) int {
 
 func (a *winfspFS) Unlink(path string) int {
 	defer track(opUnlink)()
-	parent, name, st := a.resolveParent(path)
+	parent, name, st := a.resolveExistingParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
@@ -201,7 +257,7 @@ func (a *winfspFS) Unlink(path string) int {
 
 func (a *winfspFS) Rename(oldpath string, newpath string) int {
 	defer track(opRename)()
-	oldParent, oldName, st := a.resolveParent(oldpath)
+	oldParent, oldName, st := a.resolveExistingParent(oldpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}

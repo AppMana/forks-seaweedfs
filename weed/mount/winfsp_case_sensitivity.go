@@ -38,5 +38,12 @@ func winFspDirectoryListingPath(requested, canonical string, caseSensitive bool)
 	return requested
 }
 
+func winFspMutationName(requested, canonical string, found, caseSensitive bool) (string, bool) {
+	if !caseSensitive && found {
+		return canonical, true
+	}
+	return requested, false
+}
+
 // DefaultWinFspCaseSensitive is the default for the weed mount Windows option.
 const DefaultWinFspCaseSensitive = defaultWinFspCaseSensitive

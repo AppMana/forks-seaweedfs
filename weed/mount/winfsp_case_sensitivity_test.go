@@ -42,3 +42,15 @@ func TestWinFspDirectoryListingUsesCanonicalPathWhenCaseInsensitive(t *testing.T
 		t.Fatalf("case-sensitive listing path = %q; want %q", got, requested)
 	}
 }
+
+func TestWinFspMutationUsesExistingCanonicalName(t *testing.T) {
+	if got, exists := winFspMutationName("caseprobe.tmp", "CaseProbe.tmp", true, false); got != "CaseProbe.tmp" || !exists {
+		t.Fatalf("case-insensitive mutation = %q, %v; want CaseProbe.tmp, true", got, exists)
+	}
+	if got, exists := winFspMutationName("caseprobe.tmp", "CaseProbe.tmp", true, true); got != "caseprobe.tmp" || exists {
+		t.Fatalf("case-sensitive mutation = %q, %v; want caseprobe.tmp, false", got, exists)
+	}
+	if got, exists := winFspMutationName("new.tmp", "", false, false); got != "new.tmp" || exists {
+		t.Fatalf("new case-insensitive mutation = %q, %v; want new.tmp, false", got, exists)
+	}
+}

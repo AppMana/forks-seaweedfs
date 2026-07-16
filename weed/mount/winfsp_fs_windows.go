@@ -547,10 +547,13 @@ func (a *winfspFS) Readdir(path string,
 	fh uint64) int {
 	defer track(opReaddir)()
 
-	dirPath := a.fullPath(path)
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
+	}
+	dirPath := a.fullPath(path)
+	if canonicalPath, canonicalStatus := a.wfs.inodeToPath.GetPath(ino); canonicalStatus == fuse.OK {
+		dirPath = util.FullPath(winFspDirectoryListingPath(string(dirPath), string(canonicalPath), a.caseSensitive))
 	}
 
 	fill(".", nil, 0)

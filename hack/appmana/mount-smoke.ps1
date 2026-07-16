@@ -79,6 +79,13 @@ function Invoke-NamespaceCoherenceTest([string]$mnt) {
     Assert ($names -match 'hello.txt' -and $names -match 'subdir') "directory listing ($names)"
     Assert ((Get-ChildItem "$mnt\subdir").Count -eq 1) 'nested directory listing'
 
+    New-Item -ItemType Directory -Path "$mnt\CaseRoot\Nested" | Out-Null
+    Set-Content -Path "$mnt\CaseRoot\Nested\Payload.groovy" -Value 'class Payload {}'
+    $caseRootNames = (Get-ChildItem "$mnt\CASEROOT" | Select-Object -ExpandProperty Name) -join ','
+    $caseNestedNames = (Get-ChildItem "$mnt\CASEROOT\NESTED" | Select-Object -ExpandProperty Name) -join ','
+    Assert ($caseRootNames -match 'Nested') "case-folded directory listing ($caseRootNames)"
+    Assert ($caseNestedNames -match 'Payload.groovy') "nested case-folded directory listing ($caseNestedNames)"
+
     Rename-Item "$mnt\hello.txt" 'renamed.txt'
     Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
     Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'

@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"syscall"
@@ -73,6 +74,7 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		// chance invalid bytes do reach us.
 		Directory:                dirFullPath.Sanitized(),
 		Entry:                    newEntry,
+		OExcl:                    true,
 		Signatures:               []int32{wfs.signature},
 		SkipCheckParentDirectory: true,
 	}
@@ -99,7 +101,10 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 
 	if err != nil {
 		wfs.mapPbIdFromFilerToLocal(newEntry)
-		return fuse.EIO
+		if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
+			return fuse.Status(syscall.EEXIST)
+		}
+		return grpcErrorToFuseStatus(err)
 	}
 
 	// Map uid/gid back to local-space before writing attributes to the

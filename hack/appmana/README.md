@@ -6,7 +6,7 @@ contract failures before changing mount implementation code.
 
 ## Git atomic rename regression
 
-`mount-smoke.ps1` supports three focused cases:
+`mount-smoke.ps1` supports four focused cases:
 
 - `NamespaceCoherence` reproduces the traced WinFsp failure: a file remains
   directly readable while its parent enumeration omits it and rename returns
@@ -15,6 +15,9 @@ contract failures before changing mount implementation code.
 - `GitAtomicRenamePrimed` first runs the metadata and rename-over-existing
   sequence from the full smoke test, then runs `git init`. This is the exact
   reduced workload for the observed stale `config.lock` failure.
+- `GitLfsTempMetadata` repeatedly runs `git status` over modified LFS assets.
+  This exercises Git LFS's create-then-chmod temp-file sequence and catches a
+  deferred create becoming path-invisible after directory metadata eviction.
 
 ```powershell
 ./hack/appmana/mount-smoke.ps1 `

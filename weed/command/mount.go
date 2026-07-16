@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/mount"
 )
 
 type MountOptions struct {
@@ -44,6 +45,7 @@ type MountOptions struct {
 	disableXAttr         *bool
 	volumeLabel          *string
 	winfspOptions        *string
+	winfspCaseSensitive  *bool
 	extraOptions         []string
 	fuseCommandPid       int
 
@@ -133,6 +135,7 @@ func init() {
 	mountOptions.disableXAttr = cmdMount.Flag.Bool("disableXAttr", false, "disable xattr")
 	mountOptions.volumeLabel = cmdMount.Flag.String("volumeLabel", "SeaweedFS", "volume label shown by Windows (winfsp mounts only)")
 	mountOptions.winfspOptions = cmdMount.Flag.String("winfspOptions", "", "comma-separated extra WinFsp -o options, e.g. FileInfoTimeout=-1,DirInfoTimeout=2000 (winfsp mounts only)")
+	mountOptions.winfspCaseSensitive = cmdMount.Flag.Bool("winfspCaseSensitive", mount.DefaultWinFspCaseSensitive, "advertise a case-sensitive Windows filesystem (winfsp mounts only)")
 	mountOptions.hasAutofs = cmdMount.Flag.Bool("autofs", false, "ignore autofs mounted on the same mountpoint (useful when systemd.automount and autofs is used)")
 	mountOptions.fuseCommandPid = 0
 

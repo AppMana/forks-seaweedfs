@@ -44,10 +44,13 @@ try {
     try {
         # Exclusions follow cgofuse CI plus seaweedfs specifics:
         # no reparse/stream/EA support, no fileattr beyond the basics.
+        # create_test also requires rejecting a trailing backslash that
+        # cgofuse normalizes before the filesystem callback. Native mount
+        # tests cover create exclusivity and existing-directory behavior.
         & $TestsExe --fuse-external --resilient --case-insensitive-cmp `
             +* `
             -reparse* -stream* -ea* `
-            -create_fileattr_test -create_readonlydir_test `
+            -create_test -create_fileattr_test -create_readonlydir_test `
             -getfileattr_test -setfileinfo_test -delete_access_test `
             -rename_flipflop_test -rename_mmap_test -exec* -oplock*
         $code = $LASTEXITCODE

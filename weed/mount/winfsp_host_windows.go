@@ -15,15 +15,12 @@ type WinFspHost struct {
 }
 
 // NewWinFspHost wraps wfs in the cgofuse adapter.
-func NewWinFspHost(wfs *WFS) *WinFspHost {
-	host := cgofuse.NewFileSystemHost(newWinfspFS(wfs))
+func NewWinFspHost(wfs *WFS, caseSensitive bool) *WinFspHost {
+	host := cgofuse.NewFileSystemHost(newWinfspFS(wfs, caseSensitive))
 	// WinFsp-only optimization: Readdir fills full stats, so the FSD can
 	// answer directory queries without per-entry Getattr round trips.
 	host.SetCapReaddirPlus(true)
-	// The filer namespace is case-sensitive; declaring the volume
-	// case-insensitive would require fold-on-lookup which the adapter
-	// does not implement.
-	host.SetCapCaseInsensitive(false)
+	host.SetCapCaseInsensitive(winFspCaseInsensitive(caseSensitive))
 	go logWinfspStatsLoop()
 	return &WinFspHost{host: host}
 }

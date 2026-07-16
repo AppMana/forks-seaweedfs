@@ -17,7 +17,7 @@ param(
     [switch]$TraceSummary,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
-    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
+    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,6 +62,43 @@ function Invoke-GitAtomicRenameTest([string]$mnt) {
     }
 }
 
+function Invoke-GitLfsTempMetadataTest([string]$mnt) {
+    $gitRepo = Join-Path $mnt 'git-lfs-temp-metadata'
+    New-Item -ItemType Directory -Path $gitRepo | Out-Null
+    & git -C $gitRepo init | Out-Null
+    & git -C $gitRepo config user.name 'AppMana mount smoke'
+    & git -C $gitRepo config user.email 'mount-smoke@appmana.invalid'
+    & git -C $gitRepo lfs install --local | Out-Null
+    & git -C $gitRepo lfs track '*.lfs' | Out-Null
+
+    1..32 | ForEach-Object {
+        [IO.File]::WriteAllText((Join-Path $gitRepo "asset-$_.lfs"), "initial-$($_)-$('x' * 4096)")
+    }
+    & git -C $gitRepo add .
+    & git -C $gitRepo commit -m 'seed lfs assets' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Git LFS seed commit succeeds'
+
+    for ($iteration = 1; $iteration -le $GitIterations; $iteration++) {
+        1..32 | ForEach-Object {
+            [IO.File]::WriteAllText((Join-Path $gitRepo "asset-$_.lfs"), "iteration-$iteration-$($_)-$('y' * 4096)")
+        }
+
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $statusOutputLines = & git -C $gitRepo status --short --untracked-files=no 2>&1
+            $statusExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        if ($statusExitCode -ne 0) {
+            Write-Host ($statusOutputLines | Out-String) -ForegroundColor Red
+        }
+        Assert ($statusExitCode -eq 0) "Git LFS status iteration $iteration can chmod newly-created filter temp files"
+        if ($statusExitCode -ne 0) { break }
+    }
+}
+
 function Invoke-NamespaceCoherenceTest([string]$mnt) {
     # This is the minimal sequence captured in the failing Procmon trace:
     # the file remains directly openable, but a parent enumeration omits it
@@ -78,6 +115,27 @@ function Invoke-NamespaceCoherenceTest([string]$mnt) {
     $names = (Get-ChildItem $mnt | Select-Object -ExpandProperty Name) -join ','
     Assert ($names -match 'hello.txt' -and $names -match 'subdir') "directory listing ($names)"
     Assert ((Get-ChildItem "$mnt\subdir").Count -eq 1) 'nested directory listing'
+
+    New-Item -ItemType Directory -Path "$mnt\CaseRoot\Nested" | Out-Null
+    Set-Content -Path "$mnt\CaseRoot\Nested\Payload.groovy" -Value 'class Payload {}'
+    $caseRootNames = (Get-ChildItem "$mnt\CASEROOT" | Select-Object -ExpandProperty Name) -join ','
+    $caseNestedNames = (Get-ChildItem "$mnt\CASEROOT\NESTED" | Select-Object -ExpandProperty Name) -join ','
+    Assert ($caseRootNames -match 'Nested') "case-folded directory listing ($caseRootNames)"
+    Assert ($caseNestedNames -match 'Payload.groovy') "nested case-folded directory listing ($caseNestedNames)"
+
+    $exclusiveUpper = "$mnt\CaseExclusive.tmp"
+    $exclusiveLower = "$mnt\caseexclusive.tmp"
+    [IO.File]::WriteAllText($exclusiveUpper, 'first')
+    $caseOnlyCreateRejected = $false
+    try {
+        $stream = [IO.File]::Open($exclusiveLower, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Dispose()
+    } catch [IO.IOException] {
+        $caseOnlyCreateRejected = $true
+    }
+    $exclusiveEntries = @(Get-ChildItem $mnt | Where-Object { $_.Name -ieq 'CaseExclusive.tmp' })
+    Assert $caseOnlyCreateRejected 'case-only exclusive create reports already exists'
+    Assert ($exclusiveEntries.Count -eq 1) 'case-only exclusive create preserves one namespace entry'
 
     Rename-Item "$mnt\hello.txt" 'renamed.txt'
     Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
@@ -253,6 +311,13 @@ try {
     if ($TestCase -eq 'GitAtomicRenamePrimed') {
         Invoke-GitAtomicRenamePrelude $mnt
         Invoke-GitAtomicRenameTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
+
+    if ($TestCase -eq 'GitLfsTempMetadata') {
+        Invoke-GitLfsTempMetadataTest $mnt
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }
         exit 0

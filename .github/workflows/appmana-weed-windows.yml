@@ -107,6 +107,8 @@ jobs:
           name: weed-windows-amd64-large-disk-cgo0
       - name: Verify traced namespace and Git atomic rename regression
         run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestCase GitAtomicRenamePrimed -GitIterations 20
+      - name: Verify Git LFS temp-file metadata regression
+        run: ./hack/appmana/mount-smoke.ps1 -WeedExe (Resolve-Path ./weed.exe) -TestCase GitLfsTempMetadata -GitIterations 10
       - name: Upload mount test logs
         if: failure()
         uses: actions/upload-artifact@v4

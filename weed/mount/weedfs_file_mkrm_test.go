@@ -225,6 +225,38 @@ func TestCreateCreatesAndOpensFile(t *testing.T) {
 	}
 }
 
+func TestLookupDeferredCreateSurvivesMetadataCacheEviction(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+
+	out := &fuse.CreateOut{}
+	status := wfs.Create(make(chan struct{}), &fuse.CreateIn{
+		InHeader: fuse.InHeader{
+			NodeId: 1,
+			Caller: fuse.Caller{
+				Owner: fuse.Owner{Uid: 123, Gid: 456},
+			},
+		},
+		Flags: syscall.O_WRONLY | syscall.O_CREAT,
+		Mode:  0o640,
+	}, "deferred.txt", out)
+	if status != fuse.OK {
+		t.Fatalf("Create status = %v, want OK", status)
+	}
+
+	fullPath := util.FullPath("/deferred.txt")
+	if err := wfs.metaCache.DeleteFolderChildren(context.Background(), util.FullPath("/")); err != nil {
+		t.Fatalf("evict parent metadata cache: %v", err)
+	}
+
+	entry, status := wfs.lookupEntry(fullPath)
+	if status != fuse.OK {
+		t.Fatalf("lookup after metadata cache eviction = %v, want OK", status)
+	}
+	if entry == nil || entry.Name() != "deferred.txt" {
+		t.Fatalf("lookup entry = %#v, want deferred.txt", entry)
+	}
+}
+
 func TestReleaseFlushesDirtyCreateIfFlushWasSkipped(t *testing.T) {
 	wfs, testServer := newCreateTestWFS(t)
 

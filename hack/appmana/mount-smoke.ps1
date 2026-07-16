@@ -17,7 +17,7 @@ param(
     [switch]$TraceSummary,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
-    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed')][string]$TestCase = 'All'
+    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,6 +59,43 @@ function Invoke-GitAtomicRenameTest([string]$mnt) {
         Assert ((Test-Path (Join-Path $gitRepo '.git\config'))) "git init iteration $iteration publishes config"
         Assert (-not (Test-Path (Join-Path $gitRepo '.git\config.lock'))) "git init iteration $iteration leaves no stale config.lock"
         if ($script:failures -ne $failuresBefore) { break }
+    }
+}
+
+function Invoke-GitLfsTempMetadataTest([string]$mnt) {
+    $gitRepo = Join-Path $mnt 'git-lfs-temp-metadata'
+    New-Item -ItemType Directory -Path $gitRepo | Out-Null
+    & git -C $gitRepo init | Out-Null
+    & git -C $gitRepo config user.name 'AppMana mount smoke'
+    & git -C $gitRepo config user.email 'mount-smoke@appmana.invalid'
+    & git -C $gitRepo lfs install --local | Out-Null
+    & git -C $gitRepo lfs track '*.lfs' | Out-Null
+
+    1..32 | ForEach-Object {
+        [IO.File]::WriteAllText((Join-Path $gitRepo "asset-$_.lfs"), "initial-$($_)-$('x' * 4096)")
+    }
+    & git -C $gitRepo add .
+    & git -C $gitRepo commit -m 'seed lfs assets' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Git LFS seed commit succeeds'
+
+    for ($iteration = 1; $iteration -le $GitIterations; $iteration++) {
+        1..32 | ForEach-Object {
+            [IO.File]::WriteAllText((Join-Path $gitRepo "asset-$_.lfs"), "iteration-$iteration-$($_)-$('y' * 4096)")
+        }
+
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $statusOutputLines = & git -C $gitRepo status --short --untracked-files=no 2>&1
+            $statusExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        if ($statusExitCode -ne 0) {
+            Write-Host ($statusOutputLines | Out-String) -ForegroundColor Red
+        }
+        Assert ($statusExitCode -eq 0) "Git LFS status iteration $iteration can chmod newly-created filter temp files"
+        if ($statusExitCode -ne 0) { break }
     }
 }
 
@@ -274,6 +311,13 @@ try {
     if ($TestCase -eq 'GitAtomicRenamePrimed') {
         Invoke-GitAtomicRenamePrelude $mnt
         Invoke-GitAtomicRenameTest $mnt
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
+
+    if ($TestCase -eq 'GitLfsTempMetadata') {
+        Invoke-GitLfsTempMetadataTest $mnt
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }
         exit 0

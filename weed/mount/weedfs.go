@@ -587,6 +587,29 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 	return entry.ToProtoEntry(), fuse.OK
 }
 
+// lookupDirtyHandleEntry preserves the path visibility of an open file whose
+// metadata has not reached the filer yet. Directory cache eviction may remove
+// its deferred placeholder, but it must not make the still-open name disappear.
+func (wfs *WFS) lookupDirtyHandleEntry(fullpath util.FullPath) *filer.Entry {
+	inode, found := wfs.inodeToPath.GetInode(fullpath)
+	if !found {
+		return nil
+	}
+	fh, found := wfs.fhMap.FindFileHandle(inode)
+	if !found || !fh.dirtyMetadata || fh.isDeleted {
+		return nil
+	}
+
+	fh.entryLock.RLock()
+	defer fh.entryLock.RUnlock()
+	entry := fh.GetEntry().GetEntry()
+	if entry == nil {
+		return nil
+	}
+	dir, _ := fullpath.DirAndName()
+	return filer.FromPbEntry(dir, entry)
+}
+
 // lookupEntry looks up an entry by path, checking the local cache first.
 // Cached metadata is only authoritative when the parent directory itself is cached.
 // For uncached/read-through directories, always consult the filer directly so stale
@@ -609,6 +632,10 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, fuse.Status) 
 		// our IsDirectoryCached check and FindEntry (e.g. markDirectoryReadThrough).
 		// If it's no longer cached, fall through to the filer lookup below.
 		if wfs.metaCache.IsDirectoryCached(dirPath) {
+			if handleEntry := wfs.lookupDirtyHandleEntry(fullpath); handleEntry != nil {
+				glog.V(4).Infof("lookupEntry found deferred entry in open handle %s", fullpath)
+				return handleEntry, fuse.OK
+			}
 			// If the kernel is still tracking this path's inode, the entry
 			// was known to exist recently; a cached-dir miss here suggests
 			// metaCache/parent-cache coherence drift. Log visibly so the
@@ -636,6 +663,10 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, fuse.Status) 
 			hasDirtyHandle := false
 			hasPendingFlush := false
 			if inodeFound {
+				if handleEntry := wfs.lookupDirtyHandleEntry(fullpath); handleEntry != nil {
+					glog.V(4).Infof("lookupEntry found deferred entry in open handle %s", fullpath)
+					return handleEntry, fuse.OK
+				}
 				if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound && fh.dirtyMetadata {
 					hasDirtyHandle = true
 				}

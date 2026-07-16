@@ -33,6 +33,11 @@ type ChunkReadAt struct {
 	fileSize      int64
 	readerCache   *ReaderCache
 	readerPattern *ReaderPattern
+	// randomReadCounts tracks per-chunk reuse for adaptive promotion. The
+	// first partial random read stays a range request; a subsequent read of
+	// the same chunk promotes it into ReaderCache. sync.Map keeps concurrent
+	// FUSE reads from racing without serializing unrelated chunks.
+	randomReadCounts sync.Map // fileId -> *atomic.Uint32
 	// lastChunkFid is read/written by readChunkSliceAt on every read, which
 	// is called concurrently under WFS.Read's shared (not exclusive)
 	// per-handle lock -- see reader_pattern.go's package doc for the same
@@ -346,17 +351,31 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 
 func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunkView *ChunkView, nextChunkViews *Interval[*ChunkView], offset uint64) (n int, err error) {
 
-	// Every read -- random-mode or not -- goes through the shared,
-	// single-flight-coalesced whole-chunk cache. Bypassing it in random
-	// mode (as the old code did, falling through to an uncached, uncoalesced
-	// fetchChunkRange on a cache miss) meant that repeated or concurrent
-	// requests landing in the same chunk each paid their own full network
-	// round-trip instead of sharing one cached chunk fetch -- for a
-	// multi-chunk file accessed in a pattern the sequential/random detector
-	// misclassifies (see reader_pattern.go), this turns what should be one
-	// fetch per chunk into one fetch per request. Random vs. sequential
-	// should only affect whether we speculatively prefetch chunks that
-	// haven't been requested yet, not whether we cache what was requested.
+	if c.readerPattern.IsRandomMode() {
+		// Preserve persistent-cache hits before deciding whether this chunk
+		// has enough reuse to justify a whole-chunk download.
+		n, err = c.readerCache.chunkCache.ReadChunkAt(buffer, chunkView.FileId, offset)
+		if n > 0 {
+			return n, err
+		}
+
+		counterValue, _ := c.randomReadCounts.LoadOrStore(chunkView.FileId, &atomic.Uint32{})
+		readCount := counterValue.(*atomic.Uint32).Add(1)
+		if readCount == 1 && uint64(len(buffer)) < chunkView.ChunkSize {
+			// A one-off sparse access should not turn a 4KB request into a
+			// multi-megabyte backend transfer. If this chunk is touched again,
+			// the normal ReaderCache path below downloads it once and
+			// single-flights all subsequent readers.
+			return fetchChunkRange(ctx, buffer, c.readerCache.lookupFileIdFn, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset))
+		}
+	}
+
+	// Sequential reads and random chunks promoted after reuse go through the
+	// shared, single-flight-coalesced whole-chunk cache. The old random path
+	// bypassed it on every request, so repeated or concurrent reads landing
+	// in the same chunk each paid a separate network round-trip. Promotion
+	// preserves that fix without forcing a whole-chunk transfer for a chunk
+	// that was touched only once.
 	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	n, err = c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 	fid := chunkView.FileId

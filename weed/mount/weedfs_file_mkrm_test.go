@@ -28,6 +28,8 @@ type createEntryTestServer struct {
 	lastUID       uint32
 	lastGID       uint32
 	lastMode      uint32
+	lastOExcl     bool
+	entries       map[string]struct{}
 	createStarted chan struct{}
 	allowCreate   chan struct{}
 	startOnce     sync.Once
@@ -39,12 +41,14 @@ type createEntrySnapshot struct {
 	uid       uint32
 	gid       uint32
 	mode      uint32
+	oExcl     bool
 }
 
 func (s *createEntryTestServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
 	s.mu.Lock()
 	s.createCount++
 	s.lastDirectory = req.GetDirectory()
+	s.lastOExcl = req.GetOExcl()
 	if req.GetEntry() != nil {
 		s.lastName = req.GetEntry().GetName()
 		if req.GetEntry().GetAttributes() != nil {
@@ -53,6 +57,19 @@ func (s *createEntryTestServer) CreateEntry(ctx context.Context, req *filer_pb.C
 			s.lastMode = req.GetEntry().GetAttributes().GetFileMode()
 		}
 	}
+	if s.entries == nil {
+		s.entries = make(map[string]struct{})
+	}
+	entryKey := req.GetDirectory() + "/" + req.GetEntry().GetName()
+	_, exists := s.entries[entryKey]
+	if req.GetOExcl() && exists {
+		s.mu.Unlock()
+		return &filer_pb.CreateEntryResponse{
+			Error:     filer_pb.ErrEntryAlreadyExists.Error(),
+			ErrorCode: filer_pb.FilerError_ENTRY_ALREADY_EXISTS,
+		}, nil
+	}
+	s.entries[entryKey] = struct{}{}
 	s.mu.Unlock()
 	if s.createStarted != nil {
 		s.startOnce.Do(func() { close(s.createStarted) })
@@ -80,6 +97,7 @@ func (s *createEntryTestServer) snapshot() createEntrySnapshot {
 		uid:       s.lastUID,
 		gid:       s.lastGID,
 		mode:      s.lastMode,
+		oExcl:     s.lastOExcl,
 	}
 }
 
@@ -222,6 +240,27 @@ func TestCreateCreatesAndOpensFile(t *testing.T) {
 	}
 	if snapshot.mode != 0o640 {
 		t.Fatalf("CreateEntry mode = %o, want %o", snapshot.mode, 0o640)
+	}
+}
+
+func TestMkdirUsesExclusiveCreate(t *testing.T) {
+	wfs, testServer := newCreateTestWFS(t)
+	in := &fuse.MkdirIn{
+		InHeader: fuse.InHeader{
+			NodeId: 1,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: 123, Gid: 456}},
+		},
+		Mode: 0o755,
+	}
+
+	if status := wfs.Mkdir(make(chan struct{}), in, "existing", &fuse.EntryOut{}); status != fuse.OK {
+		t.Fatalf("first Mkdir status = %v, want OK", status)
+	}
+	if status := wfs.Mkdir(make(chan struct{}), in, "existing", &fuse.EntryOut{}); status != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("second Mkdir status = %v, want EEXIST", status)
+	}
+	if snapshot := testServer.snapshot(); !snapshot.oExcl {
+		t.Fatal("Mkdir CreateEntry request did not set o_excl")
 	}
 }
 

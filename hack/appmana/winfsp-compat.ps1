@@ -33,7 +33,8 @@ try {
         Start-Sleep -Milliseconds 500
     }
     $mount = Start-Process -FilePath $WeedExe -PassThru -NoNewWindow -ArgumentList @(
-        'mount', '-filer=127.0.0.1:8888', "-dir=$mnt", "-cacheDir=$(Join-Path $WorkRoot 'cache')"
+        'mount', '-filer=127.0.0.1:8888', "-dir=$mnt", "-cacheDir=$(Join-Path $WorkRoot 'cache')",
+        '-winfspCaseSensitive=true'
     )
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline -and -not (Test-Path $mnt)) { Start-Sleep -Milliseconds 250 }

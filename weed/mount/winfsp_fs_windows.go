@@ -140,6 +140,21 @@ func (a *winfspFS) resolveExistingParent(path string) (uint64, string, fuse.Stat
 	return parent, actual, fuse.OK
 }
 
+func (a *winfspFS) resolveMutationName(parent uint64, requested string) (string, bool, fuse.Status) {
+	if a.caseSensitive {
+		return requested, false, fuse.OK
+	}
+	_, canonical, status := a.lookupChild(parent, requested)
+	if status == fuse.ENOENT {
+		return requested, false, fuse.OK
+	}
+	if status != fuse.OK {
+		return requested, false, status
+	}
+	name, exists := winFspMutationName(requested, canonical, true, false)
+	return name, exists, fuse.OK
+}
+
 func (a *winfspFS) header(ino uint64) fuse.InHeader {
 	return fuse.InHeader{
 		NodeId: ino,
@@ -230,6 +245,13 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
+	name, exists, st := a.resolveMutationName(parent, name)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	if exists {
+		return -cgofuse.EEXIST
+	}
 	var out fuse.EntryOut
 	in := fuse.MkdirIn{InHeader: a.header(parent), Mode: mode & 07777}
 	return toWinErrno(a.wfs.Mkdir(nil, &in, name, &out))
@@ -265,6 +287,24 @@ func (a *winfspFS) Rename(oldpath string, newpath string) int {
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
+	if !a.caseSensitive {
+		oldIno, _, oldStatus := a.lookupChild(oldParent, oldName)
+		newIno, canonicalNewName, newStatus := a.lookupChild(newParent, newName)
+		if oldStatus != fuse.OK {
+			return toWinErrno(oldStatus)
+		}
+		switch newStatus {
+		case fuse.OK:
+			// Preserve the requested spelling for a case-only rename of the
+			// same object. Otherwise replace the existing canonical target.
+			if newIno != oldIno {
+				newName = canonicalNewName
+			}
+		case fuse.ENOENT:
+		default:
+			return toWinErrno(newStatus)
+		}
+	}
 	in := fuse.RenameIn{
 		InHeader: a.header(oldParent),
 		Newdir:   newParent,
@@ -277,6 +317,13 @@ func (a *winfspFS) Symlink(target string, newpath string) int {
 	parent, name, st := a.resolveParent(newpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
+	}
+	name, exists, st := a.resolveMutationName(parent, name)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	if exists {
+		return -cgofuse.EEXIST
 	}
 	var out fuse.EntryOut
 	hdr := a.header(parent)
@@ -304,6 +351,13 @@ func (a *winfspFS) Link(oldpath string, newpath string) int {
 	parent, name, st := a.resolveParent(newpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
+	}
+	name, exists, st := a.resolveMutationName(parent, name)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	if exists {
+		return -cgofuse.EEXIST
 	}
 	var out fuse.EntryOut
 	in := fuse.LinkIn{InHeader: a.header(parent), Oldnodeid: oldIno}
@@ -381,6 +435,13 @@ func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
 		return toWinErrno(st), invalidFh
+	}
+	name, exists, st := a.resolveMutationName(parent, name)
+	if st != fuse.OK {
+		return toWinErrno(st), invalidFh
+	}
+	if exists && flags&cgofuse.O_EXCL != 0 {
+		return -cgofuse.EEXIST, invalidFh
 	}
 	in := fuse.CreateIn{
 		InHeader: a.header(parent),

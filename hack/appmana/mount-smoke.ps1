@@ -86,6 +86,20 @@ function Invoke-NamespaceCoherenceTest([string]$mnt) {
     Assert ($caseRootNames -match 'Nested') "case-folded directory listing ($caseRootNames)"
     Assert ($caseNestedNames -match 'Payload.groovy') "nested case-folded directory listing ($caseNestedNames)"
 
+    $exclusiveUpper = "$mnt\CaseExclusive.tmp"
+    $exclusiveLower = "$mnt\caseexclusive.tmp"
+    [IO.File]::WriteAllText($exclusiveUpper, 'first')
+    $caseOnlyCreateRejected = $false
+    try {
+        $stream = [IO.File]::Open($exclusiveLower, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Dispose()
+    } catch [IO.IOException] {
+        $caseOnlyCreateRejected = $true
+    }
+    $exclusiveEntries = @(Get-ChildItem $mnt | Where-Object { $_.Name -ieq 'CaseExclusive.tmp' })
+    Assert $caseOnlyCreateRejected 'case-only exclusive create reports already exists'
+    Assert ($exclusiveEntries.Count -eq 1) 'case-only exclusive create preserves one namespace entry'
+
     Rename-Item "$mnt\hello.txt" 'renamed.txt'
     Assert (-not (Test-Path "$mnt\hello.txt")) 'rename removes old name'
     Assert ((Get-Content "$mnt\renamed.txt" -Raw) -eq 'seaweedfs on windows') 'rename keeps content'

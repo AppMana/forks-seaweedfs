@@ -30,3 +30,15 @@ func TestFindWinFspName(t *testing.T) {
 		t.Fatalf("exact lookup = %q, %v; want Library, true", got, found)
 	}
 }
+
+func TestWinFspDirectoryListingUsesCanonicalPathWhenCaseInsensitive(t *testing.T) {
+	requested := "/REPOSITORY/BUILDSRC/appmana-gradle-plugins/src/main/groovy"
+	canonical := "/repository/buildSrc/appmana-gradle-plugins/src/main/groovy"
+
+	if got := winFspDirectoryListingPath(requested, canonical, false); got != canonical {
+		t.Fatalf("case-insensitive listing path = %q; want %q", got, canonical)
+	}
+	if got := winFspDirectoryListingPath(requested, canonical, true); got != requested {
+		t.Fatalf("case-sensitive listing path = %q; want %q", got, requested)
+	}
+}

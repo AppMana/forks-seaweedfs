@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -86,6 +87,26 @@ func (s *createEntryTestServer) CreateEntry(ctx context.Context, req *filer_pb.C
 
 func (s *createEntryTestServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 	return &filer_pb.UpdateEntryResponse{}, nil
+}
+
+func (s *createEntryTestServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.entries[req.GetDirectory()+"/"+req.GetName()]; !exists {
+		return &filer_pb.LookupDirectoryEntryResponse{}, nil
+	}
+	return &filer_pb.LookupDirectoryEntryResponse{
+		Entry: &filer_pb.Entry{
+			Name:        req.GetName(),
+			IsDirectory: true,
+			Attributes: &filer_pb.FuseAttributes{
+				FileMode: uint32(0o755) | uint32(os.ModeDir),
+				Crtime:   time.Now().Unix(),
+				Mtime:    time.Now().Unix(),
+			},
+		},
+	}, nil
 }
 
 func (s *createEntryTestServer) snapshot() createEntrySnapshot {
@@ -261,6 +282,29 @@ func TestMkdirUsesExclusiveCreate(t *testing.T) {
 	}
 	if snapshot := testServer.snapshot(); !snapshot.oExcl {
 		t.Fatal("Mkdir CreateEntry request did not set o_excl")
+	}
+}
+
+func TestMkdirExistingDirectoryInvalidatesStaleNegativeCache(t *testing.T) {
+	wfs, testServer := newCreateTestWFS(t)
+	// Simulate a directory created through another mount after this mount
+	// cached the parent. MkdirAll follows EEXIST with an immediate lookup.
+	testServer.entries = map[string]struct{}{
+		"//existing": {},
+	}
+	in := &fuse.MkdirIn{
+		InHeader: fuse.InHeader{
+			NodeId: 1,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: 123, Gid: 456}},
+		},
+		Mode: 0o755,
+	}
+
+	if status := wfs.Mkdir(make(chan struct{}), in, "existing", &fuse.EntryOut{}); status != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("Mkdir status = %v, want EEXIST", status)
+	}
+	if status := wfs.Lookup(make(chan struct{}), &in.InHeader, "existing", &fuse.EntryOut{}); status != fuse.OK {
+		t.Fatalf("Lookup after EEXIST = %v, want OK", status)
 	}
 }
 

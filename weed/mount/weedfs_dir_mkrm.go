@@ -102,6 +102,7 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 	if err != nil {
 		wfs.mapPbIdFromFilerToLocal(newEntry)
 		if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
+			wfs.inodeToPath.InvalidateChildrenCache(dirFullPath)
 			return fuse.Status(syscall.EEXIST)
 		}
 		return grpcErrorToFuseStatus(err)

@@ -227,6 +227,41 @@ func TestIsGoodMove(t *testing.T) {
 			targetLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn4"}},
 			expected:       false,
 		},
+
+		{
+			// rep 001 allows two copies in one rack; replica-placement alone would
+			// permit this, but the target shares a host with another replica, so the
+			// machine anti-affinity must reject it.
+			name:        "test 001 reject move onto a machine already holding a replica",
+			replication: "001",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.1:8080"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.2:8080"}},
+				},
+			},
+			sourceLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.2:8080"}},
+			targetLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.1:8081"}},
+			expected:       false,
+		},
+
+		{
+			name:        "test 001 allow move onto a different machine in the rack",
+			replication: "001",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.1:8080"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.2:8080"}},
+				},
+			},
+			sourceLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.2:8080"}},
+			targetLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "10.0.0.3:8080"}},
+			expected:       true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -262,10 +297,122 @@ func TestBalance(t *testing.T) {
 
 }
 
+// Regression test: a freshly added empty volume server must end up sharing the
+// data roughly evenly, not having every volume drained onto it. Before the fix,
+// adjustAfterMove never updated the per-disk VolumeInfos that the density-based
+// capacity function reads, so the planner saw a stale topology and moved every
+// volume from the full node onto the empty one.
+func TestBalanceDoesNotDrainOntoOneNode(t *testing.T) {
+	const mb = 1024 * 1024
+	volumeSizeLimitMb := uint64(100)
+
+	makeNode := func(id string, volumes []*master_pb.VolumeInformationMessage) *Node {
+		return &Node{
+			info: &master_pb.DataNodeInfo{
+				Id: id,
+				DiskInfos: map[string]*master_pb.DiskInfo{
+					"": {
+						MaxVolumeCount: 10,
+						VolumeCount:    int64(len(volumes)),
+						VolumeInfos:    volumes,
+					},
+				},
+			},
+			dc:   "dc1",
+			rack: "rack1",
+		}
+	}
+
+	var fullVolumes []*master_pb.VolumeInformationMessage
+	for id := uint32(1); id <= 6; id++ {
+		fullVolumes = append(fullVolumes, &master_pb.VolumeInformationMessage{Id: id, Size: 95 * mb})
+	}
+	fullNode := makeNode("full", fullVolumes)
+	emptyNode := makeNode("empty", nil)
+	nodes := []*Node{fullNode, emptyNode}
+
+	volumeReplicas := map[uint32][]*VolumeReplica{}
+	for _, v := range fullVolumes {
+		loc := newLocation("dc1", "rack1", fullNode.info)
+		volumeReplicas[v.Id] = []*VolumeReplica{{location: &loc, info: v}}
+	}
+
+	for _, n := range nodes {
+		n.selectVolumes(func(v *master_pb.VolumeInformationMessage) bool { return true })
+	}
+
+	c := &commandVolumeBalance{volumeSizeLimitMb: volumeSizeLimitMb}
+	if err := c.balanceSelectedVolume(types.HardDriveType, volumeReplicas, nodes, sortWritableVolumes); err != nil {
+		t.Fatalf("balanceSelectedVolume: %v", err)
+	}
+
+	fullCount := len(fullNode.info.DiskInfos[""].VolumeInfos)
+	emptyCount := len(emptyNode.info.DiskInfos[""].VolumeInfos)
+	if fullCount == 0 || emptyCount == 0 {
+		t.Fatalf("expected volumes spread across both nodes, got full=%d empty=%d", fullCount, emptyCount)
+	}
+	if diff := fullCount - emptyCount; diff > 1 || diff < -1 {
+		t.Fatalf("expected balanced distribution within one volume, got full=%d empty=%d", fullCount, emptyCount)
+	}
+}
+
+// volumesPerExec caps the number of moves performed in a single execution.
+func TestBalanceVolumesPerExec(t *testing.T) {
+	const mb = 1024 * 1024
+	volumeSizeLimitMb := uint64(100)
+
+	makeNode := func(id string, volumes []*master_pb.VolumeInformationMessage) *Node {
+		return &Node{
+			info: &master_pb.DataNodeInfo{
+				Id: id,
+				DiskInfos: map[string]*master_pb.DiskInfo{
+					"": {
+						MaxVolumeCount: 10,
+						VolumeCount:    int64(len(volumes)),
+						VolumeInfos:    volumes,
+					},
+				},
+			},
+			dc:   "dc1",
+			rack: "rack1",
+		}
+	}
+
+	var fullVolumes []*master_pb.VolumeInformationMessage
+	for id := uint32(1); id <= 6; id++ {
+		fullVolumes = append(fullVolumes, &master_pb.VolumeInformationMessage{Id: id, Size: 95 * mb})
+	}
+	fullNode := makeNode("full", fullVolumes)
+	emptyNode := makeNode("empty", nil)
+	nodes := []*Node{fullNode, emptyNode}
+
+	volumeReplicas := map[uint32][]*VolumeReplica{}
+	for _, v := range fullVolumes {
+		loc := newLocation("dc1", "rack1", fullNode.info)
+		volumeReplicas[v.Id] = []*VolumeReplica{{location: &loc, info: v}}
+	}
+
+	for _, n := range nodes {
+		n.selectVolumes(func(v *master_pb.VolumeInformationMessage) bool { return true })
+	}
+
+	c := &commandVolumeBalance{volumeSizeLimitMb: volumeSizeLimitMb, volumesPerExec: 1}
+	if err := c.balanceSelectedVolume(types.HardDriveType, volumeReplicas, nodes, sortWritableVolumes); err != nil {
+		t.Fatalf("balanceSelectedVolume: %v", err)
+	}
+
+	if c.movedCount != 1 {
+		t.Fatalf("expected exactly 1 move with volumesPerExec=1, got %d", c.movedCount)
+	}
+	if got := len(emptyNode.info.DiskInfos[""].VolumeInfos); got != 1 {
+		t.Fatalf("expected empty node to receive exactly 1 volume, got %d", got)
+	}
+}
+
 func TestVolumeSelection(t *testing.T) {
 	topologyInfo := parseOutput(topoData)
 
-	vids, err := collectVolumeIdsForTierChange(topologyInfo, 1000, types.ToDiskType(types.HddType), "", 20.0, 0)
+	vids, err := collectVolumeIdsForTierChange(topologyInfo, 1000, types.ToDiskType(types.HddType), "", "", 20.0, 0)
 	if err != nil {
 		t.Errorf("collectVolumeIdsForTierChange: %v", err)
 	}

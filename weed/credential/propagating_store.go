@@ -86,7 +86,7 @@ func (s *PropagatingCredentialStore) propagateChange(ctx context.Context, fn fun
 		wg.Add(1)
 		go func(server string) {
 			defer wg.Done()
-			err := pb.WithGrpcClient(false, 0, func(conn *grpc.ClientConn) error {
+			err := pb.WithGrpcClient(context.Background(), false, 0, func(conn *grpc.ClientConn) error {
 				glog.V(4).Infof("IAM: successfully connected to S3 server %s for propagation", server)
 				client := s3_pb.NewSeaweedS3IamCacheClient(conn)
 				return fn(propagateCtx, client)
@@ -137,6 +137,81 @@ func (s *PropagatingCredentialStore) DetachUserPolicy(ctx context.Context, usern
 
 func (s *PropagatingCredentialStore) ListAttachedUserPolicies(ctx context.Context, username string) ([]string, error) {
 	return s.CredentialStore.ListAttachedUserPolicies(ctx, username)
+}
+
+// SaveConfiguration overrides the embedded CredentialStore.SaveConfiguration
+// so bulk identity / group updates also push to running S3 caches. The IAM
+// API flow ends each handler with SaveConfiguration after recomputing
+// identity.Actions (the legacy authorization field), so reusing PutIdentity
+// here is what keeps inline-policy changes visible to S3 servers without
+// requiring a restart. We diff against the prior store state so deletions
+// also fan out (RemoveIdentity / RemoveGroup); without the diff a postgres
+// user who got pruned by SaveConfiguration would linger in the S3 cache.
+func (s *PropagatingCredentialStore) SaveConfiguration(ctx context.Context, config *iam_pb.S3ApiConfiguration) error {
+	priorUsers, priorErr := s.CredentialStore.ListUsers(ctx)
+	if priorErr != nil {
+		glog.V(1).Infof("failed to list users before SaveConfiguration; skipping deletion propagation: %v", priorErr)
+		priorUsers = nil
+	}
+	priorGroups, gPriorErr := s.CredentialStore.ListGroups(ctx)
+	if gPriorErr != nil {
+		glog.V(1).Infof("failed to list groups before SaveConfiguration; skipping deletion propagation: %v", gPriorErr)
+		priorGroups = nil
+	}
+
+	if err := s.CredentialStore.SaveConfiguration(ctx, config); err != nil {
+		return err
+	}
+
+	keptUsers := make(map[string]struct{}, len(config.Identities))
+	for _, ident := range config.Identities {
+		if ident != nil {
+			keptUsers[ident.Name] = struct{}{}
+		}
+	}
+	keptGroups := make(map[string]struct{}, len(config.Groups))
+	for _, g := range config.Groups {
+		if g != nil {
+			keptGroups[g.Name] = struct{}{}
+		}
+	}
+
+	s.propagateChange(ctx, func(tx context.Context, client s3_pb.SeaweedS3IamCacheClient) error {
+		for _, ident := range config.Identities {
+			if ident == nil {
+				continue
+			}
+			if _, err := client.PutIdentity(tx, &iam_pb.PutIdentityRequest{Identity: ident}); err != nil {
+				return err
+			}
+		}
+		for _, g := range config.Groups {
+			if g == nil {
+				continue
+			}
+			if _, err := client.PutGroup(tx, &iam_pb.PutGroupRequest{Group: g}); err != nil {
+				return err
+			}
+		}
+		for _, name := range priorUsers {
+			if _, kept := keptUsers[name]; kept {
+				continue
+			}
+			if _, err := client.RemoveIdentity(tx, &iam_pb.RemoveIdentityRequest{Username: name}); err != nil {
+				return err
+			}
+		}
+		for _, name := range priorGroups {
+			if _, kept := keptGroups[name]; kept {
+				continue
+			}
+			if _, err := client.RemoveGroup(tx, &iam_pb.RemoveGroupRequest{GroupName: name}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return nil
 }
 
 func (s *PropagatingCredentialStore) CreateUser(ctx context.Context, identity *iam_pb.Identity) error {
@@ -304,6 +379,41 @@ func (s *PropagatingCredentialStore) DeleteUserInlinePolicy(ctx context.Context,
 func (s *PropagatingCredentialStore) ListUserInlinePolicies(ctx context.Context, userName string) ([]string, error) {
 	if store, ok := s.CredentialStore.(InlinePolicyStore); ok {
 		return store.ListUserInlinePolicies(ctx, userName)
+	}
+	return nil, nil
+}
+
+func (s *PropagatingCredentialStore) PutGroupInlinePolicy(ctx context.Context, groupName, policyName string, document policy_engine.PolicyDocument) error {
+	if store, ok := s.CredentialStore.(GroupInlinePolicyStore); ok {
+		return store.PutGroupInlinePolicy(ctx, groupName, policyName, document)
+	}
+	return nil
+}
+
+func (s *PropagatingCredentialStore) GetGroupInlinePolicy(ctx context.Context, groupName, policyName string) (*policy_engine.PolicyDocument, error) {
+	if store, ok := s.CredentialStore.(GroupInlinePolicyStore); ok {
+		return store.GetGroupInlinePolicy(ctx, groupName, policyName)
+	}
+	return nil, nil
+}
+
+func (s *PropagatingCredentialStore) DeleteGroupInlinePolicy(ctx context.Context, groupName, policyName string) error {
+	if store, ok := s.CredentialStore.(GroupInlinePolicyStore); ok {
+		return store.DeleteGroupInlinePolicy(ctx, groupName, policyName)
+	}
+	return nil
+}
+
+func (s *PropagatingCredentialStore) ListGroupInlinePolicies(ctx context.Context, groupName string) ([]string, error) {
+	if store, ok := s.CredentialStore.(GroupInlinePolicyStore); ok {
+		return store.ListGroupInlinePolicies(ctx, groupName)
+	}
+	return nil, nil
+}
+
+func (s *PropagatingCredentialStore) LoadGroupInlinePolicies(ctx context.Context) (map[string]map[string]policy_engine.PolicyDocument, error) {
+	if loader, ok := s.CredentialStore.(GroupInlinePoliciesLoader); ok {
+		return loader.LoadGroupInlinePolicies(ctx)
 	}
 	return nil, nil
 }

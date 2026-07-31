@@ -2,6 +2,7 @@ package page_writer
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -118,34 +119,23 @@ func (up *UploadPipeline) SaveDataAt(p []byte, off int64, isSequential bool, tsN
 	}
 	if !found {
 		if len(up.writableChunks) > up.writableChunkLimit {
-			// if current file chunks is over the per file buffer count limit
+			// Per-pipeline soft cap. Seal the fullest gap-free chunk;
+			// gappy chunks must wait so in-flight FUSE writeback can fill
+			// the gap (issue #9330). If none qualifies, fall through —
+			// the memChunkCounter ceiling below redirects to swap.
 			candidateChunkIndex, fullness := LogicChunkIndex(-1), int64(0)
 			for lci, mc := range up.writableChunks {
-				chunkFullness := mc.WrittenSize()
-				if fullness < chunkFullness {
+				if !mc.IsContiguouslyWritten() {
+					continue
+				}
+				if b := mc.WrittenSize(); b > fullness {
 					candidateChunkIndex = lci
-					fullness = chunkFullness
+					fullness = b
 				}
 			}
-			/*  // this algo generates too many chunks
-			candidateChunkIndex, lowestActivityScore := LogicChunkIndex(-1), int64(math.MaxInt64)
-			for wci, wc := range up.writableChunks {
-				activityScore := wc.ActivityScore()
-				if lowestActivityScore >= activityScore {
-					if lowestActivityScore == activityScore {
-						chunkFullness := wc.WrittenSize()
-						if fullness < chunkFullness {
-							candidateChunkIndex = lci
-							fullness = chunkFullness
-						}
-					}
-					candidateChunkIndex = wci
-					lowestActivityScore = activityScore
-				}
+			if candidateChunkIndex >= 0 {
+				up.moveToSealed(up.writableChunks[candidateChunkIndex], candidateChunkIndex)
 			}
-			*/
-			up.moveToSealed(up.writableChunks[candidateChunkIndex], candidateChunkIndex)
-			// fmt.Printf("flush chunk %d with %d bytes written\n", logicChunkIndex, fullness)
 		}
 		// fmt.Printf("isSequential:%v len(up.writableChunks):%v memChunkCounter:%v", isSequential, len(up.writableChunks), memChunkCounter)
 		if isSequential &&
@@ -270,28 +260,52 @@ func (up *UploadPipeline) moveToSealed(memChunk PageChunk, logicChunkIndex Logic
 	up.chunksLock.Lock()
 }
 
-// EvictOneWritableChunk force-seals the fullest writable chunk in this
-// pipeline, submitting it for async upload. Called by the accountant's
-// evictor when Reserve would block. Returns true if a chunk was sealed.
-// The fullest-chunk heuristic matches the over-limit path in SaveDataAt:
-// sealing the chunk closest to full maximizes the upload's usefulness
-// and avoids thrashing on repeatedly re-creating the same half-empty
-// chunk. Callers must not hold up.chunksLock.
+// EvictOneWritableChunk force-seals one writable chunk so the accountant's
+// Reserve loop can make progress. Strict pass picks the fullest gap-free
+// chunk (issue #9330). Fallback picks the oldest non-empty writer when
+// nothing is gap-free; without it Reserve deadlocks (cond.Wait only wakes
+// on Release, Release only fires on upload completion). Callers must not
+// hold up.chunksLock.
 func (up *UploadPipeline) EvictOneWritableChunk() bool {
 	up.chunksLock.Lock()
 	defer up.chunksLock.Unlock()
 	if len(up.writableChunks) == 0 {
 		return false
 	}
-	var bestIndex LogicChunkIndex
-	var bestBytes int64 = -1
+
+	bestIndex := LogicChunkIndex(-1)
+	var bestBytes int64
 	for lci, wc := range up.writableChunks {
+		if !wc.IsContiguouslyWritten() {
+			continue
+		}
 		if b := wc.WrittenSize(); b > bestBytes {
 			bestIndex = lci
 			bestBytes = b
 		}
 	}
-	if bestBytes < 0 {
+
+	if bestIndex < 0 {
+		oldestTsNs := int64(math.MaxInt64)
+		var fallbackBytes int64
+		for lci, wc := range up.writableChunks {
+			b := wc.WrittenSize()
+			if b == 0 {
+				continue
+			}
+			ts := wc.LastWriteTsNs()
+			if ts == 0 {
+				continue
+			}
+			if ts < oldestTsNs || (ts == oldestTsNs && b > fallbackBytes) {
+				bestIndex = lci
+				oldestTsNs = ts
+				fallbackBytes = b
+			}
+		}
+	}
+
+	if bestIndex < 0 {
 		return false
 	}
 	up.moveToSealed(up.writableChunks[bestIndex], bestIndex)
@@ -328,6 +342,13 @@ func (up *UploadPipeline) ProactiveFlush(nowNs int64, idleThresholdNs int64, max
 		}
 		age := nowNs - lastWrite
 		if age < idleThresholdNs {
+			continue
+		}
+		// Skip gappy chunks; FUSE writeback may still be in flight for the
+		// hole and SaveContent would bake it into split volume chunks
+		// (issue #9330). Failing here is just a missed flush — FlushAll
+		// at close still seals everything.
+		if !chunk.IsContiguouslyWritten() {
 			continue
 		}
 		written := chunk.WrittenSize()

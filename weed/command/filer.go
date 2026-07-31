@@ -178,13 +178,14 @@ func init() {
 	filerSftpOptions.port = cmdFiler.Flag.Int("sftp.port", 2022, "SFTP server listen port")
 	filerSftpOptions.sshPrivateKey = cmdFiler.Flag.String("sftp.sshPrivateKey", "", "path to the SSH private key file for host authentication")
 	filerSftpOptions.hostKeysFolder = cmdFiler.Flag.String("sftp.hostKeysFolder", "", "path to folder containing SSH private key files for host authentication")
-	filerSftpOptions.authMethods = cmdFiler.Flag.String("sftp.authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, keyboard-interactive")
+	filerSftpOptions.authMethods = cmdFiler.Flag.String("sftp.authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, certificate")
 	filerSftpOptions.maxAuthTries = cmdFiler.Flag.Int("sftp.maxAuthTries", 6, "maximum number of authentication attempts per connection")
 	filerSftpOptions.bannerMessage = cmdFiler.Flag.String("sftp.bannerMessage", "SeaweedFS SFTP Server - Unauthorized access is prohibited", "message displayed before authentication")
 	filerSftpOptions.loginGraceTime = cmdFiler.Flag.Duration("sftp.loginGraceTime", 2*time.Minute, "timeout for authentication")
 	filerSftpOptions.clientAliveInterval = cmdFiler.Flag.Duration("sftp.clientAliveInterval", 5*time.Second, "interval for sending keep-alive messages")
 	filerSftpOptions.clientAliveCountMax = cmdFiler.Flag.Int("sftp.clientAliveCountMax", 3, "maximum number of missed keep-alive messages before disconnecting")
 	filerSftpOptions.userStoreFile = cmdFiler.Flag.String("sftp.userStoreFile", "", "path to JSON file containing user credentials and permissions")
+	filerSftpOptions.trustedUserCAKeysFile = cmdFiler.Flag.String("sftp.trustedUserCAKeysFile", "", "path to a file with trusted user CA public keys (OpenSSH authorized_keys format); required when 'certificate' is in -sftp.authMethods")
 	filerSftpOptions.dataCenter = cmdFiler.Flag.String("sftp.dataCenter", "", "prefer to read and write to volumes in this data center")
 	filerSftpOptions.bindIp = cmdFiler.Flag.String("sftp.ip.bind", "", "ip address to bind to. If empty, default to same as -ip.bind option.")
 	filerSftpOptions.localSocket = cmdFiler.Flag.String("sftp.localSocket", "", "default to /tmp/seaweedfs-sftp-<port>.sock")
@@ -235,6 +236,12 @@ func runFiler(cmd *Command, args []string) bool {
 	filerWebDavOptions.resolvePaths()
 	filerSftpOptions.resolvePaths()
 	util.LoadSecurityConfiguration()
+
+	// Share the S3 static identity config file with the filer regardless of
+	// whether the embedded S3 gateway runs on this node: the IAM gRPC service
+	// the admin UI and weed shell talk to is wired up unconditionally, and it
+	// needs the same identities the S3 server would load from -s3.config.
+	f.s3ConfigFile = filerS3Options.config
 
 	switch {
 	case *f.metricsHttpIp != "":
@@ -328,6 +335,7 @@ func (fo *FilerOptions) startFiler() {
 	if *fo.bindIp == "" {
 		*fo.bindIp = *fo.ip
 	}
+	util.SetOutboundLocalIP(*fo.bindIp)
 	if *fo.allowedOrigins == "" {
 		*fo.allowedOrigins = "*"
 	}
@@ -431,11 +439,21 @@ func (fo *FilerOptions) startFiler() {
 	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.filer"))
 	filer_pb.RegisterSeaweedFilerServer(grpcS, fs)
 
-	// Register IAM gRPC service if credential manager is available
+	// Register the IAM gRPC service. Auth is opt-in: when
+	// jwt.filer_signing.key is configured the service requires a Bearer token
+	// signed with that key; otherwise it runs unauthenticated, matching the
+	// rest of the filer's gRPC surface. Operators who expose the filer gRPC
+	// port beyond a trusted network should set jwt.filer_signing.key on both
+	// the filer and the admin server.
 	if credentialManager != nil {
-		iamGrpcServer := weed_server.NewIamGrpcServer(credentialManager)
+		adminSigningKey := security.SigningKey(util.GetViper().GetString("jwt.filer_signing.key"))
+		iamGrpcServer := weed_server.NewIamGrpcServer(credentialManager, adminSigningKey)
 		iam_pb.RegisterSeaweedIdentityAccessManagementServer(grpcS, iamGrpcServer)
-		glog.V(0).Info("Registered IAM gRPC service on filer")
+		if len(adminSigningKey) == 0 {
+			glog.V(0).Info("Registered IAM gRPC service on filer (unauthenticated; set jwt.filer_signing.key in security.toml to require admin Bearer token)")
+		} else {
+			glog.V(0).Info("Registered IAM gRPC service on filer (admin Bearer token required)")
+		}
 	}
 
 	reflection.Register(grpcS)

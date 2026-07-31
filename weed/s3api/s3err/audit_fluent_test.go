@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
 	"github.com/stretchr/testify/assert"
 )
@@ -84,4 +85,46 @@ func TestGetAccessLogRemoteIP(t *testing.T) {
 			assert.Equal(t, tc.expectedRemote, log.RemoteIP)
 		})
 	}
+}
+
+// TestGetAccessLogRequesterFromFallback reproduces the fallback audit path for
+// GET/HEAD/IAM operations: authentication records the requester on a request
+// copy the track() middleware never sees, yet the fallback audit entry (built
+// from the original request) must still report the authenticated user.
+func TestGetAccessLogRequesterFromFallback(t *testing.T) {
+	// track() installs the holder before authentication runs.
+	outer := s3_constants.EnsureIdentityHolder(httptest.NewRequest(http.MethodGet, "/bucket/object", nil))
+
+	// auth records the identity on a copy and hands that copy to the handler;
+	// the copy itself is discarded once the handler returns.
+	_ = outer.WithContext(s3_constants.SetIdentityNameInContext(outer.Context(), "admin"))
+
+	// The handler returned without logging, so track() builds the fallback entry
+	// from the original request.
+	log := GetAccessLog(outer, http.StatusOK, ErrNone)
+
+	assert.Equal(t, "admin", log.Requester, "fallback audit entry must report the authenticated requester")
+}
+
+func TestGetAccessLogRequesterAnonymous(t *testing.T) {
+	req := s3_constants.EnsureIdentityHolder(httptest.NewRequest(http.MethodGet, "/bucket/object", nil))
+
+	log := GetAccessLog(req, http.StatusOK, ErrNone)
+
+	assert.Empty(t, log.Requester, "anonymous request must not report a requester")
+}
+
+func TestAuditTrackingFlag(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/bucket/object", nil)
+	assert.False(t, AuditAlreadyLogged(req), "untracked request reports not logged")
+
+	tracked := EnsureAuditTracking(req)
+	assert.NotSame(t, req, tracked, "EnsureAuditTracking returns a new request when no flag is present")
+	assert.False(t, AuditAlreadyLogged(tracked), "tracked request starts unlogged")
+
+	again := EnsureAuditTracking(tracked)
+	assert.Same(t, tracked, again, "EnsureAuditTracking is idempotent when flag already present")
+
+	MarkAuditLogged(tracked)
+	assert.True(t, AuditAlreadyLogged(tracked), "flag flips after MarkAuditLogged")
 }

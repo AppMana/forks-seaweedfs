@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"strconv"
 	"sync"
@@ -47,13 +48,84 @@ type Volume struct {
 	ldbTimeout             int64
 
 	isCompactionInProgress atomic.Bool
+	lastDiskCheckNs        atomic.Int64 // unix time in nanoseconds for phantom volume detection
 
 	volumeInfoRWLock sync.RWMutex
 	volumeInfo       *volume_server_pb.VolumeInfo
 	location         *DiskLocation
 	diskId           uint32 // ID of this volume's disk in Store.Locations array
 
-	lastIoError error
+	// lastIoError is the most recent EIO from a read/write/delete; cleared
+	// on the next successful or non-EIO op. lastIoErrorCount tracks
+	// consecutive EIOs so CollectHeartbeat can require a sustained failure
+	// before unmounting the replica — protects against a transient
+	// hardware/network blip hitting multiple replicas at once and
+	// stranding the only good copy.
+	//
+	// ioErrorQuarantined is sticky: once CollectHeartbeat sees the streak
+	// cross IoErrorTolerance it sets this and never clears it on its own.
+	// A subsequent successful read clears the streak counter but must NOT
+	// un-quarantine the volume — only MarkVolumeWritable does that, after
+	// an operator has decided the disk is healthy. Without the sticky
+	// bit, one good read between heartbeats would silently put a known-
+	// bad replica back into rotation.
+	//
+	// All four fields are guarded together so the heartbeat reader sees
+	// a consistent snapshot.
+	lastIoError        error
+	lastIoErrorCount   int32
+	ioErrorQuarantined bool
+	lastIoErrorLock    sync.RWMutex
+}
+
+// noteIoError records an EIO and increments the consecutive-error
+// counter. Caller has already verified errors.Is(err, syscall.EIO).
+func (v *Volume) noteIoError(err error) {
+	v.lastIoErrorLock.Lock()
+	defer v.lastIoErrorLock.Unlock()
+	v.lastIoError = err
+	v.lastIoErrorCount++
+}
+
+// clearIoError resets the EIO streak counter only. The sticky quarantine
+// bit set by CollectHeartbeat is intentionally left alone — recovery is
+// an operator decision via MarkVolumeWritable. Called on any successful
+// op or on a non-EIO error (which still breaks the EIO streak; only
+// sustained EIOs are diagnostic of a failing volume).
+func (v *Volume) clearIoError() {
+	v.lastIoErrorLock.Lock()
+	defer v.lastIoErrorLock.Unlock()
+	v.lastIoError = nil
+	v.lastIoErrorCount = 0
+}
+
+// resetIoErrorState clears both the EIO streak and the sticky quarantine
+// flag. Used by MarkVolumeWritable to rejoin a previously-quarantined
+// replica; if the disk is still bad, the next failed op re-arms the
+// streak.
+func (v *Volume) resetIoErrorState() {
+	v.lastIoErrorLock.Lock()
+	defer v.lastIoErrorLock.Unlock()
+	v.lastIoError = nil
+	v.lastIoErrorCount = 0
+	v.ioErrorQuarantined = false
+}
+
+// markIoQuarantined sets the sticky quarantine flag. Idempotent; safe
+// to call from CollectHeartbeat each pass while the volume remains
+// quarantined.
+func (v *Volume) markIoQuarantined() {
+	v.lastIoErrorLock.Lock()
+	defer v.lastIoErrorLock.Unlock()
+	v.ioErrorQuarantined = true
+}
+
+// getIoErrorState returns the latest EIO, the consecutive-EIO count,
+// and the sticky quarantine flag as one consistent snapshot.
+func (v *Volume) getIoErrorState() (error, int32, bool) {
+	v.lastIoErrorLock.RLock()
+	defer v.lastIoErrorLock.RUnlock()
+	return v.lastIoError, v.lastIoErrorCount, v.ioErrorQuarantined
 }
 
 func NewVolume(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, replicaPlacement *super_block.ReplicaPlacement, ttl *needle.TTL, preallocate int64, ver needle.Version, memoryMapMaxSizeMb uint32, ldbTimeout int64) (v *Volume, e error) {
@@ -240,6 +312,19 @@ func (v *Volume) Close() {
 	v.doClose()
 }
 
+// SwapDataBackend atomically replaces the data backend (e.g. swapping a
+// remote-tier backend for a freshly downloaded local .dat), closing the old
+// one. Held under dataFileAccessLock so a concurrent read/write never observes
+// a half-swapped or closed backend.
+func (v *Volume) SwapDataBackend(newBackend backend.BackendStorageFile) {
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
+	if v.DataBackend != nil {
+		v.DataBackend.Close()
+	}
+	v.DataBackend = newBackend
+}
+
 func (v *Volume) doClose() {
 	if v.nm != nil {
 		if err := v.nm.Sync(); err != nil {
@@ -329,6 +414,24 @@ func (v *Volume) ToVolumeInformationMessage() (types.NeedleId, *master_pb.Volume
 		return 0, nil
 	}
 
+	// Detect phantom volumes: the .dat was unlinked from disk but is still held
+	// open as a deleted FD, so the volume keeps serving and heartbeating while no
+	// disk-path operation can ever succeed. Skip remote-tiered volumes, whose .dat
+	// legitimately lives in cloud storage. Only a present .dat is cached for 30s; a
+	// missing one is re-checked every heartbeat so the volume stays suppressed until
+	// the file returns. See github.com/seaweedfs/seaweedfs/issues/10004
+	if fileCount > 0 && !v.HasRemoteFile() {
+		const diskCheckIntervalNs = 30 * int64(time.Second)
+		now := time.Now().UnixNano()
+		if now-v.lastDiskCheckNs.Load() > diskCheckIntervalNs {
+			if _, err := os.Stat(v.FileName(".dat")); os.IsNotExist(err) {
+				glog.Warningf("Volume %d: data file %s missing (held open as deleted FD) - not reporting to master", v.Id, v.FileName(".dat"))
+				return 0, nil
+			}
+			v.lastDiskCheckNs.Store(now)
+		}
+	}
+
 	volumeInfo := &master_pb.VolumeInformationMessage{
 		Id:               uint32(v.Id),
 		Size:             uint64(volumeSize),
@@ -364,7 +467,7 @@ func (v *Volume) RemoteStorageNameKey() (storageName, storageKey string) {
 func (v *Volume) IsReadOnly() bool {
 	v.noWriteLock.RLock()
 	defer v.noWriteLock.RUnlock()
-	return v.noWriteOrDelete || v.noWriteCanDelete || v.location.isDiskSpaceLow
+	return v.noWriteOrDelete || v.noWriteCanDelete || v.location.isDiskSpaceLow.Load()
 }
 
 func (v *Volume) PersistReadOnly(readOnly bool) {

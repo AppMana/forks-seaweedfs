@@ -2,6 +2,7 @@ package dash
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,9 +16,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
+	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -230,6 +234,7 @@ func (s *WorkerGrpcServer) WorkerStream(stream worker_pb.WorkerService_WorkerStr
 	}
 	s.connections[workerID] = conn
 	s.connMutex.Unlock()
+	stats_collect.AdminWorkerEventsTotal.WithLabelValues("registered").Inc()
 
 	// Register worker with maintenance manager
 	s.registerWorkerWithManager(conn)
@@ -262,23 +267,27 @@ func (s *WorkerGrpcServer) WorkerStream(stream worker_pb.WorkerService_WorkerStr
 		select {
 		case <-ctx.Done():
 			glog.Infof("Worker %s connection closed: %v", workerID, ctx.Err())
-			s.unregisterWorker(conn)
+			s.unregisterWorker(conn, "unregistered")
 			return nil
 		case <-connCtx.Done():
 			glog.Infof("Worker %s connection cancelled", workerID)
-			s.unregisterWorker(conn)
+			s.unregisterWorker(conn, "unregistered")
 			return nil
 		default:
 		}
 
 		msg, err := stream.Recv()
 		if err != nil {
-			if err == io.EOF {
+			switch {
+			case err == io.EOF:
 				glog.Infof("Worker %s disconnected", workerID)
-			} else {
+			case errors.Is(err, context.Canceled), status.Code(err) == codes.Canceled:
+				// Graceful shutdown on either side cancels the stream.
+				glog.V(1).Infof("Worker %s stream canceled: %v", workerID, err)
+			default:
 				glog.Errorf("Error receiving from worker %s: %v", workerID, err)
 			}
-			s.unregisterWorker(conn)
+			s.unregisterWorker(conn, "unregistered")
 			return err
 		}
 
@@ -331,7 +340,7 @@ func (s *WorkerGrpcServer) handleWorkerMessage(conn *WorkerConnection, msg *work
 
 	case *worker_pb.WorkerMessage_Shutdown:
 		glog.Infof("Worker %s shutting down: %s", workerID, m.Shutdown.Reason)
-		s.unregisterWorker(conn)
+		s.unregisterWorker(conn, "unregistered")
 
 	default:
 		glog.Warningf("Unknown message type from worker %s", workerID)
@@ -598,7 +607,7 @@ func (s *WorkerGrpcServer) safeCloseOutgoingChannel(conn *WorkerConnection, sour
 }
 
 // unregisterWorker removes a worker connection
-func (s *WorkerGrpcServer) unregisterWorker(conn *WorkerConnection) {
+func (s *WorkerGrpcServer) unregisterWorker(conn *WorkerConnection, event string) {
 	s.connMutex.Lock()
 	existingConn, exists := s.connections[conn.workerID]
 	if !exists {
@@ -617,6 +626,7 @@ func (s *WorkerGrpcServer) unregisterWorker(conn *WorkerConnection) {
 	// Remove from map first to prevent duplicate cleanup attempts
 	delete(s.connections, conn.workerID)
 	s.connMutex.Unlock()
+	stats_collect.AdminWorkerEventsTotal.WithLabelValues(event).Inc()
 
 	// Cancel context to signal goroutines to stop
 	conn.cancel()
@@ -658,7 +668,7 @@ func (s *WorkerGrpcServer) cleanupStaleConnections() {
 
 	for _, conn := range toRemove {
 		glog.Warningf("Cleaning up stale worker connection: %s", conn.workerID)
-		s.unregisterWorker(conn)
+		s.unregisterWorker(conn, "stale_removed")
 	}
 }
 

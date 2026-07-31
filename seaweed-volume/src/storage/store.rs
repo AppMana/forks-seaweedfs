@@ -85,14 +85,27 @@ impl Store {
 
         self.locations.push(loc);
 
-        // After every disk has finished its per-disk EC scan, sweep
-        // the store for shards that live on a disk without local index
-        // files and load them by reaching across to a sibling disk's
-        // .ecx / .ecj / .vif (seaweedfs/seaweedfs#9212 / #9244).
-        // ec.balance / ec.rebuild can move shards onto a destination
-        // node's second disk while leaving the index on the disk that
-        // already held the volume; without this pass those orphan
-        // shards stay invisible to the master.
+        // First scrub partial EC artefacts left on one disk by an
+        // interrupted encode while the source .dat still lives on a
+        // sibling disk of the same store. The per-disk loader cannot
+        // see the sibling .dat and so loads the partial shards as if
+        // they were a distributed-EC layout, which makes the volume
+        // server heartbeat both a regular replica and an EC shard set
+        // for the same vid (seaweedfs/seaweedfs#9478). Running before
+        // the cross-disk reconcile keeps that pass from later
+        // re-loading shards we just cleaned up.
+        self.prune_incomplete_ec_with_sibling_dat();
+
+        // Physically mirror EC sidecars onto every shard-bearing disk
+        // so each disk mounts self-contained. Must run before the
+        // cross-disk reconciler so the orphan pass can prefer the
+        // local idx_directory.
+        self.mirror_ec_metadata_to_shard_disks();
+
+        // Cross-disk fallback for orphan shards — ec.balance can land
+        // shards on one disk while leaving the index on another. Still
+        // needed after the mirror pass for volumes whose mirror failed
+        // (read-only target, partial copy).
         self.reconcile_ec_shards_across_disks();
 
         Ok(())
@@ -106,6 +119,8 @@ impl Store {
                 tracing::error!("load_new_volumes error in {}: {}", loc.directory, e);
             }
         }
+        self.prune_incomplete_ec_with_sibling_dat();
+        self.mirror_ec_metadata_to_shard_disks();
         self.reconcile_ec_shards_across_disks();
     }
 
@@ -307,11 +322,18 @@ impl Store {
         )
     }
 
-    /// Delete a volume from any location.
-    pub fn delete_volume(&mut self, vid: VolumeId, only_empty: bool) -> Result<(), VolumeError> {
+    /// Delete a volume from any location. When keep_remote_data is true the
+    /// cloud-tier object backing the volume is left intact — used by moves
+    /// where another server is taking over the same .vif.
+    pub fn delete_volume(
+        &mut self,
+        vid: VolumeId,
+        only_empty: bool,
+        keep_remote_data: bool,
+    ) -> Result<(), VolumeError> {
         for loc in &mut self.locations {
             if loc.find_volume(vid).is_some() {
-                return loc.delete_volume(vid, only_empty);
+                return loc.delete_volume(vid, only_empty, keep_remote_data);
             }
         }
         Err(VolumeError::NotFound)
@@ -347,6 +369,16 @@ impl Store {
             let vif_path = format!("{}.vif", base);
             if std::path::Path::new(&dat_path).exists() || std::path::Path::new(&vif_path).exists()
             {
+                // A persisting .note means the copy that produced these files
+                // never completed; mounting it would expose a truncated volume.
+                // Fail the mount so the caller (VolumeCopy) treats it as an error.
+                let note_path = format!("{}.note", base);
+                if std::path::Path::new(&note_path).exists() {
+                    return Err(VolumeError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("volume {} copy incomplete: .note still present", vid),
+                    )));
+                }
                 return loc.create_volume(
                     vid,
                     collection,
@@ -576,8 +608,16 @@ impl Store {
                     as i32;
                 let mut max_count = vol_count + ec_equivalent;
 
-                if unclaimed > volume_size_limit as i64 {
-                    max_count += (unclaimed as u64 / volume_size_limit) as i32 - 1;
+                // One slot per full volume that fits in the unclaimed space.
+                // A "- 1" here used to zero the count when the disk had room for
+                // exactly one volume (free between 1x and 2x the limit), stranding
+                // auto-sized disks at max_volume_count 0 with no writable volume.
+                if unclaimed > 0 {
+                    max_count += (unclaimed as u64 / volume_size_limit) as i32;
+                }
+                // An auto-sized disk with free space always hosts at least one volume.
+                if max_count < 1 {
+                    max_count = 1;
                 }
 
                 loc.max_volume_count.store(max_count, Ordering::Relaxed);
@@ -629,22 +669,25 @@ impl Store {
             ))
         })?;
 
-        self.locations[loc_idx].mount_ec_shards(vid, collection, shard_ids)
+        self.locations[loc_idx].mount_ec_shards(vid, collection, shard_ids, "")
     }
 
     /// Mount a single EC shard, searching all locations for the shard file.
     /// Matches Go's Store.MountEcShards which mounts one shard at a time.
+    /// `source_disk_type` is the source volume's disk type from the
+    /// `VolumeEcShardsMount` RPC (#9423); pass `""` for non-RPC paths.
     pub fn mount_ec_shard(
         &mut self,
         vid: VolumeId,
         collection: &str,
         shard_id: u32,
+        source_disk_type: &str,
     ) -> Result<(), VolumeError> {
         for loc in &mut self.locations {
             // Check if the shard file exists on this location
             let shard = EcVolumeShard::new(&loc.directory, collection, vid, shard_id as u8);
             if std::path::Path::new(&shard.file_name()).exists() {
-                loc.mount_ec_shards(vid, collection, &[shard_id])?;
+                loc.mount_ec_shards(vid, collection, &[shard_id], source_disk_type)?;
                 return Ok(());
             }
         }
@@ -673,14 +716,44 @@ impl Store {
 
     /// Unmount a single EC shard, searching all locations.
     /// Matches Go's Store.UnmountEcShards which unmounts one shard at a time.
-    pub fn unmount_ec_shard(&mut self, vid: VolumeId, shard_id: u32) -> Result<(), VolumeError> {
+    pub fn unmount_ec_shard(
+        &mut self,
+        vid: VolumeId,
+        shard_id: u32,
+        req_encode_ts_ns: i64,
+    ) -> Result<(), VolumeError> {
         // Walk all locations rather than stopping at the first with the
         // vid — split-disk reconciled volumes can have the same vid on
         // multiple disks, with the target shard on any of them.
-        for loc in &mut self.locations {
-            if loc.has_ec_volume(vid) {
-                loc.unmount_ec_shards(vid, &[shard_id]);
+        for disk_id in 0..self.locations.len() {
+            let ec_vol = self.locations[disk_id].find_ec_volume(vid);
+            let has_shard = ec_vol.is_some_and(|ec_vol| ec_vol.has_shard(shard_id as u8));
+            if !has_shard {
+                continue;
             }
+            // Generation fence: when the caller carries a generation (stale-worker
+            // cleanup), only unmount a strictly-older generation; preserve a disk
+            // whose generation is same-or-newer, 0, or unknown, so a stale run cannot
+            // unmount a newer run's live shards. req 0 (legacy/shell) unmounts all.
+            let disk_gen = ec_vol.map_or(0, |v| v.encode_ts_ns);
+            if req_encode_ts_ns > 0 && !(disk_gen > 0 && disk_gen < req_encode_ts_ns) {
+                tracing::info!(
+                    volume_id = vid.0,
+                    shard_id,
+                    disk_id,
+                    disk_gen,
+                    req = req_encode_ts_ns,
+                    "UnmountEcShards skipped: generation not older than request"
+                );
+                continue;
+            }
+            tracing::info!(
+                volume_id = vid.0,
+                shard_id,
+                disk_id,
+                "UnmountEcShards"
+            );
+            self.locations[disk_id].unmount_ec_shards(vid, &[shard_id]);
         }
         // Go returns nil if shard not found (no error)
         Ok(())
@@ -709,6 +782,21 @@ impl Store {
     /// Check if any location has an EC volume.
     pub fn has_ec_volume(&self, vid: VolumeId) -> bool {
         self.locations.iter().any(|loc| loc.has_ec_volume(vid))
+    }
+
+    /// Returns every disk_id on this store that has an EcVolume entry
+    /// for `vid`. Useful for diagnostic logging when a single
+    /// `has_ec_volume` hit hides which disk is actually holding the
+    /// mount (e.g., the ReceiveFile mounted-volume guard).
+    /// Mirrors Go's `Store.FindEcVolumeDiskIds`.
+    pub fn find_ec_volume_disk_ids(&self, vid: VolumeId) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for (idx, loc) in self.locations.iter().enumerate() {
+            if loc.has_ec_volume(vid) {
+                ids.push(idx as u32);
+            }
+        }
+        ids
     }
 
     /// Returns the index of the disk location that has `(vid, shard_id)`
@@ -1413,6 +1501,47 @@ mod tests {
     }
 
     #[test]
+    fn test_maybe_adjust_volume_max_no_dead_zone() {
+        // With auto max (original_max_volume_count == 0) and a large volume size
+        // limit, a disk with room for at least one volume must not report 0
+        // slots. It once did so for disks sized between 1x and 2x the limit,
+        // leaving no writable volume and timing out every assign.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        let (_, free) = crate::storage::disk_location::get_disk_stats(dir);
+        if free < 4 {
+            return; // cannot determine free disk space
+        }
+
+        let mut store = Store::new(NeedleMapKind::InMemory);
+        store
+            .add_location(
+                dir,
+                dir,
+                0, // auto
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                Vec::new(),
+            )
+            .unwrap();
+
+        // free disk is 1.5x the limit: room for one full volume, less than two.
+        let volume_size_limit = free * 2 / 3;
+        store
+            .volume_size_limit
+            .store(volume_size_limit, Ordering::Relaxed);
+
+        store.maybe_adjust_volume_max();
+
+        let max = store.locations[0].max_volume_count.load(Ordering::Relaxed);
+        assert!(
+            max >= 1,
+            "auto-sized disk with room for one volume reported max_volume_count={max}; want >= 1"
+        );
+    }
+
+    #[test]
     fn test_find_free_location_predicate_prefers_more_capacity_and_skips_low_disk() {
         let tmp1 = TempDir::new().unwrap();
         let dir1 = tmp1.path().to_str().unwrap();
@@ -1474,7 +1603,7 @@ mod tests {
 
         std::fs::write(format!("{}/expired_ec_case_9.ec00", dir), b"expired").unwrap();
         store.locations[0]
-            .mount_ec_shards(VolumeId(9), "expired_ec_case", &[0])
+            .mount_ec_shards(VolumeId(9), "expired_ec_case", &[0], "")
             .unwrap();
         store.find_ec_volume_mut(VolumeId(9)).unwrap().expire_at_sec = 1;
 
@@ -1569,7 +1698,7 @@ mod tests {
         )
         .unwrap();
         store.locations[1]
-            .mount_ec_shards(vid, collection, &[0])
+            .mount_ec_shards(vid, collection, &[0], "")
             .unwrap();
 
         // Stray .ecx on disk 2 must not win.
@@ -1636,7 +1765,7 @@ mod tests {
         )
         .unwrap();
         store.locations[1]
-            .mount_ec_shards(vid, collection, &[0])
+            .mount_ec_shards(vid, collection, &[0], "")
             .unwrap();
 
         let got = store.find_ec_shard_target_location(collection, vid, 10);

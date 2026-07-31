@@ -18,7 +18,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/raft"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -100,9 +102,16 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 	for {
 		heartbeat, err := stream.Recv()
 		if err != nil {
-			if dn != nil {
+			// Graceful shutdown on either side cancels the stream; don't warn.
+			canceled := errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
+			switch {
+			case canceled && dn != nil:
+				glog.V(1).Infof("SendHeartbeat.Recv server %s:%d canceled: %v", dn.Ip, dn.Port, err)
+			case canceled:
+				glog.V(1).Infof("SendHeartbeat.Recv canceled: %v", err)
+			case dn != nil:
 				glog.Warningf("SendHeartbeat.Recv server %s:%d : %v", dn.Ip, dn.Port, err)
-			} else {
+			default:
 				glog.Warningf("SendHeartbeat.Recv: %v", err)
 			}
 			stats.MasterReceivedHeartbeatCounter.WithLabelValues("error").Inc()
@@ -111,9 +120,9 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 
 		if !ms.Topo.IsLeader() {
 			// tell the volume servers about the leader
-			newLeader, err := ms.Topo.MaybeLeader()
-			if err != nil || newLeader == "" {
-				glog.Warningf("SendHeartbeat find leader: %v, %v", newLeader, err)
+			newLeader, err := ms.Topo.Leader()
+			if err != nil {
+				glog.Warningf("SendHeartbeat find leader: %v", err)
 				return raft.NotLeaderError
 			}
 			if err := stream.Send(&master_pb.HeartbeatResponse{
@@ -384,7 +393,13 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 }
 
 func (ms *MasterServer) initialLockRingUpdate(clientType string, filerGroup string) *master_pb.KeepConnectedResponse {
-	if clientType != cluster.FilerType || ms.LockRingManager == nil {
+	if ms.LockRingManager == nil {
+		return nil
+	}
+	// Filers are ring members; S3 gateways are lock clients that need the same
+	// view to dial a key's primary directly. Both get the initial snapshot;
+	// later membership changes already broadcast to every connected client.
+	if clientType != cluster.FilerType && clientType != cluster.S3Type {
 		return nil
 	}
 
@@ -410,6 +425,13 @@ func (ms *MasterServer) broadcastToClients(message *master_pb.KeepConnectedRespo
 		}
 	}
 	ms.clientChansLock.RUnlock()
+}
+
+// broadcastVolumeLocationsToClients notifies connected clients about newly created volume locations.
+func (ms *MasterServer) broadcastVolumeLocationsToClients(locations []*master_pb.VolumeLocation) {
+	for _, location := range locations {
+		ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: location})
+	}
 }
 
 func (ms *MasterServer) informNewLeader(stream master_pb.Seaweed_KeepConnectedServer) error {

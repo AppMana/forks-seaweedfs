@@ -135,6 +135,9 @@ func DistributeEcShards(volumeID uint32, collection string, targets []*worker_pb
 			if _, hasVif := shardFiles["vif"]; hasVif {
 				assignedShards = append(assignedShards, "vif")
 			}
+			if _, hasEcsum := shardFiles["ecsum"]; hasEcsum {
+				assignedShards = append(assignedShards, "ecsum")
+			}
 		}
 
 		if shardDisks[target.Node] == nil {
@@ -222,7 +225,9 @@ func DistributeEcShards(volumeID uint32, collection string, targets []*worker_pb
 }
 
 // MountEcShards mounts EC shards on destination servers using an assignment map.
-func MountEcShards(volumeID uint32, collection string, shardAssignment map[string][]string, dialOption grpc.DialOption, logger logger) error {
+// sourceDiskType is forwarded to VolumeEcShardsMount so the resulting EC volume
+// reports under the source's disk type rather than the destination's (#9423).
+func MountEcShards(volumeID uint32, collection string, shardAssignment map[string][]string, sourceDiskType string, dialOption grpc.DialOption, logger logger) error {
 	if shardAssignment == nil {
 		return fmt.Errorf("shard assignment not available for mounting")
 	}
@@ -263,9 +268,10 @@ func MountEcShards(volumeID uint32, collection string, shardAssignment map[strin
 		err := operation.WithVolumeServerClient(false, pb.ServerAddress(destNode), dialOption,
 			func(client volume_server_pb.VolumeServerClient) error {
 				_, mountErr := client.VolumeEcShardsMount(context.Background(), &volume_server_pb.VolumeEcShardsMountRequest{
-					VolumeId:   volumeID,
-					Collection: collection,
-					ShardIds:   shardIds,
+					VolumeId:       volumeID,
+					Collection:     collection,
+					ShardIds:       shardIds,
+					SourceDiskType: sourceDiskType,
 				})
 				return mountErr
 			})
@@ -318,6 +324,9 @@ func sendShardFileToDestination(volumeID uint32, collection string, dialOption g
 				shardId = 0
 			} else if shardType == "vif" {
 				ext = ".vif"
+				shardId = 0
+			} else if shardType == "ecsum" {
+				ext = BitrotSidecarExt
 				shardId = 0
 			} else if strings.HasPrefix(shardType, "ec") && len(shardType) == 4 {
 				ext = "." + shardType

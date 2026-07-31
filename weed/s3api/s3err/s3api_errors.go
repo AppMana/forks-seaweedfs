@@ -57,6 +57,7 @@ const (
 	ErrNoSuchCORSConfiguration
 	ErrNoSuchLifecycleConfiguration
 	ErrNoSuchKey
+	ErrNoSuchVersion
 	ErrNoSuchUpload
 	ErrInvalidBucketName
 	ErrInvalidBucketState
@@ -145,10 +146,15 @@ const (
 	ErrNoSuchBucketEncryptionConfiguration
 	ErrInvalidStorageClass
 
+	ErrInvalidMetadataDirective
+	ErrInvalidTagDirective
+
 	ErrInvalidAttributeName
 
 	// Object key length errors
 	ErrKeyTooLongError
+
+	ErrNoSuchConfiguration
 )
 
 // Error message constants for checksum validation
@@ -274,6 +280,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrNoSuchKey: {
 		Code:           "NoSuchKey",
 		Description:    "The specified key does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchVersion: {
+		Code:           "NoSuchVersion",
+		Description:    "The specified version does not exist.",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrNoSuchUpload: {
@@ -612,6 +623,18 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
+	ErrInvalidMetadataDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown metadata directive.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrInvalidTagDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown tag directive.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
 	ErrInvalidAttributeName: {
 		Code:           "InvalidArgument",
 		Description:    "Invalid attribute name specified",
@@ -622,6 +645,12 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Code:           "KeyTooLongError",
 		Description:    "Your key is too long.",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrNoSuchConfiguration: {
+		Code:           "NoSuchConfiguration",
+		Description:    "The specified configuration does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
 	},
 }
 

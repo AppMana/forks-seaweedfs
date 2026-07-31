@@ -14,7 +14,9 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/seaweedfs/seaweedfs/weed/admin/plugin"
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -732,11 +734,14 @@ func (s *AdminServer) parseOrBuildClusterContext(raw json.RawMessage) (*plugin_p
 	if len(contextMessage.MasterGrpcAddresses) == 0 {
 		contextMessage.MasterGrpcAddresses = append(contextMessage.MasterGrpcAddresses, fallback.MasterGrpcAddresses...)
 	}
-	if len(contextMessage.FilerGrpcAddresses) == 0 {
-		contextMessage.FilerGrpcAddresses = append(contextMessage.FilerGrpcAddresses, fallback.FilerGrpcAddresses...)
+	if len(contextMessage.FilerAddresses) == 0 {
+		contextMessage.FilerAddresses = append(contextMessage.FilerAddresses, fallback.FilerAddresses...)
 	}
 	if len(contextMessage.VolumeGrpcAddresses) == 0 {
 		contextMessage.VolumeGrpcAddresses = append(contextMessage.VolumeGrpcAddresses, fallback.VolumeGrpcAddresses...)
+	}
+	if len(contextMessage.S3GrpcAddresses) == 0 {
+		contextMessage.S3GrpcAddresses = append(contextMessage.S3GrpcAddresses, fallback.S3GrpcAddresses...)
 	}
 	if contextMessage.Metadata == nil {
 		contextMessage.Metadata = map[string]string{}
@@ -749,8 +754,9 @@ func (s *AdminServer) parseOrBuildClusterContext(raw json.RawMessage) (*plugin_p
 func (s *AdminServer) buildDefaultPluginClusterContext() *plugin_pb.ClusterContext {
 	clusterContext := &plugin_pb.ClusterContext{
 		MasterGrpcAddresses: make([]string, 0),
-		FilerGrpcAddresses:  make([]string, 0),
+		FilerAddresses:      make([]string, 0),
 		VolumeGrpcAddresses: make([]string, 0),
+		S3GrpcAddresses:     make([]string, 0),
 		Metadata: map[string]string{
 			"source": "admin",
 		},
@@ -761,6 +767,9 @@ func (s *AdminServer) buildDefaultPluginClusterContext() *plugin_pb.ClusterConte
 		clusterContext.MasterGrpcAddresses = append(clusterContext.MasterGrpcAddresses, masterAddress)
 	}
 
+	// Master returns filers in pb.ServerAddress form (host:httpPort.grpcPort).
+	// Forward that verbatim; each worker converts to a gRPC or HTTP address as
+	// it needs (dialing wants gRPC, the admin shell wants the ServerAddress).
 	filerSeen := map[string]struct{}{}
 	for _, filer := range s.GetAllFilers() {
 		filer = strings.TrimSpace(filer)
@@ -771,7 +780,7 @@ func (s *AdminServer) buildDefaultPluginClusterContext() *plugin_pb.ClusterConte
 			continue
 		}
 		filerSeen[filer] = struct{}{}
-		clusterContext.FilerGrpcAddresses = append(clusterContext.FilerGrpcAddresses, filer)
+		clusterContext.FilerAddresses = append(clusterContext.FilerAddresses, filer)
 	}
 
 	volumeSeen := map[string]struct{}{}
@@ -794,9 +803,34 @@ func (s *AdminServer) buildDefaultPluginClusterContext() *plugin_pb.ClusterConte
 		glog.V(1).Infof("failed to build default plugin volume context: %v", err)
 	}
 
+	s3Seen := map[string]struct{}{}
+	if err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
+		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
+			ClientType: cluster.S3Type,
+		})
+		if err != nil {
+			return err
+		}
+		for _, node := range resp.GetClusterNodes() {
+			address := strings.TrimSpace(node.GetAddress())
+			if address == "" {
+				continue
+			}
+			if _, exists := s3Seen[address]; exists {
+				continue
+			}
+			s3Seen[address] = struct{}{}
+			clusterContext.S3GrpcAddresses = append(clusterContext.S3GrpcAddresses, address)
+		}
+		return nil
+	}); err != nil {
+		glog.V(1).Infof("failed to list cluster S3 nodes: %v", err)
+	}
+
 	sort.Strings(clusterContext.MasterGrpcAddresses)
-	sort.Strings(clusterContext.FilerGrpcAddresses)
+	sort.Strings(clusterContext.FilerAddresses)
 	sort.Strings(clusterContext.VolumeGrpcAddresses)
+	sort.Strings(clusterContext.S3GrpcAddresses)
 
 	return clusterContext
 }
@@ -905,8 +939,8 @@ func applyDescriptorDefaultsToPersistedConfig(
 	if descriptor.AdminRuntimeDefaults != nil {
 		runtime := config.AdminRuntime
 		defaults := descriptor.AdminRuntimeDefaults
-		if runtime.DetectionIntervalSeconds <= 0 {
-			runtime.DetectionIntervalSeconds = defaults.DetectionIntervalSeconds
+		if runtime.DetectionIntervalMinutes <= 0 {
+			runtime.DetectionIntervalMinutes = defaults.DetectionIntervalMinutes
 		}
 		if runtime.DetectionTimeoutSeconds <= 0 {
 			runtime.DetectionTimeoutSeconds = defaults.DetectionTimeoutSeconds

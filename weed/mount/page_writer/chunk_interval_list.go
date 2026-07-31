@@ -86,6 +86,24 @@ func (list *ChunkWrittenIntervalList) WrittenSize() (writtenByteCount int64) {
 	return
 }
 
+// IsContiguouslyWritten reports whether the written bytes form one
+// unbroken run starting at offset 0. Pressure-driven sealing uses this
+// to avoid racing in-flight FUSE writeback on a gap range — sealing a
+// gappy chunk would emit volume chunks with no coverage for the gap and
+// reads would silently zero-fill it (issue #9330).
+func (list *ChunkWrittenIntervalList) IsContiguouslyWritten() bool {
+	first := list.head.next
+	if first == list.tail || first.StartOffset != 0 {
+		return false
+	}
+	for t := first; t.next != list.tail; t = t.next {
+		if t.stopOffset != t.next.StartOffset {
+			return false
+		}
+	}
+	return true
+}
+
 func (list *ChunkWrittenIntervalList) addInterval(interval *ChunkWrittenInterval) {
 
 	//t := list.head

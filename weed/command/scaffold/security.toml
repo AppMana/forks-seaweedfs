@@ -4,7 +4,16 @@
 #    /etc/seaweedfs/security.toml
 # this file is read by master, volume server, filer, and worker
 
-# comma separated origins allowed to make requests to the filer and s3 gateway. 
+# Any value below can also be supplied as an environment variable instead of
+# living in this file: prefix the key with WEED_, upper-case it, and replace
+# "." with "_". This is the recommended way to inject the secrets in here from
+# a Kubernetes Secret (env valueFrom.secretKeyRef) rather than a ConfigMap.
+# The JWT signing keys map to:
+#   WEED_JWT_SIGNING_KEY, WEED_JWT_SIGNING_READ_KEY              (master <-> volume)
+#   WEED_JWT_FILER_SIGNING_KEY, WEED_JWT_FILER_SIGNING_READ_KEY  (s3/clients <-> filer)
+# A set env var wins over the file, so the file can stay empty (or absent).
+
+# comma separated origins allowed to make requests to the filer and s3 gateway.
 # enter in this format: https://domain.com, or http://localhost:port
 [cors.allowed_origins]
 values = "*"
@@ -44,6 +53,13 @@ expires_after_seconds = 10           # seconds
 # - f.e. the S3 API Shim generates the JWT
 # - the Filer server validates the JWT on writing
 # NOTE: This key is ALSO used as a fallback signing key for S3 STS if s3.iam.config does not specify a signingKey.
+# NOTE: This key also gates the filer IAM gRPC service (CreateUser, PutPolicy,
+#       CreateAccessKey, ...). When set, every IAM RPC must carry a Bearer
+#       token signed with this key in its "authorization" gRPC metadata; mint
+#       such a token with security.GenJwtForFilerAdmin. When empty, the IAM
+#       gRPC service runs unauthenticated, like the rest of the filer's gRPC
+#       surface — set the key on both filer and admin if the gRPC port is
+#       reachable beyond a trusted network.
 # the jwt defaults to expire after 10 seconds.
 [jwt.filer_signing]
 key = ""

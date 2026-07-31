@@ -87,6 +87,23 @@ func (ma *MetaAggregator) HasRemotePeers() bool {
 	return false
 }
 
+// HasPeer reports whether address is currently a tracked filer peer (or this
+// filer's own address). Callers use this to gate operations on known cluster
+// members.
+func (ma *MetaAggregator) HasPeer(address pb.ServerAddress) bool {
+	if address == ma.self || address.Equals(ma.self) {
+		return true
+	}
+	ma.peerChansLock.Lock()
+	defer ma.peerChansLock.Unlock()
+	for peer := range ma.peerChans {
+		if peer == address || peer.Equals(address) {
+			return true
+		}
+	}
+	return false
+}
+
 func (ma *MetaAggregator) loopSubscribeToOneFiler(f *Filer, self pb.ServerAddress, peer pb.ServerAddress, startFrom time.Time, stopChan chan struct{}) {
 	lastTsNs := startFrom.UnixNano()
 	for {
@@ -290,8 +307,13 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 					return err
 				}
 			}
-			// Process any additional batched events
+			// Process any additional batched events. Mirror the envelope's nil
+			// guard: the server can fold a freshness signal (nil EventNotification)
+			// into the batched tail, and processOne dereferences it.
 			for _, batchedEvent := range resp.Events {
+				if batchedEvent.EventNotification == nil {
+					continue
+				}
 				if err := processOne(batchedEvent); err != nil {
 					return err
 				}

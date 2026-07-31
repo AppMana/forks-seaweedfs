@@ -15,6 +15,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 /*
@@ -158,9 +160,48 @@ func (ms *MasterServer) ReleaseAdminToken(ctx context.Context, req *master_pb.Re
 	return resp, nil
 }
 
+// isKnownPingTarget reports whether target is a peer that the master has
+// learned about as part of cluster membership. Restricting Ping to known
+// peers avoids turning the RPC into a generic outbound dialer. The lookups
+// are O(1) so the gate stays cheap on clusters with thousands of nodes.
+func (ms *MasterServer) isKnownPingTarget(ctx context.Context, target string, targetType string) bool {
+	addr := pb.ServerAddress(target)
+	switch targetType {
+	case cluster.FilerType, cluster.BrokerType, cluster.S3Type:
+		return ms.Cluster.IsKnownNode(targetType, addr)
+	case cluster.VolumeServerType:
+		if ms.Topo != nil && ms.Topo.LookupDataNodeByAddress(addr) != nil {
+			return true
+		}
+		// Only the leader receives volume-server heartbeats, so a follower's
+		// topology is empty. Fall back to the volume-server set the master
+		// learns over its own MasterClient subscription to the leader, the
+		// same source the filer gate trusts.
+		if ms.MasterClient != nil {
+			return ms.MasterClient.HasVolumeServer(addr)
+		}
+		return false
+	case cluster.MasterType:
+		if ms.option != nil && ms.option.Master.Equals(addr) {
+			return true
+		}
+		if ms.MasterClient != nil {
+			_, ok := ms.MasterClient.ListMasterSet()[addr.ToHttpAddress()]
+			return ok
+		}
+		return false
+	}
+	return false
+}
+
 func (ms *MasterServer) Ping(ctx context.Context, req *master_pb.PingRequest) (resp *master_pb.PingResponse, pingErr error) {
 	resp = &master_pb.PingResponse{
 		StartTimeNs: time.Now().UnixNano(),
+	}
+	// Empty target is a self-liveness probe and stays unauthenticated.
+	if req.Target != "" && !ms.isKnownPingTarget(ctx, req.Target, req.TargetType) {
+		resp.StopTimeNs = time.Now().UnixNano()
+		return resp, status.Errorf(codes.InvalidArgument, "unknown ping target %s of type %s", req.Target, req.TargetType)
 	}
 	if req.TargetType == cluster.FilerType {
 		pingErr = pb.WithFilerClient(false, 0, pb.ServerAddress(req.Target), ms.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
@@ -181,7 +222,7 @@ func (ms *MasterServer) Ping(ctx context.Context, req *master_pb.PingRequest) (r
 		})
 	}
 	if req.TargetType == cluster.MasterType {
-		pingErr = pb.WithMasterClient(false, pb.ServerAddress(req.Target), ms.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+		pingErr = pb.WithMasterClient(context.Background(), false, pb.ServerAddress(req.Target), ms.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 			pingResp, err := client.Ping(ctx, &master_pb.PingRequest{})
 			if pingResp != nil {
 				resp.RemoteTimeNs = pingResp.StartTimeNs

@@ -56,7 +56,12 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 	if fileName != "" && strings.Contains(formValues.Get("Key"), "${filename}") {
 		formValues.Set("Key", strings.Replace(formValues.Get("Key"), "${filename}", fileName, -1))
 	}
-	object := s3_constants.NormalizeObjectKey(formValues.Get("Key"))
+	rawObject := formValues.Get("Key")
+	if rawObject == "" || !s3_constants.IsValidObjectKey(rawObject) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+		return
+	}
+	object := s3_constants.NormalizeObjectKey(rawObject)
 	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
 		return
@@ -131,7 +136,11 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 	// Forward validated POST form fields to the underlying PUT as headers.
 	applyPostPolicyFormHeaders(r, formValues)
 
-	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, fileBody, bucket, object, 1, nil)
+	// Use fileSize, not r.ContentLength: the multipart body wrapping form
+	// fields and boundaries inflates ContentLength relative to the
+	// object body, which would mis-evaluate any size-filtered rule.
+	ttlSec := s3a.lifecycleTTLForObjectWrite(bucket, object, fileSize)
+	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, fileBody, bucket, object, 1, ttlSec, nil, false)
 
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)

@@ -225,7 +225,7 @@ message ValueMap {
 
 message AdminRuntimeDefaults {
   bool enabled = 1;
-  int32 detection_interval_seconds = 2;
+  int32 detection_interval_minutes = 2;
   int32 detection_timeout_seconds = 3;
   int32 max_jobs_per_detection = 4;
   int32 global_execution_concurrency = 5;
@@ -241,7 +241,7 @@ message AdminRuntimeDefaults {
 
 message AdminRuntimeConfig {
   bool enabled = 1;
-  int32 detection_interval_seconds = 2;
+  int32 detection_interval_minutes = 2;
   int32 detection_timeout_seconds = 3;
   int32 max_jobs_per_detection = 4;
   int32 global_execution_concurrency = 5;
@@ -348,9 +348,12 @@ message JobResult {
 
 message ClusterContext {
   repeated string master_grpc_addresses = 1;
-  repeated string filer_grpc_addresses = 2;
+  // Filers in pb.ServerAddress form (host:httpPort.grpcPort). Consumers
+  // convert to a gRPC or HTTP address as needed; see weed/pb/server_address.go.
+  repeated string filer_addresses = 2;
   repeated string volume_grpc_addresses = 3;
   map<string, string> metadata = 4;
+  repeated string s3_grpc_addresses = 5;
 }
 
 message ActivityEvent {

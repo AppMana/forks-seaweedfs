@@ -15,6 +15,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/posixlock"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/mount/page_writer"
@@ -69,6 +70,13 @@ type Option struct {
 	UidGidMapper         *meta_cache.UidGidMapper
 	IncludeSystemEntries bool
 
+	// DefaultPermissions mirrors the FUSE default_permissions mount option.
+	// When set, the kernel enforces unix permission bits from the getattr/
+	// lookup attributes before it ever calls Open/Create/Mknod, so the mount
+	// skips its own redundant permission checks (and the group lookups behind
+	// them) on those hot paths.
+	DefaultPermissions bool
+
 	// Periodic metadata flush interval in seconds (0 to disable)
 	// This protects chunks from being purged by volume.fsck for long-running writes
 	MetadataFlushSeconds int
@@ -96,8 +104,10 @@ type Option struct {
 
 	// EnableDistributedLock enables DLM-based write coordination across mounts.
 	// When true, opening a file for write acquires a distributed lock that is
-	// held (with auto-renewal) until the file is closed. Only one mount can
-	// have a file open for writing at a time.
+	// held (with auto-renewal) until the file is closed, so only one mount can
+	// have a file open for writing at a time; POSIX advisory locks (flock/fcntl)
+	// are also routed to the inode's owner filer so they are honored across
+	// mounts. Disabled under writeback cache, which implies single-writer.
 	EnableDistributedLock bool
 
 	// WritebackCache enables async flush on close for improved small file write performance.
@@ -146,6 +156,9 @@ type WFS struct {
 	fhLockTable           *util.LockTable[FileHandleId]
 	hardLinkLockTable     *util.LockTable[string]
 	posixLocks            *PosixLockTable
+	posixSid              uint64             // this mount's session id, for routed-lock owner identity
+	posixHint             *posixLockHint     // local fcntl-lock hint for routed mode
+	posixOwn              *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
 	rdmaClient            *RDMAMountClient
 	peerRegistrar         *PeerRegistrar
 	peerDirectory         *PeerDirectory
@@ -250,6 +263,9 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		fhLockTable:       util.NewLockTable[FileHandleId](),
 		hardLinkLockTable: util.NewLockTable[string](),
 		posixLocks:        NewPosixLockTable(),
+		posixSid:          randomPosixSid(),
+		posixHint:         newPosixLockHint(),
+		posixOwn:          posixlock.NewManager(),
 		refreshingDirs:    make(map[util.FullPath]struct{}),
 		atimeMap:          make(map[uint64]time.Time, 8192),
 		openMtimeCache:    make(map[uint64][2]int64, 8192),
@@ -319,6 +335,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 				wfs.markDirectoryReadThrough(dirPath)
 			}
 		})
+	wfs.metaCache.SetPinnedChildFn(wfs.isLocalOnlyEntry)
 	grace.OnInterrupt(func() {
 		// grace calls os.Exit(0) after all hooks, so WaitForAsyncFlush
 		// after server.Serve() would never execute.  Drain here first.
@@ -522,15 +539,20 @@ func (wfs *WFS) StartBackgroundTasks() error {
 	startTime := time.Now()
 	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano(), wfs.option.WritebackCache, func(lastTsNs int64, err error) {
 		glog.Warningf("meta events follow retry from %v: %v", time.Unix(0, lastTsNs), err)
-		if deleteErr := wfs.metaCache.DeleteFolderChildren(context.Background(), util.FullPath(wfs.option.FilerMountRootPath)); deleteErr != nil {
-			glog.Warningf("meta cache cleanup failed: %v", deleteErr)
-		}
+		// A subscription gap may have dropped events, so distrust every cached
+		// listing. Reset the flags first (safe — it never deletes entries), then
+		// wipe the root's stale children through the apply loop so the delete
+		// cannot strand a concurrent rebuild cached-but-empty.
 		wfs.inodeToPath.InvalidateAllChildrenCache()
+		wfs.purgeDirectoryCache(util.FullPath(wfs.option.FilerMountRootPath))
 	}, followers...)
 	go wfs.loopCheckQuota()
 	go wfs.loopFlushDirtyMetadata()
 	go wfs.loopEvictIdleDirCache()
 	go wfs.loopProactiveFlush()
+	if wfs.crossMountLocks() {
+		go wfs.loopRenewPosixLeases()
+	}
 
 	return nil
 }
@@ -559,6 +581,29 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 		entry, status = wfs.maybeLoadEntry(path)
 	}
 	return
+}
+
+// isLocalOnlyEntry reports whether entry holds local-only state not yet on the
+// filer — an open handle with dirty metadata, or a pending async flush. A
+// directory rebuild refills from a filer listing that omits such an entry, so it
+// must be preserved across the wipe; this is the same signal lookupEntry trusts
+// over a filer ErrNotFound for deferred creates.
+//
+// Keyed off the inode the entry carries, not inodeToPath: a kernel Forget can
+// drop the path→inode mapping while an async writeback flush is still in flight,
+// and the entry must stay pinned until that flush reaches the filer.
+func (wfs *WFS) isLocalOnlyEntry(entry *filer.Entry) bool {
+	if entry == nil || entry.Attr.Inode == 0 {
+		return false
+	}
+	inode := entry.Attr.Inode
+	if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound && fh.dirtyMetadata {
+		return true
+	}
+	wfs.pendingAsyncFlushMu.Lock()
+	_, pending := wfs.pendingAsyncFlush[inode]
+	wfs.pendingAsyncFlushMu.Unlock()
+	return pending
 }
 
 func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.Status) {
@@ -636,16 +681,15 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, fuse.Status) 
 				glog.V(4).Infof("lookupEntry found deferred entry in open handle %s", fullpath)
 				return handleEntry, fuse.OK
 			}
-			// If the kernel is still tracking this path's inode, the entry
-			// was known to exist recently; a cached-dir miss here suggests
-			// metaCache/parent-cache coherence drift. Log visibly so the
-			// next occurrence shows up in mount.log without -v=4.
-			if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); inodeFound {
-				glog.Warningf("lookupEntry: %s missing from cache while parent %s is cached; inode still tracked (possible coherence bug)", fullpath, dirPath)
-			} else {
+			// Authoritative ENOENT only if inodeToPath also has no record.
+			// If the kernel still tracks this inode, the three layers
+			// disagree; trust the filer over the local cache (the
+			// filer-ErrNotFound branch below logs the confirmed drift).
+			if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); !inodeFound {
 				glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
+				return nil, fuse.ENOENT
 			}
-			return nil, fuse.ENOENT
+			glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
 		}
 	}
 
@@ -728,6 +772,9 @@ func (wfs *WFS) ClearCacheDir() {
 	os.RemoveAll(wfs.option.getUniqueCacheDirForRead())
 }
 
+// markDirectoryReadThrough drops a hot directory's cached listing. Only safe
+// from the apply loop (onDirectoryUpdate), where it serializes with a build's
+// markCachedFn; off-loop callers must use purgeDirectoryCache.
 func (wfs *WFS) markDirectoryReadThrough(dirPath util.FullPath) {
 	if !wfs.inodeToPath.MarkDirectoryReadThrough(dirPath, time.Now()) {
 		return
@@ -735,6 +782,15 @@ func (wfs *WFS) markDirectoryReadThrough(dirPath util.FullPath) {
 	if err := wfs.metaCache.DeleteFolderChildren(context.Background(), dirPath); err != nil {
 		glog.V(2).Infof("clear dir cache %s: %v", dirPath, err)
 	}
+}
+
+// purgeDirectoryCache drops a directory's cached listing from off the apply loop
+// (idle eviction, kernel Forget, copy-range fallback), routing through it so a
+// stale wipe can't strand a concurrently-rebuilt directory cached-but-empty.
+func (wfs *WFS) purgeDirectoryCache(dirPath util.FullPath) {
+	wfs.metaCache.PurgeDirectoryChildren(dirPath, func() {
+		wfs.inodeToPath.InvalidateChildrenCache(dirPath)
+	})
 }
 
 func (wfs *WFS) loopEvictIdleDirCache() {
@@ -746,9 +802,7 @@ func (wfs *WFS) loopEvictIdleDirCache() {
 	for range ticker.C {
 		dirs := wfs.inodeToPath.CollectEvictableDirs(time.Now(), wfs.dirIdleEvict)
 		for _, dir := range dirs {
-			if err := wfs.metaCache.DeleteFolderChildren(context.Background(), dir); err != nil {
-				glog.V(2).Infof("evict dir cache %s: %v", dir, err)
-			}
+			wfs.purgeDirectoryCache(dir)
 		}
 	}
 }

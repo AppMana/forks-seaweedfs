@@ -22,6 +22,11 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 
+	if v.nm == nil {
+		glog.V(0).Infof("volume %d: needle map not loaded; read returns not-found", v.Id)
+		return -1, ErrorNotFound
+	}
+
 	nv, ok := v.nm.Get(n.Id)
 	if !ok || nv.Offset.IsZero() {
 		return -1, ErrorNotFound
@@ -108,6 +113,13 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 	if readOption.HasSlowRead {
 		v.dataFileAccessLock.RLock()
 	}
+	if v.nm == nil {
+		if readOption.HasSlowRead {
+			v.dataFileAccessLock.RUnlock()
+		}
+		glog.V(0).Infof("volume %d: needle map not loaded; read returns not-found", v.Id)
+		return ErrorNotFound
+	}
 	nv, ok := v.nm.Get(n.Id)
 	if readOption.HasSlowRead {
 		v.dataFileAccessLock.RUnlock()
@@ -146,6 +158,13 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		}
 		// possibly re-read needle offset if volume is compacted
 		if readOption.VolumeRevision != v.SuperBlock.CompactionRevision {
+			if v.nm == nil {
+				if readOption.HasSlowRead {
+					v.dataFileAccessLock.RUnlock()
+				}
+				glog.V(0).Infof("volume %d: needle map not loaded mid-read", v.Id)
+				return ErrorNotFound
+			}
 			// the volume is compacted
 			nv, ok = v.nm.Get(n.Id)
 			if !ok || nv.Offset.IsZero() {
@@ -160,6 +179,14 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		count, err := n.ReadNeedleData(v.DataBackend, actualOffset, buf, x)
 		if readOption.HasSlowRead {
 			v.dataFileAccessLock.RUnlock()
+		}
+		// Thread the underlying read error through the EIO tracker.
+		// Without this, large/range GETs through readNeedleDataInto
+		// would never trip IoErrorTolerance even on a failing disk.
+		// io.EOF is treated as a clean end-of-stream below, not an
+		// error.
+		if err != nil && err != io.EOF {
+			v.checkReadWriteError(err)
 		}
 
 		toWrite := min(count, int(offset+size-x))
@@ -182,6 +209,11 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 			break
 		}
 	}
+	// Whole-needle read completed without a backend error — clear any
+	// pending EIO streak. If a non-EIO failure happens later (CRC etc.)
+	// we still return that error to the caller, but the disk itself
+	// produced clean bytes.
+	v.checkReadWriteError(nil)
 	if offset == 0 && size == int64(n.DataSize) && (n.Checksum != crc && uint32(n.Checksum) != crc.Value()) {
 		// the crc.Value() function is to be deprecated. this double checking is for backward compatibility
 		// with seaweed version using crc.Value() instead of uint32(crc), which appears in commit 056c480eb
@@ -205,7 +237,9 @@ func (v *Volume) ReadNeedleBlob(offset int64, size Size) ([]byte, error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 
-	return needle.ReadNeedleBlob(v.DataBackend, offset, size, v.Version())
+	blob, err := needle.ReadNeedleBlob(v.DataBackend, offset, size, v.Version())
+	v.checkReadWriteError(err)
+	return blob, err
 }
 
 type VolumeFileScanner interface {

@@ -2,7 +2,15 @@ name: "S3 Go Tests"
 
 on:
   pull_request:
-  
+    paths:
+      - 'weed/s3api/**'
+      - 'weed/filer/**'
+      - 'weed/server/**'
+      - 'test/s3/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/s3-go-tests.yml'
+
 concurrency:
   group: ${{ github.head_ref }}/s3-go-tests
   cancel-in-progress: true
@@ -25,7 +33,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -89,7 +97,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -137,7 +145,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -188,7 +196,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -245,6 +253,77 @@ jobs:
           path: test/s3/retention/weed-test*.log
           retention-days: 3
 
+  s3-lifecycle-tests:
+    name: S3 Lifecycle Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per test so each gets a fresh `weed mini` server, avoiding
+        # the cross-test volume-pool exhaustion that surfaced when several
+        # TTL-pinned bucket collections piled up in a single run.
+        test:
+          - TestLifecycleAbortIncompleteMultipartUpload
+          - TestLifecycleAdminDispatchSucceedsWithCustomFilerGrpcPort
+          - TestLifecycleBootstrapWalkOnExistingObjects
+          - TestLifecycleConfigUpdateBetweenSweeps
+          - TestLifecycleDeleteBucketLifecycleStopsDispatching
+          - TestLifecycleDisabledRuleSkipsObject
+          - TestLifecycleEmptyBucketSweepIsNoOp
+          - TestLifecycleExpirationDateInThePast
+          - TestLifecycleExpirationFiresOnBackdatedObject
+          - TestLifecycleExpiredDeleteMarkerCleanup
+          - TestLifecycleMultipleBucketsInOneSweep
+          - TestLifecycleMultipleRulesInOneBucket
+          - TestLifecycleNewerNoncurrentVersions
+          - TestLifecycleNoncurrentVersionExpiration
+          - TestLifecycleSizeFilterGreaterThan
+          - TestLifecycleSkipsObjectLockedObjects
+          - TestLifecycleSuspendedVersioningExpiration
+          - TestLifecycleTagFilter
+          - TestLifecycleVersionedBucketCreatesDeleteMarker
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+        id: go
+
+      - name: Install SeaweedFS
+        run: |
+          go install -buildvcs=false
+
+      - name: Run ${{ matrix.test }}
+        timeout-minutes: 8
+        working-directory: test/s3/lifecycle
+        run: |
+          set -x
+          make test-with-server TEST_PATTERN='^${{ matrix.test }}$$'
+
+      - name: Show server logs on failure
+        if: failure()
+        working-directory: test/s3/lifecycle
+        run: |
+          if [ -f weed-test.log ]; then
+            echo "=== Last 200 lines of server logs ==="
+            tail -200 weed-test.log
+          fi
+          ps aux | grep -E "(weed|test)" || true
+          netstat -tlnp 2>/dev/null | grep -E "(8333|9333|8080|8888)" || true
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3-lifecycle-test-logs-${{ matrix.test }}
+          path: test/s3/lifecycle/weed-test*.log
+          retention-days: 3
+
   s3-checksum-tests:
     name: S3 Checksum Tests
     runs-on: ubuntu-22.04
@@ -252,7 +331,7 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -310,7 +389,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -374,7 +453,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -423,7 +502,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -491,7 +570,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -546,7 +625,7 @@ jobs:
     
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/gorilla/mux"
@@ -71,6 +72,10 @@ func NewEmbeddedIamApiForTest() *EmbeddedIamApiForTest {
 			s3cfg.Policies = make([]*iam_pb.Policy, len(config.Policies))
 			for i, p := range config.Policies {
 				s3cfg.Policies[i] = proto.Clone(p).(*iam_pb.Policy)
+			}
+			s3cfg.Groups = make([]*iam_pb.Group, len(config.Groups))
+			for i, g := range config.Groups {
+				s3cfg.Groups[i] = proto.Clone(g).(*iam_pb.Group)
 			}
 		}
 		return err
@@ -184,6 +189,10 @@ func TestEmbeddedIamCreateUser(t *testing.T) {
 	// Verify response contains correct username
 	assert.NotNil(t, out.CreateUserResult.User.UserName)
 	assert.Equal(t, "TestUser", *out.CreateUserResult.User.UserName)
+
+	// Issue #9786: terraform aws provider >= 6.41 blocks on a valid ARN.
+	assert.True(t, arn.IsARN(aws.StringValue(out.CreateUserResult.User.Arn)),
+		"CreateUser must return a valid ARN, got %q", aws.StringValue(out.CreateUserResult.User.Arn))
 
 	// Verify user was persisted in config
 	assert.Len(t, api.mockConfig.Identities, 1)
@@ -333,6 +342,51 @@ func TestEmbeddedIamGetUser(t *testing.T) {
 	// Verify response contains correct username
 	assert.NotNil(t, out.GetUserResult.User.UserName)
 	assert.Equal(t, "TestUser", *out.GetUserResult.User.UserName)
+
+	// Issue #9786: the terraform aws provider reads the user back after creating
+	// it and waits until GetUser returns a value that passes arn.IsARN.
+	assert.True(t, arn.IsARN(aws.StringValue(out.GetUserResult.User.Arn)),
+		"GetUser must return a valid ARN, got %q", aws.StringValue(out.GetUserResult.User.Arn))
+}
+
+// TestEmbeddedIamGetUserImplicitUsername verifies GetUser without a UserName defaults
+// to the user that signed the request rather than returning NoSuchEntity for an empty
+// username, matching documented AWS IAM behavior.
+func TestEmbeddedIamGetUserImplicitUsername(t *testing.T) {
+	const accessKey = UserAccessKeyPrefix + "TESTFAKEKEY000001"
+
+	api := NewEmbeddedIamApiForTest()
+	api.mockConfig = &iam_pb.S3ApiConfiguration{
+		Identities: []*iam_pb.Identity{
+			{
+				Name: "TestUser",
+				Credentials: []*iam_pb.Credential{
+					{AccessKey: accessKey, SecretKey: "testsecretfake"},
+				},
+			},
+		},
+	}
+	// handleImplicitUsername resolves the username via iam.LookupByAccessKey,
+	// so the iam state must know about the credential.
+	if err := api.iam.LoadS3ApiConfigurationFromBytes(mustMarshalJSON(api.mockConfig)); err != nil {
+		t.Fatalf("failed to load iam config: %v", err)
+	}
+
+	// GetUser request with NO UserName, but signed by accessKey.
+	form := url.Values{}
+	form.Set("Action", "GetUser")
+	req, _ := http.NewRequest(http.MethodPost, "/", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+accessKey+
+		"/20220420/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=fakesig")
+
+	out := iamGetUserResponse{}
+	rr, err := executeEmbeddedIamRequest(api, req, &out)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, "body=%s", rr.Body.String())
+
+	require.NotNil(t, out.GetUserResult.User.UserName)
+	assert.Equal(t, "TestUser", *out.GetUserResult.User.UserName)
 }
 
 // TestEmbeddedIamCreatePolicy tests creating a policy via the embedded IAM API
@@ -370,6 +424,98 @@ func TestEmbeddedIamCreatePolicy(t *testing.T) {
 	assert.Equal(t, "S3-read-only-example-bucket", *out.CreatePolicyResult.Policy.PolicyName)
 	assert.NotNil(t, out.CreatePolicyResult.Policy.Arn)
 	assert.NotNil(t, out.CreatePolicyResult.Policy.PolicyId)
+}
+
+// TestEmbeddedIamCreatePolicyVersion covers the embedded IAM path for issue
+// #9785: updating a managed policy in place via CreatePolicyVersion (used by the
+// AWS Terraform provider) instead of returning 501 NotImplemented.
+func TestEmbeddedIamCreatePolicyVersion(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	svc := iam.New(session.New())
+	policyArn := aws.String("arn:aws:iam:::policy/tf-managed")
+
+	// Create the managed policy.
+	createReq, _ := svc.CreatePolicyRequest(&iam.CreatePolicyInput{
+		PolicyName:     aws.String("tf-managed"),
+		PolicyDocument: aws.String(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":["arn:aws:s3:::EXAMPLE-BUCKET"]}]}`),
+	})
+	_ = createReq.Build()
+	resp, err := executeEmbeddedIamRequest(api, createReq.HTTPRequest, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.Code)
+
+	// Update it in place. This used to return 501 NotImplemented.
+	cpvReq, _ := svc.CreatePolicyVersionRequest(&iam.CreatePolicyVersionInput{
+		PolicyArn:      policyArn,
+		PolicyDocument: aws.String(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*"],"Resource":["arn:aws:s3:::EXAMPLE-BUCKET"]}]}`),
+		SetAsDefault:   aws.Bool(true),
+	})
+	_ = cpvReq.Build()
+	out := iamCreatePolicyVersionResponse{}
+	resp, err = executeEmbeddedIamRequest(api, cpvReq.HTTPRequest, &out)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.Code)
+	require.NotNil(t, out.CreatePolicyVersionResult.PolicyVersion.VersionId)
+	assert.Equal(t, "v1", *out.CreatePolicyVersionResult.PolicyVersion.VersionId)
+	require.NotNil(t, out.CreatePolicyVersionResult.PolicyVersion.IsDefaultVersion)
+	assert.True(t, *out.CreatePolicyVersionResult.PolicyVersion.IsDefaultVersion)
+
+	// The stored document must reflect the update.
+	gpvReq, _ := svc.GetPolicyVersionRequest(&iam.GetPolicyVersionInput{PolicyArn: policyArn, VersionId: aws.String("v1")})
+	_ = gpvReq.Build()
+	gpvOut := iamGetPolicyVersionResponse{}
+	resp, err = executeEmbeddedIamRequest(api, gpvReq.HTTPRequest, &gpvOut)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.Code)
+	require.NotNil(t, gpvOut.GetPolicyVersionResult.PolicyVersion.Document)
+	assert.Contains(t, *gpvOut.GetPolicyVersionResult.PolicyVersion.Document, "s3:Get*")
+	assert.NotContains(t, *gpvOut.GetPolicyVersionResult.PolicyVersion.Document, "s3:List*")
+}
+
+// TestEmbeddedIamCreatePolicyVersionMissingPolicy verifies NoSuchEntity when the
+// target policy does not exist.
+func TestEmbeddedIamCreatePolicyVersionMissingPolicy(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	req, _ := iam.New(session.New()).CreatePolicyVersionRequest(&iam.CreatePolicyVersionInput{
+		PolicyArn:      aws.String("arn:aws:iam:::policy/does-not-exist"),
+		PolicyDocument: aws.String(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*"],"Resource":["arn:aws:s3:::EXAMPLE-BUCKET"]}]}`),
+		SetAsDefault:   aws.Bool(true),
+	})
+	_ = req.Build()
+	resp, err := executeEmbeddedIamRequest(api, req.HTTPRequest, nil)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, resp.Code)
+	code, _ := extractEmbeddedIamErrorCodeAndMessage(resp)
+	assert.Equal(t, "NoSuchEntity", code)
+}
+
+// TestEmbeddedIamCreatePolicyVersionRequiresSetAsDefault verifies the embedded
+// path also rejects a non-default version request given the single-version model.
+func TestEmbeddedIamCreatePolicyVersionRequiresSetAsDefault(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	svc := iam.New(session.New())
+	policyArn := aws.String("arn:aws:iam:::policy/tf-managed")
+
+	createReq, _ := svc.CreatePolicyRequest(&iam.CreatePolicyInput{
+		PolicyName:     aws.String("tf-managed"),
+		PolicyDocument: aws.String(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*"],"Resource":["arn:aws:s3:::EXAMPLE-BUCKET"]}]}`),
+	})
+	_ = createReq.Build()
+	resp, err := executeEmbeddedIamRequest(api, createReq.HTTPRequest, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.Code)
+
+	// SetAsDefault omitted must be rejected.
+	cpvReq, _ := svc.CreatePolicyVersionRequest(&iam.CreatePolicyVersionInput{
+		PolicyArn:      policyArn,
+		PolicyDocument: aws.String(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Put*"],"Resource":["arn:aws:s3:::EXAMPLE-BUCKET"]}]}`),
+	})
+	_ = cpvReq.Build()
+	resp, err = executeEmbeddedIamRequest(api, cpvReq.HTTPRequest, nil)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	code, _ := extractEmbeddedIamErrorCodeAndMessage(resp)
+	assert.Equal(t, "InvalidInput", code)
 }
 
 // TestEmbeddedIamPutUserPolicy tests attaching a policy to a user
@@ -619,37 +765,47 @@ func TestEmbeddedIamListUserPolicies(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rr3.Code)
 }
 
-// TestEmbeddedIamGroupInlinePoliciesNotImplemented tests that group inline policies
-// return NotImplemented in embedded IAM mode.
-func TestEmbeddedIamGroupInlinePoliciesNotImplemented(t *testing.T) {
+// TestEmbeddedIamGroupInlinePolicies_CRUD exercises the Put/Get/List/Delete
+// round-trip for group inline policies and verifies that an unknown policy
+// surfaces as NoSuchEntity (not the legacy NotImplemented).
+func TestEmbeddedIamGroupInlinePolicies_CRUD(t *testing.T) {
 	api := NewEmbeddedIamApiForTest()
 	s3cfg := &iam_pb.S3ApiConfiguration{
 		Groups: []*iam_pb.Group{
 			{Name: "developers", Members: []string{"alice"}},
 		},
 	}
+	api.mockConfig = s3cfg
 
-	notImpl := s3err.GetAPIError(s3err.ErrNotImplemented).Code
+	policyDoc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::*"}]}`
 
 	_, iamErr := api.PutGroupPolicy(s3cfg, url.Values{
 		"GroupName":      {"developers"},
 		"PolicyName":     {"DevPolicy"},
-		"PolicyDocument": {`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::*"}]}`},
+		"PolicyDocument": {policyDoc},
 	})
-	assert.NotNil(t, iamErr)
-	assert.Equal(t, notImpl, iamErr.Code)
+	require.Nil(t, iamErr, "PutGroupPolicy must succeed; got: %+v", iamErr)
 
-	_, iamErr = api.GetGroupPolicy(s3cfg, url.Values{"GroupName": {"developers"}, "PolicyName": {"DevPolicy"}})
-	assert.NotNil(t, iamErr)
-	assert.Equal(t, notImpl, iamErr.Code)
+	listResp, iamErr := api.ListGroupPolicies(s3cfg, url.Values{"GroupName": {"developers"}})
+	require.Nil(t, iamErr)
+	assert.Equal(t, []string{"DevPolicy"}, listResp.ListGroupPoliciesResult.PolicyNames)
+
+	getResp, iamErr := api.GetGroupPolicy(s3cfg, url.Values{"GroupName": {"developers"}, "PolicyName": {"DevPolicy"}})
+	require.Nil(t, iamErr)
+	assert.Equal(t, "developers", getResp.GetGroupPolicyResult.GroupName)
+	assert.Equal(t, "DevPolicy", getResp.GetGroupPolicyResult.PolicyName)
+	assert.Contains(t, getResp.GetGroupPolicyResult.PolicyDocument, "s3:GetObject")
 
 	_, iamErr = api.DeleteGroupPolicy(s3cfg, url.Values{"GroupName": {"developers"}, "PolicyName": {"DevPolicy"}})
-	assert.NotNil(t, iamErr)
-	assert.Equal(t, notImpl, iamErr.Code)
+	require.Nil(t, iamErr)
 
-	_, iamErr = api.ListGroupPolicies(s3cfg, url.Values{"GroupName": {"developers"}})
-	assert.NotNil(t, iamErr)
-	assert.Equal(t, notImpl, iamErr.Code)
+	_, iamErr = api.GetGroupPolicy(s3cfg, url.Values{"GroupName": {"developers"}, "PolicyName": {"DevPolicy"}})
+	require.NotNil(t, iamErr)
+	assert.Equal(t, iam.ErrCodeNoSuchEntityException, iamErr.Code)
+
+	_, iamErr = api.GetGroupPolicy(s3cfg, url.Values{"GroupName": {"ghosts"}, "PolicyName": {"DevPolicy"}})
+	require.NotNil(t, iamErr, "GetGroupPolicy on a missing group must error")
+	assert.Equal(t, iam.ErrCodeNoSuchEntityException, iamErr.Code)
 }
 
 // TestEmbeddedIamAttachUserPolicy tests attaching a managed policy to a user.

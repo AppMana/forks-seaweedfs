@@ -16,6 +16,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// metadataFlushTimeout bounds a close()/fsync metadata flush so an overwhelmed
+// filer cannot wedge the calling process forever. It is deliberately generous:
+// a healthy CreateEntry completes in well under a second, so this only fires on
+// a genuinely stuck filer, never on a normal flush.
+const metadataFlushTimeout = 30 * time.Second
+
 /**
  * Flush method
  *
@@ -60,7 +66,7 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 		// If handle is not found, it might have been already released
 		// This is not an error condition for FLUSH
 		if in.LockOwner != 0 {
-			wfs.posixLocks.ReleasePosixOwner(in.NodeId, in.LockOwner)
+			wfs.releasePosixOwner(in.NodeId, in.LockOwner)
 		}
 		return fuse.OK
 	}
@@ -69,11 +75,22 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	// did not hold byte-range locks. Only force the synchronous close path when
 	// this owner actually has POSIX locks to release; otherwise writebackCache
 	// would silently degrade to a blocking flush for ordinary close().
-	hasPosixLocks := wfs.posixLocks.HasPosixOwner(in.NodeId, in.LockOwner)
+	hasPosixLocks := wfs.hasPosixOwner(in.NodeId, in.LockOwner)
 	allowAsync := !hasPosixLocks
-	status := wfs.doFlush(fh, in.Uid, in.Gid, allowAsync)
+
+	// Bound the flush with a deadline instead of tying it to the FUSE cancel
+	// channel. A FUSE interrupt is not a process kill: Go's async preemption
+	// (SIGURG) makes a close() under load emit an interrupt on nearly every
+	// flush (see go-fuse RawFileSystem docs), so cancelling the in-flight
+	// metadata CreateEntry on that interrupt turned healthy concurrent close()s
+	// into EIO. The deadline still keeps close() from hanging forever against an
+	// overwhelmed filer without failing benign flushes.
+	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
+	defer cancelFunc()
+
+	status := wfs.doFlush(ctx, fh, in.Uid, in.Gid, allowAsync)
 	if in.LockOwner != 0 {
-		wfs.posixLocks.ReleasePosixOwner(in.NodeId, in.LockOwner)
+		wfs.releasePosixOwner(in.NodeId, in.LockOwner)
 	}
 	return status
 }
@@ -104,12 +121,15 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 		return fuse.ENOENT
 	}
 
+	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
+	defer cancelFunc()
+
 	// Fsync is an explicit sync request — always flush synchronously
-	return wfs.doFlush(fh, in.Uid, in.Gid, false)
+	return wfs.doFlush(ctx, fh, in.Uid, in.Gid, false)
 
 }
 
-func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
+func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
 
 	// WinFsp may issue overlapping Flush/Cleanup callbacks for several
 	// Windows handles that cgofuse maps to the same FUSE file handle. The
@@ -168,8 +188,8 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	if err := retryMetadataFlush(func() error {
-		return wfs.flushMetadataToFilerLocked(fh, dir, name, uid, gid)
+	if err := retryMetadataFlush(ctx, func() error {
+		return wfs.flushMetadataToFilerLocked(ctx, fh, dir, name, uid, gid)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
@@ -192,7 +212,7 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 // When -dlm is enabled, the distributed lock is already held by the FileHandle
 // from open-for-write through close, so no additional distributed lock is
 // needed here.
-func (wfs *WFS) flushMetadataToFilerLocked(fh *FileHandle, dir, name string, uid, gid uint32) error {
+func (wfs *WFS) flushMetadataToFilerLocked(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
 	fileFullPath := fh.FullPath()
 	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
 
@@ -207,11 +227,9 @@ func (wfs *WFS) flushMetadataToFilerLocked(fh *FileHandle, dir, name string, uid
 		if entry.Attributes.Gid == 0 {
 			entry.Attributes.Gid = gid
 		}
-		flushNow := time.Now()
-		entry.Attributes.Mtime = flushNow.Unix()
-		entry.Attributes.MtimeNs = int32(flushNow.Nanosecond())
-		entry.Attributes.Ctime = flushNow.Unix()
-		entry.Attributes.CtimeNs = int32(flushNow.Nanosecond())
+		// Do not stamp mtime/ctime here. Write/SetAttr already maintain
+		// them on the entry; overwriting at flush time clobbered user-set
+		// mtime (utimes/touch -m -d) once the deferred flush ran.
 	}
 
 	glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))
@@ -248,7 +266,7 @@ func (wfs *WFS) flushMetadataToFilerLocked(fh *FileHandle, dir, name string, uid
 
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	resp, err := wfs.streamCreateEntry(ctx, request)
 	if err != nil {
 		glog.Errorf("fh flush create %s: %v", fileFullPath, err)
 		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)

@@ -288,6 +288,10 @@ async fn run(
         config.jwt_read_signing_expires_seconds,
     );
     let master_url = config.masters.first().cloned().unwrap_or_default();
+    // Defensive-copy the configured seed masters before freezing the lookup
+    // set, so any later mutation of config.masters cannot desync them.
+    let master_urls: Vec<String> = config.masters.clone();
+    let seed_master_set = VolumeServerState::build_seed_master_set(&master_urls);
     let self_url = format!("{}:{}", config.ip, config.port);
     let (http_client, outgoing_http_scheme) = build_outgoing_http_client(&config)?;
     let outgoing_grpc_tls = load_outgoing_grpc_tls(&config)?;
@@ -323,8 +327,11 @@ async fn run(
             seaweed_volume::remote_storage::s3_tier::S3TierRegistry::new(),
         ),
         read_mode: config.read_mode,
+        allow_untrusted_remote_endpoints: config.allow_untrusted_remote_endpoints,
         master_url,
-        master_urls: config.masters.clone(),
+        master_urls,
+        seed_master_set,
+        current_master_url: tokio::sync::RwLock::new(String::new()),
         self_url,
         http_client,
         outgoing_http_scheme,
@@ -539,6 +546,12 @@ async fn run(
                     whitelist.extend(sec.guard_white_list.iter().cloned());
                     let mut guard = state_reload.guard.write().unwrap();
                     guard.update_whitelist(&whitelist);
+                    guard.update_signing_keys(
+                        SigningKey(sec.jwt_signing_key),
+                        sec.jwt_signing_expires,
+                        SigningKey(sec.jwt_read_signing_key),
+                        sec.jwt_read_signing_expires,
+                    );
                 }
 
                 // Trigger heartbeat to report new volumes

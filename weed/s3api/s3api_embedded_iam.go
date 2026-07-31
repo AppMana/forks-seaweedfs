@@ -80,6 +80,9 @@ const (
 	MaxServiceAccountsPerUser = 100  // Maximum service accounts per user
 	MaxDescriptionLength      = 1000 // Maximum description length in characters
 	MaxManagedPoliciesPerUser = 10   // Maximum managed policies attached to a user
+	MaxUserTags               = 50   // Maximum tags per user
+	MaxUserTagKeyLength       = 128  // Maximum tag key length
+	MaxUserTagValueLength     = 256  // Maximum tag value length
 )
 
 // Type aliases for IAM response types from shared package
@@ -93,6 +96,8 @@ type (
 	iamGetPolicyResponse                = iamlib.GetPolicyResponse
 	iamListPolicyVersionsResponse       = iamlib.ListPolicyVersionsResponse
 	iamGetPolicyVersionResponse         = iamlib.GetPolicyVersionResponse
+	iamCreatePolicyVersionResponse      = iamlib.CreatePolicyVersionResponse
+	iamDeletePolicyVersionResponse      = iamlib.DeletePolicyVersionResponse
 	iamCreateUserResponse               = iamlib.CreateUserResponse
 	iamDeleteUserResponse               = iamlib.DeleteUserResponse
 	iamGetUserResponse                  = iamlib.GetUserResponse
@@ -132,6 +137,11 @@ type (
 	iamDeleteGroupPolicyResponse         = iamlib.DeleteGroupPolicyResponse
 	iamListGroupPoliciesResponse         = iamlib.ListGroupPoliciesResponse
 	iamListGroupsForUserResponse         = iamlib.ListGroupsForUserResponse
+	// User tag response types
+	iamTagUserResponse      = iamlib.TagUserResponse
+	iamUntagUserResponse    = iamlib.UntagUserResponse
+	iamListUserTagsResponse = iamlib.ListUserTagsResponse
+	iamTag                  = iamlib.IAMTag
 )
 
 // Helper function wrappers using shared package
@@ -206,7 +216,7 @@ func (e *EmbeddedIamApi) writeIamErrorResponse(w http.ResponseWriter, r *http.Re
 		s3err.WriteXMLResponse(w, r, http.StatusNotFound, errorResp)
 	case iam.ErrCodeEntityAlreadyExistsException:
 		s3err.WriteXMLResponse(w, r, http.StatusConflict, errorResp)
-	case iam.ErrCodeMalformedPolicyDocumentException, iam.ErrCodeInvalidInputException:
+	case iam.ErrCodeMalformedPolicyDocumentException, iam.ErrCodeInvalidInputException, "ValidationError":
 		s3err.WriteXMLResponse(w, r, http.StatusBadRequest, errorResp)
 	case "AccessDenied", iam.ErrCodeLimitExceededException:
 		s3err.WriteXMLResponse(w, r, http.StatusForbidden, errorResp)
@@ -257,7 +267,8 @@ func (e *EmbeddedIamApi) ReloadConfiguration() error {
 func (e *EmbeddedIamApi) ListUsers(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) *iamListUsersResponse {
 	resp := &iamListUsersResponse{}
 	for _, ident := range s3cfg.Identities {
-		resp.ListUsersResult.Users = append(resp.ListUsersResult.Users, &iam.User{UserName: &ident.Name})
+		user := iamlib.NewUser(ident.Name)
+		resp.ListUsersResult.Users = append(resp.ListUsersResult.Users, &user)
 	}
 	return resp
 }
@@ -305,7 +316,7 @@ func (e *EmbeddedIamApi) CreateUser(s3cfg *iam_pb.S3ApiConfiguration, values url
 		}
 	}
 
-	resp.CreateUserResult.User.UserName = &userName
+	resp.CreateUserResult.User = iamlib.NewUser(userName)
 	s3cfg.Identities = append(s3cfg.Identities, &iam_pb.Identity{Name: userName}) // Disabled defaults to false (enabled)
 	return resp, nil
 }
@@ -345,7 +356,7 @@ func (e *EmbeddedIamApi) GetUser(s3cfg *iam_pb.S3ApiConfiguration, userName stri
 	resp := &iamGetUserResponse{}
 	for _, ident := range s3cfg.Identities {
 		if userName == ident.Name {
-			resp.GetUserResult.User = iam.User{UserName: &ident.Name}
+			resp.GetUserResult.User = iamlib.NewUser(ident.Name)
 			return resp, nil
 		}
 	}
@@ -821,6 +832,87 @@ func (e *EmbeddedIamApi) GetPolicyVersion(ctx context.Context, values url.Values
 	return resp, nil
 }
 
+// CreatePolicyVersion replaces a managed policy's document with a new version.
+// SeaweedFS keeps a single current document per managed policy (no version
+// history), so the new document always becomes version "v1" / the default. This
+// is what the AWS Terraform provider calls to update an aws_iam_policy in place.
+func (e *EmbeddedIamApi) CreatePolicyVersion(ctx context.Context, values url.Values) (*iamCreatePolicyVersionResponse, *iamError) {
+	resp := &iamCreatePolicyVersionResponse{}
+	policyName, err := iamPolicyNameFromArn(values.Get("PolicyArn"))
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err}
+	}
+	policyDocumentString := values.Get("PolicyDocument")
+	if policyDocumentString == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("PolicyDocument is required")}
+	}
+	// SeaweedFS stores a single, always-default managed policy version. On AWS,
+	// SetAsDefault=false stages a non-default version without activating it; we
+	// can't honor that, so reject it rather than silently changing permissions.
+	if !strings.EqualFold(values.Get("SetAsDefault"), "true") {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("SetAsDefault must be true: SeaweedFS stores a single managed policy version")}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	policyDocument, err := e.GetPolicyDocument(&policyDocumentString)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeMalformedPolicyDocumentException, Error: err}
+	}
+	if _, err := e.getActions(&policyDocument); err != nil {
+		return resp, &iamError{Code: iam.ErrCodeMalformedPolicyDocumentException, Error: err}
+	}
+	existing, err := e.credentialManager.GetPolicy(ctx, policyName)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	if existing == nil {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy %s not found", policyName)}
+	}
+	if err := e.credentialManager.UpdatePolicy(ctx, policyName, policyDocument); err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+
+	versionID := "v1"
+	isDefaultVersion := true
+	document := policyDocumentString
+	resp.CreatePolicyVersionResult.PolicyVersion = iam.PolicyVersion{
+		VersionId:        &versionID,
+		IsDefaultVersion: &isDefaultVersion,
+		Document:         &document,
+	}
+	return resp, nil
+}
+
+// DeletePolicyVersion is accepted for API completeness. With a single stored
+// version that is always the default, the only valid responses are NoSuchEntity
+// (unknown version) and the AWS "cannot delete the default version" conflict.
+func (e *EmbeddedIamApi) DeletePolicyVersion(ctx context.Context, values url.Values) (*iamDeletePolicyVersionResponse, *iamError) {
+	resp := &iamDeletePolicyVersionResponse{}
+	policyName, err := iamPolicyNameFromArn(values.Get("PolicyArn"))
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err}
+	}
+	versionID := values.Get("VersionId")
+	if versionID == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("VersionId is required")}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	policy, err := e.credentialManager.GetPolicy(ctx, policyName)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	if policy == nil {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy %s not found", policyName)}
+	}
+	if versionID == "v1" {
+		return resp, &iamError{Code: iam.ErrCodeDeleteConflictException, Error: fmt.Errorf("cannot delete the default version of policy %s", policyName)}
+	}
+	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy version %s not found", versionID)}
+}
+
 func iamPolicyNameFromArn(policyArn string) (string, error) {
 	const policyPathDelimiter = ":policy/"
 	idx := strings.Index(policyArn, policyPathDelimiter)
@@ -1155,6 +1247,217 @@ func (e *EmbeddedIamApi) ListUserPolicies(s3cfg *iam_pb.S3ApiConfiguration, valu
 			resp.ListUserPoliciesResult.IsTruncated = false
 			return resp, nil
 		}
+	}
+	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
+}
+
+// parseTagListParams reads AWS query-encoded "Tags.member.N.Key" / "Tags.member.N.Value"
+// pairs from form values, returning them in numeric order.
+func parseTagListParams(values url.Values) ([]*iam_pb.UserTag, *iamError) {
+	type indexed struct {
+		idx   int
+		key   string
+		value string
+	}
+	indexes := make(map[int]*indexed)
+	for name, vs := range values {
+		if len(vs) == 0 || !strings.HasPrefix(name, "Tags.member.") {
+			continue
+		}
+		rest := strings.TrimPrefix(name, "Tags.member.")
+		dot := strings.Index(rest, ".")
+		if dot < 0 {
+			continue
+		}
+		n, err := strconv.Atoi(rest[:dot])
+		if err != nil || n < 1 {
+			continue
+		}
+		entry, ok := indexes[n]
+		if !ok {
+			entry = &indexed{idx: n}
+			indexes[n] = entry
+		}
+		switch rest[dot+1:] {
+		case "Key":
+			entry.key = vs[0]
+		case "Value":
+			entry.value = vs[0]
+		}
+	}
+	keys := make([]int, 0, len(indexes))
+	for k := range indexes {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	tags := make([]*iam_pb.UserTag, 0, len(keys))
+	for _, k := range keys {
+		t := indexes[k]
+		if t.key == "" {
+			return nil, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("tag key cannot be empty")}
+		}
+		if len(t.key) > MaxUserTagKeyLength {
+			return nil, &iamError{Code: "ValidationError", Error: fmt.Errorf("tag key %q exceeds %d characters", t.key, MaxUserTagKeyLength)}
+		}
+		if len(t.value) > MaxUserTagValueLength {
+			return nil, &iamError{Code: "ValidationError", Error: fmt.Errorf("tag value for key %q exceeds %d characters", t.key, MaxUserTagValueLength)}
+		}
+		tags = append(tags, &iam_pb.UserTag{Key: t.key, Value: t.value})
+	}
+	return tags, nil
+}
+
+// parseTagKeysParams reads AWS query-encoded "TagKeys.member.N" entries and
+// validates each entry is a non-empty key within MaxUserTagKeyLength.
+func parseTagKeysParams(values url.Values) ([]string, *iamError) {
+	entries := make(map[int]string)
+	for name, vs := range values {
+		if len(vs) == 0 || !strings.HasPrefix(name, "TagKeys.member.") {
+			continue
+		}
+		rest := strings.TrimPrefix(name, "TagKeys.member.")
+		n, err := strconv.Atoi(rest)
+		if err != nil || n < 1 {
+			continue
+		}
+		entries[n] = vs[0]
+	}
+	keys := make([]int, 0, len(entries))
+	for k := range entries {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	result := make([]string, 0, len(keys))
+	for _, k := range keys {
+		key := entries[k]
+		if key == "" {
+			return nil, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("tag key cannot be empty")}
+		}
+		if len(key) > MaxUserTagKeyLength {
+			return nil, &iamError{Code: "ValidationError", Error: fmt.Errorf("tag key %q exceeds %d characters", key, MaxUserTagKeyLength)}
+		}
+		result = append(result, key)
+	}
+	return result, nil
+}
+
+// mergeUserTags overwrites existing tags with matching keys and appends new ones,
+// preserving original order for stable iteration.
+func mergeUserTags(existing []*iam_pb.UserTag, incoming []*iam_pb.UserTag) []*iam_pb.UserTag {
+	index := make(map[string]int, len(existing))
+	merged := make([]*iam_pb.UserTag, 0, len(existing)+len(incoming))
+	for _, t := range existing {
+		merged = append(merged, &iam_pb.UserTag{Key: t.Key, Value: t.Value})
+		index[t.Key] = len(merged) - 1
+	}
+	for _, t := range incoming {
+		if i, ok := index[t.Key]; ok {
+			merged[i].Value = t.Value
+			continue
+		}
+		index[t.Key] = len(merged)
+		merged = append(merged, &iam_pb.UserTag{Key: t.Key, Value: t.Value})
+	}
+	return merged
+}
+
+// TagUser adds or updates tags on an IAM user.
+// https://docs.aws.amazon.com/IAM/latest/APIReference/API_TagUser.html
+func (e *EmbeddedIamApi) TagUser(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamTagUserResponse, *iamError) {
+	resp := &iamTagUserResponse{}
+	userName := values.Get("UserName")
+	if userName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("UserName is required")}
+	}
+	incoming, iamErr := parseTagListParams(values)
+	if iamErr != nil {
+		return resp, iamErr
+	}
+	if len(incoming) == 0 {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("at least one tag is required")}
+	}
+	// Reject duplicate keys within the same request to match AWS semantics.
+	seen := make(map[string]bool, len(incoming))
+	for _, t := range incoming {
+		if seen[t.Key] {
+			return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("duplicate tag key %q", t.Key)}
+		}
+		seen[t.Key] = true
+	}
+	for _, ident := range s3cfg.Identities {
+		if ident.Name != userName {
+			continue
+		}
+		merged := mergeUserTags(ident.Tags, incoming)
+		if len(merged) > MaxUserTags {
+			return resp, &iamError{Code: iam.ErrCodeLimitExceededException, Error: fmt.Errorf("cannot exceed %d tags per user", MaxUserTags)}
+		}
+		ident.Tags = merged
+		return resp, nil
+	}
+	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
+}
+
+// UntagUser removes the named tags from an IAM user. Unknown keys are silently ignored.
+// https://docs.aws.amazon.com/IAM/latest/APIReference/API_UntagUser.html
+func (e *EmbeddedIamApi) UntagUser(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamUntagUserResponse, *iamError) {
+	resp := &iamUntagUserResponse{}
+	userName := values.Get("UserName")
+	if userName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("UserName is required")}
+	}
+	keys, iamErr := parseTagKeysParams(values)
+	if iamErr != nil {
+		return resp, iamErr
+	}
+	if len(keys) == 0 {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("at least one TagKeys entry is required")}
+	}
+	for _, ident := range s3cfg.Identities {
+		if ident.Name != userName {
+			continue
+		}
+		if len(ident.Tags) == 0 {
+			return resp, nil
+		}
+		toRemove := make(map[string]bool, len(keys))
+		for _, k := range keys {
+			toRemove[k] = true
+		}
+		filtered := make([]*iam_pb.UserTag, 0, len(ident.Tags))
+		for _, t := range ident.Tags {
+			if toRemove[t.Key] {
+				continue
+			}
+			filtered = append(filtered, t)
+		}
+		ident.Tags = filtered
+		return resp, nil
+	}
+	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
+}
+
+// ListUserTags returns the tags attached to an IAM user.
+// https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListUserTags.html
+// Pagination is not implemented: tag counts are bounded by MaxUserTags so the
+// full set always fits in a single response.
+func (e *EmbeddedIamApi) ListUserTags(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamListUserTagsResponse, *iamError) {
+	resp := &iamListUserTagsResponse{}
+	userName := values.Get("UserName")
+	if userName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("UserName is required")}
+	}
+	for _, ident := range s3cfg.Identities {
+		if ident.Name != userName {
+			continue
+		}
+		tags := make([]*iamTag, 0, len(ident.Tags))
+		for _, t := range ident.Tags {
+			tags = append(tags, &iamTag{Key: t.Key, Value: t.Value})
+		}
+		resp.ListUserTagsResult.Tags = tags
+		resp.ListUserTagsResult.IsTruncated = false
+		return resp, nil
 	}
 	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
 }
@@ -1794,8 +2097,8 @@ func (e *EmbeddedIamApi) GetGroup(s3cfg *iam_pb.S3ApiConfiguration, values url.V
 		if g.Name == groupName {
 			resp.GetGroupResult.Group.GroupName = &g.Name
 			for _, member := range g.Members {
-				memberName := member
-				resp.GetGroupResult.Users = append(resp.GetGroupResult.Users, &iam.User{UserName: &memberName})
+				user := iamlib.NewUser(member)
+				resp.GetGroupResult.Users = append(resp.GetGroupResult.Users, &user)
 			}
 			return resp, nil
 		}
@@ -1986,29 +2289,130 @@ func (e *EmbeddedIamApi) ListGroupsForUser(s3cfg *iam_pb.S3ApiConfiguration, val
 	return resp, nil
 }
 
-// notImplementedError returns a NotImplemented IAM error for the embedded server.
-func notImplementedGroupInlineError() *iamError {
-	return &iamError{Code: s3err.GetAPIError(s3err.ErrNotImplemented).Code, Error: fmt.Errorf("group inline policies are not supported in embedded IAM mode; use the standalone IAM server or managed policies (AttachGroupPolicy)")}
+// groupExists returns true if a group of the given name is present in the
+// supplied S3 IAM configuration.
+func groupExists(s3cfg *iam_pb.S3ApiConfiguration, groupName string) bool {
+	for _, g := range s3cfg.Groups {
+		if g.Name == groupName {
+			return true
+		}
+	}
+	return false
 }
 
-// PutGroupPolicy is not supported in embedded IAM mode.
+// PutGroupPolicy attaches an inline policy to a group. The document (including
+// any Condition block) is persisted via the credential store and registered
+// in the IAM policy engine via hydrateRuntimePolicies on the next reload.
 func (e *EmbeddedIamApi) PutGroupPolicy(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamPutGroupPolicyResponse, *iamError) {
-	return &iamPutGroupPolicyResponse{}, notImplementedGroupInlineError()
+	resp := &iamPutGroupPolicyResponse{}
+	groupName := values.Get("GroupName")
+	if groupName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("GroupName is required")}
+	}
+	policyName := values.Get("PolicyName")
+	if policyName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("PolicyName is required")}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	policyDocumentString := values.Get("PolicyDocument")
+	policyDocument, err := e.GetPolicyDocument(&policyDocumentString)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeMalformedPolicyDocumentException, Error: err}
+	}
+	if !groupExists(s3cfg, groupName) {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("group %s does not exist", groupName)}
+	}
+	if err := e.credentialManager.PutGroupInlinePolicy(context.Background(), groupName, policyName, policyDocument); err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	// DoActions reloads the IAM configuration for PutGroupPolicy, so the
+	// engine registration via hydrateRuntimePolicies happens there. No
+	// internal refresh is needed.
+	return resp, nil
 }
 
-// GetGroupPolicy is not supported in embedded IAM mode.
+// GetGroupPolicy returns the JSON document for an inline policy on a group.
 func (e *EmbeddedIamApi) GetGroupPolicy(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamGetGroupPolicyResponse, *iamError) {
-	return &iamGetGroupPolicyResponse{}, notImplementedGroupInlineError()
+	resp := &iamGetGroupPolicyResponse{}
+	groupName := values.Get("GroupName")
+	policyName := values.Get("PolicyName")
+	if groupName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("GroupName is required")}
+	}
+	if policyName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("PolicyName is required")}
+	}
+	if !groupExists(s3cfg, groupName) {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("group %s does not exist", groupName)}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	doc, err := e.credentialManager.GetGroupInlinePolicy(context.Background(), groupName, policyName)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	if doc == nil {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy %s not found on group %s", policyName, groupName)}
+	}
+	docJSON, err := json.Marshal(doc)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	resp.GetGroupPolicyResult.GroupName = groupName
+	resp.GetGroupPolicyResult.PolicyName = policyName
+	resp.GetGroupPolicyResult.PolicyDocument = string(docJSON)
+	return resp, nil
 }
 
-// DeleteGroupPolicy is not supported in embedded IAM mode.
+// DeleteGroupPolicy removes an inline policy from a group.
 func (e *EmbeddedIamApi) DeleteGroupPolicy(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamDeleteGroupPolicyResponse, *iamError) {
-	return &iamDeleteGroupPolicyResponse{}, notImplementedGroupInlineError()
+	resp := &iamDeleteGroupPolicyResponse{}
+	groupName := values.Get("GroupName")
+	policyName := values.Get("PolicyName")
+	if groupName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("GroupName is required")}
+	}
+	if policyName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("PolicyName is required")}
+	}
+	if !groupExists(s3cfg, groupName) {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("group %s does not exist", groupName)}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	if err := e.credentialManager.DeleteGroupInlinePolicy(context.Background(), groupName, policyName); err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	// DoActions reloads the IAM configuration for DeleteGroupPolicy, so the
+	// engine deregistration via hydrateRuntimePolicies happens there. No
+	// internal refresh is needed.
+	return resp, nil
 }
 
-// ListGroupPolicies is not supported in embedded IAM mode.
+// ListGroupPolicies returns the names of inline policies attached to a group.
 func (e *EmbeddedIamApi) ListGroupPolicies(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamListGroupPoliciesResponse, *iamError) {
-	return &iamListGroupPoliciesResponse{}, notImplementedGroupInlineError()
+	resp := &iamListGroupPoliciesResponse{}
+	groupName := values.Get("GroupName")
+	if groupName == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("GroupName is required")}
+	}
+	if !groupExists(s3cfg, groupName) {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("group %s does not exist", groupName)}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	names, err := e.credentialManager.ListGroupInlinePolicies(context.Background(), groupName)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	resp.ListGroupPoliciesResult.PolicyNames = names
+	resp.ListGroupPoliciesResult.IsTruncated = false
+	return resp, nil
 }
 
 // handleImplicitUsername adds username who signs the request to values if 'username' is not specified.
@@ -2165,11 +2569,23 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 	if e.readOnly {
 		switch action {
 		case "ListUsers", "ListAccessKeys", "GetUser", "GetUserPolicy", "ListUserPolicies", "ListAttachedUserPolicies", "ListPolicies", "GetPolicy", "ListPolicyVersions", "GetPolicyVersion", "ListServiceAccounts", "GetServiceAccount",
-			"GetGroup", "ListGroups", "ListAttachedGroupPolicies", "GetGroupPolicy", "ListGroupPolicies", "ListGroupsForUser":
+			"GetGroup", "ListGroups", "ListAttachedGroupPolicies", "GetGroupPolicy", "ListGroupPolicies", "ListGroupsForUser",
+			"ListUserTags",
+			actionListOpenIDConnectProviders, actionGetOpenIDConnectProvider:
 			// Allowed read-only actions
 		default:
 			return nil, &iamError{Code: s3err.GetAPIError(s3err.ErrAccessDenied).Code, Error: fmt.Errorf("IAM write operations are disabled on this server")}
 		}
+	}
+
+	// OIDC provider actions don't operate on S3ApiConfiguration; dispatch
+	// before the unrelated config load + reload churn.
+	if response, iamErr, ok := e.dispatchOIDCProviderAction(ctx, values); ok {
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		response.SetRequestId(reqID)
+		return response, nil
 	}
 
 	s3cfg := &iam_pb.S3ApiConfiguration{}
@@ -2280,6 +2696,25 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 			return nil, iamErr
 		}
 		changed = false
+	case "TagUser":
+		var iamErr *iamError
+		response, iamErr = e.TagUser(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+	case "UntagUser":
+		var iamErr *iamError
+		response, iamErr = e.UntagUser(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+	case "ListUserTags":
+		var iamErr *iamError
+		response, iamErr = e.ListUserTags(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
 	case "AttachUserPolicy":
 		var iamErr *iamError
 		response, iamErr = e.AttachUserPolicy(ctx, values)
@@ -2325,6 +2760,21 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 	case "GetPolicyVersion":
 		var iamErr *iamError
 		response, iamErr = e.GetPolicyVersion(ctx, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
+	case "CreatePolicyVersion":
+		var iamErr *iamError
+		response, iamErr = e.CreatePolicyVersion(ctx, values)
+		if iamErr != nil {
+			glog.Errorf("CreatePolicyVersion: %+v", iamErr.Error)
+			return nil, iamErr
+		}
+		changed = false
+	case "DeletePolicyVersion":
+		var iamErr *iamError
+		response, iamErr = e.DeletePolicyVersion(ctx, values)
 		if iamErr != nil {
 			return nil, iamErr
 		}
@@ -2481,7 +2931,7 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 			glog.Errorf("Failed to reload IAM configuration after mutation: %v", err)
 			// Don't fail the request since the persistent save succeeded
 		}
-	} else if action == "AttachUserPolicy" || action == "DetachUserPolicy" || action == "CreatePolicy" || action == "DeletePolicy" || action == "CreateUser" {
+	} else if action == "AttachUserPolicy" || action == "DetachUserPolicy" || action == "CreatePolicy" || action == "CreatePolicyVersion" || action == "DeletePolicy" || action == "CreateUser" || action == "PutGroupPolicy" || action == "DeleteGroupPolicy" {
 		// Even if changed=false (persisted via credentialManager), we should still reload
 		// if we are utilizing the local in-memory cache for speed
 		if err := e.ReloadConfiguration(); err != nil {
@@ -2503,7 +2953,7 @@ func (e *EmbeddedIamApi) DoActions(w http.ResponseWriter, r *http.Request) {
 
 	// Handle implicit username for HTTP requests
 	switch r.Form.Get("Action") {
-	case "ListAccessKeys", "CreateAccessKey", "DeleteAccessKey", "UpdateAccessKey", "ListUserPolicies":
+	case "ListAccessKeys", "CreateAccessKey", "DeleteAccessKey", "UpdateAccessKey", "ListUserPolicies", "GetUser":
 		e.handleImplicitUsername(r, values)
 	case "CreateServiceAccount":
 		createdBy := s3_constants.GetIdentityNameFromContext(r)

@@ -35,9 +35,15 @@ func Detection(metrics []*types.VolumeHealthMetrics, clusterInfo *types.ClusterI
 		maxResults = math.MaxInt32
 	}
 
-	// Group volumes by disk type to ensure we compare apples to apples
+	// Group volumes by disk type to ensure we compare apples to apples.
+	// Remote-tiered volumes are skipped: a "move" copies .idx/.vif then
+	// Volume.Destroy on the source deletes the remote object the destination
+	// now points at. Mirrors shell/command_volume_balance.go.
 	volumesByDiskType := make(map[string][]*types.VolumeHealthMetrics)
 	for _, metric := range metrics {
+		if metric.HasRemoteCopy {
+			continue
+		}
 		volumesByDiskType[metric.DiskType] = append(volumesByDiskType[metric.DiskType], metric)
 	}
 
@@ -656,6 +662,7 @@ func planBalanceDestination(activeTopology *topology.ActiveTopology, selectedVol
 				DataCenter: disk.DataCenter,
 				Rack:       disk.Rack,
 				NodeID:     disk.NodeID,
+				Host:       hostFromAddress(disk.Address, disk.NodeID),
 			}
 			if !IsGoodMove(rp, replicas, selectedVolume.Server, target) {
 				continue
@@ -765,6 +772,7 @@ func isValidBalanceDestination(plan *topology.DestinationPlan, allowedServers ma
 		DataCenter: plan.TargetDC,
 		Rack:       plan.TargetRack,
 		NodeID:     plan.TargetNode,
+		Host:       hostFromAddress(plan.TargetAddress, plan.TargetNode),
 	}
 	return IsGoodMove(rp, replicas, sourceNodeID, target)
 }

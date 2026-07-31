@@ -1,8 +1,6 @@
 package mount
 
 import (
-	"context"
-
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -63,13 +61,14 @@ Side effects: increments the lookup count on success
 
 */
 func (wfs *WFS) Forget(nodeid, nlookup uint64) {
+	// Forget only decrements the kernel's inode lookup count.  File handle
+	// lifecycle is driven independently by FUSE Open/Release — touching the
+	// fhMap here would couple two unrelated refcounts and could tear down a
+	// still-live handle if Forget ever raced ahead of Release.
 	wfs.inodeToPath.Forget(nodeid, nlookup, func(dir util.FullPath) {
-		wfs.metaCache.DeleteFolderChildren(context.Background(), dir)
+		// Runs after Forget releases its lock; a concurrent lookup+rebuild can
+		// re-cache the directory in that window, so purge through the apply loop
+		// rather than wiping the store directly.
+		wfs.purgeDirectoryCache(dir)
 	})
-	// ReleaseByInode returns nil if the handle is already draining (counter
-	// was already <= 0 from a prior Release).  Only non-async handles that
-	// reach counter 0 here need cleanup.
-	if fhToRelease := wfs.fhMap.ReleaseByInode(nodeid); fhToRelease != nil {
-		fhToRelease.ReleaseHandle()
-	}
 }

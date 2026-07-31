@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
+
+const oidcProvidersDir = filer.IamConfigDirectory + "/oidc-providers"
 
 func (s3a *S3ApiServer) subscribeMetaEvents(clientName string, lastTsNs int64, prefix string, directoriesToWatch []string) {
 
@@ -30,12 +33,14 @@ func (s3a *S3ApiServer) subscribeMetaEvents(clientName string, lastTsNs int64, p
 		// These handlers check for nil entries internally
 		_ = s3a.onBucketMetadataChange(dir, message.OldEntry, message.NewEntry)
 		_ = s3a.onIamConfigChange(dir, message.OldEntry, message.NewEntry)
+		_ = s3a.onOIDCProviderChange(dir, message.OldEntry, message.NewEntry)
 		_ = s3a.onCircuitBreakerConfigChange(dir, message.OldEntry, message.NewEntry)
 
 		// For moves across directories, replay a delete event for the source directory
 		if message.NewParentPath != "" && resp.Directory != message.NewParentPath {
 			_ = s3a.onBucketMetadataChange(resp.Directory, message.OldEntry, nil)
 			_ = s3a.onIamConfigChange(resp.Directory, message.OldEntry, nil)
+			_ = s3a.onOIDCProviderChange(resp.Directory, message.OldEntry, nil)
 			_ = s3a.onCircuitBreakerConfigChange(resp.Directory, message.OldEntry, nil)
 		}
 
@@ -123,6 +128,33 @@ func (s3a *S3ApiServer) onIamConfigChange(dir string, oldEntry *filer_pb.Entry, 
 	return nil
 }
 
+// onOIDCProviderChange refreshes the IAM-managed OIDC provider runtime view
+// whenever the persisted store under /etc/iam/oidc-providers changes — both
+// for mutations originated on this S3 server (the local IAM API also calls
+// RefreshOIDCProvidersFromStore inline, but the subscribe path costs nothing
+// extra) and for mutations originated on peer S3 servers, which this is the
+// only mechanism to learn about. A single refresh covers create, update,
+// delete, and rename because the store is small and a full reload is the
+// safest way to reach a consistent view.
+func (s3a *S3ApiServer) onOIDCProviderChange(dir string, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) error {
+	if dir != oidcProvidersDir && !strings.HasPrefix(dir, oidcProvidersDir+"/") {
+		return nil
+	}
+	if s3a.iam == nil || s3a.iam.iamIntegration == nil {
+		return nil
+	}
+	s3iam, ok := s3a.iam.iamIntegration.(*S3IAMIntegration)
+	if !ok || s3iam.iamManager == nil {
+		return nil
+	}
+	if err := s3iam.iamManager.RefreshOIDCProvidersFromStore(context.Background()); err != nil {
+		glog.Warningf("OIDC provider refresh after %s change failed: %v", dir, err)
+		return err
+	}
+	glog.V(2).Infof("Refreshed IAM-managed OIDC providers after %s change", dir)
+	return nil
+}
+
 // onCircuitBreakerConfigChange handles circuit breaker config file changes (create, update, delete)
 func (s3a *S3ApiServer) onCircuitBreakerConfigChange(dir string, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) error {
 	if dir != s3_constants.CircuitBreakerConfigDir {
@@ -182,55 +214,15 @@ func (s3a *S3ApiServer) updateBucketConfigCacheFromEntry(entry *filer_pb.Entry) 
 	glog.V(3).Infof("updateBucketConfigCacheFromEntry: called for bucket %s, ExtObjectLockEnabledKey=%s",
 		bucket, string(entry.Extended[s3_constants.ExtObjectLockEnabledKey]))
 
-	// Create new bucket config from the entry
+	// Create new bucket config from the entry. populateBucketConfigDerivedFields
+	// is the single source of truth for mapping Entry.Extended → cached
+	// fields (incl. LifecycleTTL), so a meta-log Put/DeleteBucketLifecycle
+	// here can't leave a stale resolver in cache.
 	config := &BucketConfig{
-		Name:         bucket,
-		Entry:        entry,
-		IsPublicRead: false, // Explicitly default to false for private buckets
+		Name:  bucket,
+		Entry: entry,
 	}
-
-	// Extract configuration from extended attributes
-	if entry.Extended != nil {
-		if versioning, exists := entry.Extended[s3_constants.ExtVersioningKey]; exists {
-			config.Versioning = string(versioning)
-		}
-		if ownership, exists := entry.Extended[s3_constants.ExtOwnershipKey]; exists {
-			config.Ownership = string(ownership)
-		}
-		if acl, exists := entry.Extended[s3_constants.ExtAmzAclKey]; exists {
-			config.ACL = acl
-			// Parse ACL and cache public-read status
-			config.IsPublicRead = parseAndCachePublicReadStatus(acl)
-		} else {
-			// No ACL means private bucket
-			config.IsPublicRead = false
-		}
-		if owner, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
-			config.Owner = string(owner)
-		}
-		// Parse Object Lock configuration if present
-		if objectLockConfig, found := LoadObjectLockConfigurationFromExtended(entry); found {
-			config.ObjectLockConfig = objectLockConfig
-			glog.V(2).Infof("updateBucketConfigCacheFromEntry: cached Object Lock configuration for bucket %s: %+v", bucket, objectLockConfig)
-		} else {
-			glog.V(3).Infof("updateBucketConfigCacheFromEntry: no Object Lock configuration found for bucket %s", bucket)
-		}
-
-		// Load bucket policy if present (for performance optimization)
-		config.BucketPolicy = loadBucketPolicyFromExtended(entry, bucket)
-	}
-
-	// Sync bucket policy to the policy engine for evaluation
-	s3a.syncBucketPolicyToEngine(bucket, config.BucketPolicy)
-
-	// Parse CORS configuration directly from the subscription entry's Content field.
-	// This avoids a separate RPC call that could return stale data when racing with
-	// concurrent metadata updates (e.g., PutBucketCors clearing the cache while this
-	// handler is still processing an older event).
-	config.CORS = parseCORSFromEntryContent(entry.Content)
-	if config.CORS != nil {
-		glog.V(2).Infof("updateBucketConfigCacheFromEntry: parsed CORS config for bucket %s from entry content", bucket)
-	}
+	s3a.populateBucketConfigDerivedFields(config)
 
 	// Update timestamp
 	config.LastModified = time.Now()

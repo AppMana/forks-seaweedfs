@@ -408,6 +408,57 @@ func TestECPlanningNotBlockedByUnrelatedBalance(t *testing.T) {
 		"EC must still see all 4 disks even with an unrelated in-flight balance")
 }
 
+// #9369: same-type physical disks collapse into one DiskInfo at the master;
+// the active topology must still expose one entry per physical disk_id.
+func TestECPlannerSeesEachPhysicalDisk(t *testing.T) {
+	topology := NewActiveTopology(10)
+
+	const numServers = 7
+	const disksPerServer = 2
+	nodes := make([]*master_pb.DataNodeInfo, 0, numServers)
+	for i := 1; i <= numServers; i++ {
+		volumeInfos := make([]*master_pb.VolumeInformationMessage, 0, disksPerServer)
+		for d := uint32(0); d < disksPerServer; d++ {
+			volumeInfos = append(volumeInfos, &master_pb.VolumeInformationMessage{
+				Id:       uint32(i*10 + int(d)),
+				DiskId:   d,
+				DiskType: "hdd",
+			})
+		}
+		nodes = append(nodes, &master_pb.DataNodeInfo{
+			Id: fmt.Sprintf("127.0.0.1:%d", 8080+i),
+			DiskInfos: map[string]*master_pb.DiskInfo{
+				"hdd": {
+					DiskId:         0,
+					VolumeCount:    int64(disksPerServer),
+					MaxVolumeCount: 200,
+					VolumeInfos:    volumeInfos,
+				},
+			},
+		})
+	}
+
+	require.NoError(t, topology.UpdateTopology(&master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{{
+			Id: "dc1",
+			RackInfos: []*master_pb.RackInfo{{
+				Id:            "rack1",
+				DataNodeInfos: nodes,
+			}},
+		}},
+	}))
+
+	candidates := topology.GetDisksWithEffectiveCapacity(TaskTypeErasureCoding, "", 0)
+	assert.Equal(t, numServers*disksPerServer, len(candidates))
+
+	seen := make(map[string]bool, len(candidates))
+	for _, c := range candidates {
+		key := fmt.Sprintf("%s:%d", c.NodeID, c.DiskID)
+		assert.False(t, seen[key], "duplicate placement target %s", key)
+		seen[key] = true
+	}
+}
+
 // TestPublicInterfaces tests the public interface methods
 func TestPublicInterfaces(t *testing.T) {
 	topology := NewActiveTopology(10)

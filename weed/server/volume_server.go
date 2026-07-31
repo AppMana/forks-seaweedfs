@@ -34,26 +34,32 @@ type VolumeServer struct {
 	readBufferSizeMB              int
 
 	SeedMasterNodes []pb.ServerAddress
-	whiteList       []string
-	currentMaster   pb.ServerAddress
-	pulsePeriod     time.Duration
-	dataCenter      string
-	rack            string
-	store           *storage.Store
-	guard           *security.Guard
-	grpcDialOption  grpc.DialOption
+	// seedMasterSet mirrors SeedMasterNodes keyed by the canonical http
+	// form. It is computed once in NewVolumeServer so admission paths can
+	// answer is-this-a-seed-master in O(1).
+	seedMasterSet     map[string]struct{}
+	whiteList         []string
+	currentMaster     pb.ServerAddress
+	currentMasterLock sync.RWMutex
+	pulsePeriod       time.Duration
+	dataCenter        string
+	rack              string
+	store             *storage.Store
+	guard             *security.Guard
+	grpcDialOption    grpc.DialOption
 
-	needleMapKind            storage.NeedleMapKind
-	ldbTimout                int64
-	FixJpgOrientation        bool
-	ReadMode                 string
-	compactionBytePerSecond  int64
-	maintenanceBytePerSecond int64
-	metricsAddress           string
-	metricsIntervalSec       int
-	fileSizeLimitBytes       int64
-	isHeartbeating           bool
-	stopChan                 chan bool
+	needleMapKind                 storage.NeedleMapKind
+	ldbTimout                     int64
+	FixJpgOrientation             bool
+	ReadMode                      string
+	AllowUntrustedRemoteEndpoints bool
+	compactionBytePerSecond       int64
+	maintenanceBytePerSecond      int64
+	metricsAddress                string
+	metricsIntervalSec            int
+	fileSizeLimitBytes            int64
+	isHeartbeating                bool
+	stopChan                      chan bool
 }
 
 func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
@@ -76,6 +82,8 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	hasSlowRead bool,
 	readBufferSizeMB int,
 	ldbTimeout int64,
+	allowUntrustedRemoteEndpoints bool,
+	diskProbeConfig stats.DiskIOProbeConfig,
 ) *VolumeServer {
 
 	v := util.GetViper()
@@ -111,19 +119,29 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		readBufferSizeMB:              readBufferSizeMB,
 		ldbTimout:                     ldbTimeout,
 		whiteList:                     whiteList,
+		AllowUntrustedRemoteEndpoints: allowUntrustedRemoteEndpoints,
 	}
 
 	whiteList = append(whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...)
-	vs.SeedMasterNodes = masterNodes
+	// Copy the caller's slice so subsequent external mutation cannot desync
+	// SeedMasterNodes from the frozen lookup set built below.
+	seedMasters := make([]pb.ServerAddress, len(masterNodes))
+	copy(seedMasters, masterNodes)
+	vs.SeedMasterNodes = seedMasters
+	vs.seedMasterSet = make(map[string]struct{}, len(seedMasters))
+	for _, m := range seedMasters {
+		vs.seedMasterSet[m.ToHttpAddress()] = struct{}{}
+	}
 
 	vs.checkWithMaster()
 
-	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, id, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, diskTags, ldbTimeout)
+	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, id, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, diskTags, ldbTimeout, diskProbeConfig)
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)
 	adminMux.HandleFunc("/status", requestIDMiddleware(vs.statusHandler))
 	adminMux.HandleFunc("/healthz", requestIDMiddleware(vs.healthzHandler))
+	adminMux.HandleFunc("/readyz", requestIDMiddleware(vs.healthzHandler))
 	if signingKey == "" || enableUiAccess {
 		// only expose the volume server details for safe environments
 		adminMux.HandleFunc("/ui/index.html", requestIDMiddleware(vs.uiStatusHandler))
@@ -172,6 +190,12 @@ func (vs *VolumeServer) Reload() {
 	util.LoadConfiguration("security", false)
 	v := util.GetViper()
 	vs.guard.UpdateWhiteList(append(vs.whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...))
+	vs.guard.UpdateSigningKeys(
+		v.GetString("jwt.signing.key"),
+		v.GetInt("jwt.signing.expires_after_seconds"),
+		v.GetString("jwt.signing.read.key"),
+		v.GetInt("jwt.signing.read.expires_after_seconds"),
+	)
 }
 
 // Returns whether a volume server is in maintenance (i.e. read-only) mode.

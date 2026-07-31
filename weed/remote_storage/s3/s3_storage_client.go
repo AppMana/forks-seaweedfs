@@ -36,6 +36,14 @@ func (s s3RemoteStorageMaker) HasBucket() bool {
 }
 
 func (s s3RemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
+	return MakeWithHTTPClient(conf, nil)
+}
+
+// MakeWithHTTPClient builds an s3 remote storage client using the supplied
+// *http.Client (or the AWS SDK default when nil). Callers that need to pin
+// the dial path against DNS rebinding can pass a client whose transport has
+// a guarded DialContext.
+func MakeWithHTTPClient(conf *remote_pb.RemoteConf, httpClient *http.Client) (remote_storage.RemoteStorageClient, error) {
 	client := &s3RemoteStorageClient{
 		supportTagging: true,
 		conf:           conf,
@@ -45,6 +53,9 @@ func (s s3RemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.R
 		Endpoint:                      aws.String(conf.S3Endpoint),
 		S3ForcePathStyle:              aws.Bool(conf.S3ForcePathStyle),
 		S3DisableContentMD5Validation: aws.Bool(true),
+	}
+	if httpClient != nil {
+		config.HTTPClient = httpClient
 	}
 	if conf.S3AccessKey != "" && conf.S3SecretKey != "" {
 		config.Credentials = credentials.NewStaticCredentials(conf.S3AccessKey, conf.S3SecretKey, "")
@@ -232,7 +243,7 @@ func (s *s3RemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteSto
 	dataSlice := make([]byte, int(size))
 	writerAt := aws.NewWriteAtBuffer(dataSlice)
 
-	_, err = downloader.Download(writerAt, &s3.GetObjectInput{
+	n, err := downloader.Download(writerAt, &s3.GetObjectInput{
 		Bucket: aws.String(loc.Bucket),
 		Key:    aws.String(loc.Path[1:]),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)),
@@ -240,8 +251,29 @@ func (s *s3RemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteSto
 	if err != nil {
 		return nil, fmt.Errorf("failed to download file %s%s: %v", loc.Bucket, loc.Path, err)
 	}
+	// The buffer is pre-sized to size, so a short read leaves the tail
+	// zero-padded and would be cached as valid-looking but corrupt content.
+	// Reject it instead.
+	if n != size {
+		return nil, fmt.Errorf("short read from %s%s at offset %d: got %d bytes, want %d", loc.Bucket, loc.Path, offset, n, size)
+	}
 
 	return writerAt.Bytes(), nil
+}
+
+func (s *s3RemoteStorageClient) ReadFileAsStream(ctx context.Context, loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (reader io.ReadCloser, err error) {
+	output, err := s.conn.GetObjectWithContext(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(loc.Bucket),
+		Key:    aws.String(loc.Path[1:]),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)),
+	})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == s3.ErrCodeNoSuchKey {
+			return nil, remote_storage.ErrRemoteObjectNotFound
+		}
+		return nil, fmt.Errorf("failed to open stream for %s%s: %v", loc.Bucket, loc.Path, err)
+	}
+	return output.Body, nil
 }
 
 func (s *s3RemoteStorageClient) WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
@@ -287,6 +319,9 @@ func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, 
 		Key:     aws.String(loc.Path[1:]),
 		Body:    reader,
 		Tagging: awsTags,
+	}
+	if entry.Attributes != nil && entry.Attributes.Mime != "" {
+		uploadInput.ContentType = aws.String(entry.Attributes.Mime)
 	}
 	if s.conf.S3StorageClass != "" {
 		uploadInput.StorageClass = aws.String(s.conf.S3StorageClass)

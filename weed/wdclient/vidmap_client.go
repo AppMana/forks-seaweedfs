@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 // VolumeLocationProvider is the interface for looking up volume locations
@@ -198,7 +199,7 @@ func (vc *vidMapClient) LookupVolumeIdsWithFallback(ctx context.Context, volumeI
 
 		providerResults, err := vc.provider.LookupVolumeIds(ctx, stillNeedLookup)
 		if err != nil {
-			return batchResult, fmt.Errorf("provider lookup failed: %v", err)
+			return batchResult, fmt.Errorf("provider lookup failed: %w", err)
 		}
 
 		// Update cache with results
@@ -288,6 +289,13 @@ func (vc *vidMapClient) LookupFileId(ctx context.Context, fileId string) (fullUr
 // LookupVolumeServerUrl safely looks up volume server URLs
 func (vc *vidMapClient) LookupVolumeServerUrl(vid string) (serverUrls []string, err error) {
 	return vc.getStableVidMap().LookupVolumeServerUrl(vid)
+}
+
+// HasVolumeServer reports whether addr is currently a known volume server
+// (hosts at least one volume or EC shard) in the cached vid map. Used by
+// admission paths that must only contact peers learned from the master.
+func (vc *vidMapClient) HasVolumeServer(addr pb.ServerAddress) bool {
+	return vc.getStableVidMap().hasVolumeServer(addr)
 }
 
 // GetDataCenter safely retrieves the data center

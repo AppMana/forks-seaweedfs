@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,9 +16,11 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/kms"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/cors"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/lifecycle_xml"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
@@ -34,9 +37,17 @@ type BucketConfig struct {
 	CORS             *cors.CORSConfiguration
 	ObjectLockConfig *ObjectLockConfiguration      // Cached parsed Object Lock configuration
 	BucketPolicy     *policy_engine.PolicyDocument // Cached bucket policy for performance
-	KMSKeyCache      *BucketKMSCache               // Per-bucket KMS key cache for SSE-KMS operations
-	LastModified     time.Time
-	Entry            *filer_pb.Entry
+	// LifecycleTTL answers "what volume TTL should this PutObject get?"
+	// using only fast-path-safe predicates (prefix + size; tags excluded
+	// because they're mutable post-PUT). nil = no TTL applies (fast path
+	// not enabled on the bucket, no lifecycle config, versioned bucket,
+	// or only ineligible rules). The fast path is opt-in per bucket. The
+	// lifecycle worker reads bucket entries directly off the meta-log
+	// rather than this cache.
+	LifecycleTTL *LifecycleTTLResolver
+	KMSKeyCache  *BucketKMSCache // Per-bucket KMS key cache for SSE-KMS operations
+	LastModified time.Time
+	Entry        *filer_pb.Entry
 }
 
 // BucketKMSCache represents per-bucket KMS key caching for SSE-KMS operations
@@ -371,11 +382,43 @@ func (s3a *S3ApiServer) getBucketConfig(bucket string) (*BucketConfig, s3err.Err
 		Entry:        entry,
 		IsPublicRead: false, // Explicitly default to false for private buckets
 	}
+	s3a.populateBucketConfigDerivedFields(config)
 
-	// Extract configuration from extended attributes
+	// Cache the result
+	s3a.bucketConfigCache.Set(bucket, config)
+
+	return config, s3err.ErrNone
+}
+
+// populateBucketConfigDerivedFields fills every field on BucketConfig that is
+// derived from Entry.Extended / Entry.Content (versioning flag, ACL, owner,
+// object lock, bucket policy, CORS, lifecycle TTL resolver). It is the
+// single source of truth for that mapping; callers that take a fresh
+// BucketConfig (getBucketConfig, updateBucketConfig after the user's update
+// fn runs, the meta-log subscription cache refresher) all funnel through
+// here so a missed field can't silently keep stale data — e.g. a stale
+// LifecycleTTL after a Put/DeleteBucketLifecycle would keep stamping the
+// old policy's irreversible volume TTL onto new writes.
+func (s3a *S3ApiServer) populateBucketConfigDerivedFields(config *BucketConfig) {
+	// Reset every derived field so stale values from a previous Entry
+	// don't survive a clear (e.g. DELETE policy → BucketPolicy=nil).
+	config.Versioning = ""
+	config.Ownership = ""
+	config.ACL = nil
+	config.Owner = ""
+	config.IsPublicRead = false
+	config.ObjectLockConfig = nil
+	config.BucketPolicy = nil
+	config.LifecycleTTL = nil
+	config.CORS = nil
+
+	entry := config.Entry
+	if entry == nil {
+		return
+	}
+	bucket := config.Name
+
 	if entry.Extended != nil {
-		glog.V(3).Infof("getBucketConfig: checking extended attributes for bucket %s, ExtObjectLockEnabledKey value=%s",
-			bucket, string(entry.Extended[s3_constants.ExtObjectLockEnabledKey]))
 		if versioning, exists := entry.Extended[s3_constants.ExtVersioningKey]; exists {
 			config.Versioning = string(versioning)
 		}
@@ -384,38 +427,47 @@ func (s3a *S3ApiServer) getBucketConfig(bucket string) (*BucketConfig, s3err.Err
 		}
 		if acl, exists := entry.Extended[s3_constants.ExtAmzAclKey]; exists {
 			config.ACL = acl
-			// Parse ACL once and cache public-read status
+			// Parse ACL once and cache public-read status.
 			config.IsPublicRead = parseAndCachePublicReadStatus(acl)
-		} else {
-			// No ACL means private bucket
-			config.IsPublicRead = false
 		}
 		if owner, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
 			config.Owner = string(owner)
 		}
-		// Parse Object Lock configuration if present
 		if objectLockConfig, found := LoadObjectLockConfigurationFromExtended(entry); found {
 			config.ObjectLockConfig = objectLockConfig
-			glog.V(3).Infof("getBucketConfig: loaded Object Lock config from extended attributes for bucket %s: %+v", bucket, objectLockConfig)
-		} else {
-			glog.V(3).Infof("getBucketConfig: no Object Lock config found in extended attributes for bucket %s", bucket)
 		}
-
-		// Load bucket policy if present (for performance optimization)
 		config.BucketPolicy = loadBucketPolicyFromExtended(entry, bucket)
+
+		// The lifecycle TTL fast path is opt-in per bucket: a volume TTL
+		// stamped at write time can't honor a later policy change (rule
+		// removed or lengthened) the way worker-driven expiration does,
+		// so it stays off unless explicitly enabled. Skip the XML parse
+		// entirely when off. nil on parse error so the PUT path falls
+		// through to "no TTL" rather than rejecting writes.
+		if bytes.Equal(entry.Extended[s3_constants.ExtLifecycleTtlFastPathKey], []byte("true")) {
+			if xmlBytes, ok := entry.Extended[bucketLifecycleConfigurationXMLKey]; ok && len(xmlBytes) > 0 {
+				if rules, err := lifecycle_xml.ParseCanonical(xmlBytes); err == nil {
+					// Object Lock requires versioning, so an ObjectLockConfig
+					// implies the bucket is versioned even when the explicit
+					// Versioning header was never written. BucketIsVersioned
+					// in this file uses the same OR — keep them aligned.
+					versioned := config.Versioning == s3_constants.VersioningEnabled ||
+						config.Versioning == s3_constants.VersioningSuspended ||
+						config.ObjectLockConfig != nil
+					config.LifecycleTTL = NewLifecycleTTLResolver(rules, versioned)
+				} else {
+					glog.V(1).Infof("populateBucketConfigDerivedFields: bucket %s lifecycle xml parse: %v", bucket, err)
+				}
+			}
+		}
 	}
 
-	// Sync bucket policy to the policy engine for evaluation
+	// Sync bucket policy to the policy engine for evaluation.
 	s3a.syncBucketPolicyToEngine(bucket, config.BucketPolicy)
 
 	// Parse CORS configuration directly from the entry's Content field.
 	// This avoids a redundant RPC call since we already have the entry.
 	config.CORS = parseCORSFromEntryContent(entry.Content)
-
-	// Cache the result
-	s3a.bucketConfigCache.Set(bucket, config)
-
-	return config, s3err.ErrNone
 }
 
 // updateBucketConfig updates bucket configuration and invalidates cache
@@ -478,19 +530,72 @@ func (s3a *S3ApiServer) updateBucketConfig(bucket string, updateFn func(*BucketC
 			bucket, s3_constants.ExtObjectLockEnabledKey, string(nextConfig.Entry.Extended[s3_constants.ExtObjectLockEnabledKey]))
 	}
 
-	// Save to filer
-	glog.V(3).Infof("updateBucketConfig: saving entry to filer for bucket %s", bucket)
-	err := s3a.updateEntry(s3a.bucketRoot(bucket), nextConfig.Entry)
-	if err != nil {
-		glog.Errorf("updateBucketConfig: failed to update bucket entry for %s: %v", bucket, err)
+	// Patch only the changed/removed extended keys, leaving Entry.content
+	// untouched so a concurrent content write (e.g. encryption) is preserved.
+	oldExt := config.Entry.GetExtended()
+	newExt := nextConfig.Entry.Extended
+	set := make(map[string][]byte)
+	for k, v := range newExt {
+		if ov, ok := oldExt[k]; !ok || !bytes.Equal(ov, v) {
+			set[k] = v
+		}
+	}
+	var del []string
+	for k := range oldExt {
+		if _, ok := newExt[k]; !ok {
+			del = append(del, k)
+		}
+	}
+	glog.V(3).Infof("updateBucketConfig: patching %d/%d extended keys for bucket %s", len(set), len(del), bucket)
+	if err := s3a.patchBucketEntry(bucket, &filer_pb.ObjectMutation{SetExtended: set, DeleteExtended: del}); err != nil {
+		glog.Errorf("updateBucketConfig: failed to patch bucket entry for %s: %v", bucket, err)
 		return s3err.ErrInternalError
 	}
-	glog.V(3).Infof("updateBucketConfig: saved entry to filer for bucket %s", bucket)
 
-	// Update cache
-	s3a.bucketConfigCache.Set(bucket, nextConfig)
+	// Invalidate rather than cache nextConfig: its content may be stale relative
+	// to a concurrent content write. The next read re-fetches the merged entry.
+	if s3a.bucketConfigCache != nil {
+		s3a.bucketConfigCache.Remove(bucket)
+		s3a.bucketConfigCache.RemoveNegativeCache(bucket)
+	}
 
 	return s3err.ErrNone
+}
+
+// patchBucketEntry applies a field-level PATCH_EXTENDED mutation to the bucket's
+// entry via ObjectTransaction, routed to the bucket's owner filer so its per-path
+// lock serializes concurrent config writes cluster-wide rather than racing
+// whole-entry rewrites. A nil/empty mutation is a no-op.
+func (s3a *S3ApiServer) patchBucketEntry(bucket string, m *filer_pb.ObjectMutation) error {
+	if m == nil || (len(m.SetExtended) == 0 && len(m.DeleteExtended) == 0 && !m.SetContent) {
+		return nil
+	}
+	dir := s3a.option.BucketsPath
+	bucketPath := dir + "/" + bucket
+	m.Type = filer_pb.ObjectMutation_PATCH_EXTENDED
+	m.Directory = dir
+	m.Name = bucket
+	req := &filer_pb.ObjectTransactionRequest{
+		LockKey:   bucketPath,
+		RouteKey:  objectWriteRouteKeyPrefix + bucketPath,
+		Mutations: []*filer_pb.ObjectMutation{m},
+	}
+	txn := func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.ObjectTransaction(context.Background(), req)
+		if err != nil {
+			return err
+		}
+		if resp.Error != "" {
+			return fmt.Errorf("patch bucket %s: %s", bucket, resp.Error)
+		}
+		return nil
+	}
+	if s3a.objectWriteLockClient != nil {
+		if owner := s3a.objectWriteLockClient.PrimaryForKey(objectWriteRouteKeyPrefix + bucketPath); owner != "" {
+			return pb.WithFilerClient(false, 0, owner, s3a.option.GrpcDialOption, txn)
+		}
+	}
+	return s3a.WithFilerClient(false, txn)
 }
 
 func cloneBucketConfig(config *BucketConfig) *BucketConfig {
@@ -1019,27 +1124,11 @@ func (s3a *S3ApiServer) setBucketMetadata(bucket string, metadata *BucketMetadat
 		return fmt.Errorf("failed to marshal bucket metadata to protobuf: %w", err)
 	}
 
-	// Update the bucket entry with new content
-	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		// Get current bucket entry
-		entry, err := s3a.getBucketEntry(bucket)
-		if err != nil {
-			return fmt.Errorf("error retrieving bucket directory %s: %w", bucket, err)
-		}
-		if entry == nil {
-			return fmt.Errorf("bucket directory not found %s", bucket)
-		}
-
-		// Update content with metadata
-		entry.Content = metadataBytes
-
-		request := &filer_pb.UpdateEntryRequest{
-			Directory: s3a.bucketRoot(bucket),
-			Entry:     entry,
-		}
-
-		_, err = client.UpdateEntry(context.Background(), request)
-		return err
+	// Patch only Entry.content so a concurrent extended-attribute write
+	// (e.g. versioning) is preserved.
+	err = s3a.patchBucketEntry(bucket, &filer_pb.ObjectMutation{
+		SetContent: true,
+		Content:    metadataBytes,
 	})
 
 	// Invalidate cache after successful update

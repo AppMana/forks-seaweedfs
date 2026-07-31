@@ -25,6 +25,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/policy"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	. "github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -74,6 +76,7 @@ const s3ChunkCacheChunkSizeMB = 4
 
 type S3ApiServer struct {
 	s3_pb.UnimplementedSeaweedS3IamCacheServer
+	s3_lifecycle_pb.UnimplementedSeaweedS3LifecycleInternalServer
 	option                *S3ApiServerOption
 	iam                   *IdentityAccessManagement
 	iamIntegration        *S3IAMIntegration // Advanced IAM integration for JWT authentication
@@ -93,12 +96,23 @@ type S3ApiServer struct {
 	stsHandlers           *STSHandlers    // STS HTTP handlers for AssumeRoleWithWebIdentity
 	cipher                bool            // encrypt data on volume servers
 	newObjectWriteLock    func(bucket, object string) objectWriteLock
+	// objectWriteLockClient resolves a key's owner filer for route-by-key.
+	objectWriteLockClient *cluster.LockClient
+	// unreachableOwners holds owners (pb.ServerAddress -> expiry time.Time) whose
+	// last owner-first read hit a transport error, so route-by-key reads briefly
+	// skip them instead of re-dialing a dead owner every request until the ring
+	// drops it. Bypasses the gateway's filer health tracking, which no-ops for an
+	// owner outside the static -filer list.
+	unreachableOwners sync.Map
 	// Shared ReaderCache used by the S3 GET streaming path. It lives for the
 	// lifetime of the server so that concurrent and repeat reads share a
 	// single in-flight download per chunk, and so that no per-request
 	// teardown waits on context.Background() fetches. The chunkCache field
 	// is nil in this commit; a follow-up wires in an in-memory chunk cache.
 	readerCache *filer.ReaderCache
+
+	versionsHealQueue      *versionsHealQueue
+	versionsReconcilerStop func()
 }
 
 type objectWriteLock interface {
@@ -147,6 +161,8 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	// Uses the battle-tested vidMap with filer-based lookups
 	// Supports multiple filer addresses with automatic failover for high availability
 	var filerClient *wdclient.FilerClient
+	var masterClient *wdclient.MasterClient
+	var objectWriteLockClient *cluster.LockClient
 	if len(option.Masters) > 0 {
 		// Enable filer discovery via master
 		masterMap := make(map[string]pb.ServerAddress)
@@ -157,7 +173,22 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		if clientHost == "0.0.0.0" || clientHost == "" {
 			clientHost = util.DetectedHostAddress()
 		}
-		masterClient := wdclient.NewMasterClient(option.GrpcDialOption, option.FilerGroup, cluster.S3Type, pb.ServerAddress(util.JoinHostPort(clientHost, option.GrpcPort)), "", "", *pb.NewServiceDiscoveryFromMap(masterMap))
+		masterClient = wdclient.NewMasterClient(option.GrpcDialOption, option.FilerGroup, cluster.S3Type, pb.ServerAddress(util.JoinHostPort(clientHost, option.GrpcPort)), option.DataCenter, "", *pb.NewServiceDiscoveryFromMap(masterMap))
+		// Build the object-write lock client and subscribe to the master's
+		// lock-ring updates BEFORE starting the master loop, so the initial
+		// LockRingUpdate sent on connect isn't dropped (the master only delivers
+		// it once per connect). The masterClient already filters updates to this
+		// server's filer group.
+		if len(option.Filers) > 0 {
+			objectWriteLockClient = cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])
+			masterClient.SetOnLockRingUpdateFn(func(update *master_pb.LockRingUpdate) {
+				servers := make([]pb.ServerAddress, 0, len(update.Servers))
+				for _, s := range update.Servers {
+					servers = append(servers, pb.ServerAddress(s))
+				}
+				objectWriteLockClient.SetRing(servers, update.Version)
+			})
+		}
 		// Start the master client connection loop - required for GetMaster() to work
 		go masterClient.KeepConnectedToMaster(context.Background())
 
@@ -184,6 +215,12 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 
 	// Update credential store to use FilerClient's current filer for HA
 	iam.SetFilerClient(filerClient)
+
+	// Fan IAM mutations out to peer S3 servers, mirroring the filer-embedded path.
+	iamPropagationEnabled := masterClient != nil && iam.credentialManager != nil
+	if iamPropagationEnabled {
+		iam.credentialManager.SetMasterClient(masterClient, option.GrpcDialOption)
+	}
 
 	// Keep attempting to load configuration from filer now that we have a client
 	// The initial load in NewIdentityAccessManagementWithStore might have failed if client was nil
@@ -258,9 +295,14 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	}
 
 	if len(option.Filers) > 0 {
-		objectWriteLockClient := cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])
+		// Reuse the lock client built in the masters block (already subscribed to
+		// ring updates); create a plain one when no masters are configured.
+		if objectWriteLockClient == nil {
+			objectWriteLockClient = cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])
+		}
+		s3ApiServer.objectWriteLockClient = objectWriteLockClient
 		s3ApiServer.newObjectWriteLock = func(bucket, object string) objectWriteLock {
-			lockKey := fmt.Sprintf("s3.object.write:%s", s3ApiServer.toFilerPath(bucket, object))
+			lockKey := objectWriteRouteKeyPrefix + s3ApiServer.toFilerPath(bucket, object)
 			owner := fmt.Sprintf("s3api-%d", s3ApiServer.randomClientId)
 			lock := objectWriteLockClient.NewShortLivedLock(lockKey, owner)
 			if err := lock.AttemptToLock(objectWriteLockTTL); err != nil {
@@ -312,8 +354,23 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 			// Set IAM integration in server
 			s3ApiServer.iamIntegration = s3iam
 
-			// Set the integration in the traditional IAM for compatibility
+			// Set the integration in the traditional IAM for compatibility.
+			// SetIAMIntegration no longer auto-enables auth — see the function comment.
+			// Only force isAuthEnabled when the operator actually pointed us at an
+			// IAM config file. Without one, EnableIam is the implicit mini default
+			// and we must keep the "no credentials = allow all" startup behavior so
+			// `docker run seaweedfs` works out of the box (fixes #9557).
+			//
+			// SetIAMIntegration also flushes the policies already loaded from the
+			// credential store into this manager's engine. The earlier config
+			// loads (the synchronous one in NewIdentityAccessManagementWithStore
+			// and the async goroutine) may have run before iamIntegration was set,
+			// in which case their syncRuntimePoliciesToIAMManager call was a no-op
+			// and identities relying on policy_names would get AccessDenied.
 			iam.SetIAMIntegration(s3iam)
+			if option.IamConfig != "" {
+				iam.EnableAuthEnforcement()
+			}
 
 			// Initialize STS HTTP handlers for AssumeRoleWithWebIdentity endpoint
 			if stsService := iamManager.GetSTSService(); stsService != nil {
@@ -330,8 +387,10 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		s3ApiServer.embeddedIam = NewEmbeddedIamApi(s3ApiServer.credentialManager, iam, option.IamReadOnly)
 		if option.IamReadOnly {
 			glog.V(1).Infof("Embedded IAM API initialized in read-only mode (use -s3.iam.readOnly=false to enable write operations)")
+		} else if iamPropagationEnabled {
+			glog.V(1).Infof("Embedded IAM API initialized in writable mode (updates propagate to other S3 servers)")
 		} else {
-			glog.V(1).Infof("Embedded IAM API initialized in writable mode (WARNING: updates will not be propagated to other S3 servers)")
+			glog.Warningf("Embedded IAM API initialized in writable mode but no master is configured; updates will not be propagated to other S3 servers")
 		}
 	}
 
@@ -341,10 +400,24 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 				glog.Errorf("fail to load config file %s: %v", option.Config, err)
 			} else {
 				glog.V(1).Infof("Loaded %d identities from config file %s", len(s3ApiServer.iam.identities), option.Config)
-				s3ApiServer.iam.updateCredentialManagerStaticIdentities()
 			}
 		})
 	}
+
+	// Refresh the JWT signing keys on SIGHUP so an operator can rotate them
+	// without restarting; otherwise filer/volume auth stays stuck on the stale
+	// key after a rotation.
+	grace.OnReload(func() {
+		util.LoadConfiguration("security", false)
+		v := util.GetViper()
+		s3ApiServer.filerGuard.UpdateSigningKeys(
+			v.GetString("jwt.filer_signing.key"),
+			v.GetInt("jwt.filer_signing.expires_after_seconds"),
+			v.GetString("jwt.filer_signing.read.key"),
+			v.GetInt("jwt.filer_signing.read.expires_after_seconds"),
+		)
+		util_http.ReloadJwtSigningReadConfig()
+	})
 	s3ApiServer.bucketRegistry = NewBucketRegistry(s3ApiServer)
 
 	// Update IAM with the final filer client (already handled by SetFilerClient above,
@@ -373,15 +446,23 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		filer.IamConfigDirectory + "/policies",
 		filer.IamConfigDirectory + "/service_accounts",
 		filer.IamConfigDirectory + "/groups",
+		filer.IamConfigDirectory + "/oidc-providers",
 	})
 
 	// Start bucket size metrics collection in background
 	go s3ApiServer.startBucketSizeMetricsLoop(context.Background())
 
+	// Start the versioning reconciler that drains stranded .versions/
+	// pointer-to-missing-file states without waiting for a client GET.
+	s3ApiServer.versionsReconcilerStop = s3ApiServer.startVersioningReconciler()
+
 	return s3ApiServer, nil
 }
 
 func (s3a *S3ApiServer) Shutdown() {
+	if s3a.versionsReconcilerStop != nil {
+		s3a.versionsReconcilerStop()
+	}
 	if s3a.iam != nil {
 		s3a.iam.Shutdown()
 	}
@@ -645,9 +726,10 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 	// plus REST-style endpoints for AWS CLI
 	s3a.registerS3TablesRoutes(apiRouter)
 
-	// Readiness Probe
+	// Health probes
 	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/status").HandlerFunc(s3a.StatusHandler)
 	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/healthz").HandlerFunc(s3a.StatusHandler)
+	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/readyz").HandlerFunc(s3a.StatusHandler)
 
 	// Object path pattern with (?s) flag to match newlines in object keys
 	const objectPath = "/{object:(?s).+}"
@@ -660,6 +742,10 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		// Register path-style domains
 		for _, domain := range pathStyleDomains {
 			routers = append(routers, apiRouter.Host(domain).PathPrefix("/{bucket}").Subrouter())
+			apiRouter.Host(domain).
+				Methods(http.MethodGet).
+				Path("/").
+				HandlerFunc(track(s3a.iam.Auth(s3a.ListBucketsHandler, ACTION_LIST), "LIST"))
 		}
 
 		// Register virtual-host style domains
@@ -668,12 +754,21 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 				fmt.Sprintf("%s.%s", "{bucket:.+}", virtualHost)).Subrouter())
 		}
 	}
+	// Always register a Host-less path-style catch-all last so requests that
+	// arrive via an IP, an unlisted hostname, or a reverse proxy that rewrites
+	// the Host header still match bucket routes. Host-specific routers above
+	// take precedence because they were registered first.
 	routers = append(routers, apiRouter.PathPrefix("/{bucket}").Subrouter())
 
 	// Get CORS middleware instance with caching
 	corsMiddleware := s3a.getCORSMiddleware()
 
 	for _, bucket := range routers {
+		// Reject `..`/`.`/NUL in {bucket} or {object} vars before any handler
+		// runs. SkipClean(true) keeps `..` in the matched path; the filer would
+		// otherwise collapse it via filepath.Join and cross bucket boundaries.
+		bucket.Use(validateRequestPath)
+
 		// Apply CORS middleware to bucket routers for automatic CORS header handling
 		bucket.Use(corsMiddleware.Handler)
 
@@ -788,6 +883,16 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 
 		// GetBucketRequestPayment
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketRequestPaymentHandler, ACTION_READ)), "GET")).Queries("requestPayment", "")
+		// PutBucketRequestPayment
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketRequestPaymentHandler, ACTION_ADMIN)), "PUT")).Queries("requestPayment", "")
+
+		// Static bucket configuration endpoints for AWS-SDK compatibility
+		// GetBucketPolicyStatus
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketPolicyStatusHandler, ACTION_READ)), "GET")).Queries("policyStatus", "")
+		// GetBucketAccelerateConfiguration
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketAccelerateConfigurationHandler, ACTION_READ)), "GET")).Queries("accelerate", "")
+		// GetBucketLogging
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketLoggingHandler, ACTION_READ)), "GET")).Queries("logging", "")
 
 		// GetBucketVersioning
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketVersioningHandler, ACTION_READ)), "GET")).Queries("versioning", "")
@@ -811,6 +916,16 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetPublicAccessBlockHandler, ACTION_ADMIN)), "GET")).Queries("publicAccessBlock", "")
 		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutPublicAccessBlockHandler, ACTION_ADMIN)), "PUT")).Queries("publicAccessBlock", "")
 		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeletePublicAccessBlockHandler, ACTION_ADMIN)), "DELETE")).Queries("publicAccessBlock", "")
+
+		// Empty bucket configuration stubs for AWS-SDK compatibility (analytics, inventory, intelligent-tiering, metrics)
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetAnalyticsConfiguration, ACTION_READ)), "GET")).Queries("analytics", "", "id", "{id:.*}")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.ListBucketAnalyticsConfigurations, ACTION_READ)), "GET")).Queries("analytics", "")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetInventoryConfiguration, ACTION_READ)), "GET")).Queries("inventory", "", "id", "{id:.*}")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.ListBucketInventoryConfigurations, ACTION_READ)), "GET")).Queries("inventory", "")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetIntelligentTieringConfiguration, ACTION_READ)), "GET")).Queries("intelligent-tiering", "", "id", "{id:.*}")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.ListBucketIntelligentTieringConfigurations, ACTION_READ)), "GET")).Queries("intelligent-tiering", "")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetMetricsConfiguration, ACTION_READ)), "GET")).Queries("metrics", "", "id", "{id:.*}")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.ListBucketMetricsConfigurations, ACTION_READ)), "GET")).Queries("metrics", "")
 
 		// ListObjectsV2
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.AuthWithPublicRead(func(w http.ResponseWriter, r *http.Request) {

@@ -4,9 +4,10 @@
 //! matching Go's `server/volume_grpc_client_to_master.go`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
@@ -314,6 +315,7 @@ fn collect_ec_shard_delta_messages(
                         disk_type: ec_vol.disk_type.to_string(),
                         expire_at_sec: ec_vol.expire_at_sec,
                         disk_id: disk_id as u32,
+                        encode_ts_ns: ec_vol.encode_ts_ns,
                         ..Default::default()
                     },
                 );
@@ -344,6 +346,12 @@ fn diff_ec_shard_delta_messages(
         if !current.contains_key(key) {
             let mut deleted = message.clone();
             deleted.shard_sizes = vec![0];
+            tracing::info!(
+                volume_id = deleted.id,
+                disk_id = deleted.disk_id,
+                ec_index_bits = deleted.ec_index_bits,
+                "deletes ec shards"
+            );
             deleted_ec_shards.push(deleted);
         }
     }
@@ -397,6 +405,15 @@ async fn do_heartbeat(
     let mut response_stream = client.send_heartbeat(stream).await?.into_inner();
 
     info!("Heartbeat stream established with {}", grpc_addr);
+    // Publish the master we're now talking to in canonical http host:port
+    // form so Ping admission can recognise it once a leader change moves us
+    // off the seed list. Mirrors Go's vs.setCurrentMaster(masterAddress).
+    {
+        let normalised =
+            super::volume_server::to_http_address(current_master).into_owned();
+        let mut guard = state.current_master_url.write().await;
+        *guard = normalised;
+    }
     if is_stopping(state) {
         state.is_heartbeating.store(false, Ordering::Relaxed);
         send_deregister_heartbeat(config, state, &tx).await;
@@ -811,6 +828,27 @@ fn build_heartbeat_with_ec_status(
                 delete_vids.push(vol.id);
                 should_delete_volume = true;
             } else if !vol.is_expired(volume_size, volume_size_limit) {
+                // Detect phantom volumes: the .dat was unlinked from disk but is still
+                // held open as a deleted FD, so the volume keeps serving and heartbeating
+                // while no disk-path operation can ever succeed. Skip remote-tiered volumes,
+                // whose .dat legitimately lives in cloud storage. Only a present .dat is
+                // cached for 30s; a missing one is re-checked every heartbeat so the volume
+                // stays suppressed until the file returns. See issues/10004
+                if vol.file_count() > 0 && !vol.has_remote_file {
+                    const DISK_CHECK_INTERVAL_NS: i64 = 30 * 1_000_000_000;
+                    let now_ns = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_nanos() as i64;
+                    if now_ns - vol.last_disk_check_ns.load(Ordering::Relaxed) > DISK_CHECK_INTERVAL_NS {
+                        if !Path::new(&vol.file_name(".dat")).exists() {
+                            warn!("Volume {}: data file {} missing (held open as deleted FD) - not reporting to master", vol.id.0, vol.file_name(".dat"));
+                            continue;
+                        }
+                        vol.last_disk_check_ns.store(now_ns, Ordering::Relaxed);
+                    }
+                }
+
                 let (remote_storage_name, remote_storage_key) = vol.remote_storage_name_key();
                 volumes.push(master_pb::VolumeInformationMessage {
                     id: vol.id.0,
@@ -860,7 +898,7 @@ fn build_heartbeat_with_ec_status(
         }
 
         for vid in delete_vids {
-            let _ = loc.delete_volume(vid, false);
+            let _ = loc.delete_volume(vid, false, false);
         }
     }
 
@@ -1031,8 +1069,11 @@ mod tests {
             write_queue: std::sync::OnceLock::new(),
             s3_tier_registry: std::sync::RwLock::new(S3TierRegistry::new()),
             read_mode: ReadMode::Local,
+            allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
             master_urls: Vec::new(),
+            seed_master_set: std::collections::HashSet::new(),
+            current_master_url: tokio::sync::RwLock::new(String::new()),
             self_url: String::new(),
             http_client: reqwest::Client::new(),
             outgoing_http_scheme: "http".to_string(),
@@ -1241,7 +1282,7 @@ mod tests {
         let shard_path = format!("{}/ec_metrics_case_27.ec00", dir);
         std::fs::write(&shard_path, b"ec-shard").unwrap();
         store.locations[0]
-            .mount_ec_shards(VolumeId(27), "ec_metrics_case", &[0])
+            .mount_ec_shards(VolumeId(27), "ec_metrics_case", &[0], "")
             .unwrap();
 
         let state = test_state_with_store(store);
@@ -1283,7 +1324,7 @@ mod tests {
 
         std::fs::write(format!("{}/expired_heartbeat_ec_31.ec00", dir), b"expired").unwrap();
         store.locations[0]
-            .mount_ec_shards(VolumeId(31), "expired_heartbeat_ec", &[0])
+            .mount_ec_shards(VolumeId(31), "expired_heartbeat_ec", &[0], "")
             .unwrap();
         store
             .find_ec_volume_mut(VolumeId(31))
@@ -1586,7 +1627,7 @@ mod tests {
 
         std::fs::write(format!("{}/ec_delta_case_81.ec00", dir), b"delta").unwrap();
         store.locations[0]
-            .mount_ec_shards(VolumeId(81), "ec_delta_case", &[0])
+            .mount_ec_shards(VolumeId(81), "ec_delta_case", &[0], "")
             .unwrap();
         let current = collect_ec_shard_delta_messages(&store);
         let (new_ec_shards, deleted_ec_shards) =

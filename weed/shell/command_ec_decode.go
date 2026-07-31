@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 
@@ -114,7 +115,7 @@ func doEcDecode(commandEnv *CommandEnv, topoInfo *master_pb.TopologyInfo, collec
 	}
 
 	// find volume location
-	nodeToEcShardsInfo := collectEcNodeShardsInfo(topoInfo, vid, diskType)
+	nodeToEcShardsInfo, dataShards := collectEcNodeShardsInfo(topoInfo, vid, diskType)
 
 	fmt.Printf("ec volume %d shard locations: %+v\n", vid, nodeToEcShardsInfo)
 
@@ -147,7 +148,7 @@ func doEcDecode(commandEnv *CommandEnv, topoInfo *master_pb.TopologyInfo, collec
 	}
 
 	// collect ec shards to the server with most space
-	targetNodeLocation, err := collectEcShards(commandEnv, nodeToEcShardsInfo, collection, vid, eligibleTargets)
+	targetNodeLocation, err := collectEcShards(commandEnv, nodeToEcShardsInfo, collection, vid, eligibleTargets, dataShards)
 	if err != nil {
 		return fmt.Errorf("collectEcShards for volume %d: %v", vid, err)
 	}
@@ -173,6 +174,13 @@ func doEcDecode(commandEnv *CommandEnv, topoInfo *master_pb.TopologyInfo, collec
 	err = mountDecodedVolume(commandEnv.option.GrpcDialOption, targetNodeLocation, vid)
 	if err != nil {
 		return fmt.Errorf("mount decoded volume %d on %s: %v", vid, targetNodeLocation, err)
+	}
+
+	// Confirm the regenerated .dat is present and non-empty before destroying
+	// the shards. Without this gate, a silent failure in generate/mount could
+	// leave the cluster with neither shards nor volume.
+	if err := verifyDecodedVolumeBeforeDelete(commandEnv.option.GrpcDialOption, targetNodeLocation, vid); err != nil {
+		return fmt.Errorf("verify decoded volume %d on %s before deleting shards: %w", vid, targetNodeLocation, err)
 	}
 
 	// delete the previous ec shards
@@ -225,6 +233,30 @@ func unmountAndDeleteEcShardsWithPrefix(prefix string, grpcDialOption grpc.DialO
 	return ewg.Wait()
 }
 
+func verifyDecodedVolumeBeforeDelete(grpcDialOption grpc.DialOption, target pb.ServerAddress, vid needle.VolumeId) error {
+	var resp *volume_server_pb.ReadVolumeFileStatusResponse
+	if err := operation.WithVolumeServerClient(false, target, grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
+		r, e := client.ReadVolumeFileStatus(context.Background(), &volume_server_pb.ReadVolumeFileStatusRequest{
+			VolumeId: uint32(vid),
+		})
+		if e != nil {
+			return e
+		}
+		resp = r
+		return nil
+	}); err != nil {
+		return fmt.Errorf("read volume file status: %w", err)
+	}
+	if resp.DatFileSize == 0 {
+		return fmt.Errorf("decoded .dat is 0 bytes")
+	}
+	if resp.IdxFileSize == 0 {
+		return fmt.Errorf("decoded .idx is 0 bytes")
+	}
+	glog.V(0).Infof("ec decode verification ok for volume %d on %s: dat=%d idx=%d", vid, target, resp.DatFileSize, resp.IdxFileSize)
+	return nil
+}
+
 func mountDecodedVolume(grpcDialOption grpc.DialOption, targetNodeLocation pb.ServerAddress, vid needle.VolumeId) error {
 	return operation.WithVolumeServerClient(false, targetNodeLocation, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 		_, mountErr := volumeServerClient.VolumeMount(context.Background(), &volume_server_pb.VolumeMountRequest{
@@ -249,7 +281,7 @@ func generateNormalVolume(grpcDialOption grpc.DialOption, vid needle.VolumeId, c
 
 }
 
-func collectEcShards(commandEnv *CommandEnv, nodeToShardsInfo map[pb.ServerAddress]*erasure_coding.ShardsInfo, collection string, vid needle.VolumeId, eligibleTargets map[pb.ServerAddress]struct{}) (targetNodeLocation pb.ServerAddress, err error) {
+func collectEcShards(commandEnv *CommandEnv, nodeToShardsInfo map[pb.ServerAddress]*erasure_coding.ShardsInfo, collection string, vid needle.VolumeId, eligibleTargets map[pb.ServerAddress]struct{}, dataShards int) (targetNodeLocation pb.ServerAddress, err error) {
 
 	maxShardCount := -1
 	existingShardsInfo := erasure_coding.NewShardsInfo()
@@ -259,7 +291,7 @@ func collectEcShards(commandEnv *CommandEnv, nodeToShardsInfo map[pb.ServerAddre
 				continue
 			}
 		}
-		toBeCopiedShardCount := si.MinusParityShards().Count()
+		toBeCopiedShardCount := si.MinusParityShards(dataShards).Count()
 		if toBeCopiedShardCount > maxShardCount {
 			maxShardCount = toBeCopiedShardCount
 			targetNodeLocation = loc
@@ -278,7 +310,7 @@ func collectEcShards(commandEnv *CommandEnv, nodeToShardsInfo map[pb.ServerAddre
 			continue
 		}
 
-		needToCopyShardsInfo := si.Minus(existingShardsInfo).MinusParityShards()
+		needToCopyShardsInfo := si.Minus(existingShardsInfo).MinusParityShards(dataShards)
 
 		err = operation.WithVolumeServerClient(false, targetNodeLocation, commandEnv.option.GrpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 
@@ -369,19 +401,30 @@ func collectEcShardIds(topoInfo *master_pb.TopologyInfo, collectionPattern strin
 	return
 }
 
-func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId, diskType types.DiskType) map[pb.ServerAddress]*erasure_coding.ShardsInfo {
+func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId, diskType types.DiskType) (map[pb.ServerAddress]*erasure_coding.ShardsInfo, int) {
 	res := make(map[pb.ServerAddress]*erasure_coding.ShardsInfo)
 	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		if diskInfo, found := dn.DiskInfos[string(diskType)]; found {
+			// A node may report several EcShardInfos for one volume — one per
+			// physical disk holding shards of it (multi-disk nodes). Union them
+			// rather than overwriting, or only the last disk's shards survive and
+			// the node looks like it is missing shards it actually has.
 			for _, v := range diskInfo.EcShardInfos {
 				if v.Id == uint32(vid) {
-					res[pb.NewServerAddressFromDataNode(dn)] = erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(v)
+					addr := pb.NewServerAddressFromDataNode(dn)
+					si := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(v)
+					if existing, ok := res[addr]; ok {
+						existing.Add(si)
+					} else {
+						res[addr] = si
+					}
 				}
 			}
 		}
 	})
 
-	return res
+	// OSS is always 10+4; the per-volume ratio override lives in the enterprise build.
+	return res, erasure_coding.DataShardsCount
 }
 
 type decodeDiskUsageState struct {

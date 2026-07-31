@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/admin/topology"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
-	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding/placement"
-	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding/ecbalancer"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks/base"
 	workerutil "github.com/seaweedfs/seaweedfs/weed/worker/tasks/util"
@@ -48,11 +52,28 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 	skippedCollectionFilter := 0
 	skippedQuietTime := 0
 	skippedFullness := 0
+	skippedRemote := 0
+	skippedTooFewNodes := 0
 	consecutivePlanningFailures := 0
 
-	var planner *ecPlacementPlanner
+	// EC shard replica placement: explicit config wins, else the master default.
+	var replicaPlacement *super_block.ReplicaPlacement
+	if clusterInfo != nil {
+		replicaPlacement = super_block.ResolveReplicaPlacement(ecConfig.ReplicaPlacement, clusterInfo.DefaultReplicaPlacement)
+	}
+	// EC placement honors only the rack/node digits; the data-center digit can't
+	// express a useful per-DC EC shard cap (it maxes at 2). Warn once per cycle so a
+	// 1xx/2xx setting isn't silently ineffective.
+	if replicaPlacement != nil && replicaPlacement.DiffDataCenterCount > 0 {
+		glog.Warningf("EC Detection: replica placement data-center digit (%d) is ignored for EC; only rack/node digits are honored", replicaPlacement.DiffDataCenterCount)
+	}
 
 	allowedCollections := wildcard.CompileWildcardMatchers(ecConfig.CollectionFilter)
+
+	// Cluster node count for the min-node safety gate (mirrors the shell ec.encode
+	// guard that refuses to encode when nodes < parity shards, so shards cannot be
+	// spread for fault tolerance).
+	clusterNodeCount := countTopologyNodes(clusterInfo.ActiveTopology)
 
 	// Group metrics by VolumeID to handle replicas and select canonical server
 	volumeGroups := make(map[uint32][]*types.VolumeHealthMetrics)
@@ -71,6 +92,20 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 	}
 	sort.Slice(groupKeys, func(i, j int) bool { return groupKeys[i] < groupKeys[j] })
 
+	// Build the EC placement snapshot once per detection cycle. planECDestinations
+	// reserves the shards it assigns directly into it, so volumes planned later in
+	// this cycle see the reduced capacity. Rebuilding it per volume re-walked the
+	// whole topology (and ActiveTopology's growing pending-task set) every time,
+	// which is O(volumes × topology) and times out on large clusters. The node
+	// address map is precomputed for the same reason (ResolveServerAddress rebuilds
+	// the full node map on every call).
+	var ecSnapshot *ecbalancer.Topology
+	var nodeAddresses map[string]string
+	if clusterInfo != nil && clusterInfo.ActiveTopology != nil {
+		ecSnapshot = ecbalancer.FromActiveTopology(clusterInfo.ActiveTopology, erasure_coding.DataShardsCount)
+		nodeAddresses = buildNodeAddressMap(clusterInfo.ActiveTopology)
+	}
+
 	// Iterate over groups to check criteria and creation tasks
 	for idx, volumeID := range groupKeys {
 		if ctx != nil {
@@ -88,18 +123,60 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 
 		groupMetrics := volumeGroups[volumeID]
 
-		// Find canonical metric (lowest Server ID) to ensure consistent task deduplication
-		metric := groupMetrics[0]
-		for _, m := range groupMetrics {
-			if m.Server < metric.Server {
-				metric = m
-			}
-		}
+		// Prefer the lowest-server credible replica so a 0-byte stub or a
+		// leftover EC shard set on a lower server can't become canonical and
+		// strand the volume in skippedTooSmall / skippedAlreadyEC.
+		metric := selectCanonicalMetric(groupMetrics)
 
 		// Skip if already EC volume
 		if metric.IsECVolume {
 			skippedAlreadyEC++
 			continue
+		}
+
+		// Handle the "stuck source" state from #9448: a previous encode
+		// succeeded but the post-encode source-delete left a regular replica
+		// behind, so the master heartbeats BOTH the replica AND its EC shards.
+		// metric.IsECVolume above is set only for the EC-side metric path, so
+		// the canonical metric we picked is the regular replica with
+		// IsECVolume=false. Re-proposing an encode in that state collides with
+		// the mounted shards on the targets ("ec volume %d is mounted; refusing
+		// overwrite") and the detector re-queues forever.
+		//
+		// We only act when the EC shard set is COMPLETE — fewer than
+		// totalShards present means the existing recovery branch below
+		// (around the `existingECShards` block) should keep its chance to
+		// fold the partial shards into the new task. Counting walks
+		// EcIndexBits to handle a single info entry carrying multiple shards.
+		if clusterInfo.ActiveTopology != nil {
+			shardCount := countExistingEcShardsForVolume(clusterInfo.ActiveTopology, metric.VolumeID, metric.Collection)
+			totalShards := erasure_coding.DataShardsCount + erasure_coding.ParityShardsCount
+			if shardCount >= totalShards {
+				glog.Warningf("EC Detection: Volume %d has all %d EC shards in topology; "+
+					"source replica on %s is orphaned (#9448).",
+					metric.VolumeID, totalShards, metric.Server)
+				if clusterInfo.GrpcDialOption != nil {
+					deleted, cleanupErr := cleanupOrphanSourceReplicas(ctx, clusterInfo, metric, totalShards)
+					switch {
+					case cleanupErr != nil:
+						// Don't fall through to a re-encode — that would just
+						// collide with the mounted shards again. Surface the
+						// failure and wait for the next cycle; the source is
+						// still safe.
+						glog.Warningf("EC Detection: failed to auto-clean orphaned source for volume %d: %v", metric.VolumeID, cleanupErr)
+					case deleted > 0:
+						glog.Infof("EC Detection: auto-cleaned %d orphaned source replica(s) for volume %d after verifying all %d EC shards present", deleted, metric.VolumeID, totalShards)
+					default:
+						glog.V(1).Infof("EC Detection: no orphaned regular replicas found in topology for volume %d (collection %q)", metric.VolumeID, metric.Collection)
+					}
+				} else {
+					glog.Warningf("EC Detection: no gRPC dial option available to auto-clean orphaned source for volume %d; "+
+						"to clean up by hand, send a targeted VolumeDelete RPC to %s only — DO NOT use the cluster-wide `volume.delete` shell command, which would also delete the EC shards.",
+						metric.VolumeID, metric.Server)
+				}
+				skippedAlreadyEC++
+				continue
+			}
 		}
 
 		// Check minimum size requirement
@@ -111,6 +188,21 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 		// Check collection filter if specified
 		if len(allowedCollections) > 0 && !wildcard.MatchesAnyWildcard(allowedCollections, metric.Collection) {
 			skippedCollectionFilter++
+			continue
+		}
+
+		// Skip remote/tiered volumes: encoding them would lose the tiering. The
+		// shell ec.encode excludes remote volumes for the same reason.
+		if metric.HasRemoteCopy {
+			skippedRemote++
+			continue
+		}
+
+		// Min-node safety gate: don't encode when the cluster has fewer nodes than
+		// this collection's parity shards — shards could not be spread to tolerate
+		// failures. Mirrors the shell ec.encode guard (node count < parity shards).
+		if clusterNodeCount > 0 && clusterNodeCount < erasure_coding.ParityShardsCount {
+			skippedTooFewNodes++
 			continue
 		}
 
@@ -148,12 +240,11 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 				}
 
 				glog.Infof("EC Detection: ActiveTopology available, planning destinations for volume %d", metric.VolumeID)
-				if planner == nil {
-					planner = newECPlacementPlanner(clusterInfo.ActiveTopology, ecConfig.PreferredTags)
-				}
-				multiPlan, err := planECDestinations(planner, metric, ecConfig)
+				dataShards := erasure_coding.DataShardsCount
+				parityShards := erasure_coding.ParityShardsCount
+				multiPlan, shardsPerPlan, err := planECDestinations(ecSnapshot, nodeAddresses, metric, ecConfig, replicaPlacement, dataShards, parityShards)
 				if err != nil {
-					glog.Warningf("Failed to plan EC destinations for volume %d: %v", metric.VolumeID, err)
+					glog.V(2).Infof("Failed to plan EC destinations for volume %d: %v", metric.VolumeID, err)
 					consecutivePlanningFailures++
 					if len(results) >= minProposalsBeforeEarlyStop && consecutivePlanningFailures >= maxConsecutivePlanningFailures {
 						glog.Warningf("EC Detection: stopping early after %d consecutive placement failures with %d proposals already planned", consecutivePlanningFailures, len(results))
@@ -168,7 +259,7 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 
 				// Calculate expected shard size for EC operation
 				// Each data shard will be approximately volumeSize / dataShards
-				expectedShardSize := uint64(metric.Size) / uint64(erasure_coding.DataShardsCount)
+				expectedShardSize := uint64(metric.Size) / uint64(dataShards)
 
 				// Add pending EC shard task to ActiveTopology for capacity management
 
@@ -216,12 +307,19 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 				for _, shard := range existingECShards {
 					key := fmt.Sprintf("%s:%d", shard.ServerID, shard.DiskID)
 					if !duplicateCheck[key] { // Avoid duplicates if EC shards are on same disk as volume replicas
+						shardIds := append([]uint32(nil), shard.ShardIds...)
+						// Free exactly the shards on this disk. Without an explicit
+						// impact the cleanup falls back to CalculateECShardCleanupImpact,
+						// which credits TotalShardsCount (14) regardless of ratio.
+						cleanupImpact := topology.StorageSlotChange{ShardSlots: -int32(len(shardIds))}
 						sources = append(sources, topology.TaskSourceSpec{
-							ServerID:    shard.ServerID,
-							DiskID:      shard.DiskID,
-							DataCenter:  shard.DataCenter,
-							Rack:        shard.Rack,
-							CleanupType: topology.CleanupECShards,
+							ServerID:      shard.ServerID,
+							DiskID:        shard.DiskID,
+							DataCenter:    shard.DataCenter,
+							Rack:          shard.Rack,
+							CleanupType:   topology.CleanupECShards,
+							ShardIds:      shardIds,
+							StorageImpact: &cleanupImpact,
 						})
 						duplicateCheck[key] = true
 					}
@@ -230,16 +328,20 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 				glog.V(2).Infof("Found %d volume replicas and %d existing EC shards for volume %d (total %d cleanup sources)",
 					len(replicaLocations), len(existingECShards), metric.VolumeID, len(sources))
 
-				// Convert shard destinations to TaskDestinationSpec
+				// Convert shard destinations to TaskDestinationSpec. A destination may
+				// hold several shards (small clusters), so reserve capacity for the
+				// actual per-disk shard count that Place assigned (shardsPerPlan),
+				// which is exactly what createECTargets writes.
 				destinations := make([]topology.TaskDestinationSpec, len(shardDestinations))
-				shardImpact := topology.CalculateECShardStorageImpact(1, int64(expectedShardSize)) // 1 shard per destination
-				shardSize := int64(expectedShardSize)
 				for i, dest := range shardDestinations {
+					shardCount := len(shardsPerPlan[i])
+					shardImpact := topology.CalculateECShardStorageImpact(int32(shardCount), int64(expectedShardSize))
+					destSize := int64(expectedShardSize) * int64(shardCount)
 					destinations[i] = topology.TaskDestinationSpec{
 						ServerID:      dest,
 						DiskID:        shardDiskIDs[i],
 						StorageImpact: &shardImpact,
-						EstimatedSize: &shardSize,
+						EstimatedSize: &destSize,
 					}
 				}
 
@@ -263,9 +365,9 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 					continue // Skip this volume if topology task addition fails
 				}
 
-				if planner != nil {
-					planner.applyTaskReservations(int64(metric.Size), sources, destinations)
-				}
+				// Cross-volume in-cycle capacity is tracked by ActiveTopology via the
+				// pending task above, which the next volume's FromActiveTopology snapshot
+				// reflects; no separate planner reservation is needed.
 
 				glog.V(2).Infof("Added pending EC shard task %s to ActiveTopology for volume %d with %d cleanup sources and %d shard destinations",
 					taskID, metric.VolumeID, len(sources), len(multiPlan.Plans))
@@ -281,10 +383,10 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 					Sources: sourcesProto,
 
 					// Unified targets - all EC shard destinations
-					Targets: createECTargets(multiPlan),
+					Targets: createECTargets(multiPlan, shardsPerPlan),
 
 					TaskParams: &worker_pb.TaskParams_ErasureCodingParams{
-						ErasureCodingParams: createECTaskParams(multiPlan),
+						ErasureCodingParams: createECTaskParams(dataShards, parityShards, metric.DiskType),
 					},
 				}
 
@@ -316,8 +418,8 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 	// Log debug summary if no tasks were created
 	if len(results) == 0 && len(metrics) > 0 && !stoppedEarly {
 		totalVolumes := len(metrics)
-		glog.V(1).Infof("EC detection: No tasks created for %d volumes (skipped: %d already EC, %d too small, %d filtered, %d not quiet, %d not full)",
-			totalVolumes, skippedAlreadyEC, skippedTooSmall, skippedCollectionFilter, skippedQuietTime, skippedFullness)
+		glog.V(1).Infof("EC detection: No tasks created for %d volumes (skipped: %d already EC, %d too small, %d filtered, %d not quiet, %d not full, %d remote, %d too few nodes)",
+			totalVolumes, skippedAlreadyEC, skippedTooSmall, skippedCollectionFilter, skippedQuietTime, skippedFullness, skippedRemote, skippedTooFewNodes)
 
 		// Show details for first few volumes
 		for i, metric := range metrics {
@@ -334,408 +436,181 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 	return results, hasMore, nil
 }
 
-type ecDiskState struct {
-	baseAvailable      int64
-	reservedVolumes    int32
-	reservedShardSlots int32
+// countTopologyNodes counts volume-server nodes in the active topology, used by
+// the min-node safety gate.
+func countTopologyNodes(at *topology.ActiveTopology) int {
+	if at == nil {
+		return 0
+	}
+	topo := at.GetTopologyInfo()
+	if topo == nil {
+		return 0
+	}
+	n := 0
+	for _, dc := range topo.DataCenterInfos {
+		for _, rack := range dc.RackInfos {
+			n += len(rack.DataNodeInfos)
+		}
+	}
+	return n
 }
 
-type ecPlacementPlanner struct {
-	activeTopology *topology.ActiveTopology
-	candidates     []*placement.DiskCandidate
-	candidateByKey map[string]*placement.DiskCandidate
-	diskStates     map[string]*ecDiskState
-	diskTags       map[string][]string
-	preferredTags  []string
-}
-
-func newECPlacementPlanner(activeTopology *topology.ActiveTopology, preferredTags []string) *ecPlacementPlanner {
-	if activeTopology == nil {
+// buildNodeAddressMap resolves every node's server address once per detection
+// cycle. ResolveServerAddress rebuilds the full node map on each call, so
+// resolving per shard destination is O(destinations × topology); callers build
+// this map once and look up addresses from it.
+func buildNodeAddressMap(at *topology.ActiveTopology) map[string]string {
+	if at == nil {
 		return nil
 	}
-
-	disks := activeTopology.GetDisksWithEffectiveCapacity(topology.TaskTypeErasureCoding, "", 0)
-	candidates := diskInfosToCandidates(disks)
-	tagsByKey := collectDiskTags(disks)
-	normalizedPreferredTags := util.NormalizeTagList(preferredTags)
-	if len(candidates) == 0 {
-		return &ecPlacementPlanner{
-			activeTopology: activeTopology,
-			candidates:     candidates,
-			candidateByKey: map[string]*placement.DiskCandidate{},
-			diskStates:     map[string]*ecDiskState{},
-			diskTags:       tagsByKey,
-			preferredTags:  normalizedPreferredTags,
-		}
+	allNodes := at.GetAllNodes()
+	m := make(map[string]string, len(allNodes))
+	for id, n := range allNodes {
+		m[id] = string(pb.NewServerAddressFromDataNode(n))
 	}
-
-	candidateByKey := make(map[string]*placement.DiskCandidate, len(candidates))
-	diskStates := make(map[string]*ecDiskState, len(candidates))
-	for _, candidate := range candidates {
-		key := ecDiskKey(candidate.NodeID, candidate.DiskID)
-		candidateByKey[key] = candidate
-		diskStates[key] = &ecDiskState{
-			baseAvailable: int64(candidate.FreeSlots),
-		}
-	}
-
-	return &ecPlacementPlanner{
-		activeTopology: activeTopology,
-		candidates:     candidates,
-		candidateByKey: candidateByKey,
-		diskStates:     diskStates,
-		diskTags:       tagsByKey,
-		preferredTags:  normalizedPreferredTags,
-	}
+	return m
 }
 
-func (p *ecPlacementPlanner) selectDestinations(sourceRack, sourceDC string, shardsNeeded int) ([]*placement.DiskCandidate, error) {
-	if p == nil || p.activeTopology == nil {
-		return nil, fmt.Errorf("ec placement planner is not initialized")
+// planECDestinations places all shards of the volume via the shared ecbalancer
+// policy and returns the per-disk destination plans plus, parallel to them, the
+// shard ids ecbalancer.Place assigned to each disk (so createECTargets and the
+// capacity reservations use the real assignment, not a round-robin guess).
+//
+// snap is the cycle-wide placement snapshot, built once by the caller and reused
+// across volumes: Place reserves the shards it assigns into it, so later volumes
+// in the same detection cycle see the reduced capacity. Rebuilding it per volume
+// is O(volumes × topology) and times out on large clusters.
+//
+// Encode is lenient (PlaceDurabilityFirst): it relaxes caps/anti-affinity/RP as
+// needed rather than fail, and prefers the source disk type but spills if that
+// type can't hold every shard. rp is the resolved replica placement (may be nil).
+func planECDestinations(snap *ecbalancer.Topology, nodeAddresses map[string]string, metric *types.VolumeHealthMetrics, ecConfig *Config, rp *super_block.ReplicaPlacement, dataShards, parityShards int) (*topology.MultiDestinationPlan, [][]uint32, error) {
+	if snap == nil {
+		return nil, nil, fmt.Errorf("EC placement snapshot not available")
 	}
-	if shardsNeeded <= 0 {
-		return nil, fmt.Errorf("invalid shardsNeeded %d", shardsNeeded)
+	if dataShards <= 0 || parityShards <= 0 {
+		return nil, nil, fmt.Errorf("invalid EC ratio: dataShards=%d parityShards=%d", dataShards, parityShards)
 	}
+	totalShards := dataShards + parityShards
+	// Survive losing one disk: each disk holds at most parityShards shards,
+	// so we need at least ceil(totalShards / parityShards) disks.
+	minTotalDisks := (totalShards + parityShards - 1) / parityShards
+	expectedShardSize := uint64(metric.Size) / uint64(dataShards)
 
-	config := placement.PlacementRequest{
-		ShardsNeeded:           shardsNeeded,
-		MaxShardsPerServer:     0,
-		MaxShardsPerRack:       0,
-		MaxTaskLoad:            topology.MaxTaskLoadForECPlacement,
-		PreferDifferentServers: true,
-		PreferDifferentRacks:   true,
+	// Encode is greenfield: any EC shards already present for this volume are stale
+	// leftovers from a prior failed attempt, which the task deletes
+	// (cleanupStaleEcShards) before distributing the new shards. Release them so they
+	// don't occupy capacity or skew anti-affinity / per-disk caps during planning.
+	snap.ReleaseVolumeShards(metric.Collection, metric.VolumeID)
+	need := make([]int, totalShards)
+	for i := range need {
+		need[i] = i
 	}
-
-	var lastErr error
-	for _, candidates := range p.buildCandidateSets(shardsNeeded) {
-		if len(candidates) == 0 {
-			continue
-		}
-		result, err := placement.SelectDestinations(candidates, config)
-		if err == nil {
-			return result.SelectedDisks, nil
-		}
-		lastErr = err
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no EC placement candidates available")
-	}
-	return nil, lastErr
-}
-
-func (p *ecPlacementPlanner) applyTaskReservations(volumeSize int64, sources []topology.TaskSourceSpec, destinations []topology.TaskDestinationSpec) {
-	if p == nil {
-		return
-	}
-
-	touched := make(map[string]bool)
-
-	for _, source := range sources {
-		impact := p.sourceImpact(source, volumeSize)
-		p.applyImpact(source.ServerID, source.DiskID, impact)
-		p.bumpShardCount(source.ServerID, source.DiskID, impact.ShardSlots)
-		key := ecDiskKey(source.ServerID, source.DiskID)
-		if !touched[key] {
-			p.bumpLoad(source.ServerID, source.DiskID)
-			touched[key] = true
-		}
-	}
-
-	for _, dest := range destinations {
-		impact := p.destinationImpact(dest, volumeSize)
-		p.applyImpact(dest.ServerID, dest.DiskID, impact)
-		p.bumpShardCount(dest.ServerID, dest.DiskID, impact.ShardSlots)
-		key := ecDiskKey(dest.ServerID, dest.DiskID)
-		if !touched[key] {
-			p.bumpLoad(dest.ServerID, dest.DiskID)
-			touched[key] = true
-		}
-	}
-}
-
-func (p *ecPlacementPlanner) sourceImpact(source topology.TaskSourceSpec, volumeSize int64) topology.StorageSlotChange {
-	if source.StorageImpact != nil {
-		return *source.StorageImpact
-	}
-	if source.CleanupType == topology.CleanupECShards {
-		return topology.CalculateECShardCleanupImpact(volumeSize)
-	}
-	impact, _ := topology.CalculateTaskStorageImpact(topology.TaskTypeErasureCoding, volumeSize)
-	return impact
-}
-
-func (p *ecPlacementPlanner) destinationImpact(dest topology.TaskDestinationSpec, volumeSize int64) topology.StorageSlotChange {
-	if dest.StorageImpact != nil {
-		return *dest.StorageImpact
-	}
-	_, impact := topology.CalculateTaskStorageImpact(topology.TaskTypeErasureCoding, volumeSize)
-	return impact
-}
-
-func (p *ecPlacementPlanner) applyImpact(nodeID string, diskID uint32, impact topology.StorageSlotChange) {
-	if impact.IsZero() {
-		return
-	}
-	key := ecDiskKey(nodeID, diskID)
-	state, ok := p.diskStates[key]
-	if !ok {
-		return
-	}
-
-	state.reservedVolumes += impact.VolumeSlots
-	state.reservedShardSlots += impact.ShardSlots
-
-	available := state.baseAvailable - int64(state.reservedVolumes) - int64(state.reservedShardSlots)/int64(topology.ShardsPerVolumeSlot)
-	if available < 0 {
-		available = 0
-	}
-
-	if candidate, ok := p.candidateByKey[key]; ok {
-		candidate.FreeSlots = int(available)
-		candidate.VolumeCount = candidate.MaxVolumeCount - available
-	}
-}
-
-func (p *ecPlacementPlanner) bumpLoad(nodeID string, diskID uint32) {
-	key := ecDiskKey(nodeID, diskID)
-	if candidate, ok := p.candidateByKey[key]; ok {
-		candidate.LoadCount++
-	}
-}
-
-func (p *ecPlacementPlanner) bumpShardCount(nodeID string, diskID uint32, delta int32) {
-	if delta == 0 {
-		return
-	}
-	key := ecDiskKey(nodeID, diskID)
-	if candidate, ok := p.candidateByKey[key]; ok {
-		candidate.ShardCount += int(delta)
-		if candidate.ShardCount < 0 {
-			candidate.ShardCount = 0
-		}
-	}
-}
-
-func ecDiskKey(nodeID string, diskID uint32) string {
-	return fmt.Sprintf("%s:%d", nodeID, diskID)
-}
-
-func collectDiskTags(disks []*topology.DiskInfo) map[string][]string {
-	tagMap := make(map[string][]string, len(disks))
-	for _, disk := range disks {
-		if disk == nil || disk.DiskInfo == nil {
-			continue
-		}
-		key := ecDiskKey(disk.NodeID, disk.DiskID)
-		tags := util.NormalizeTagList(disk.DiskInfo.Tags)
-		if len(tags) > 0 {
-			tagMap[key] = tags
-		}
-	}
-	return tagMap
-}
-
-func diskHasTag(tags []string, tag string) bool {
-	if tag == "" || len(tags) == 0 {
-		return false
-	}
-	for _, candidate := range tags {
-		if candidate == tag {
-			return true
-		}
-	}
-	return false
-}
-
-// buildCandidateSets builds tiered candidate sets for preferred-tag prioritized placement.
-// For a planner with preferredTags, it accumulates disks matching each tag in order into
-// progressively larger tiers. It emits a candidate set once a tier reaches shardsNeeded,
-// then continues accumulating for subsequent tags. Finally, it falls back to the full
-// p.candidates set if preferred-tag tiers are insufficient. This ensures tagged disks
-// are selected first before falling back to all available candidates.
-func (p *ecPlacementPlanner) buildCandidateSets(shardsNeeded int) [][]*placement.DiskCandidate {
-	if p == nil {
-		return nil
-	}
-	if len(p.preferredTags) == 0 {
-		return [][]*placement.DiskCandidate{p.candidates}
-	}
-	selected := make(map[string]bool, len(p.candidates))
-	var tier []*placement.DiskCandidate
-	var candidateSets [][]*placement.DiskCandidate
-	for _, tag := range p.preferredTags {
-		for _, candidate := range p.candidates {
-			key := ecDiskKey(candidate.NodeID, candidate.DiskID)
-			if selected[key] {
-				continue
-			}
-			if diskHasTag(p.diskTags[key], tag) {
-				selected[key] = true
-				tier = append(tier, candidate)
-			}
-		}
-		if shardsNeeded > 0 && len(tier) >= shardsNeeded {
-			candidateSets = append(candidateSets, append([]*placement.DiskCandidate(nil), tier...))
-		}
-	}
-	// Defensive check: selectDestinations always ensures shardsNeeded > 0 before calling
-	// buildCandidateSets, but this branch handles direct callers and edge cases.
-	if shardsNeeded <= 0 && len(tier) > 0 {
-		candidateSets = append(candidateSets, append([]*placement.DiskCandidate(nil), tier...))
-	}
-	if len(tier) < len(p.candidates) {
-		candidateSets = append(candidateSets, p.candidates)
-	} else if len(candidateSets) == 0 {
-		candidateSets = append(candidateSets, p.candidates)
-	}
-	return candidateSets
-}
-
-// planECDestinations plans the destinations for erasure coding operation
-// This function implements EC destination planning logic directly in the detection phase
-func planECDestinations(planner *ecPlacementPlanner, metric *types.VolumeHealthMetrics, ecConfig *Config) (*topology.MultiDestinationPlan, error) {
-	if planner == nil || planner.activeTopology == nil {
-		return nil, fmt.Errorf("active topology not available for EC placement")
-	}
-	// Calculate expected shard size for EC operation
-	expectedShardSize := uint64(metric.Size) / uint64(erasure_coding.DataShardsCount)
-
-	// Get source node information from topology
-	var sourceRack, sourceDC string
-
-	// Extract rack and DC from topology info
-	topologyInfo := planner.activeTopology.GetTopologyInfo()
-	if topologyInfo != nil {
-		for _, dc := range topologyInfo.DataCenterInfos {
-			for _, rack := range dc.RackInfos {
-				for _, dataNodeInfo := range rack.DataNodeInfos {
-					if dataNodeInfo.Id == metric.Server {
-						sourceDC = dc.Id
-						sourceRack = rack.Id
-						break
-					}
-				}
-				if sourceRack != "" {
-					break
-				}
-			}
-			if sourceDC != "" {
-				break
-			}
-		}
-	}
-
-	// Select best disks for EC placement with rack/DC diversity using the cached planner
-	selectedDisks, err := planner.selectDestinations(sourceRack, sourceDC, erasure_coding.TotalShardsCount)
+	res, err := snap.Place(metric.VolumeID, metric.Collection, need, ecbalancer.Constraints{
+		DiskType:         metric.DiskType,
+		DiskTypePolicy:   ecbalancer.DiskTypePrefer,
+		PreferredTags:    ecConfig.PreferredTags,
+		ReplicaPlacement: rp,
+		Ratio:            func(string) (int, int) { return dataShards, parityShards },
+	}, ecbalancer.PlaceDurabilityFirst)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if len(selectedDisks) < erasure_coding.MinTotalDisks {
-		return nil, fmt.Errorf("found %d disks, but could not find %d suitable destinations for EC placement", len(selectedDisks), erasure_coding.MinTotalDisks)
+	if res.SpilledToOtherDiskType {
+		glog.Warningf("EC volume %d: placed shards outside preferred disk type %q", metric.VolumeID, metric.DiskType)
+	}
+	if res.SpilledOutsidePreferredTags {
+		glog.Warningf("EC volume %d: placed shards outside preferred tags %v", metric.VolumeID, ecConfig.PreferredTags)
+	}
+	if len(res.Relaxed) > 0 {
+		// Encode is best-effort (PlaceDurabilityFirst): it relaxes these constraints
+		// rather than defer when the cluster can't satisfy them. Surface it so a tight
+		// replica placement isn't silently weakened; rebalancing tightens the spread.
+		glog.Warningf("EC volume %d: placed with relaxed constraints %v; replica placement not fully satisfied (rebalancing will adjust)", metric.VolumeID, res.Relaxed)
+	}
+
+	// Group the per-shard destinations into one plan per (node,disk), iterating
+	// shard ids in order for determinism.
+	type diskGroup struct {
+		node, rack, dc string
+		diskID         uint32
+		shards         []uint32
+	}
+	type diskKey struct {
+		node   string
+		diskID uint32
+	}
+	groups := make(map[diskKey]*diskGroup, totalShards)
+	order := make([]diskKey, 0, totalShards)
+	for sid := 0; sid < totalShards; sid++ {
+		d, ok := res.Destinations[sid]
+		if !ok {
+			return nil, nil, fmt.Errorf("EC volume %d: shard %d was not placed", metric.VolumeID, sid)
+		}
+		key := diskKey{node: d.Node, diskID: d.DiskID}
+		g := groups[key]
+		if g == nil {
+			g = &diskGroup{node: d.Node, rack: d.Rack, dc: d.DataCenter, diskID: d.DiskID}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.shards = append(g.shards, uint32(sid))
+	}
+	if len(order) < minTotalDisks {
+		return nil, nil, fmt.Errorf("placed onto %d disks, but EC %d+%d needs at least %d so no disk holds more than %d shards",
+			len(order), dataShards, parityShards, minTotalDisks, parityShards)
 	}
 
 	var plans []*topology.DestinationPlan
+	shardsPerPlan := make([][]uint32, 0, len(order))
 	rackCount := make(map[string]int)
 	dcCount := make(map[string]int)
-
-	for _, disk := range selectedDisks {
-		// Get the target server address
-		targetAddress, err := workerutil.ResolveServerAddress(disk.NodeID, planner.activeTopology)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve address for target server %s: %v", disk.NodeID, err)
+	for _, key := range order {
+		g := groups[key]
+		targetAddress, ok := nodeAddresses[g.node]
+		if !ok {
+			return nil, nil, fmt.Errorf("failed to resolve address for target server %s", g.node)
 		}
-
-		plan := &topology.DestinationPlan{
-			TargetNode:     disk.NodeID,
-			TargetAddress:  targetAddress,
-			TargetDisk:     disk.DiskID,
-			TargetRack:     disk.Rack,
-			TargetDC:       disk.DataCenter,
-			ExpectedSize:   expectedShardSize, // Set calculated EC shard size
-			PlacementScore: calculateECScoreCandidate(disk, sourceRack, sourceDC),
-		}
-		plans = append(plans, plan)
-
-		// Count rack and DC diversity
-		rackKey := fmt.Sprintf("%s:%s", disk.DataCenter, disk.Rack)
-		rackCount[rackKey]++
-		dcCount[disk.DataCenter]++
+		plans = append(plans, &topology.DestinationPlan{
+			TargetNode:    g.node,
+			TargetAddress: targetAddress,
+			TargetDisk:    g.diskID,
+			TargetRack:    g.rack,
+			TargetDC:      g.dc,
+			ExpectedSize:  expectedShardSize,
+		})
+		shardsPerPlan = append(shardsPerPlan, g.shards)
+		rackCount[fmt.Sprintf("%s:%s", g.dc, g.rack)]++
+		dcCount[g.dc]++
 	}
 
-	// Log capacity utilization information using ActiveTopology's encapsulated logic
-	totalEffectiveCapacity := int64(0)
-	for _, plan := range plans {
-		key := ecDiskKey(plan.TargetNode, plan.TargetDisk)
-		if candidate, ok := planner.candidateByKey[key]; ok {
-			totalEffectiveCapacity += int64(candidate.FreeSlots)
-		}
-	}
-
-	glog.V(1).Infof("Planned EC destinations for volume %d (size=%d bytes): expected shard size=%d bytes, %d shards across %d racks, %d DCs, total effective capacity=%d slots",
-		metric.VolumeID, metric.Size, expectedShardSize, len(plans), len(rackCount), len(dcCount), totalEffectiveCapacity)
-
-	// Log storage impact for EC task (source only - EC has multiple targets handled individually)
-	sourceChange, _ := topology.CalculateTaskStorageImpact(topology.TaskTypeErasureCoding, int64(metric.Size))
-	glog.V(2).Infof("EC task capacity management: source_reserves_with_zero_impact={VolumeSlots:%d, ShardSlots:%d}, %d_targets_will_receive_shards, estimated_size=%d",
-		sourceChange.VolumeSlots, sourceChange.ShardSlots, len(plans), metric.Size)
-	glog.V(2).Infof("EC source reserves capacity but with zero StorageSlotChange impact")
+	glog.V(1).Infof("Planned EC destinations for volume %d (size=%d bytes): expected shard size=%d bytes, %d shards across %d disks, %d racks, %d DCs",
+		metric.VolumeID, metric.Size, expectedShardSize, totalShards, len(plans), len(rackCount), len(dcCount))
 
 	return &topology.MultiDestinationPlan{
 		Plans:          plans,
-		TotalShards:    len(plans),
+		TotalShards:    totalShards,
 		SuccessfulRack: len(rackCount),
 		SuccessfulDCs:  len(dcCount),
-	}, nil
+	}, shardsPerPlan, nil
 }
 
-// createECTargets creates unified TaskTarget structures from the multi-destination plan
-// with proper shard ID assignment during planning phase
-func createECTargets(multiPlan *topology.MultiDestinationPlan) []*worker_pb.TaskTarget {
-	var targets []*worker_pb.TaskTarget
-	numTargets := len(multiPlan.Plans)
-
-	// Create shard assignment arrays for each target (round-robin distribution)
-	targetShards := make([][]uint32, numTargets)
-	for i := range targetShards {
-		targetShards[i] = make([]uint32, 0)
-	}
-
-	// Distribute shards in round-robin fashion to spread both data and parity shards
-	// This ensures each target gets a mix of data shards (0-9) and parity shards (10-13)
-	for shardId := uint32(0); shardId < uint32(erasure_coding.TotalShardsCount); shardId++ {
-		targetIndex := int(shardId) % numTargets
-		targetShards[targetIndex] = append(targetShards[targetIndex], shardId)
-	}
-
-	// Create targets with assigned shard IDs
+// createECTargets builds TaskTargets from the per-disk plans and the shard ids
+// ecbalancer.Place assigned to each (shardsPerPlan is parallel to multiPlan.Plans).
+func createECTargets(multiPlan *topology.MultiDestinationPlan, shardsPerPlan [][]uint32) []*worker_pb.TaskTarget {
+	targets := make([]*worker_pb.TaskTarget, 0, len(multiPlan.Plans))
 	for i, plan := range multiPlan.Plans {
-		target := &worker_pb.TaskTarget{
+		shardIDs := shardsPerPlan[i]
+		targets = append(targets, &worker_pb.TaskTarget{
 			Node:          plan.TargetAddress,
 			DiskId:        plan.TargetDisk,
 			Rack:          plan.TargetRack,
 			DataCenter:    plan.TargetDC,
-			ShardIds:      targetShards[i], // Round-robin assigned shards
+			ShardIds:      shardIDs,
 			EstimatedSize: plan.ExpectedSize,
-		}
-		targets = append(targets, target)
-
-		// Log shard assignment with data/parity classification
-		dataShards := make([]uint32, 0)
-		parityShards := make([]uint32, 0)
-		for _, shardId := range targetShards[i] {
-			if shardId < uint32(erasure_coding.DataShardsCount) {
-				dataShards = append(dataShards, shardId)
-			} else {
-				parityShards = append(parityShards, shardId)
-			}
-		}
-		glog.V(2).Infof("EC planning: target %s assigned shards %v (data: %v, parity: %v)",
-			plan.TargetNode, targetShards[i], dataShards, parityShards)
+		})
+		glog.V(2).Infof("EC planning: target %s disk %d assigned shards %v", plan.TargetNode, plan.TargetDisk, shardIDs)
 	}
-
-	glog.V(1).Infof("EC planning: distributed %d shards across %d targets using round-robin (data shards 0-%d, parity shards %d-%d)",
-		erasure_coding.TotalShardsCount, numTargets,
-		erasure_coding.DataShardsCount-1, erasure_coding.DataShardsCount, erasure_coding.TotalShardsCount-1)
 	return targets
 }
 
@@ -761,15 +636,15 @@ func convertTaskSourcesToProtobuf(sources []topology.TaskSourceSpec, volumeID ui
 			pbSource.EstimatedSize = uint64(*source.EstimatedSize)
 		}
 
-		// Set appropriate volume ID or shard IDs based on cleanup type
+		// Populated ShardIds is the wire-level marker that flags an
+		// EC-shard cleanup source; the worker routes it through
+		// cleanupStaleEcShards and skips it in getReplicas.
 		switch source.CleanupType {
 		case topology.CleanupVolumeReplica:
-			// This is a volume replica, use the actual volume ID
 			pbSource.VolumeId = volumeID
 		case topology.CleanupECShards:
-			// This is EC shards, also use the volume ID for consistency
 			pbSource.VolumeId = volumeID
-			// Note: ShardIds would need to be passed separately if we need specific shard info
+			pbSource.ShardIds = append([]uint32(nil), source.ShardIds...)
 		}
 
 		protobufSources = append(protobufSources, pbSource)
@@ -778,73 +653,15 @@ func convertTaskSourcesToProtobuf(sources []topology.TaskSourceSpec, volumeID ui
 	return protobufSources, nil
 }
 
-// createECTaskParams creates clean EC task parameters (destinations now in unified targets)
-func createECTaskParams(multiPlan *topology.MultiDestinationPlan) *worker_pb.ErasureCodingTaskParams {
+// createECTaskParams creates clean EC task parameters (destinations now in unified targets).
+// sourceDiskType is forwarded to VolumeEcShardsMount so the resulting EC volume
+// reports under the source's disk type rather than the target location's (#9423).
+func createECTaskParams(dataShards, parityShards int, sourceDiskType string) *worker_pb.ErasureCodingTaskParams {
 	return &worker_pb.ErasureCodingTaskParams{
-		DataShards:   erasure_coding.DataShardsCount,   // Standard data shards
-		ParityShards: erasure_coding.ParityShardsCount, // Standard parity shards
+		DataShards:     int32(dataShards),
+		ParityShards:   int32(parityShards),
+		SourceDiskType: sourceDiskType,
 	}
-}
-
-// diskInfosToCandidates converts topology.DiskInfo slice to placement.DiskCandidate slice
-func diskInfosToCandidates(disks []*topology.DiskInfo) []*placement.DiskCandidate {
-	var candidates []*placement.DiskCandidate
-	for _, disk := range disks {
-		if disk.DiskInfo == nil {
-			continue
-		}
-
-		// Calculate free slots (using default max if not set)
-		freeSlots := int(disk.DiskInfo.MaxVolumeCount - disk.DiskInfo.VolumeCount)
-		if freeSlots < 0 {
-			freeSlots = 0
-		}
-
-		// Calculate EC shard count for this specific disk
-		// EcShardInfos contains all shards, so we need to filter by DiskId and sum actual shard counts
-		ecShardCount := 0
-		if disk.DiskInfo.EcShardInfos != nil {
-			for _, shardInfo := range disk.DiskInfo.EcShardInfos {
-				if shardInfo.DiskId == disk.DiskID {
-					ecShardCount += erasure_coding.GetShardCount(shardInfo)
-				}
-			}
-		}
-
-		candidates = append(candidates, &placement.DiskCandidate{
-			NodeID:         disk.NodeID,
-			DiskID:         disk.DiskID,
-			DataCenter:     disk.DataCenter,
-			Rack:           disk.Rack,
-			VolumeCount:    disk.DiskInfo.VolumeCount,
-			MaxVolumeCount: disk.DiskInfo.MaxVolumeCount,
-			ShardCount:     ecShardCount,
-			FreeSlots:      freeSlots,
-			LoadCount:      disk.LoadCount,
-		})
-	}
-	return candidates
-}
-
-// calculateECScoreCandidate calculates placement score for EC operations.
-// Used for logging and plan metadata.
-func calculateECScoreCandidate(disk *placement.DiskCandidate, sourceRack, sourceDC string) float64 {
-	if disk == nil {
-		return 0.0
-	}
-
-	score := 0.0
-
-	// Prefer disks with available capacity (primary factor)
-	if disk.MaxVolumeCount > 0 {
-		utilization := float64(disk.VolumeCount) / float64(disk.MaxVolumeCount)
-		score += (1.0 - utilization) * 60.0 // Up to 60 points for available capacity
-	}
-
-	// Consider current load (secondary factor)
-	score += (10.0 - float64(disk.LoadCount)) // Up to 10 points for low load
-
-	return score
 }
 
 // findVolumeReplicaLocations finds all replica locations (server + disk) for the specified volume
@@ -863,4 +680,127 @@ func findExistingECShards(activeTopology *topology.ActiveTopology, volumeID uint
 		return nil
 	}
 	return activeTopology.GetECShardLocations(volumeID, collection)
+}
+
+// cleanupOrphanSourceReplicas deletes any regular volume replicas still
+// present in the topology for (volumeID, collection) after re-verifying that
+// the full EC shard set is intact. Caller must hold expectedShards equal to
+// the configured totalShards count. Issues VolumeDelete RPC to each replica
+// server's address — that endpoint only touches the regular volume on the
+// targeted server, never EC shards (those live in a separate store path).
+// The cluster-wide `volume.delete` shell command is what would have nuked
+// the EC shards too; the targeted RPC used here is safe by construction.
+// Returns the count of replicas successfully deleted plus any error.
+func cleanupOrphanSourceReplicas(ctx context.Context, clusterInfo *types.ClusterInfo, metric *types.VolumeHealthMetrics, expectedShards int) (int, error) {
+	if clusterInfo == nil || clusterInfo.ActiveTopology == nil {
+		return 0, fmt.Errorf("active topology unavailable")
+	}
+	if clusterInfo.GrpcDialOption == nil {
+		return 0, fmt.Errorf("grpc dial option unavailable")
+	}
+
+	// Re-verify shard completeness right before acting. Defensive: detection
+	// processes many volumes sequentially and the topology snapshot we built
+	// at start-of-detection could have lost shards in between (a volume
+	// server going down between iterations). Refusing to delete the source
+	// when we can no longer prove the shards are complete is the safer
+	// failure mode — the source replica is the only complete copy.
+	actualShards := countExistingEcShardsForVolume(clusterInfo.ActiveTopology, metric.VolumeID, metric.Collection)
+	if actualShards < expectedShards {
+		return 0, fmt.Errorf("EC shard set shrank between detection and cleanup (%d < %d); refusing to delete source replica", actualShards, expectedShards)
+	}
+
+	replicas := findVolumeReplicaLocations(clusterInfo.ActiveTopology, metric.VolumeID, metric.Collection)
+	if len(replicas) == 0 {
+		return 0, nil
+	}
+
+	deleted := 0
+	var deleteErrors []string
+	for _, replica := range replicas {
+		serverAddress := replica.ServerID
+		var isReadOnly bool
+		err := operation.WithVolumeServerClient(false, pb.ServerAddress(serverAddress), clusterInfo.GrpcDialOption,
+			func(client volume_server_pb.VolumeServerClient) error {
+				// Re-probe before deleting: only a still-readonly source replica is
+				// safe to remove. One that came back writable may have accepted
+				// writes the EC shards do not contain, so deleting it loses data.
+				status, statusErr := client.VolumeStatus(ctx, &volume_server_pb.VolumeStatusRequest{VolumeId: metric.VolumeID})
+				if statusErr != nil {
+					return statusErr
+				}
+				isReadOnly = status.GetIsReadOnly()
+				if !isReadOnly {
+					return nil
+				}
+				_, deleteErr := client.VolumeDelete(ctx, &volume_server_pb.VolumeDeleteRequest{
+					VolumeId:  metric.VolumeID,
+					OnlyEmpty: false,
+				})
+				return deleteErr
+			})
+		if err != nil {
+			deleteErrors = append(deleteErrors, fmt.Sprintf("server %s: %v", serverAddress, err))
+			continue
+		}
+		if !isReadOnly {
+			glog.Warningf("EC Detection: source replica for volume %d on %s is writable; not deleting (may hold writes the EC shards lack)", metric.VolumeID, serverAddress)
+			continue
+		}
+		deleted++
+		glog.V(1).Infof("EC Detection: deleted orphan regular replica for volume %d on %s", metric.VolumeID, serverAddress)
+	}
+
+	if len(deleteErrors) > 0 {
+		return deleted, fmt.Errorf("%d of %d replica delete(s) failed: %s", len(deleteErrors), len(replicas), strings.Join(deleteErrors, "; "))
+	}
+	return deleted, nil
+}
+
+// countExistingEcShardsForVolume returns the number of distinct EC shard IDs
+// for (volumeID, collection) present in the topology, counting only the single
+// largest encode generation. Shards are grouped by encode_ts_ns (the per-encode
+// identity from .vif), so two interrupted encode runs whose shard sets overlap
+// are never unioned into a false-complete set that would wrongly trigger the
+// orphaned-source delete. Walks every disk's EcIndexBits bitmap rather than
+// trusting len(EcShardInfos), because a single info entry can carry multiple
+// shards. Shards reporting encode_ts_ns==0 (pre-upgrade servers) form their own
+// generation bucket.
+//
+// Limitation: the heartbeat carries one encode_ts_ns per (volume, disk), so this
+// separates generations living on different disks; same-disk mixing is prevented
+// upstream by the pre-encode artifact wipe and the cross-run read guard.
+func countExistingEcShardsForVolume(activeTopology *topology.ActiveTopology, volumeID uint32, collection string) int {
+	if activeTopology == nil {
+		return 0
+	}
+	topologyInfo := activeTopology.GetTopologyInfo()
+	if topologyInfo == nil {
+		return 0
+	}
+	perGeneration := make(map[int64]erasure_coding.ShardBits)
+	for _, dc := range topologyInfo.DataCenterInfos {
+		for _, rack := range dc.RackInfos {
+			for _, node := range rack.DataNodeInfos {
+				for _, diskInfo := range node.DiskInfos {
+					for _, ecShardInfo := range diskInfo.EcShardInfos {
+						if ecShardInfo == nil {
+							continue
+						}
+						if ecShardInfo.Id != volumeID || ecShardInfo.Collection != collection {
+							continue
+						}
+						perGeneration[ecShardInfo.EncodeTsNs] |= erasure_coding.ShardBits(ecShardInfo.EcIndexBits)
+					}
+				}
+			}
+		}
+	}
+	best := 0
+	for _, bits := range perGeneration {
+		if c := bits.Count(); c > best {
+			best = c
+		}
+	}
+	return best
 }

@@ -145,6 +145,37 @@ pub struct VolumeGrpcService {
 }
 
 impl VolumeGrpcService {
+    /// Verifies the gRPC caller is allowed to invoke a destructive admin
+    /// operation. Mirrors the Go side's checkGrpcAdminAuth: an empty
+    /// whitelist accepts everyone (insecure-by-default for tests and
+    /// upgrades), a populated whitelist accepts only matching peer IPs.
+    ///
+    /// `remote_addr()` on a real gRPC connection always yields the peer's
+    /// SocketAddr; if it is somehow None we deny, matching "if we don't
+    /// know who the caller is, refuse."
+    fn check_grpc_admin_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let remote = match request.remote_addr() {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!("gRPC admin auth failed: no peer info");
+                return Err(Status::permission_denied("no peer info"));
+            }
+        };
+        let host = remote.ip().to_string();
+        let guard = self.state.guard.read().unwrap();
+        if !guard.check_whitelist(&host) {
+            tracing::warn!(
+                "gRPC admin auth failed: {} is not whitelisted (remote: {})",
+                host,
+                remote,
+            );
+            return Err(Status::permission_denied(format!(
+                "not authorized: {host}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn notify_master_volume_readonly(
         &self,
         info: &MasterVolumeInfo,
@@ -368,6 +399,27 @@ impl VolumeServer for VolumeGrpcService {
 
             if !is_ec_volume {
                 let mut store = self.state.store.write().unwrap();
+                // Recheck EC state under the write lock before mutating the .dat. The
+                // is_ec_volume snapshot was taken earlier under a separate read lock;
+                // ec.encode mounts EC shards (copied from the .dat) BEFORE deleting the
+                // originals, so the vid can be EC now while the .dat still exists. A
+                // delete_volume_needle here would tombstone that .dat, which the encode
+                // then removes — the delete is lost and the needle resurrected from the
+                // pre-tombstone shards. If the vid is now EC, return a retriable 503 so
+                // the filer requeues the delete onto the EC path.
+                if store.has_ec_volume(file_id.volume_id) {
+                    results.push(volume_server_pb::DeleteResult {
+                        file_id: fid_str.clone(),
+                        status: 503,
+                        error: format!(
+                            "volume {} became ec during delete, try again",
+                            file_id.volume_id
+                        ),
+                        size: 0,
+                        version: 0,
+                    });
+                    continue;
+                }
                 match store.delete_volume_needle(file_id.volume_id, &mut n) {
                     Ok(size) => {
                         if size.0 == 0 {
@@ -389,13 +441,35 @@ impl VolumeServer for VolumeGrpcService {
                         }
                     }
                     Err(e) => {
-                        results.push(volume_server_pb::DeleteResult {
-                            file_id: fid_str.clone(),
-                            status: 500,
-                            error: e.to_string(),
-                            size: 0,
-                            version: 0,
-                        });
+                        // The volume vanished between the is_ec_volume snapshot and
+                        // this mutation. If an EC volume now occupies the vid (ec.encode
+                        // mounted EC then deleted the .dat under us), the delete belongs
+                        // on the EC journal, not here — return a retriable 503 with the
+                        // "try again" token so the filer requeues it and the retry hits
+                        // the EC path. A bare exact "not found" would be dropped
+                        // permanently by the filer chunk-GC.
+                        if matches!(e, crate::storage::volume::VolumeError::NotFound)
+                            && store.has_ec_volume(file_id.volume_id)
+                        {
+                            results.push(volume_server_pb::DeleteResult {
+                                file_id: fid_str.clone(),
+                                status: 503,
+                                error: format!(
+                                    "volume {} became ec during delete, try again",
+                                    file_id.volume_id
+                                ),
+                                size: 0,
+                                version: 0,
+                            });
+                        } else {
+                            results.push(volume_server_pb::DeleteResult {
+                                file_id: fid_str.clone(),
+                                status: 500,
+                                error: e.to_string(),
+                                size: 0,
+                                version: 0,
+                            });
+                        }
                     }
                 }
             } else {
@@ -459,6 +533,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VacuumVolumeCompactRequest>,
     ) -> Result<Response<Self::VacuumVolumeCompactStream>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
@@ -518,6 +593,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VacuumVolumeCommitRequest>,
     ) -> Result<Response<volume_server_pb::VacuumVolumeCommitResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let vid = VolumeId(request.into_inner().volume_id);
 
@@ -553,6 +629,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VacuumVolumeCleanupRequest>,
     ) -> Result<Response<volume_server_pb::VacuumVolumeCleanupResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let vid = VolumeId(request.into_inner().volume_id);
         let mut store = self.state.store.write().unwrap();
@@ -568,6 +645,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::DeleteCollectionRequest>,
     ) -> Result<Response<volume_server_pb::DeleteCollectionResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         let collection = &request.into_inner().collection;
         let mut store = self.state.store.write().unwrap();
         store
@@ -580,6 +658,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::AllocateVolumeRequest>,
     ) -> Result<Response<volume_server_pb::AllocateVolumeResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
@@ -728,6 +807,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeMountRequest>,
     ) -> Result<Response<volume_server_pb::VolumeMountResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
@@ -744,6 +824,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeUnmountRequest>,
     ) -> Result<Response<volume_server_pb::VolumeUnmountResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         let vid = VolumeId(request.into_inner().volume_id);
         let mut store = self.state.store.write().unwrap();
         // Go returns nil when volume is not found (idempotent unmount)
@@ -757,6 +838,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeDeleteRequest>,
     ) -> Result<Response<volume_server_pb::VolumeDeleteResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
@@ -770,7 +852,7 @@ impl VolumeServer for VolumeGrpcService {
             }
         }
         store
-            .delete_volume(vid, req.only_empty)
+            .delete_volume(vid, req.only_empty, req.keep_remote_data)
             .map_err(|e| Status::internal(e.to_string()))?;
         self.state.volume_state_notify.notify_one();
         Ok(Response::new(volume_server_pb::VolumeDeleteResponse {}))
@@ -780,6 +862,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeMarkReadonlyRequest>,
     ) -> Result<Response<volume_server_pb::VolumeMarkReadonlyResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
         // Go: volume lookup (L239-241) happens before maintenance check (L166 in makeVolumeReadonly)
@@ -799,6 +882,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeMarkWritableRequest>,
     ) -> Result<Response<volume_server_pb::VolumeMarkWritableResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
         let info = {
@@ -848,6 +932,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeConfigureRequest>,
     ) -> Result<Response<volume_server_pb::VolumeConfigureResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
@@ -995,18 +1080,15 @@ impl VolumeServer for VolumeGrpcService {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
-        // If volume already exists locally, delete it first
-        {
+        // A pre-existing local replica is NOT deleted up front. Deleting before
+        // the source is confirmed reachable destroys a healthy copy on a
+        // transient source outage (and, on retry, can lose the volume
+        // entirely). The delete is deferred until read_volume_file_status below
+        // proves the source holds the volume; readability alone is the gate.
+        let had_existing_volume = {
             let store = self.state.store.read().unwrap();
-            if store.find_volume(vid).is_some() {
-                drop(store);
-                let mut store = self.state.store.write().unwrap();
-                store.delete_volume(vid, false).map_err(|e| {
-                    Status::internal(format!("failed to delete existing volume {}: {}", vid, e))
-                })?;
-                self.state.volume_state_notify.notify_one();
-            }
-        }
+            store.find_volume(vid).is_some()
+        };
 
         // Parse source_data_node address: "ip:port.grpcPort" or "ip:port" (grpc = port + 10000)
         let source = &req.source_data_node;
@@ -1047,6 +1129,19 @@ impl VolumeServer for VolumeGrpcService {
             .map_err(|e| Status::internal(format!("read volume file status failed, {}", e)))?
             .into_inner();
 
+        // Source is reachable and holds the volume: only now is it safe to drop
+        // an existing local replica before overwriting its files.
+        if had_existing_volume {
+            let mut store = self.state.store.write().unwrap();
+            // keep remote data: the inbound copy carries a .vif that may point
+            // at the same cloud-tier object the existing volume references.
+            store.delete_volume(vid, false, true).map_err(|e| {
+                Status::internal(format!("failed to delete existing volume {}: {}", vid, e))
+            })?;
+            drop(store);
+            self.state.volume_state_notify.notify_one();
+        }
+
         let requested_disk_type = if !req.disk_type.is_empty() {
             DiskType::from_string(&req.disk_type)
         } else {
@@ -1078,9 +1173,12 @@ impl VolumeServer for VolumeGrpcService {
         let idx_base_name =
             crate::storage::volume::volume_file_name(&idx_base, &vol_info.collection, vid);
 
-        // Write a .note file to indicate copy in progress
+        // Write a .note file to indicate copy in progress. A leftover note
+        // fails the volume load on restart, so a write failure must abort.
         let note_path = format!("{}.note", data_base_name);
-        let _ = std::fs::write(&note_path, format!("copying from {}", source));
+        std::fs::write(&note_path, format!("copying from {}", source)).map_err(|e| {
+            Status::internal(format!("write .note for volume {}: {}", vid, e))
+        })?;
 
         let has_remote_dat = vol_info
             .volume_info
@@ -1159,7 +1257,7 @@ impl VolumeServer for VolumeGrpcService {
                     .await
                     .map_err(|e| Status::internal(e))?;
                     if dat_modified_ts_ns > 0 {
-                        set_file_mtime(&dat_path, dat_modified_ts_ns);
+                        let _ = set_file_mtime(&dat_path, dat_modified_ts_ns);
                     }
                 }
 
@@ -1184,7 +1282,7 @@ impl VolumeServer for VolumeGrpcService {
                 .await
                 .map_err(|e| Status::internal(e))?;
                 if idx_modified_ts_ns > 0 {
-                    set_file_mtime(&idx_path, idx_modified_ts_ns);
+                    let _ = set_file_mtime(&idx_path, idx_modified_ts_ns);
                 }
 
                 // Copy .vif file (ignore if not found on source)
@@ -1208,11 +1306,19 @@ impl VolumeServer for VolumeGrpcService {
                 .await
                 .map_err(|e| Status::internal(e))?;
                 if vif_modified_ts_ns > 0 {
-                    set_file_mtime(&vif_path, vif_modified_ts_ns);
+                    let _ = set_file_mtime(&vif_path, vif_modified_ts_ns);
                 }
 
-                // Remove the .note file
-                let _ = std::fs::remove_file(&note_path);
+                // Remove the .note file. A leftover note fails the load on the
+                // next restart, so a removal failure must fail the copy.
+                if let Err(e) = std::fs::remove_file(&note_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(Status::internal(format!(
+                            "remove .note for volume {}: {}",
+                            vid, e
+                        )));
+                    }
+                }
 
                 // Verify file sizes
                 if !has_remote_dat {
@@ -1466,9 +1572,11 @@ impl VolumeServer for VolumeGrpcService {
                             // EcVolume holds fds on the same inodes, so overwriting
                             // corrupts live readers.
                             if store.has_ec_volume(VolumeId(info.volume_id)) {
+                                let mounted_disks =
+                                    store.find_ec_volume_disk_ids(VolumeId(info.volume_id));
                                 resp_error = Some(format!(
-                                    "ec volume {} is mounted; unmount before ReceiveFile",
-                                    info.volume_id
+                                    "ec volume {} is mounted on disk_ids:{:?}; unmount before ReceiveFile",
+                                    info.volume_id, mounted_disks
                                 ));
                                 break;
                             }
@@ -2086,6 +2194,12 @@ impl VolumeServer for VolumeGrpcService {
                 ec_shard_config: Some(crate::storage::volume::VifEcShardConfig {
                     data_shards: data_shards,
                     parity_shards: parity_shards,
+                    // This run's identity; the read path rejects a shard from a
+                    // different encode run.
+                    encode_ts_ns: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as i64,
                 }),
                 ..Default::default()
             };
@@ -2542,15 +2656,78 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::VolumeEcShardsDeleteRequest>,
     ) -> Result<Response<volume_server_pb::VolumeEcShardsDeleteResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
+
+        if req.full_teardown {
+            if req.encode_ts_ns == 0 {
+                // Blanket teardown (shell pre-encode cleanup / pre-upgrade caller): evict
+                // the volume and wipe every EC artifact for it on every disk, not just the
+                // listed shards, so a remote node retains no stale generation a fresh copy
+                // collides with. Echo the acknowledgement so the caller can tell a
+                // pre-upgrade server apart.
+                {
+                    let mut store = self.state.store.write().unwrap();
+                    let _ = store.remove_ec_volume(vid);
+                    for loc in &store.locations {
+                        loc.remove_ec_volume_files_full_teardown(&req.collection, vid)
+                            .map_err(|e| {
+                                Status::internal(format!(
+                                    "full teardown of ec volume {}: {}",
+                                    req.volume_id, e
+                                ))
+                            })?;
+                    }
+                }
+            } else {
+                // Generation-fenced teardown (stale-worker pre-distribute cleanup): wipe
+                // only a disk whose .vif generation is strictly OLDER than the request;
+                // preserve same-or-newer, generation 0 (recovered/pre-upgrade live volume),
+                // and an unreadable .vif, so a stale run never wipes a newer run's live
+                // shards. Unload and remove only the strictly-older disks, never node-wide.
+                let mut store = self.state.store.write().unwrap();
+                for disk_id in 0..store.locations.len() {
+                    let disk_gen = store.locations[disk_id].ec_generation_ts_ns(&req.collection, vid);
+                    let older = matches!(disk_gen, Some(g) if g > 0 && g < req.encode_ts_ns);
+                    if !older {
+                        tracing::info!(
+                            volume_id = vid.0,
+                            disk_id,
+                            ?disk_gen,
+                            req = req.encode_ts_ns,
+                            "ec full teardown preserved: generation not older than request"
+                        );
+                        continue;
+                    }
+                    store.locations[disk_id].remove_ec_volume(vid);
+                    store.locations[disk_id]
+                        .remove_ec_volume_files_full_teardown(&req.collection, vid)
+                        .map_err(|e| {
+                            Status::internal(format!(
+                                "fenced teardown of ec volume {}: {}",
+                                req.volume_id, e
+                            ))
+                        })?;
+                }
+            }
+            self.state.volume_state_notify.notify_one();
+            return Ok(Response::new(
+                volume_server_pb::VolumeEcShardsDeleteResponse {
+                    full_teardown_done: true,
+                },
+            ));
+        }
+
         let mut store = self.state.store.write().unwrap();
         store.delete_ec_shards(vid, &req.collection, &req.shard_ids);
         drop(store);
         self.state.volume_state_notify.notify_one();
         Ok(Response::new(
-            volume_server_pb::VolumeEcShardsDeleteResponse {},
+            volume_server_pb::VolumeEcShardsDeleteResponse {
+                full_teardown_done: false,
+            },
         ))
     }
 
@@ -2566,7 +2743,7 @@ impl VolumeServer for VolumeGrpcService {
         let mut store = self.state.store.write().unwrap();
         for &shard_id in &req.shard_ids {
             store
-                .mount_ec_shard(vid, &req.collection, shard_id)
+                .mount_ec_shard(vid, &req.collection, shard_id, &req.source_disk_type)
                 .map_err(|e| {
                     Status::internal(format!("mount {}.{}: {}", req.volume_id, shard_id, e))
                 })?;
@@ -2590,9 +2767,11 @@ impl VolumeServer for VolumeGrpcService {
         // Matches Go: for _, shardId := range req.ShardIds { err = vs.store.UnmountEcShards(...) }
         let mut store = self.state.store.write().unwrap();
         for &shard_id in &req.shard_ids {
-            store.unmount_ec_shard(vid, shard_id).map_err(|e| {
-                Status::internal(format!("unmount {}.{}: {}", req.volume_id, shard_id, e))
-            })?;
+            store
+                .unmount_ec_shard(vid, shard_id, req.encode_ts_ns)
+                .map_err(|e| {
+                    Status::internal(format!("unmount {}.{}: {}", req.volume_id, shard_id, e))
+                })?;
         }
         drop(store);
         self.state.volume_state_notify.notify_one();
@@ -2624,6 +2803,21 @@ impl VolumeServer for VolumeGrpcService {
                 ))
             })?;
 
+        // Reject a shard whose identity doesn't match the caller's index; the caller
+        // then recovers from parity. Lenient only when the caller has no identity
+        // (pre-upgrade reader): a known caller must not accept an unstamped holder,
+        // which would serve a stale shard from a different encode run.
+        if req.encode_ts_ns != 0 && req.encode_ts_ns != ec_vol.encode_ts_ns {
+            return Err(Status::failed_precondition(format!(
+                "ec shard {}.{} belongs to a different encode run",
+                req.volume_id, req.shard_id
+            )));
+        }
+
+        // Identity of the shard actually served, echoed on every response chunk so
+        // the client can reject a different encode run even from a pre-upgrade server.
+        let served_encode_ts_ns = ec_vol.encode_ts_ns;
+
         // Check if the requested needle is deleted (via .ecx index, matching Go)
         if req.file_key > 0 {
             let needle_id = NeedleId(req.file_key);
@@ -2634,6 +2828,7 @@ impl VolumeServer for VolumeGrpcService {
                 if size.is_deleted() {
                     let results = vec![Ok(volume_server_pb::VolumeEcShardReadResponse {
                         is_deleted: true,
+                        encode_ts_ns: served_encode_ts_ns,
                         ..Default::default()
                     })];
                     return Ok(Response::new(Box::pin(tokio_stream::iter(results))));
@@ -2682,6 +2877,7 @@ impl VolumeServer for VolumeGrpcService {
             results.push(Ok(volume_server_pb::VolumeEcShardReadResponse {
                 data: buf,
                 is_deleted: false,
+                encode_ts_ns: served_encode_ts_ns,
             }));
             if n < chunk_size {
                 break; // short read means EOF
@@ -2950,6 +3146,15 @@ impl VolumeServer for VolumeGrpcService {
             dat_path
         };
 
+        // Store the source .dat mtime, not the upload time, so a reload computes
+        // TTL from real data age (matches Go VolumeTierMoveDatToRemote).
+        let dat_modified_secs = std::fs::metadata(&dat_path)
+            .and_then(|m| m.modified())
+            .map_err(|e| Status::internal(format!("stat data file {}: {}", dat_path, e)))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         // Look up the S3 tier backend
         let backend = {
             let registry = self.state.s3_tier_registry.read().unwrap();
@@ -3002,18 +3207,13 @@ impl VolumeServer for VolumeGrpcService {
                 {
                     let mut store = state.store.write().unwrap();
                     if let Some((_, vol)) = store.find_volume_mut(vid) {
-                        let now_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
                         vol.volume_info.files.push(volume_server_pb::RemoteFile {
                             backend_type: backend_type.clone(),
                             backend_id: backend_id.clone(),
                             key,
                             offset: 0,
                             file_size: size,
-                            modified_time: now_unix,
+                            modified_time: dat_modified_secs,
                             extension: ".dat".to_string(),
                         });
                         vol.refresh_remote_write_mode();
@@ -3064,7 +3264,7 @@ impl VolumeServer for VolumeGrpcService {
         let vid = VolumeId(req.volume_id);
 
         // Validate volume and get remote storage info
-        let (dat_path, storage_name, storage_key) = {
+        let (dat_path, storage_name, storage_key, remote_modified_secs) = {
             let store = self.state.store.read().unwrap();
             let (_, vol) = store
                 .find_volume(vid)
@@ -3094,7 +3294,14 @@ impl VolumeServer for VolumeGrpcService {
                 )));
             }
 
-            (dat_path, storage_name, storage_key)
+            let remote_modified_secs = vol
+                .volume_info
+                .files
+                .first()
+                .map(|f| f.modified_time)
+                .unwrap_or(0);
+
+            (dat_path, storage_name, storage_key, remote_modified_secs)
         };
 
         // Look up the S3 tier backend
@@ -3141,6 +3348,15 @@ impl VolumeServer for VolumeGrpcService {
                             storage_name_clone, dat_path, e
                         ))
                     })?;
+
+                // Restore the .dat mtime so a reload computes TTL from real data age,
+                // not download time (matches Go VolumeTierMoveDatFromRemote).
+                if remote_modified_secs > 0 {
+                    let modified_ts_ns = (remote_modified_secs as i64).saturating_mul(1_000_000_000);
+                    if let Err(e) = set_file_mtime(&dat_path, modified_ts_ns) {
+                        tracing::warn!("volume {} restore data file {} modified time: {}", vid, dat_path, e);
+                    }
+                }
 
                 if !keep_remote {
                     // Delete remote file
@@ -3240,8 +3456,9 @@ impl VolumeServer for VolumeGrpcService {
 
     async fn volume_server_leave(
         &self,
-        _request: Request<volume_server_pb::VolumeServerLeaveRequest>,
+        request: Request<volume_server_pb::VolumeServerLeaveRequest>,
     ) -> Result<Response<volume_server_pb::VolumeServerLeaveResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         *self.state.is_stopping.write().unwrap() = true;
         self.state.is_heartbeating.store(false, Ordering::Relaxed);
         // Wake heartbeat loop to send deregistration.
@@ -3272,6 +3489,25 @@ impl VolumeServer for VolumeGrpcService {
             .remote_conf
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("remote storage configuration is required"))?;
+
+        // Reject SSRF-prone endpoints unless the operator opted out. Every
+        // S3-compatible backend (s3, wasabi, backblaze, ...) dials a
+        // caller-supplied endpoint URL directly via make_remote_storage_client,
+        // so validate whichever endpoint applies. An empty endpoint means the
+        // provider default (e.g. real AWS S3) and cannot target an internal
+        // host, so skip it. Extends the Go volume server's validateRemoteEndpoint
+        // gate, which only covered type "s3".
+        if !self.state.allow_untrusted_remote_endpoints {
+            if let Some(endpoint) = crate::remote_storage::s3_compatible_endpoint(remote_conf) {
+                if !endpoint.trim().is_empty() {
+                    crate::remote_storage::validate_remote_endpoint(endpoint)
+                        .await
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("reject remote endpoint: {}", e))
+                        })?;
+                }
+            }
+        }
 
         // Create remote storage client
         let client =
@@ -3391,6 +3627,7 @@ impl VolumeServer for VolumeGrpcService {
         &self,
         request: Request<volume_server_pb::ScrubVolumeRequest>,
     ) -> Result<Response<volume_server_pb::ScrubVolumeResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
         let req = request.into_inner();
 
         // Validate mode
@@ -3850,6 +4087,24 @@ impl VolumeServer for VolumeGrpcService {
 
         let start = now_ns();
 
+        // Empty target is a self-liveness probe and stays unauthenticated.
+        // Otherwise gate the dial on cluster membership: volume servers only
+        // know masters, so any other target type is refused. Mirrors Go's
+        // volume_grpc_admin.go Ping admission check. tonic forbids returning
+        // a body alongside an error, so we surface the InvalidArgument status
+        // alone — behaviour-identical to Go's status.Errorf return.
+        if !req.target.is_empty()
+            && !self
+                .state
+                .is_known_ping_target(&req.target, &req.target_type)
+                .await
+        {
+            return Err(Status::invalid_argument(format!(
+                "unknown ping target {} of type {}",
+                req.target, req.target_type
+            )));
+        }
+
         // Route ping based on target type (matches Go's volume_grpc_admin.go Ping)
         let remote_time_ns = if req.target_type == "volumeServer" {
             match ping_volume_server_target(&req.target, self.state.outgoing_grpc_tls.as_ref())
@@ -3985,42 +4240,24 @@ async fn ping_filer_target(
     Ok(resp.into_inner().start_time_ns)
 }
 
-/// Parse a SeaweedFS server address ("ip:port.grpcPort" or "ip:port") into a gRPC address.
-fn parse_grpc_address(source: &str) -> Result<String, String> {
-    if let Some(colon_idx) = source.rfind(':') {
-        let port_part = &source[colon_idx + 1..];
-        if let Some(dot_idx) = port_part.rfind('.') {
-            // Format: "ip:port.grpcPort"
-            let host = &source[..colon_idx];
-            let grpc_port = &port_part[dot_idx + 1..];
-            grpc_port
-                .parse::<u16>()
-                .map_err(|e| format!("invalid grpc port: {}", e))?;
-            return Ok(format!("{}:{}", host, grpc_port));
-        }
-        // Format: "ip:port" → grpc = port + 10000
-        let port: u16 = port_part
-            .parse()
-            .map_err(|e| format!("invalid port: {}", e))?;
-        let grpc_port = port as u32 + 10000;
-        let host = &source[..colon_idx];
-        return Ok(format!("{}:{}", host, grpc_port));
-    }
-    Err(format!("cannot parse address: {}", source))
-}
+// parse_grpc_address moved to super::grpc_client::parse_grpc_address
+// for sharing with the distributed-EC-read path in server/store_ec.rs.
+// In-file callers below still write `parse_grpc_address(...)`; this
+// `use` makes them resolve to the new home without churning every
+// call site.
+use super::grpc_client::parse_grpc_address;
 
 /// Set the modification time of a file from nanoseconds since Unix epoch.
-fn set_file_mtime(path: &str, modified_ts_ns: i64) {
+fn set_file_mtime(path: &str, modified_ts_ns: i64) -> std::io::Result<()> {
     use std::time::{Duration, SystemTime};
     let ts = if modified_ts_ns >= 0 {
         SystemTime::UNIX_EPOCH + Duration::from_nanos(modified_ts_ns as u64)
     } else {
         SystemTime::UNIX_EPOCH
     };
-    if let Ok(file) = std::fs::File::open(path) {
-        let ft = std::fs::FileTimes::new().set_accessed(ts).set_modified(ts);
-        let _ = file.set_times(ft);
-    }
+    let file = std::fs::File::open(path)?;
+    let ft = std::fs::FileTimes::new().set_accessed(ts).set_modified(ts);
+    file.set_times(ft)
 }
 
 /// Copy a file from a remote volume server via CopyFile streaming RPC.
@@ -4510,8 +4747,11 @@ mod tests {
                 crate::remote_storage::s3_tier::S3TierRegistry::new(),
             ),
             read_mode: crate::config::ReadMode::Local,
+            allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
             master_urls: Vec::new(),
+            seed_master_set: std::collections::HashSet::new(),
+            current_master_url: tokio::sync::RwLock::new(String::new()),
             self_url: String::new(),
             http_client: reqwest::Client::new(),
             outgoing_http_scheme: "http".to_string(),
@@ -4612,8 +4852,11 @@ mod tests {
                 crate::remote_storage::s3_tier::S3TierRegistry::new(),
             ),
             read_mode: crate::config::ReadMode::Local,
+            allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
             master_urls: Vec::new(),
+            seed_master_set: std::collections::HashSet::new(),
+            current_master_url: tokio::sync::RwLock::new(String::new()),
             self_url: String::new(),
             http_client: reqwest::Client::new(),
             outgoing_http_scheme: "http".to_string(),
@@ -4660,6 +4903,207 @@ mod tests {
             .write()
             .unwrap()
             .remove("s3.incr_copy_test");
+    }
+
+    /// Build a bare-bones service with no on-disk store but a configurable
+    /// seed master set, for Ping admission tests. Matches the structure of
+    /// `make_local_service_with_volume` minus the volume bits.
+    fn make_service_with_seed_masters(seeds: &[&str]) -> (VolumeGrpcService, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        let mut store = Store::new(NeedleMapKind::InMemory);
+        store
+            .add_location(
+                dir,
+                dir,
+                10,
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let master_urls: Vec<String> = seeds.iter().map(|s| (*s).to_string()).collect();
+        let seed_master_set =
+            crate::server::volume_server::VolumeServerState::build_seed_master_set(&master_urls);
+
+        let state = Arc::new(VolumeServerState {
+            store: RwLock::new(store),
+            guard: RwLock::new(Guard::new(
+                &[],
+                SigningKey(vec![]),
+                0,
+                SigningKey(vec![]),
+                0,
+            )),
+            is_stopping: RwLock::new(false),
+            maintenance: std::sync::atomic::AtomicBool::new(false),
+            state_version: std::sync::atomic::AtomicU32::new(0),
+            concurrent_upload_limit: 0,
+            concurrent_download_limit: 0,
+            inflight_upload_data_timeout: std::time::Duration::from_secs(60),
+            inflight_download_data_timeout: std::time::Duration::from_secs(60),
+            inflight_upload_bytes: std::sync::atomic::AtomicI64::new(0),
+            inflight_download_bytes: std::sync::atomic::AtomicI64::new(0),
+            upload_notify: tokio::sync::Notify::new(),
+            download_notify: tokio::sync::Notify::new(),
+            data_center: String::new(),
+            rack: String::new(),
+            file_size_limit_bytes: 0,
+            maintenance_byte_per_second: 0,
+            is_heartbeating: std::sync::atomic::AtomicBool::new(true),
+            has_master: false,
+            pre_stop_seconds: 0,
+            volume_state_notify: tokio::sync::Notify::new(),
+            write_queue: std::sync::OnceLock::new(),
+            s3_tier_registry: std::sync::RwLock::new(
+                crate::remote_storage::s3_tier::S3TierRegistry::new(),
+            ),
+            read_mode: crate::config::ReadMode::Local,
+            allow_untrusted_remote_endpoints: false,
+            master_url: master_urls.first().cloned().unwrap_or_default(),
+            master_urls,
+            seed_master_set,
+            current_master_url: tokio::sync::RwLock::new(String::new()),
+            self_url: String::new(),
+            http_client: reqwest::Client::new(),
+            outgoing_http_scheme: "http".to_string(),
+            outgoing_grpc_tls: None,
+            metrics_runtime: std::sync::RwLock::new(
+                crate::server::volume_server::RuntimeMetricsConfig::default(),
+            ),
+            metrics_notify: tokio::sync::Notify::new(),
+            fix_jpg_orientation: false,
+            has_slow_read: false,
+            read_buffer_size_bytes: 1024 * 1024,
+            security_file: String::new(),
+            cli_white_list: vec![],
+            state_file_path: String::new(),
+        });
+
+        (VolumeGrpcService { state }, tmp)
+    }
+
+    #[tokio::test]
+    async fn test_ping_empty_target_is_self_probe() {
+        // Empty target stays unauthenticated and returns Ok with timing fields
+        // populated — it is the local liveness probe path.
+        let (service, _tmp) = make_service_with_seed_masters(&[]);
+        let response = service
+            .ping(Request::new(volume_server_pb::PingRequest {
+                target: String::new(),
+                target_type: String::new(),
+            }))
+            .await
+            .expect("empty target ping must succeed");
+        let inner = response.into_inner();
+        assert!(inner.start_time_ns > 0);
+        assert!(inner.stop_time_ns >= inner.start_time_ns);
+    }
+
+    #[tokio::test]
+    async fn test_ping_seed_master_target_passes_admission() {
+        // A target that matches a configured seed master clears admission.
+        // The dial itself may or may not succeed depending on what's listening
+        // on the loopback; either way, the response must not be the
+        // InvalidArgument the gate would surface.
+        let (service, _tmp) = make_service_with_seed_masters(&["localhost:9333"]);
+        let result = service
+            .ping(Request::new(volume_server_pb::PingRequest {
+                target: "localhost:9333".to_string(),
+                target_type: "master".to_string(),
+            }))
+            .await;
+        if let Err(err) = result {
+            assert_ne!(err.code(), tonic::Code::InvalidArgument, "got {err:?}");
+            assert!(
+                !err.message().contains("unknown ping target"),
+                "admission gate should have allowed this target: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ping_unknown_master_target_rejected() {
+        // A master-type target not in the seed list and not the current
+        // master is refused with InvalidArgument.
+        let (service, _tmp) = make_service_with_seed_masters(&["localhost:9333"]);
+        let err = service
+            .ping(Request::new(volume_server_pb::PingRequest {
+                target: "localhost:9999".to_string(),
+                target_type: "master".to_string(),
+            }))
+            .await
+            .expect_err("unknown master target must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "unknown ping target localhost:9999 of type master"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_volume_server_target_always_rejected() {
+        // Volume servers do not maintain a peer-volume list, so volumeServer
+        // pings are refused regardless of address.
+        let (service, _tmp) = make_service_with_seed_masters(&["localhost:9333"]);
+        let err = service
+            .ping(Request::new(volume_server_pb::PingRequest {
+                target: "localhost:8080".to_string(),
+                target_type: "volumeServer".to_string(),
+            }))
+            .await
+            .expect_err("volumeServer target must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "unknown ping target localhost:8080 of type volumeServer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_current_master_target_passes_admission() {
+        // A target that matches the current (post-leader-change) master also
+        // clears admission, even if it is not in the seed list. Pick a port
+        // that is extremely unlikely to be live so the test does not flake on
+        // a developer machine that happens to be running a real master.
+        let (service, _tmp) = make_service_with_seed_masters(&["localhost:9333"]);
+        // Simulate the heartbeat goroutine having moved to a new leader.
+        *service.state.current_master_url.write().await = "127.0.0.1:1".to_string();
+
+        let result = service
+            .ping(Request::new(volume_server_pb::PingRequest {
+                target: "127.0.0.1:1".to_string(),
+                target_type: "master".to_string(),
+            }))
+            .await;
+        if let Err(err) = result {
+            assert_ne!(err.code(), tonic::Code::InvalidArgument, "got {err:?}");
+            assert!(
+                !err.message().contains("unknown ping target"),
+                "leader-change master should be admitted: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ping_target_with_grpc_port_suffix_is_normalised() {
+        // Seed masters in pb.ServerAddress form (`host:port.grpcPort`) must
+        // match a Ping target sent in plain `host:port` form, since the gate
+        // normalises both sides through to_http_address.
+        let (service, _tmp) = make_service_with_seed_masters(&["localhost:9333.19333"]);
+        let result = service
+            .ping(Request::new(volume_server_pb::PingRequest {
+                target: "localhost:9333".to_string(),
+                target_type: "master".to_string(),
+            }))
+            .await;
+        if let Err(err) = result {
+            assert_ne!(err.code(), tonic::Code::InvalidArgument, "got {err:?}");
+        }
     }
 
     #[tokio::test]

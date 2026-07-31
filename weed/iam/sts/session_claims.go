@@ -1,12 +1,28 @@
 package sts
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
+
+// ComputeParentUser returns a stable per-identity hash derived from the OIDC
+// (sub, iss) tuple. Only the (sub, iss) pair is guaranteed stable across token
+// refreshes per OpenID Connect Core 1.0 §5.7, so any per-user state (audit
+// logs, quotas) must key off this value rather than the access-key or session
+// id. The hash is base64-rawurl-encoded SHA-256 over "openid:<sub>:<iss>" so
+// it stays filesystem-safe and bounded in length for storage in audit paths.
+func ComputeParentUser(sub, iss string) string {
+	if sub == "" || iss == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte("openid:" + sub + ":" + iss))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
 
 // defaultCredentialGenerator is a reusable instance for generating temporary credentials
 // Reusing a single instance across all calls to ToSessionInfo() reduces allocation overhead
@@ -45,6 +61,12 @@ type STSSessionClaims struct {
 	// Session metadata
 	AssumedAt   time.Time `json:"assumed_at"`        // when role was assumed
 	MaxDuration int64     `json:"max_dur,omitempty"` // maximum session duration in seconds
+
+	// ParentUser is a stable hash of (sub, iss) for tokens minted from an OIDC
+	// identity. It survives token rotation since only the (sub, iss) tuple is
+	// guaranteed stable per OpenID Connect Core 1.0. Empty for non-federated
+	// session types.
+	ParentUser string `json:"puid,omitempty"`
 }
 
 // NewSTSSessionClaims creates new STS session claims with all required information
@@ -57,6 +79,10 @@ func NewSTSSessionClaims(sessionId, issuer string, expiresAt time.Time) *STSSess
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			NotBefore: jwt.NewNumericDate(now),
+			// jti = sessionId. The session id is already a unique random
+			// identifier, so reusing it as the JWT id avoids a second secret
+			// while still giving the revocation layer a stable lookup key.
+			ID: sessionId,
 		},
 		SessionId: sessionId,
 		TokenType: TokenTypeSession,
@@ -96,6 +122,7 @@ func (c *STSSessionClaims) ToSessionInfo() *SessionInfo {
 		ExternalUserId:   c.ExternalUserId,
 		ProviderIssuer:   c.ProviderIssuer,
 		RequestContext:   c.RequestContext,
+		ParentUser:       c.ParentUser,
 		// Provide the Subject (sub) from registered claims
 		Subject:     c.Subject,
 		Credentials: credentials,
@@ -180,5 +207,12 @@ func (c *STSSessionClaims) WithMaxDuration(duration time.Duration) *STSSessionCl
 // WithSessionName sets the session name
 func (c *STSSessionClaims) WithSessionName(sessionName string) *STSSessionClaims {
 	c.SessionName = sessionName
+	return c
+}
+
+// WithParentUser sets the stable per-identity hash for the session. See
+// ComputeParentUser for the derivation rule.
+func (c *STSSessionClaims) WithParentUser(parentUser string) *STSSessionClaims {
+	c.ParentUser = parentUser
 	return c
 }

@@ -91,9 +91,20 @@ func (f *ProviderFactory) convertToOIDCConfig(configMap map[string]interface{}) 
 		return nil, fmt.Errorf(ErrIssuerRequired)
 	}
 
-	if clientID, ok := configMap[ConfigFieldClientID].(string); ok {
+	clientIDPresent := false
+	if clientID, ok := configMap[ConfigFieldClientID].(string); ok && clientID != "" {
 		config.ClientID = clientID
-	} else {
+		clientIDPresent = true
+	}
+	// Accept the AWS-compatible plural form. Either field satisfies the
+	// "at least one client id" requirement; both can be set together.
+	if rawList, ok := configMap[ConfigFieldClientIDs]; ok {
+		if list, err := f.convertToStringSlice(rawList); err == nil && len(list) > 0 {
+			config.ClientIDs = list
+			clientIDPresent = true
+		}
+	}
+	if !clientIDPresent {
 		return nil, fmt.Errorf(ErrClientIDRequired)
 	}
 
@@ -121,6 +132,22 @@ func (f *ProviderFactory) convertToOIDCConfig(configMap map[string]interface{}) 
 
 	if tlsCaCert, ok := configMap[ConfigFieldTLSCACert].(string); ok {
 		config.TLSCACert = tlsCaCert
+	}
+
+	if rawThumbprints, ok := configMap[ConfigFieldThumbprints]; ok {
+		if list, err := f.convertToStringSlice(rawThumbprints); err == nil {
+			config.Thumbprints = list
+		}
+	}
+
+	if rawAllowed, ok := configMap[ConfigFieldAllowedPrincipalTagKeys]; ok {
+		if list, err := f.convertToStringSlice(rawAllowed); err == nil {
+			config.AllowedPrincipalTagKeys = list
+		}
+	}
+
+	if policyClaim, ok := configMap[ConfigFieldPolicyClaim].(string); ok {
+		config.PolicyClaim = policyClaim
 	}
 
 	if tlsInsecureSkipVerify, ok := configMap[ConfigFieldTLSInsecureSkipVerify].(bool); ok {

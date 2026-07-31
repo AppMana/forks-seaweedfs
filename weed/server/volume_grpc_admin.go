@@ -3,8 +3,13 @@ package weed_server
 import (
 	"context"
 	"fmt"
+	"net"
 	"path/filepath"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
@@ -22,9 +27,52 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
+// checkGrpcAdminAuth verifies the gRPC caller is authorized for destructive
+// admin operations by checking the peer address against the guard's whitelist.
+//
+// IP extraction prefers a typed *net.TCPAddr where available, falling back to
+// SplitHostPort on the string form, then to the raw string. The fallback
+// chain matters because in-process/passthrough connections used in tests
+// surface as unparseable strings like "@"; with an empty whitelist the
+// allow-all branch in IsWhiteListed accepts them, with a whitelist they're
+// denied as expected.
+//
+// Failed authorization attempts are logged so an operator running with a
+// configured whitelist can spot misconfigured callers and probe attempts.
+func (vs *VolumeServer) checkGrpcAdminAuth(ctx context.Context) error {
+	if vs.guard == nil {
+		return nil
+	}
+	pr, ok := peer.FromContext(ctx)
+	if !ok {
+		// Real gRPC connections always populate peer info; if we don't know
+		// who the caller is, deny.
+		glog.V(0).Infof("gRPC admin auth failed: no peer info")
+		return status.Error(codes.PermissionDenied, "no peer info")
+	}
+	addr := pr.Addr.String()
+	var host string
+	if tcpAddr, ok := pr.Addr.(*net.TCPAddr); ok {
+		host = tcpAddr.IP.String()
+	} else if h, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
+		host = h
+	} else {
+		host = addr
+	}
+	if !vs.guard.IsWhiteListed(host) {
+		glog.V(0).Infof("gRPC admin auth failed: %s is not whitelisted (remote: %s)", host, addr)
+		return status.Errorf(codes.PermissionDenied, "not authorized: %s", host)
+	}
+	return nil
+}
+
 func (vs *VolumeServer) DeleteCollection(ctx context.Context, req *volume_server_pb.DeleteCollectionRequest) (*volume_server_pb.DeleteCollectionResponse, error) {
 
 	resp := &volume_server_pb.DeleteCollectionResponse{}
+
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
 
 	err := vs.store.DeleteCollection(req.Collection)
 
@@ -40,6 +88,10 @@ func (vs *VolumeServer) DeleteCollection(ctx context.Context, req *volume_server
 
 func (vs *VolumeServer) AllocateVolume(ctx context.Context, req *volume_server_pb.AllocateVolumeRequest) (*volume_server_pb.AllocateVolumeResponse, error) {
 	resp := &volume_server_pb.AllocateVolumeResponse{}
+
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
 
 	if err := vs.CheckMaintenanceMode(); err != nil {
 		return resp, err
@@ -72,6 +124,10 @@ func (vs *VolumeServer) VolumeMount(ctx context.Context, req *volume_server_pb.V
 
 	resp := &volume_server_pb.VolumeMountResponse{}
 
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
+
 	err := vs.store.MountVolume(needle.VolumeId(req.VolumeId))
 
 	if err != nil {
@@ -88,6 +144,10 @@ func (vs *VolumeServer) VolumeUnmount(ctx context.Context, req *volume_server_pb
 
 	resp := &volume_server_pb.VolumeUnmountResponse{}
 
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
+
 	err := vs.store.UnmountVolume(needle.VolumeId(req.VolumeId))
 
 	if err != nil {
@@ -103,16 +163,21 @@ func (vs *VolumeServer) VolumeUnmount(ctx context.Context, req *volume_server_pb
 func (vs *VolumeServer) VolumeDelete(ctx context.Context, req *volume_server_pb.VolumeDeleteRequest) (*volume_server_pb.VolumeDeleteResponse, error) {
 	resp := &volume_server_pb.VolumeDeleteResponse{}
 
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
+
 	if err := vs.CheckMaintenanceMode(); err != nil {
 		return resp, err
 	}
 
-	err := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), req.OnlyEmpty)
+	err := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), req.OnlyEmpty, req.KeepRemoteData)
 
 	if err != nil {
 		glog.Errorf("volume delete %v: %v", req, err)
 	} else {
-		glog.V(2).Infof("volume delete %v", req)
+		// V(0) so destructive RPCs are always traceable.
+		glog.Infof("volume delete %v", req)
 	}
 
 	return resp, err
@@ -121,6 +186,10 @@ func (vs *VolumeServer) VolumeDelete(ctx context.Context, req *volume_server_pb.
 
 func (vs *VolumeServer) VolumeConfigure(ctx context.Context, req *volume_server_pb.VolumeConfigureRequest) (*volume_server_pb.VolumeConfigureResponse, error) {
 	resp := &volume_server_pb.VolumeConfigureResponse{}
+
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
 
 	if err := vs.CheckMaintenanceMode(); err != nil {
 		return resp, err
@@ -211,7 +280,7 @@ func (vs *VolumeServer) makeVolumeWritable(ctx context.Context, v *storage.Volum
 }
 
 func (vs *VolumeServer) notifyMasterVolumeReadonly(ctx context.Context, v *storage.Volume, isReadOnly bool) error {
-	if grpcErr := pb.WithMasterClient(false, vs.GetMaster(ctx), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+	if grpcErr := pb.WithMasterClient(context.Background(), false, vs.GetMaster(ctx), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 		_, err := client.VolumeMarkReadonly(context.Background(), &master_pb.VolumeMarkReadonlyRequest{
 			Ip:               vs.store.Ip,
 			Port:             uint32(vs.store.Port),
@@ -236,6 +305,10 @@ func (vs *VolumeServer) notifyMasterVolumeReadonly(ctx context.Context, v *stora
 func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_server_pb.VolumeMarkReadonlyRequest) (*volume_server_pb.VolumeMarkReadonlyResponse, error) {
 	resp := &volume_server_pb.VolumeMarkReadonlyResponse{}
 
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
+
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {
 		return resp, fmt.Errorf("volume %d not found", req.VolumeId)
@@ -250,6 +323,10 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 
 func (vs *VolumeServer) VolumeMarkWritable(ctx context.Context, req *volume_server_pb.VolumeMarkWritableRequest) (*volume_server_pb.VolumeMarkWritableResponse, error) {
 	resp := &volume_server_pb.VolumeMarkWritableResponse{}
+
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
 
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {
@@ -308,6 +385,10 @@ func (vs *VolumeServer) VolumeServerLeave(ctx context.Context, req *volume_serve
 
 	resp := &volume_server_pb.VolumeServerLeaveResponse{}
 
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
+
 	vs.StopHeartbeat()
 
 	return resp, nil
@@ -317,6 +398,10 @@ func (vs *VolumeServer) VolumeServerLeave(ctx context.Context, req *volume_serve
 func (vs *VolumeServer) VolumeNeedleStatus(ctx context.Context, req *volume_server_pb.VolumeNeedleStatusRequest) (*volume_server_pb.VolumeNeedleStatusResponse, error) {
 
 	resp := &volume_server_pb.VolumeNeedleStatusResponse{}
+
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
 
 	volumeId := needle.VolumeId(req.VolumeId)
 
@@ -355,9 +440,36 @@ func (vs *VolumeServer) VolumeNeedleStatus(ctx context.Context, req *volume_serv
 
 }
 
+// isKnownPingTarget reports whether target is a master this volume server
+// already knows about. Volume servers do not maintain a peer-volume or
+// peer-filer list, so Ping is scoped to the masters they heartbeat with.
+// The current-master read is taken under a lock to avoid racing with the
+// heartbeat goroutine that rewrites it on leader changes, and the seed
+// list is consulted via a pre-built set so the check stays O(1).
+func (vs *VolumeServer) isKnownPingTarget(target string, targetType string) bool {
+	if targetType != cluster.MasterType {
+		return false
+	}
+	addr := pb.ServerAddress(target)
+	key := addr.ToHttpAddress()
+	if key == "" {
+		return false
+	}
+	if current := vs.getCurrentMaster(); current != "" && current.ToHttpAddress() == key {
+		return true
+	}
+	_, ok := vs.seedMasterSet[key]
+	return ok
+}
+
 func (vs *VolumeServer) Ping(ctx context.Context, req *volume_server_pb.PingRequest) (resp *volume_server_pb.PingResponse, pingErr error) {
 	resp = &volume_server_pb.PingResponse{
 		StartTimeNs: time.Now().UnixNano(),
+	}
+	// Empty target is a self-liveness probe and stays unauthenticated.
+	if req.Target != "" && !vs.isKnownPingTarget(req.Target, req.TargetType) {
+		resp.StopTimeNs = time.Now().UnixNano()
+		return resp, status.Errorf(codes.InvalidArgument, "unknown ping target %s of type %s", req.Target, req.TargetType)
 	}
 	if req.TargetType == cluster.FilerType {
 		pingErr = pb.WithFilerClient(false, 0, pb.ServerAddress(req.Target), vs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
@@ -378,7 +490,7 @@ func (vs *VolumeServer) Ping(ctx context.Context, req *volume_server_pb.PingRequ
 		})
 	}
 	if req.TargetType == cluster.MasterType {
-		pingErr = pb.WithMasterClient(false, pb.ServerAddress(req.Target), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+		pingErr = pb.WithMasterClient(context.Background(), false, pb.ServerAddress(req.Target), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 			pingResp, err := client.Ping(ctx, &master_pb.PingRequest{})
 			if pingResp != nil {
 				resp.RemoteTimeNs = pingResp.StartTimeNs

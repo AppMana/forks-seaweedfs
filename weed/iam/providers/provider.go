@@ -49,6 +49,22 @@ type ExternalIdentity struct {
 	// Provider is the name of the identity provider
 	Provider string `json:"provider"`
 
+	// Issuer is the OIDC `iss` claim (or equivalent) from the source token.
+	// Stable per (provider, identity) and used together with UserID to derive
+	// a stable parent-user hash that survives token rotation.
+	Issuer string `json:"issuer,omitempty"`
+
+	// PrincipalTags are key/value pairs extracted from the AWS principal-tags
+	// namespace claim (`https://aws.amazon.com/tags/principal_tags`). They are
+	// surfaced as `aws:PrincipalTag/<key>` in the policy request context
+	// (subject to per-provider allowlist filtering at the STS layer).
+	PrincipalTags map[string]string `json:"principalTags,omitempty"`
+
+	// ClaimPolicies are policy names pulled from the provider-configured
+	// PolicyClaim. Empty when the provider isn't running in claim-based
+	// policy mode or the claim was absent.
+	ClaimPolicies []string `json:"claimPolicies,omitempty"`
+
 	// TokenExpiration is the expiration time of the source identity token
 	// This is used to limit session duration to not exceed the token's exp claim
 	TokenExpiration *time.Time `json:"tokenExpiration,omitempty"`

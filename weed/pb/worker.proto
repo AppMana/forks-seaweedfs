@@ -112,7 +112,51 @@ message TaskParams {
     BalanceTaskParams balance_params = 11;
     ReplicationTaskParams replication_params = 12;
     EcBalanceTaskParams ec_balance_params = 13;
+    S3LifecycleParams s3_lifecycle_params = 14;
   }
+}
+
+// S3LifecycleParams routes a worker task to one of the three lifecycle
+// subroutines. READ is the per-shard meta-log reader (one task per shard_id
+// at a time); BOOTSTRAP walks a single bucket; DRAIN drains pending
+// exceptions for a single rule.
+message S3LifecycleParams {
+  // Zero is an UNSPECIFIED sentinel: a TaskParams payload whose subtype is
+  // unset must not silently route into a READ task. Callers always populate
+  // one of READ / BOOTSTRAP / DRAIN.
+  enum Subtype {
+    SUBTYPE_UNSPECIFIED = 0;
+    READ                = 1;
+    BOOTSTRAP           = 2;
+    DRAIN               = 3;
+  }
+  Subtype subtype = 1;
+
+  // Required for BOOTSTRAP and DRAIN; ignored for READ. rule_hash is
+  // optional for BOOTSTRAP (omitting walks all rules for the bucket).
+  string bucket    = 2;
+  bytes  rule_hash = 3; // 8 bytes when present
+
+  bool   force                 = 4; // operator override; bypasses scheduling guards
+  int64  batch_time_budget_ns  = 5; // 0 = use default
+  int32  batch_event_budget    = 6; // 0 = use default
+
+  ContinuationHint continuation = 7; // resume hint for kill-resume tasks
+
+  // READ only: which (bucket, key-prefix-hash) shard this task processes.
+  // Range 0..S3LifecycleShardCount-1 (16 shards). Required for READ; ignored
+  // for BOOTSTRAP and DRAIN. Workers receive one READ task per owned shard;
+  // shards distribute across workers via the existing scheduler.
+  int32 shard_id = 8;
+}
+
+// ContinuationHint lets a long-running BOOTSTRAP or READ task hand its
+// resume point to the next scheduled invocation without going through
+// durable state. The durable state files are still authoritative; this
+// is just a scheduling hint to skip an unnecessary fresh start.
+message ContinuationHint {
+  string last_scanned_path = 1; // BOOTSTRAP only
+  int64  last_position_ns  = 2; // READ only (advisory)
 }
 
 // VacuumTaskParams for vacuum operations
@@ -126,12 +170,15 @@ message VacuumTaskParams {
 
 // ErasureCodingTaskParams for EC encoding operations
 message ErasureCodingTaskParams {
+  reserved 7;
   uint64 estimated_shard_size = 1;        // Estimated size per shard
   int32 data_shards = 2;                  // Number of data shards (default: 10)
   int32 parity_shards = 3;                // Number of parity shards (default: 4)
   string working_dir = 4;                 // Working directory for EC processing
   string master_client = 5;               // Master server address
   bool cleanup_source = 6;                // Whether to cleanup source volume after EC
+  string source_disk_type = 8;            // Source volume's disk type, passed to VolumeEcShardsMount so shards report under it (#9423)
+  int64 encode_ts_ns = 9;                 // admin-issued encode generation (unix nanos); fences a stale worker's shard cleanup against a newer run. 0 => unfenced (legacy/shell), falls back to a blanket teardown.
 }
 
 // TaskSource represents a unified source location for any task type
@@ -328,6 +375,7 @@ message ErasureCodingTaskConfig {
   int32 min_volume_size_mb = 3;     // Minimum volume size for EC
   string collection_filter = 4;     // Only process volumes from specific collections
   repeated string preferred_tags = 5; // Disk tags to prioritize for EC shard placement
+  string replica_placement = 6;     // EC shard replica placement (e.g. "020"); empty falls back to master default replication
 }
 
 // BalanceTaskConfig contains balance-specific configuration
@@ -367,6 +415,7 @@ message EcBalanceTaskConfig {
   string collection_filter = 3;           // Collection filter
   string disk_type = 4;                   // Disk type filter
   repeated string preferred_tags = 5;     // Preferred disk tags for placement
+  string replica_placement = 6;           // EC shard replica placement (e.g. "020"); empty falls back to master default replication
 }
 
 // ========== Task Persistence Messages ==========

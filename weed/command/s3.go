@@ -20,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/iceberg"
@@ -260,6 +261,9 @@ func (s3opt *S3Options) resolvePaths() {
 
 func (s3opt *S3Options) startS3Server() bool {
 
+	// Before the first filer dial below; gRPC caches conns and binds at dial time.
+	util.SetOutboundLocalIP(*s3opt.bindIp)
+
 	filerAddresses := pb.ServerAddresses(*s3opt.filer).ToAddresses()
 
 	filerBucketsPath := "/buckets"
@@ -406,6 +410,7 @@ func (s3opt *S3Options) startS3Server() bool {
 	}
 	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.s3"))
 	s3_pb.RegisterSeaweedS3IamCacheServer(grpcS, s3ApiServer)
+	s3_lifecycle_pb.RegisterSeaweedS3LifecycleInternalServer(grpcS, s3ApiServer)
 	reflection.Register(grpcS)
 	if grpcLocalL != nil {
 		go grpcS.Serve(grpcLocalL)

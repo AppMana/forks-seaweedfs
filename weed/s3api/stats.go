@@ -8,6 +8,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
@@ -20,6 +21,14 @@ func track(f http.HandlerFunc, action string) http.HandlerFunc {
 		bucket, _ := s3_constants.GetBucketAndObject(r)
 		w.Header().Set("Server", "SeaweedFS "+version.VERSION)
 		recorder := stats_collect.NewStatusResponseWriter(w)
+		// Attach an audit-tracking flag to the request so handlers that call
+		// PostLog directly mark it; we emit a fallback entry afterward for
+		// handlers (e.g. successful GET/HEAD object) that don't.
+		r = s3err.EnsureAuditTracking(r)
+		// Attach a mutable identity holder before authentication so the fallback
+		// entry can report the requester even though auth records it on a
+		// request copy this middleware never sees.
+		r = s3_constants.EnsureIdentityHolder(r)
 		start := time.Now()
 		f(recorder, r)
 		if recorder.Status == http.StatusForbidden {
@@ -28,6 +37,9 @@ func track(f http.HandlerFunc, action string) http.HandlerFunc {
 		stats_collect.S3RequestHistogram.WithLabelValues(action, bucket).Observe(time.Since(start).Seconds())
 		stats_collect.S3RequestCounter.WithLabelValues(action, strconv.Itoa(recorder.Status), bucket).Inc()
 		stats_collect.RecordBucketActiveTime(bucket)
+		if !s3err.AuditAlreadyLogged(r) {
+			s3err.PostLog(r, recorder.Status, s3err.ErrNone)
+		}
 	}
 }
 

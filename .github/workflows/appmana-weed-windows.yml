@@ -40,7 +40,13 @@ jobs:
           GOOS=windows GOARCH=amd64 go vet -copylocks=false -tags 5BytesOffset ./weed/command/ ./weed/mount/
       - name: Linux unit tests (regression gate for shared-file edits)
         working-directory: forks-seaweedfs
-        run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/...
+        # weed/filer and weed/pb carry fork-specific behavior that is not
+        # Windows-only but exists for the Windows/CSI path: the
+        # -readerCacheMode override threaded down to ReaderPattern
+        # (weed/filer), and the local-gRPC-socket TCP fallback that makes
+        # `weed mini` work where AF_UNIX bind fails (weed/pb). Both live in
+        # files upstream edits often, so they belong in the merge gate.
+        run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/... ./weed/filer/... ./weed/pb/...
 
   test-windows:
     runs-on: windows-2022

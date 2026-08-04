@@ -79,7 +79,7 @@ func newMultiChunkFixture(t *testing.T, numChunks, chunkSize int) (*ChunkReadAt,
 	readerAt := &ChunkReadAt{
 		chunkViews:  chunkViews,
 		fileSize:    fileSize,
-		readerCache: NewReaderCache(numChunks+4, alwaysMissChunkCache{}, lookupFn),
+		readerCache: NewReaderCache(numChunks+4, alwaysMissChunkCache{}, lookupFn, nil),
 		// Sequential mode: the eviction-on-transition code this test targets
 		// sits on the common path, after the random-mode branch.
 		readerPattern: NewReaderPatternWithMode(ReaderCacheModeSequential),

@@ -109,7 +109,7 @@ func newRandomCachePerfFixture(t *testing.T, chunks int, latency time.Duration) 
 	// 4.36 merge adopted upstream's 8 MiB SeqTolerance in place of the fork's
 	// 4 MiB offsetTolerance, with the last few chunks flipping to whole-chunk
 	// caching. The explicit override is what -readerCacheMode=random exists for.
-	f.reader = NewChunkReaderAtFromClientWithMode(context.Background(), NewReaderCache(chunks+1, f.cache, lookup), views, int64(chunks*randomCachePerfChunkSize), 0, ReaderCacheModeRandom)
+	f.reader = NewChunkReaderAtFromClientWithMode(context.Background(), NewReaderCache(chunks+1, f.cache, lookup, nil), views, int64(chunks*randomCachePerfChunkSize), 0, ReaderCacheModeRandom)
 
 	if !f.reader.readerPattern.IsRandomMode() {
 		t.Fatal("failed to force random reader mode")

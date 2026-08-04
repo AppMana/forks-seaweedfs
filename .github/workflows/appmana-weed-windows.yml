@@ -2,9 +2,9 @@ name: AppMana weed.exe (WinFsp) build and test
 
 on:
   push:
-    branches: [appmana-4.23-large-disk-winfsp]
+    branches: [appmana-4.23-large-disk-winfsp, 'merge/**']
   pull_request:
-    branches: [appmana-4.23-large-disk-winfsp]
+    branches: [appmana-4.23-large-disk-winfsp, 'merge/**']
   workflow_dispatch:
 
 permissions:
@@ -46,7 +46,7 @@ jobs:
         # (weed/filer), and the local-gRPC-socket TCP fallback that makes
         # `weed mini` work where AF_UNIX bind fails (weed/pb). Both live in
         # files upstream edits often, so they belong in the merge gate.
-        run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/... ./weed/filer/... ./weed/pb/...
+        run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/... ./weed/filer/... ./weed/pb/... ./weed/s3api/...
 
   test-windows:
     runs-on: windows-2022

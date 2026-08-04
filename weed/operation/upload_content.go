@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -30,6 +31,21 @@ import (
 	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
 )
 
+// GenUploadUrlProxy returns a function that builds a chunk upload URL via the
+// filer proxy.  Identical to the inline logic used by weed mount -filerProxy
+// and weed filer gateway:
+//
+//   - without filerProxy: "http://{host}/{fileId}"
+//   - with filerProxy:     "http://{filerAddress}/?proxyChunkId={fileId}"
+func GenUploadUrlProxy(filerAddress string) func(host, fileId string) string {
+	return func(host, fileId string) string {
+		if filerAddress == "" {
+			return fmt.Sprintf("http://%s/%s", host, fileId)
+		}
+		return fmt.Sprintf("http://%s/?proxyChunkId=%s", filerAddress, fileId)
+	}
+}
+
 type UploadOption struct {
 	UploadUrl         string
 	Filename          string
@@ -43,8 +59,9 @@ type UploadOption struct {
 	Md5               string
 	WantMd5           bool // compute Content-MD5 from the data when Md5 is unset and the upload is not ciphered
 	BytesBuffer       *bytes.Buffer
-	SourceUrl         string // optional: for logging when reading from a remote source
-	MaxAttempts       int    // <=0 uses the default
+	SourceUrl         string                           // optional: for logging when reading from a remote source
+	MaxAttempts       int                              // <=0 uses the default
+	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
 }
 
 type UploadResult struct {
@@ -102,11 +119,35 @@ var (
 	once        sync.Once
 )
 
-var uploadRetryableAssignErrList = []string{
-	"transport",
-	"is read only",
-	"failed to write to local disk",
-	"Volume Size ",
+// uploadStatusError carries the volume-server HTTP status of a failed upload so
+// the retry gate can decide on the status code instead of the message text.
+// StatusCode 0 means the request never got a response — a transport failure.
+type uploadStatusError struct {
+	StatusCode int
+	err        error
+}
+
+func (e *uploadStatusError) Error() string { return e.err.Error() }
+func (e *uploadStatusError) Unwrap() error { return e.err }
+
+// shouldReassignUpload reports whether an upload error means the client should
+// ask for a fresh volume assignment and retry on another volume.
+//
+// On the write path a volume server only 5xxs on a ReplicatedWrite failure
+// (local disk, replica peer down, or under-replication) — all of which a
+// different volume dodges — so any 5xx is reassignable. A status of 0 means the
+// assigned target never answered (down/unreachable), also reassignable. A 4xx
+// is a genuine client error and is surfaced. Errors without a status come from
+// the AssignVolume RPC or request setup; retry only transient transport ones.
+func shouldReassignUpload(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *uploadStatusError
+	if errors.As(err, &se) {
+		return se.StatusCode == 0 || se.StatusCode >= 500
+	}
+	return strings.Contains(err.Error(), "transport")
 }
 
 // assignVolumeTimeout bounds a single AssignVolume RPC so an overwhelmed filer
@@ -153,7 +194,7 @@ func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
 	}
 }
 
-func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
 	doUploadFunc := func() error {
 		var host string
 		var auth security.EncodedJwt
@@ -162,7 +203,11 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 			return err
 		}
 
-		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
+		genUrl := uploadOption.GenUploadUrl
+		if genUrl == nil {
+			genUrl = func(host, fileId string) string { return fmt.Sprintf("http://%s/%s", host, fileId) }
+		}
+		uploadOption.UploadUrl = genUrl(host, fileId)
 		uploadOption.Jwt = auth
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
@@ -175,7 +220,7 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 			return true
 		})
 	} else {
-		err = util.MultiRetry("uploadWithRetry", uploadRetryableAssignErrList, doUploadFunc)
+		err = util.RetryOnError("uploadWithRetry", shouldReassignUpload, doUploadFunc)
 	}
 
 	return
@@ -183,7 +228,7 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 
 // UploadWithRetry will retry both assigning volume request and uploading content
 // The option parameter does not need to specify UploadUrl and Jwt, which will come from assigning volume.
-func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
+func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
 	bytesReader, ok := reader.(*util.BytesReader)
 	if ok {
 		data = bytesReader.Bytes
@@ -234,7 +279,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 			err = fmt.Errorf("filerGrpcAddress assign volume: %w", grpcAssignErr)
 		}
 		return
-	}, uploadOption, genFileUrlFn, data)
+	}, uploadOption, data)
 	return
 }
 
@@ -495,7 +540,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	}
 	if post_err != nil {
 		stats.UploadErrorCounter.WithLabelValues("0").Inc()
-		return nil, fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)
+		return nil, &uploadStatusError{StatusCode: 0, err: fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)}
 	}
 	// print("-")
 
@@ -510,18 +555,18 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	resp_body, ra_err := io.ReadAll(resp.Body)
 	if ra_err != nil {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-		return nil, fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)}
 	}
 
 	unmarshal_err := json.Unmarshal(resp_body, &ret)
 	if unmarshal_err != nil {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		glog.ErrorfCtx(ctx, "unmarshal %s: %v", option.UploadUrl, string(resp_body))
-		return nil, fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)}
 	}
 	if ret.Error != "" {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-		return nil, fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)}
 	}
 	ret.ETag = etag
 	ret.ContentMd5 = resp.Header.Get("Content-MD5")

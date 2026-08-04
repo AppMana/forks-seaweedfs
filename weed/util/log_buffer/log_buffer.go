@@ -2,18 +2,18 @@ package log_buffer
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 )
 
 const BufferSize = 8 * 1024 * 1024
@@ -33,7 +33,7 @@ var (
 type dataToFlush struct {
 	startTime time.Time
 	stopTime  time.Time
-	data      *bytes.Buffer
+	data      []byte // slab from mem.Allocate; returned via mem.Free after flush
 	minOffset int64
 	maxOffset int64
 	done      chan struct{} // Signal when flush completes
@@ -93,6 +93,12 @@ type LogBuffer struct {
 	hasOffsets bool
 	// Disk chunk cache for historical data reads
 	diskChunkCache *DiskChunkCache
+	// curSnap is a GC-owned copy of the current window's append-only prefix
+	// buf[:len(curSnap)], shared by all readers so each byte is copied once per
+	// window instead of once per reader. Extended lazily under curSnapMu; reset
+	// at seal. Existing holders keep their prefix slices, which never mutate.
+	curSnapMu sync.Mutex
+	curSnap   []byte
 	sync.RWMutex
 }
 
@@ -294,13 +300,9 @@ func (logBuffer *LogBuffer) AddLogEntryToBuffer(logEntry *filer_pb.LogEntry) err
 		logBuffer.LastTsNs.Store(processingTsNs)
 	}
 
-	logEntryData, err := proto.Marshal(logEntry)
-	if err != nil {
-		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
-		glog.Errorf("%v", marshalErr)
-		return marshalErr
-	}
-	size := len(logEntryData)
+	// Size is computed without allocating; the entry is marshaled straight into
+	// the buffer below via MarshalToSizedBufferVT.
+	size := logEntry.SizeVT()
 
 	if logBuffer.pos == 0 {
 		logBuffer.startTime = ts
@@ -344,10 +346,17 @@ func (logBuffer *LogBuffer) AddLogEntryToBuffer(logEntry *filer_pb.LogEntry) err
 	}
 	logBuffer.stopTime = ts
 
+	// Marshal directly into the buffer, avoiding an intermediate slice and copy.
+	// On the (practically impossible) error the entry is dropped before idx/pos
+	// are advanced, leaving the buffer consistent.
+	if _, err := logEntry.MarshalToSizedBufferVT(logBuffer.buf[logBuffer.pos+4 : logBuffer.pos+4+size]); err != nil {
+		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
+		glog.Errorf("%v", marshalErr)
+		return marshalErr
+	}
 	logBuffer.idx = append(logBuffer.idx, logBuffer.pos)
 	util.Uint32toBytes(logBuffer.sizeBuf, uint32(size))
 	copy(logBuffer.buf[logBuffer.pos:logBuffer.pos+4], logBuffer.sizeBuf)
-	copy(logBuffer.buf[logBuffer.pos+4:logBuffer.pos+4+size], logEntryData)
 	logBuffer.pos += size + 4
 
 	logBuffer.offset++
@@ -408,15 +417,9 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	// Note: This also enables AddToBuffer to work correctly with Kafka-style offset-based reads
 	logEntry.Offset = logBuffer.offset
 
-	// Marshal with correct timestamp and offset
-	logEntryData, err := proto.Marshal(logEntry)
-	if err != nil {
-		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
-		glog.Errorf("%v", marshalErr)
-		return marshalErr
-	}
-
-	size := len(logEntryData)
+	// Size is computed without allocating; the entry is marshaled straight into
+	// the buffer below via MarshalToSizedBufferVT.
+	size := logEntry.SizeVT()
 
 	if logBuffer.pos == 0 {
 		logBuffer.startTime = ts
@@ -458,10 +461,17 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	}
 	logBuffer.stopTime = ts
 
+	// Marshal directly into the buffer, avoiding an intermediate slice and copy.
+	// On the (practically impossible) error the entry is dropped before idx/pos
+	// are advanced, leaving the buffer consistent.
+	if _, err := logEntry.MarshalToSizedBufferVT(logBuffer.buf[logBuffer.pos+4 : logBuffer.pos+4+size]); err != nil {
+		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
+		glog.Errorf("%v", marshalErr)
+		return marshalErr
+	}
 	logBuffer.idx = append(logBuffer.idx, logBuffer.pos)
 	util.Uint32toBytes(logBuffer.sizeBuf, uint32(size))
 	copy(logBuffer.buf[logBuffer.pos:logBuffer.pos+4], logBuffer.sizeBuf)
-	copy(logBuffer.buf[logBuffer.pos+4:logBuffer.pos+4+size], logEntryData)
 	logBuffer.pos += size + 4
 
 	logBuffer.offset++
@@ -534,7 +544,7 @@ func (logBuffer *LogBuffer) loopFlush() {
 		if d == nil {
 			break // shutdown sentinel
 		}
-		logBuffer.flushFn(logBuffer, d.startTime, d.stopTime, d.data.Bytes(), d.minOffset, d.maxOffset)
+		logBuffer.flushFn(logBuffer, d.startTime, d.stopTime, d.data, d.minOffset, d.maxOffset)
 		d.releaseMemory()
 		// local logbuffer is different from aggregate logbuffer here
 		if d.maxOffset >= 0 {
@@ -606,6 +616,13 @@ func (logBuffer *LogBuffer) copyToFlushInternal(withCallback bool) *dataToFlush 
 		// CRITICAL: logBuffer.offset is the "next offset to assign", so last offset in buffer is offset-1
 		lastOffsetInBuffer := logBuffer.offset - 1
 		logBuffer.buf = logBuffer.prevBuffers.SealBuffer(logBuffer.startTime, logBuffer.stopTime, logBuffer.buf, logBuffer.pos, logBuffer.bufferStartOffset, lastOffsetInBuffer)
+		// Hand a fully extended prefix snapshot to the sealed slot so sealed
+		// readers reuse it instead of re-copying the window; reset for the next
+		// window either way (holders keep their immutable prefix slices).
+		if len(logBuffer.curSnap) == logBuffer.pos {
+			logBuffer.prevBuffers.buffers[len(logBuffer.prevBuffers.buffers)-1].snapshot = logBuffer.curSnap[:logBuffer.pos:logBuffer.pos]
+		}
+		logBuffer.curSnap = nil
 		// Use zero time (time.Time{}) not epoch time (time.Unix(0,0))
 		// Epoch time (1970) breaks time-based reads after flush
 		logBuffer.startTime = time.Time{}
@@ -697,11 +714,20 @@ func (logBuffer *LogBuffer) SetLastFlushTsNs(ts int64) {
 }
 
 func (d *dataToFlush) releaseMemory() {
-	d.data.Reset()
-	bufferPool.Put(d.data)
+	// Guard nil: mem.Free(nil) would put a zero-cap slice into the smallest slot
+	// pool, so a later Allocate could hand back nil and panic. Also makes a double
+	// release harmless.
+	if d.data != nil {
+		mem.Free(d.data)
+		d.data = nil
+	}
 }
 
-func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bufferCopy *bytes.Buffer, batchIndex int64, err error) {
+// ReadFromBuffer returns the in-memory log data at lastReadPosition. isPooled
+// reports whether the returned buffer is a private pooled copy the caller must
+// return via ReleaseMemory; when false the buffer wraps a snapshot shared with
+// other readers and must not be released (or written to).
+func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bufferCopy *bytes.Buffer, batchIndex int64, isPooled bool, err error) {
 	logBuffer.RLock()
 	defer logBuffer.RUnlock()
 
@@ -728,19 +754,19 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 				// Case 3: try disk read (historical data might exist)
 				if requestedOffset < logBuffer.offset {
 					// Data was in the buffer range but buffer is now empty = flushed to disk
-					return nil, -2, ResumeFromDiskError
+					return nil, -2, false, ResumeFromDiskError
 				}
 				// requestedOffset == logBuffer.offset: Current position
 				// CRITICAL: For subscribers starting from offset 0, try disk read first
 				// (historical data might exist from previous runs)
 				if requestedOffset == 0 && logBuffer.bufferStartOffset == 0 && logBuffer.offset == 0 {
 					// Initial state: try disk read before waiting for new data
-					return nil, -2, ResumeFromDiskError
+					return nil, -2, false, ResumeFromDiskError
 				}
 				// Otherwise, wait for new data to arrive
-				return nil, logBuffer.offset, nil
+				return nil, logBuffer.offset, false, nil
 			}
-			return copiedBytes(logBuffer.buf[:logBuffer.pos]), logBuffer.offset, nil
+			return logBuffer.currentSnapshotView(0, logBuffer.pos), logBuffer.offset, false, nil
 		}
 
 		// Check previous buffers for the requested offset
@@ -750,9 +776,9 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 				// (prevBuffers are created when buffer is flushed)
 				if buf.size == 0 {
 					// Empty prevBuffer covering this offset means data was flushed
-					return nil, -2, ResumeFromDiskError
+					return nil, -2, false, ResumeFromDiskError
 				}
-				return copiedBytes(buf.buf[:buf.size]), buf.offset, nil
+				return sharedBufferView(buf, 0), buf.offset, false, nil
 			}
 		}
 
@@ -760,16 +786,16 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 		if requestedOffset < logBuffer.bufferStartOffset {
 			// Data not in current buffers - must be on disk (flushed or never existed)
 			// Return ResumeFromDiskError to trigger disk read
-			return nil, -2, ResumeFromDiskError
+			return nil, -2, false, ResumeFromDiskError
 		}
 
 		if requestedOffset > logBuffer.offset {
 			// Future data, not available yet
-			return nil, logBuffer.offset, nil
+			return nil, logBuffer.offset, false, nil
 		}
 
 		// Offset not found - return nil
-		return nil, logBuffer.offset, nil
+		return nil, logBuffer.offset, false, nil
 	}
 
 	// TIMESTAMP-BASED READ (original logic)
@@ -798,7 +824,7 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 		// Buffer is empty - return ResumeFromDiskError so caller can read from disk
 		// This fixes issue #4977 where SubscribeMetadata stalls because
 		// MetaAggregator.MetaLogBuffer is empty in single-filer setups
-		return nil, -2, ResumeFromDiskError
+		return nil, -2, false, ResumeFromDiskError
 	} else if lastReadPosition.Time.Before(tsMemory) { // case 2.3
 		// For time-based reads, only check timestamp for disk reads
 		// Don't use offset comparisons as they're not meaningful for time-based subscriptions
@@ -812,7 +838,7 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 			// Treat first read with sentinel/zero offset as inclusive of earliest in-memory data
 		} else {
 			// Data not in memory buffers - read from disk
-			return nil, -2, ResumeFromDiskError
+			return nil, -2, false, ResumeFromDiskError
 		}
 	}
 
@@ -821,17 +847,17 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 	if lastReadPosition.Time.Equal(logBuffer.stopTime) && !logBuffer.stopTime.IsZero() {
 		// For first-read sentinel/zero offset, allow inclusive read at the boundary
 		if lastReadPosition.Offset > 0 {
-			return nil, logBuffer.offset, nil
+			return nil, logBuffer.offset, false, nil
 		}
 	}
 	if lastReadPosition.Time.After(logBuffer.stopTime) && !logBuffer.stopTime.IsZero() {
-		return nil, logBuffer.offset, nil
+		return nil, logBuffer.offset, false, nil
 	}
 	// Also check prevBuffers when current buffer is empty (startTime is zero)
 	if lastReadPosition.Time.Before(logBuffer.startTime) || logBuffer.startTime.IsZero() {
 		for _, buf := range logBuffer.prevBuffers.buffers {
 			if buf.startTime.After(lastReadPosition.Time) {
-				return copiedBytes(buf.buf[:buf.size]), buf.offset, nil
+				return sharedBufferView(buf, 0), buf.offset, false, nil
 			}
 			if !buf.startTime.After(lastReadPosition.Time) && buf.stopTime.After(lastReadPosition.Time) {
 				searchTime := lastReadPosition.Time
@@ -842,19 +868,19 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 				if err != nil {
 					// Buffer corruption detected - return error wrapped with ErrBufferCorrupted
 					glog.Errorf("ReadFromBuffer: buffer corruption in prevBuffer: %v", err)
-					return nil, -1, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
+					return nil, -1, false, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
 				}
 				if pos < buf.size {
-					return copiedBytes(buf.buf[pos:buf.size]), buf.offset, nil
+					return sharedBufferView(buf, pos), buf.offset, false, nil
 				}
 			}
 		}
 		// If current buffer is not empty, return it
 		if logBuffer.pos > 0 {
-			return copiedBytes(logBuffer.buf[:logBuffer.pos]), logBuffer.offset, nil
+			return logBuffer.currentSnapshotView(0, logBuffer.pos), logBuffer.offset, false, nil
 		}
 		// Buffer is empty and no data in prevBuffers - wait for new data
-		return nil, logBuffer.offset, nil
+		return nil, logBuffer.offset, false, nil
 	}
 
 	lastTs := lastReadPosition.Time.UnixNano()
@@ -886,7 +912,7 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 		if err != nil {
 			// Buffer corruption detected in binary search
 			glog.Errorf("ReadFromBuffer: buffer corruption at idx[%d] pos %d: %v", mid, pos, err)
-			return nil, -1, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
+			return nil, -1, false, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
 		}
 		if t <= searchTs {
 			l = mid + 1
@@ -897,11 +923,11 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 				if err != nil {
 					// Buffer corruption detected in binary search (previous entry)
 					glog.Errorf("ReadFromBuffer: buffer corruption at idx[%d] pos %d: %v", mid-1, logBuffer.idx[mid-1], err)
-					return nil, -1, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
+					return nil, -1, false, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
 				}
 			}
 			if prevT <= searchTs {
-				return copiedBytes(logBuffer.buf[pos:logBuffer.pos]), logBuffer.offset, nil
+				return logBuffer.currentSnapshotView(pos, logBuffer.pos), logBuffer.offset, false, nil
 			}
 			h = mid
 		}
@@ -909,9 +935,13 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 
 	// Binary search didn't find the timestamp - data may have been flushed to disk already
 	// Returning -2 signals to caller that data is not available in memory
-	return nil, -2, nil
+	return nil, -2, false, nil
 
 }
+
+// ReleaseMemory returns a pooled buffer for reuse. Only call it for buffers
+// ReadFromBuffer reported as pooled: recycling a shared sealed-window view
+// would let the next copiedBytes overwrite bytes other readers still hold.
 func (logBuffer *LogBuffer) ReleaseMemory(b *bytes.Buffer) {
 	bufferPool.Put(b)
 }
@@ -936,23 +966,45 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// logEntryPool reduces allocations in readTs which is called frequently during binary search
-var logEntryPool = sync.Pool{
-	New: func() interface{} {
-		return &filer_pb.LogEntry{}
-	},
+// copiedBytes returns a private copy of buf backed by the shared, size-classed
+// slab pool. The caller owns it until mem.Free (see dataToFlush.releaseMemory),
+// so the live buffer never outlives the flush. Routing through mem reuses slabs
+// across the process instead of reallocating a window-sized array per flush.
+func copiedBytes(buf []byte) []byte {
+	copied := mem.Allocate(len(buf))
+	copy(copied, buf)
+	return copied
 }
 
-// resetLogEntry clears a LogEntry for pool reuse
-func resetLogEntry(e *filer_pb.LogEntry) {
-	proto.Reset(e)
+// sharedBufferView wraps the sealed window's shared snapshot from pos onward.
+// The returned buffer aliases memory shared with other readers: it must be
+// treated as read-only and never passed to ReleaseMemory (the full-slice cap
+// makes an accidental append reallocate instead of scribbling on the snapshot).
+func sharedBufferView(mb *MemBuffer, pos int) *bytes.Buffer {
+	snap := mb.sharedSnapshot()
+	return bytes.NewBuffer(snap[pos:len(snap):len(snap)])
 }
 
-func copiedBytes(buf []byte) (copied *bytes.Buffer) {
-	copied = bufferPool.Get().(*bytes.Buffer)
-	copied.Reset()
-	copied.Write(buf)
-	return
+// currentSnapshotView returns buf[from:to] of the current window as a view of
+// the shared prefix snapshot, extending the snapshot to cover [0:to) first.
+// buf[:pos] is append-only until the window seals, so extension only ever
+// appends stable bytes; earlier holders' slices are unaffected. Callers must
+// hold the read lock (keeps buf and pos stable during extension).
+func (logBuffer *LogBuffer) currentSnapshotView(from, to int) *bytes.Buffer {
+	logBuffer.curSnapMu.Lock()
+	if cap(logBuffer.curSnap) < to {
+		// First use in this window (or the rare window whose array outgrew the
+		// previous one): size to the window array so extensions never reallocate.
+		grown := make([]byte, len(logBuffer.curSnap), len(logBuffer.buf))
+		copy(grown, logBuffer.curSnap)
+		logBuffer.curSnap = grown
+	}
+	if len(logBuffer.curSnap) < to {
+		logBuffer.curSnap = append(logBuffer.curSnap, logBuffer.buf[len(logBuffer.curSnap):to]...)
+	}
+	snap := logBuffer.curSnap[:to]
+	logBuffer.curSnapMu.Unlock()
+	return bytes.NewBuffer(snap[from:to:to])
 }
 
 func readTs(buf []byte, pos int) (size int, ts int64, err error) {
@@ -970,19 +1022,129 @@ func readTs(buf []byte, pos int) (size int, ts int64, err error) {
 
 	entryData := buf[pos+4 : pos+4+size]
 
-	// Use pooled LogEntry to avoid allocation on every call
-	logEntry := logEntryPool.Get().(*filer_pb.LogEntry)
-	defer func() {
-		resetLogEntry(logEntry)
-		logEntryPool.Put(logEntry)
-	}()
-
-	err = proto.Unmarshal(entryData, logEntry)
+	// Read only LogEntry.ts_ns rather than unmarshaling the whole entry. This
+	// runs on every binary-search probe in ReadFromBuffer; a full proto.Unmarshal
+	// there allocates fresh slices for the data/key byte fields on each call, which
+	// dominated allocation churn under metadata-subscription fan-out.
+	ts, err = readTsNs(entryData)
 	if err != nil {
-		// Return error instead of failing fast
-		// This allows caller to handle corruption gracefully
-		return 0, 0, fmt.Errorf("corrupted log buffer: failed to unmarshal LogEntry at pos %d, size %d: %w", pos, size, err)
+		return 0, 0, fmt.Errorf("corrupted log buffer at pos %d, size %d: %w", pos, size, err)
 	}
 
-	return size, logEntry.TsNs, nil
+	return size, ts, nil
+}
+
+// readTsNs scans a marshaled LogEntry and returns its ts_ns (field 1, varint)
+// without decoding the data/key byte fields. Fields serialize in number order,
+// so ts_ns is normally the first tag and this returns after one varint; the full
+// scan keeps it correct for any field order. A missing field 1 means the proto3
+// default, ts_ns == 0.
+func readTsNs(entryData []byte) (tsNs int64, err error) {
+	for i := 0; i < len(entryData); {
+		tag, n := binary.Uvarint(entryData[i:])
+		if n <= 0 {
+			return 0, fmt.Errorf("bad field tag at %d", i)
+		}
+		i += n
+		fieldNum := tag >> 3
+		switch tag & 0x7 { // wire type
+		case 0: // varint
+			v, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return 0, fmt.Errorf("bad varint for field %d", fieldNum)
+			}
+			i += m
+			if fieldNum == 1 { // ts_ns
+				return int64(v), nil
+			}
+		case 1: // 64-bit
+			i += 8
+		case 2: // length-delimited: read length, skip payload without copying
+			l, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return 0, fmt.Errorf("bad length for field %d", fieldNum)
+			}
+			i += m
+			if l > uint64(len(entryData)-i) {
+				return 0, fmt.Errorf("field %d length %d overruns buffer", fieldNum, l)
+			}
+			i += int(l)
+		case 5: // 32-bit
+			i += 4
+		default:
+			return 0, fmt.Errorf("unknown wire type for field %d", fieldNum)
+		}
+		if i > len(entryData) {
+			return 0, fmt.Errorf("field %d overruns buffer", fieldNum)
+		}
+	}
+	return 0, nil
+}
+
+// unmarshalLogEntryAliased decodes a marshaled LogEntry into out, pointing the
+// data and key fields at sub-slices of entryData instead of copying them. A full
+// proto.Unmarshal allocates fresh slices for those byte fields on every entry
+// (protobuf consumeBytesNoZero), which dominated allocation churn when many
+// metadata subscribers each re-read the in-memory log window.
+//
+// The aliased data/key are only valid while entryData is, i.e. for the duration
+// of the eachLogEntryFn callback. Callers must copy anything they retain past the
+// callback; all current subscribers do (they re-decode data into their own event
+// or hand it to a synchronous grpc Send).
+func unmarshalLogEntryAliased(entryData []byte, out *filer_pb.LogEntry) error {
+	out.TsNs = 0
+	out.PartitionKeyHash = 0
+	out.Data = nil
+	out.Key = nil
+	out.Offset = 0
+	for i := 0; i < len(entryData); {
+		tag, n := binary.Uvarint(entryData[i:])
+		if n <= 0 {
+			return fmt.Errorf("bad field tag at %d", i)
+		}
+		i += n
+		fieldNum := tag >> 3
+		switch tag & 0x7 { // wire type
+		case 0: // varint: ts_ns / partition_key_hash / offset
+			v, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return fmt.Errorf("bad varint for field %d", fieldNum)
+			}
+			i += m
+			switch fieldNum {
+			case 1:
+				out.TsNs = int64(v)
+			case 2:
+				out.PartitionKeyHash = int32(v)
+			case 5:
+				out.Offset = int64(v)
+			}
+		case 2: // length-delimited: data / key, aliased not copied
+			l, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return fmt.Errorf("bad length for field %d", fieldNum)
+			}
+			i += m
+			if l > uint64(len(entryData)-i) {
+				return fmt.Errorf("field %d length %d overruns buffer", fieldNum, l)
+			}
+			switch fieldNum {
+			case 3:
+				out.Data = entryData[i : i+int(l)]
+			case 4:
+				out.Key = entryData[i : i+int(l)]
+			}
+			i += int(l)
+		case 1: // 64-bit
+			i += 8
+		case 5: // 32-bit
+			i += 4
+		default:
+			return fmt.Errorf("unknown wire type for field %d", fieldNum)
+		}
+		if i > len(entryData) {
+			return fmt.Errorf("field %d overruns buffer", fieldNum)
+		}
+	}
+	return nil
 }

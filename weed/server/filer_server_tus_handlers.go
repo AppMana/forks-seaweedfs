@@ -17,6 +17,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -26,11 +27,21 @@ func (fs *FilerServer) tusHandler(w http.ResponseWriter, r *http.Request) {
 	// Set common TUS response headers
 	w.Header().Set("Tus-Resumable", TusVersion)
 
-	// Check Tus-Resumable header for non-OPTIONS requests
+	// OPTIONS is capability discovery only and carries no data, so it is left
+	// unauthenticated like the main filer OPTIONS handler. Every other TUS method
+	// authenticates the credential first, then authorizes the server-stored
+	// TargetPath below, once routing has resolved which resource it acts on.
+	var claims *security.SeaweedFilerClaims
 	if r.Method != http.MethodOptions {
 		tusVersion := r.Header.Get("Tus-Resumable")
 		if tusVersion != TusVersion {
 			http.Error(w, "Unsupported TUS version", http.StatusPreconditionFailed)
+			return
+		}
+
+		var authenticated bool
+		if claims, authenticated = fs.authenticateFilerJwt(r, r.Method != http.MethodHead); !authenticated {
+			writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
 			return
 		}
 	}
@@ -43,18 +54,51 @@ func (fs *FilerServer) tusHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if this is an upload location (contains upload ID after {tusPrefix}/.uploads/)
 	uploadsPrefix := tusPrefix + "/.uploads/"
 	if strings.HasPrefix(reqPath, uploadsPrefix) {
+		// Session ids this server mints are canonical UUIDs. Rejecting aliases
+		// (a trailing path or any non-canonical spelling) keeps one URL bound to
+		// one stored authorization resource.
 		uploadID := strings.TrimPrefix(reqPath, uploadsPrefix)
-		uploadID = strings.Split(uploadID, "/")[0] // Get just the ID, not any trailing path
+		if !isCanonicalTusUploadID(uploadID) {
+			writeTusSessionNotFound(w, r.Method)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodHead, http.MethodPatch, http.MethodDelete:
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		if r.Method == http.MethodPatch {
+			ctx = context.WithoutCancel(ctx)
+		}
+		session, err := fs.readTusSessionInfo(ctx, uploadID)
+		if err != nil {
+			// A transient filer error resolves to "not found"; log it so it is
+			// distinguishable from a genuinely missing session.
+			glog.V(1).Infof("TUS session %s not resolved: %v", uploadID, err)
+			writeTusSessionNotFound(w, r.Method)
+			return
+		}
+		if !authorizeFilerJwtPaths(r, claims, []string{session.TargetPath}) {
+			writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+			return
+		}
+		if err := fs.loadTusSessionChunks(ctx, session); err != nil {
+			glog.Errorf("Failed to load TUS session %s chunks: %v", uploadID, err)
+			writeTusSessionNotFound(w, r.Method)
+			return
+		}
 
 		switch r.Method {
 		case http.MethodHead:
-			fs.tusHeadHandler(w, r, uploadID)
+			fs.tusHeadHandler(w, session)
 		case http.MethodPatch:
-			fs.tusPatchHandler(w, r, uploadID)
+			fs.tusPatchHandler(w, r, session)
 		case http.MethodDelete:
-			fs.tusDeleteHandler(w, r, uploadID)
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			fs.tusDeleteHandler(w, r, session)
 		}
 		return
 	}
@@ -64,9 +108,66 @@ func (fs *FilerServer) tusHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodOptions:
 		fs.tusOptionsHandler(w, r)
 	case http.MethodPost:
+		if !authorizeFilerJwtPaths(r, claims, []string{fs.tusTargetPath(r)}) {
+			writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+			return
+		}
 		fs.tusCreateHandler(w, r)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// writeTusSessionNotFound answers a request whose session cannot be resolved.
+// DELETE is idempotent and returns 204 for a missing session; other verbs 404.
+func writeTusSessionNotFound(w http.ResponseWriter, method string) {
+	if method == http.MethodDelete {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.Error(w, "Upload not found", http.StatusNotFound)
+}
+
+// isCanonicalTusUploadID reports whether uploadID is a canonical UUID, the only
+// form this server mints, so an aliased or crafted id cannot address a session.
+func isCanonicalTusUploadID(uploadID string) bool {
+	id, err := uuid.Parse(uploadID)
+	return err == nil && id.String() == uploadID
+}
+
+// tusTargetPath resolves the filer path a TUS create request targets from the
+// request URL. It guarantees a leading slash so the result matches stored
+// absolute paths and JWT AllowedPrefixes even if TusBasePath were misconfigured
+// with a trailing slash.
+func (fs *FilerServer) tusTargetPath(r *http.Request) string {
+	target := strings.TrimPrefix(r.URL.Path, fs.option.TusBasePath)
+	if target != "" && !strings.HasPrefix(target, "/") {
+		target = "/" + target
+	}
+	return canonicalTusTargetPath(target)
+}
+
+// canonicalTusTargetPath normalises an absolute filer target, or returns "" when
+// the input is empty or not absolute, so authorization and the final write agree
+// on one path.
+func canonicalTusTargetPath(target string) string {
+	if target == "" || !strings.HasPrefix(target, "/") {
+		return ""
+	}
+	return path.Clean(target)
+}
+
+// writeTusCompleteError maps a completeTusUpload failure to the same HTTP status
+// the normal write path uses: a read-only prefix returns 507 and a WORM-protected
+// target returns 403, rather than a generic 500.
+func writeTusCompleteError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrReadOnly):
+		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+	case errors.Is(err, ErrWormEnforced):
+		http.Error(w, err.Error(), http.StatusForbidden)
+	default:
+		http.Error(w, "Failed to complete upload", http.StatusInternalServerError)
 	}
 }
 
@@ -107,10 +208,17 @@ func (fs *FilerServer) tusCreateHandler(w http.ResponseWriter, r *http.Request) 
 	// TusBasePath is pre-normalized in filer_server.go (leading slash, no trailing slash)
 	tusPrefix := fs.option.TusBasePath
 
-	// Determine target path from request URL
-	targetPath := strings.TrimPrefix(r.URL.Path, tusPrefix)
+	// Determine target path from request URL (leading slash guaranteed)
+	targetPath := fs.tusTargetPath(r)
 	if targetPath == "" || targetPath == "/" {
 		http.Error(w, "Target path required", http.StatusBadRequest)
+		return
+	}
+
+	// Reject writes to a read-only prefix up front, before creating a session or
+	// uploading any chunks, matching the normal write path.
+	if fs.filer.FilerConf.MatchStorageRule(targetPath).ReadOnly {
+		http.Error(w, ErrReadOnly.Error(), http.StatusInsufficientStorage)
 		return
 	}
 
@@ -159,16 +267,15 @@ func (fs *FilerServer) tusCreateHandler(w http.ResponseWriter, r *http.Request) 
 
 			// Check if upload is complete
 			if bytesWritten == session.Size {
-				// Refresh session to get updated chunks
-				session, err = fs.getTusSession(ctx, uploadID)
-				if err != nil {
+				// Ensure the pinned session still exists, then refresh its chunks.
+				if err = fs.refreshTusSessionChunks(ctx, session); err != nil {
 					glog.Errorf("Failed to get updated TUS session: %v", err)
 					http.Error(w, "Failed to complete upload", http.StatusInternalServerError)
 					return
 				}
 				if err := fs.completeTusUpload(ctx, session); err != nil {
 					glog.Errorf("Failed to complete TUS upload: %v", err)
-					http.Error(w, "Failed to complete upload", http.StatusInternalServerError)
+					writeTusCompleteError(w, err)
 					return
 				}
 			}
@@ -181,15 +288,7 @@ func (fs *FilerServer) tusCreateHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 // tusHeadHandler handles HEAD requests to get current upload offset
-func (fs *FilerServer) tusHeadHandler(w http.ResponseWriter, r *http.Request, uploadID string) {
-	ctx := r.Context()
-
-	session, err := fs.getTusSession(ctx, uploadID)
-	if err != nil {
-		http.Error(w, "Upload not found", http.StatusNotFound)
-		return
-	}
-
+func (fs *FilerServer) tusHeadHandler(w http.ResponseWriter, session *TusSession) {
 	w.Header().Set("Upload-Offset", strconv.FormatInt(session.Offset, 10))
 	w.Header().Set("Upload-Length", strconv.FormatInt(session.Size, 10))
 	w.Header().Set("Cache-Control", "no-store")
@@ -197,7 +296,7 @@ func (fs *FilerServer) tusHeadHandler(w http.ResponseWriter, r *http.Request, up
 }
 
 // tusPatchHandler handles PATCH requests to upload data
-func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, uploadID string) {
+func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, session *TusSession) {
 	// Use a context that ignores cancellation from the request context.
 	// The filer's connection has an inactivity timeout: after the request body is fully read,
 	// internal operations (assigning file IDs, uploading to volume servers, completing uploads)
@@ -208,13 +307,6 @@ func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, u
 	contentType := r.Header.Get("Content-Type")
 	if contentType != "application/offset+octet-stream" {
 		http.Error(w, "Content-Type must be application/offset+octet-stream", http.StatusUnsupportedMediaType)
-		return
-	}
-
-	// Get current session
-	session, err := fs.getTusSession(ctx, uploadID)
-	if err != nil {
-		http.Error(w, "Upload not found", http.StatusNotFound)
 		return
 	}
 
@@ -258,9 +350,8 @@ func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, u
 
 	// Check if upload is complete
 	if newOffset == session.Size {
-		// Refresh session to get updated chunks
-		session, err = fs.getTusSession(ctx, uploadID)
-		if err != nil {
+		// Ensure the authorized session still exists, then refresh its chunks.
+		if err = fs.refreshTusSessionChunks(ctx, session); err != nil {
 			glog.Errorf("Failed to get updated TUS session: %v", err)
 			http.Error(w, "Failed to complete upload", http.StatusInternalServerError)
 			return
@@ -268,7 +359,7 @@ func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, u
 
 		if err := fs.completeTusUpload(ctx, session); err != nil {
 			glog.Errorf("Failed to complete TUS upload: %v", err)
-			http.Error(w, "Failed to complete upload", http.StatusInternalServerError)
+			writeTusCompleteError(w, err)
 			return
 		}
 	}
@@ -278,10 +369,10 @@ func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, u
 }
 
 // tusDeleteHandler handles DELETE requests to cancel uploads
-func (fs *FilerServer) tusDeleteHandler(w http.ResponseWriter, r *http.Request, uploadID string) {
+func (fs *FilerServer) tusDeleteHandler(w http.ResponseWriter, r *http.Request, session *TusSession) {
 	ctx := r.Context()
 
-	if err := fs.deleteTusSession(ctx, uploadID); err != nil {
+	if err := fs.deleteTusSession(ctx, session.ID); err != nil {
 		glog.Errorf("Failed to delete TUS session: %v", err)
 		http.Error(w, "Failed to delete upload", http.StatusInternalServerError)
 		return

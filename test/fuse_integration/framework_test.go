@@ -34,14 +34,18 @@ type FuseTestFramework struct {
 
 // TestConfig holds configuration for FUSE tests
 type TestConfig struct {
-	Collection   string
-	Replication  string
-	ChunkSizeMB  int
-	CacheSizeMB  int
-	NumVolumes   int
-	EnableDebug  bool
-	MountOptions []string
-	SkipCleanup  bool // for debugging failed tests
+	Collection  string
+	Replication string
+	ChunkSizeMB int
+	CacheSizeMB int
+	NumVolumes  int
+	EnableDebug bool
+	// MountGlobalOptions are glog flags (-v, -logtostderr, ...) registered on
+	// weed's global flagset; they must precede the subcommand name or the
+	// mount process dies at flag parsing.
+	MountGlobalOptions []string
+	MountOptions       []string
+	SkipCleanup        bool // for debugging failed tests
 }
 
 // DefaultTestConfig returns a default configuration for FUSE tests
@@ -82,33 +86,45 @@ func NewFuseTestFramework(t *testing.T, config *TestConfig) *FuseTestFramework {
 	}
 }
 
-// freePort asks the OS for a free TCP port in a range where the gRPC
-// offset (port + 10000) won't collide with well-known ports.
-// Stay below the Linux ephemeral floor (32768) so the kernel does not
-// reuse the chosen port for an outbound connection between close() here
-// and re-bind in the child "weed mini" process.
+// grpcPortOffset mirrors weed's HTTP->gRPC port convention (gRPC = HTTP + offset);
+// "weed mount" derives the filer gRPC port from the filer HTTP address the same way.
+const grpcPortOffset = 10000
+
+// freePort returns a free filer HTTP port whose gRPC sibling (port+grpcPortOffset)
+// is also free. Both must stay below the Linux ephemeral floor (32768): a gRPC port
+// above it can be transiently grabbed by an outbound connection, forcing mini to
+// relocate its filer gRPC port while "weed mount" keeps dialing HTTP+10000 — the
+// mount then never connects and the test times out. Capping HTTP at 22000 keeps the
+// gRPC port at or below 32000.
 func freePort(t *testing.T) int {
 	t.Helper()
 	const (
 		minServicePort = 20000
-		maxServicePort = 32000
+		maxServicePort = 22000
 	)
 
 	portCount := maxServicePort - minServicePort + 1
 	start := minServicePort + int(time.Now().UnixNano()%int64(portCount))
 
-	for attempt := 0; attempt < 512; attempt++ {
+	for attempt := 0; attempt < portCount; attempt++ {
 		port := minServicePort + (start-minServicePort+attempt)%portCount
-		l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-		if err != nil {
-			continue
+		if portIsFree(port) && portIsFree(port+grpcPortOffset) {
+			return port
 		}
-		l.Close()
-		return port
 	}
 
-	t.Fatalf("failed to allocate port <= %d after repeated attempts", maxServicePort)
+	t.Fatalf("failed to allocate a free HTTP/gRPC port pair in [%d,%d]", minServicePort, maxServicePort)
 	return 0
+}
+
+// portIsFree reports whether a TCP port can currently be bound on 127.0.0.1.
+func portIsFree(port int) bool {
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	l.Close()
+	return true
 }
 
 // Setup starts "weed mini" and mounts the FUSE filesystem.
@@ -246,19 +262,20 @@ func (f *FuseTestFramework) copyLogsForCI() {
 
 // startMini starts "weed mini" which runs master+volume+filer in one process.
 func (f *FuseTestFramework) startMini(config *TestConfig) error {
-	args := []string{
-		"mini",
-		"-dir=" + f.dataDir,
-		"-ip=127.0.0.1",
-		"-ip.bind=127.0.0.1",
-		"-filer.port=" + strconv.Itoa(f.filerPort),
-		"-s3=false",
-		"-webdav=false",
-		"-admin.ui=false",
-	}
+	var args []string
 	if config.EnableDebug {
 		args = append(args, "-v=4")
 	}
+	args = append(args,
+		"mini",
+		"-dir="+f.dataDir,
+		"-ip=127.0.0.1",
+		"-ip.bind=127.0.0.1",
+		"-filer.port="+strconv.Itoa(f.filerPort),
+		"-s3=false",
+		"-webdav=false",
+		"-admin.ui=false",
+	)
 
 	proc, err := f.startProcess("mini", args)
 	if err != nil {
@@ -270,14 +287,18 @@ func (f *FuseTestFramework) startMini(config *TestConfig) error {
 
 // mountFuse mounts the SeaweedFS FUSE filesystem
 func (f *FuseTestFramework) mountFuse(config *TestConfig) error {
-	args := []string{
+	args := append([]string{}, config.MountGlobalOptions...)
+	if config.EnableDebug {
+		args = append(args, "-v=4")
+	}
+	args = append(args,
 		"mount",
-		"-filer=127.0.0.1:" + strconv.Itoa(f.filerPort),
-		"-dir=" + f.mountPoint,
+		"-filer=127.0.0.1:"+strconv.Itoa(f.filerPort),
+		"-dir="+f.mountPoint,
 		"-filer.path=/",
 		"-dirAutoCreate",
 		"-allowOthers=false",
-	}
+	)
 
 	if config.Collection != "" {
 		args = append(args, "-collection="+config.Collection)
@@ -290,9 +311,6 @@ func (f *FuseTestFramework) mountFuse(config *TestConfig) error {
 	}
 	if config.CacheSizeMB > 0 {
 		args = append(args, fmt.Sprintf("-cacheCapacityMB=%d", config.CacheSizeMB))
-	}
-	if config.EnableDebug {
-		args = append(args, "-v=4")
 	}
 
 	args = append(args, config.MountOptions...)
@@ -333,11 +351,19 @@ func (f *FuseTestFramework) waitForService(addr string, timeout time.Duration) e
 	return fmt.Errorf("service at %s not ready within timeout", addr)
 }
 
-// waitForMount waits for the FUSE mount to be ready
+// waitForMount waits for the FUSE mount to be ready. A stat/ReadDir probe
+// alone is not enough: the bare mount point directory passes both before the
+// mount process finishes starting, letting tests race ahead and write to the
+// local disk underneath the mount. The mount point's device ID differing from
+// its parent's confirms a filesystem is actually mounted there.
 func (f *FuseTestFramework) waitForMount(timeout time.Duration) error {
+	parentDev, err := deviceID(filepath.Dir(f.mountPoint))
+	if err != nil {
+		return fmt.Errorf("stat mount point parent: %v", err)
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(f.mountPoint); err == nil {
+		if dev, err := deviceID(f.mountPoint); err == nil && dev != parentDev {
 			if _, err := os.ReadDir(f.mountPoint); err == nil {
 				return nil
 			}
@@ -345,6 +371,15 @@ func (f *FuseTestFramework) waitForMount(timeout time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("mount point not ready within timeout")
+}
+
+// deviceID returns the device ID of the filesystem containing path.
+func deviceID(path string) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Dev), nil
 }
 
 // findWeedBinary locates the weed binary.

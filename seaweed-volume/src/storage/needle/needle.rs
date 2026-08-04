@@ -712,7 +712,7 @@ fn format_needle_id_cookie(key: NeedleId, cookie: Cookie) -> String {
 /// Parse "needle_id_cookie_hex" or "needle_id_cookie_hex_delta" into (NeedleId, Cookie).
 /// Matches Go's ParsePath + ParseNeedleIdCookie: supports an optional `_delta` suffix
 /// where delta is a decimal number added to the NeedleId (used for sub-file addressing).
-/// Rejects strings that are too short or too long.
+/// Rejects strings that are too short or too long, and deltas that overflow the needle id.
 pub fn parse_needle_id_cookie(s: &str) -> Result<(NeedleId, Cookie), String> {
     // Go ParsePath: check for "_" suffix containing a decimal delta
     let (hex_part, delta) = if let Some(underscore_pos) = s.rfind('_') {
@@ -743,23 +743,22 @@ pub fn parse_needle_id_cookie(s: &str) -> Result<(NeedleId, Cookie), String> {
     let needle_id_hex = &hex_part[..split];
     let cookie_hex = &hex_part[split..];
 
-    let needle_id_bytes = hex::decode(needle_id_hex).map_err(|e| format!("Parse needleId error: {}", e))?;
-    let cookie_bytes = hex::decode(cookie_hex).map_err(|e| format!("Parse cookie error: {}", e))?;
-
-    // Pad needle id to 8 bytes
-    let mut nid_buf = [0u8; 8];
-    if needle_id_bytes.len() > 8 {
-        return Err(format!("KeyHash is too long."));
-    }
-    let start = 8 - needle_id_bytes.len();
-    nid_buf[start..].copy_from_slice(&needle_id_bytes);
-
-    let mut key = NeedleId::from_bytes(&nid_buf[0..8]);
-    let cookie = Cookie::from_bytes(&cookie_bytes[0..4]);
+    // Go parses both with strconv.ParseUint, which accepts odd-length hex
+    let mut key = NeedleId(
+        u64::from_str_radix(needle_id_hex, 16)
+            .map_err(|e| format!("Parse needleId error: {}", e))?,
+    );
+    let cookie = Cookie(
+        u32::from_str_radix(cookie_hex, 16).map_err(|e| format!("Parse cookie error: {}", e))?,
+    );
 
     // Apply delta if present (Go: n.Id += Uint64ToNeedleId(d))
     if let Some(d) = delta {
-        key = NeedleId(key.0.wrapping_add(d));
+        key = NeedleId(
+            key.0
+                .checked_add(d)
+                .ok_or_else(|| format!("delta {} overflows needle id {:x}", d, key.0))?,
+        );
     }
 
     Ok((key, cookie))
@@ -940,5 +939,26 @@ mod tests {
         let (key, cookie) = parse_needle_id_cookie(&s).unwrap();
         assert_eq!(key, NeedleId(1));
         assert_eq!(cookie, Cookie(0x12345678));
+    }
+
+    #[test]
+    fn test_parse_rejects_delta_overflow() {
+        assert!(parse_needle_id_cookie("ffffffffffffffff00000000_1").is_err());
+        let (key, _) = parse_needle_id_cookie("fffffffffffffffe00000000_1").unwrap();
+        assert_eq!(key, NeedleId(u64::MAX));
+    }
+
+    #[test]
+    fn test_parse_odd_length_needle_id() {
+        // Go's shell formats purge fids with strconv.FormatUint, which does not
+        // pad the needle id hex to an even length.
+        let (key, cookie) = parse_needle_id_cookie("100000000").unwrap();
+        assert_eq!(key, NeedleId(1));
+        assert_eq!(cookie, Cookie(0));
+
+        let fid = FileId::parse("3,12300000000").unwrap();
+        assert_eq!(fid.volume_id, VolumeId(3));
+        assert_eq!(fid.key, NeedleId(0x123));
+        assert_eq!(fid.cookie, Cookie(0));
     }
 }

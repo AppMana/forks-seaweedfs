@@ -16,6 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	clustermaintenance "github.com/seaweedfs/seaweedfs/weed/cluster/maintenance"
 	"github.com/seaweedfs/seaweedfs/weed/credential"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -32,7 +33,10 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/lifecycle_xml"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/scheduler"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks"
 
@@ -73,6 +77,27 @@ func (s *AdminServer) getFilerConfig() (*FilerConfig, error) {
 	return config, err
 }
 
+// getFilerConf reads filer.conf so callers can inspect per-path rules such as
+// the read-only flag that quota enforcement toggles. A missing filer.conf
+// yields an empty (all-writable) config rather than an error.
+func (s *AdminServer) getFilerConf() (*filer.FilerConf, error) {
+	fc := filer.NewFilerConf()
+	err := s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		content, err := filer.ReadInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName)
+		if err != nil {
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if len(content) > 0 {
+			return fc.LoadFromBytes(content)
+		}
+		return nil
+	})
+	return fc, err
+}
+
 // getCollectionName returns the collection name for a bucket, prefixed with filer group if configured
 func getCollectionName(filerGroup, bucketName string) string {
 	if filerGroup != "" {
@@ -85,6 +110,7 @@ type AdminServer struct {
 	masterClient    *wdclient.MasterClient
 	templateFS      http.FileSystem
 	dataDir         string
+	filerGroup      string
 	grpcDialOption  grpc.DialOption
 	cacheExpiration time.Duration
 	lastCacheUpdate time.Time
@@ -134,13 +160,13 @@ type AdminServer struct {
 
 // Type definitions moved to types.go
 
-func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, icebergPort int) *AdminServer {
+func NewAdminServer(masters string, filerGroup string, templateFS http.FileSystem, dataDir string, icebergPort int) *AdminServer {
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.admin")
 
 	// Create master client with multiple master support
 	masterClient := wdclient.NewMasterClient(
 		grpcDialOption,
-		"",      // filerGroup - not needed for admin
+		filerGroup,
 		"admin", // clientType
 		"",      // clientHost - not needed for admin
 		"",      // dataCenter - not needed for admin
@@ -162,6 +188,7 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 		masterClient:                  masterClient,
 		templateFS:                    templateFS,
 		dataDir:                       dataDir,
+		filerGroup:                    filerGroup,
 		grpcDialOption:                grpcDialOption,
 		cacheExpiration:               defaultCacheTimeout,
 		filerCacheExpiration:          defaultFilerCacheTimeout,
@@ -291,6 +318,13 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 	go server.publishMaintenanceMetrics(bgCtx)
 
 	return server
+}
+
+func (s *AdminServer) listClusterNodesRequest(clientType string) *master_pb.ListClusterNodesRequest {
+	return &master_pb.ListClusterNodesRequest{
+		ClientType: clientType,
+		FilerGroup: s.filerGroup,
+	}
 }
 
 // vacuumToggler abstracts the master's vacuum enable/disable for testing.
@@ -661,6 +695,12 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 		glog.Warningf("Failed to get filer configuration, using defaults: %v", err)
 	}
 
+	// Read filer.conf so we can surface the read-only flag quota enforcement sets
+	fc, err := s.getFilerConf()
+	if err != nil {
+		glog.Warningf("Failed to read filer.conf for bucket read-only state: %v", err)
+	}
+
 	// Now list buckets from the filer and match with collection data
 	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		// Paginate through all buckets in the buckets directory
@@ -759,19 +799,24 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 					createdAt = time.Unix(resp.Entry.Attributes.Crtime, 0)
 					lastModified = time.Unix(resp.Entry.Attributes.Mtime, 0)
 				}
+				readOnly := fc.MatchStorageRule(filerConfig.BucketsPath + "/" + bucketName + "/").ReadOnly
+				lifecycleRuleCount, lifecycleEnabledCount := extractLifecycleCountsFromEntry(resp.Entry)
 				bucket := S3Bucket{
-					Name:               bucketName,
-					CreatedAt:          createdAt,
-					LogicalSize:        logicalSize,
-					PhysicalSize:       physicalSize,
-					LastModified:       lastModified,
-					Quota:              quota,
-					QuotaEnabled:       quotaEnabled,
-					VersioningStatus:   versioningStatus,
-					ObjectLockEnabled:  objectLockEnabled,
-					ObjectLockMode:     objectLockMode,
-					ObjectLockDuration: objectLockDuration,
-					Owner:              owner,
+					Name:                  bucketName,
+					CreatedAt:             createdAt,
+					LogicalSize:           logicalSize,
+					PhysicalSize:          physicalSize,
+					LastModified:          lastModified,
+					Quota:                 quota,
+					QuotaEnabled:          quotaEnabled,
+					ReadOnly:              readOnly,
+					VersioningStatus:      versioningStatus,
+					ObjectLockEnabled:     objectLockEnabled,
+					ObjectLockMode:        objectLockMode,
+					ObjectLockDuration:    objectLockDuration,
+					Owner:                 owner,
+					LifecycleRuleCount:    lifecycleRuleCount,
+					LifecycleEnabledCount: lifecycleEnabledCount,
 				}
 				buckets = append(buckets, bucket)
 			}
@@ -818,6 +863,13 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 	} else if data, ok := stats[collectionName]; ok {
 		details.Bucket.LogicalSize = data.LogicalSize
 		details.Bucket.PhysicalSize = data.PhysicalSize
+	}
+
+	// Surface the read-only flag quota enforcement sets in filer.conf
+	if fc, err := s.getFilerConf(); err != nil {
+		glog.Warningf("Failed to read filer.conf for bucket read-only state: %v", err)
+	} else {
+		details.Bucket.ReadOnly = fc.MatchStorageRule(filerConfig.BucketsPath + "/" + bucketName + "/").ReadOnly
 	}
 
 	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
@@ -869,6 +921,7 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 		details.Bucket.ObjectLockMode = objectLockMode
 		details.Bucket.ObjectLockDuration = objectLockDuration
 		details.Bucket.Owner = owner
+		details.Bucket.LifecycleRuleCount, details.Bucket.LifecycleEnabledCount = extractLifecycleCountsFromEntry(bucketResp.Entry)
 
 		return nil
 	})
@@ -878,6 +931,68 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 	}
 
 	return details, nil
+}
+
+// GetBucketLifecycle returns the lifecycle configuration stored on a bucket's filer entry
+func (s *AdminServer) GetBucketLifecycle(bucketName string) (*BucketLifecycle, error) {
+	filerConfig, err := s.getFilerConfig()
+	if err != nil {
+		glog.Warningf("Failed to get filer configuration, using defaults: %v", err)
+	}
+
+	lifecycle := &BucketLifecycle{
+		Bucket: bucketName,
+		Rules:  []BucketLifecycleRule{},
+	}
+
+	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
+			Directory: filerConfig.BucketsPath,
+			Name:      bucketName,
+		})
+		if err != nil {
+			return fmt.Errorf("bucket not found: %w", err)
+		}
+
+		xmlBytes := resp.Entry.Extended[scheduler.BucketLifecycleConfigurationXMLKey]
+		if len(xmlBytes) == 0 {
+			return nil
+		}
+		rules, err := lifecycle_xml.ParseCanonical(xmlBytes)
+		if err != nil {
+			return fmt.Errorf("parse lifecycle configuration: %w", err)
+		}
+		lifecycle.XML = string(xmlBytes)
+		for _, rule := range rules {
+			lifecycle.Rules = append(lifecycle.Rules, toBucketLifecycleRule(rule))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return lifecycle, nil
+}
+
+func toBucketLifecycleRule(rule *s3lifecycle.Rule) BucketLifecycleRule {
+	out := BucketLifecycleRule{
+		ID:                              rule.ID,
+		Status:                          rule.Status,
+		Prefix:                          rule.Prefix,
+		Tags:                            rule.FilterTags,
+		SizeGreaterThan:                 rule.FilterSizeGreaterThan,
+		SizeLessThan:                    rule.FilterSizeLessThan,
+		ExpirationDays:                  rule.ExpirationDays,
+		ExpiredObjectDeleteMarker:       rule.ExpiredObjectDeleteMarker,
+		NoncurrentVersionExpirationDays: rule.NoncurrentVersionExpirationDays,
+		NewerNoncurrentVersions:         rule.NewerNoncurrentVersions,
+		AbortMultipartDays:              rule.AbortMPUDaysAfterInitiation,
+	}
+	if !rule.ExpirationDate.IsZero() {
+		out.ExpirationDate = rule.ExpirationDate.Format(time.DateOnly)
+	}
+	return out
 }
 
 // CreateS3Bucket creates a new S3 bucket
@@ -1112,9 +1227,7 @@ func (s *AdminServer) GetClusterFilers() (*ClusterFilersData, error) {
 
 	// Get filer information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.FilerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.FilerType))
 		if err != nil {
 			return err
 		}
@@ -1159,9 +1272,7 @@ func (s *AdminServer) GetClusterBrokers() (*ClusterBrokersData, error) {
 
 	// Get broker information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.BrokerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.BrokerType))
 		if err != nil {
 			return err
 		}
@@ -1206,9 +1317,7 @@ func (s *AdminServer) GetClusterS3Servers() (*ClusterS3ServersData, error) {
 
 	// Get S3 server information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.S3Type,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.S3Type))
 		if err != nil {
 			return err
 		}
@@ -1419,8 +1528,8 @@ func (s *AdminServer) RunPluginDetectionWithReport(
 
 // DispatchPluginProposals dispatches a batch of proposals using the same
 // capacity-aware dispatch logic as the scheduler loop (executor reservation with
-// backoff, per-job retry on transient errors). The plugin lock must already be
-// held by the caller.
+// backoff, per-job retry on transient errors). The dispatch takes the cluster
+// admin lock around each job itself; callers must not hold it.
 func (s *AdminServer) DispatchPluginProposals(
 	ctx context.Context,
 	jobType string,
@@ -1642,9 +1751,7 @@ func (s *AdminServer) UpdateTopicRetention(namespace, name string, enabled bool,
 	// Get broker information from master
 	var brokerAddress string
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.BrokerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.BrokerType))
 		if err != nil {
 			return err
 		}
@@ -1772,6 +1879,24 @@ func extractObjectLockInfoFromEntry(entry *filer_pb.Entry) (bool, string, int32)
 // Function to extract versioning information from bucket entry using shared utilities
 func extractVersioningFromEntry(entry *filer_pb.Entry) string {
 	return s3api.GetVersioningStatus(entry)
+}
+
+func extractLifecycleCountsFromEntry(entry *filer_pb.Entry) (ruleCount, enabledCount int) {
+	xmlBytes := entry.Extended[scheduler.BucketLifecycleConfigurationXMLKey]
+	if len(xmlBytes) == 0 {
+		return
+	}
+	rules, err := lifecycle_xml.ParseCanonical(xmlBytes)
+	if err != nil {
+		return
+	}
+	for _, rule := range rules {
+		ruleCount++
+		if rule.Status == s3lifecycle.StatusEnabled {
+			enabledCount++
+		}
+	}
+	return
 }
 
 // GetConfigPersistence returns the config persistence manager

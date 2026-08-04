@@ -595,19 +595,14 @@ func (s *AdminServer) TriggerPluginDetectionAPI(w http.ResponseWriter, r *http.R
 }
 
 // RunPluginJobTypeAPI runs full workflow for one job type: detect then dispatch detected jobs.
+// RunPluginDetection and the dispatch path take the cluster admin lock
+// themselves (around detection and around each job), so no lock is held
+// across the whole workflow here.
 func (s *AdminServer) RunPluginJobTypeAPI(w http.ResponseWriter, r *http.Request) {
 	jobType := strings.TrimSpace(mux.Vars(r)["jobType"])
 	if jobType == "" {
 		writeJSONError(w, http.StatusBadRequest, "jobType is required")
 		return
-	}
-	releaseLock, err := s.acquirePluginLock(fmt.Sprintf("plugin detect+execute %s", jobType))
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if releaseLock != nil {
-		defer releaseLock()
 	}
 
 	var req struct {
@@ -805,9 +800,7 @@ func (s *AdminServer) buildDefaultPluginClusterContext() *plugin_pb.ClusterConte
 
 	s3Seen := map[string]struct{}{}
 	if err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.S3Type,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.S3Type))
 		if err != nil {
 			return err
 		}

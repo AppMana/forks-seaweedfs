@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -173,19 +174,11 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 		return &filer_pb.CreateEntryResponse{}, fmt.Errorf("CreateEntry cleanupChunks %s %s: %v", req.Directory, req.Entry.Name, err2)
 	}
 
-	so, err := fs.detectStorageOption(ctx, string(util.NewFullPath(req.Directory, req.Entry.Name)), "", "", 0, "", "", "", "")
-	if err != nil {
-		return nil, err
-	}
 	newEntry := filer.FromPbEntry(req.Directory, req.Entry)
 	newEntry.Chunks = chunks
-	// Don't apply TTL to remote entries - they're managed by remote storage
-	if newEntry.Remote == nil {
-		if newEntry.TtlSec == 0 {
-			newEntry.TtlSec = so.TtlSeconds
-		}
-	} else {
-		newEntry.TtlSec = 0
+	so, err := fs.applyStorageDefaultsToEntry(ctx, newEntry)
+	if err != nil {
+		return nil, err
 	}
 
 	// Serialize concurrent mutations to the same path on this filer so the
@@ -361,6 +354,23 @@ func (fs *FilerServer) ObjectTransactionBatch(ctx context.Context, req *filer_pb
 	return resp, nil
 }
 
+// applyStorageDefaultsToEntry enforces the path's storage rule (read-only
+// prefixes reject the write) and fills in the rule TTL when the entry carries
+// none. Remote entries never expire locally; the remote storage owns their
+// lifecycle.
+func (fs *FilerServer) applyStorageDefaultsToEntry(ctx context.Context, entry *filer.Entry) (*operation.StorageOption, error) {
+	so, err := fs.detectStorageOption(ctx, string(entry.FullPath), "", "", 0, "", "", "", "")
+	if err != nil {
+		return nil, err
+	}
+	if entry.Remote != nil {
+		entry.TtlSec = 0
+	} else if entry.TtlSec == 0 {
+		entry.TtlSec = so.TtlSeconds
+	}
+	return so, nil
+}
+
 // applyObjectMutation applies a single mutation while the transaction's path
 // lock is held. PUT entries are expected to be fully prepared by the caller
 // (chunks resolved); mutations here are metadata-scoped. A DELETE of an absent
@@ -373,15 +383,30 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 			return fmt.Errorf("PUT requires an entry")
 		}
 		newEntry := filer.FromPbEntry(m.Directory, m.Entry)
-		return fs.filer.CreateEntry(ctx, newEntry, nil, false, fromOtherCluster, signatures, false, fs.filer.MaxFilenameLength)
+		so, err := fs.applyStorageDefaultsToEntry(ctx, newEntry)
+		if err != nil {
+			return err
+		}
+		return fs.filer.CreateEntry(ctx, newEntry, nil, false, fromOtherCluster, signatures, false, so.MaxFileNameLength)
 
 	case filer_pb.ObjectMutation_DELETE:
 		fullpath := util.NewFullPath(m.Directory, m.Name)
 		err := fs.filer.DeleteEntryMetaAndData(ctx, fullpath, m.IsRecursive, false, m.IsDeleteData, fromOtherCluster, signatures, 0)
-		if err == filer_pb.ErrNotFound {
-			return nil
+		if err != nil && err != filer_pb.ErrNotFound {
+			return err
 		}
-		return err
+		if m.RemoveEmptyParent {
+			// A parent that exists only to hold this child (e.g. a .versions/
+			// directory losing its last version) is torn down in the same locked
+			// transaction. Best-effort: a non-empty or already-removed parent is
+			// the expected no-op, and a failed teardown must not fail the
+			// already-applied delete.
+			parentErr := fs.filer.DeleteEntryMetaAndData(ctx, util.FullPath(m.Directory), false, false, false, fromOtherCluster, signatures, 0)
+			if parentErr != nil && parentErr != filer_pb.ErrNotFound && !strings.Contains(parentErr.Error(), filer.MsgFailDelNonEmptyFolder) {
+				glog.V(1).InfofCtx(ctx, "remove empty parent %s: %v", m.Directory, parentErr)
+			}
+		}
+		return nil
 
 	case filer_pb.ObjectMutation_PATCH_EXTENDED:
 		fullpath := util.NewFullPath(m.Directory, m.Name)

@@ -432,7 +432,9 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 			glog.Errorf("share %s never became available; staging symlink not created", uncPath)
 		}()
 	} else if os.Getenv("WEED_WINFSP_NO_MOUNTMGR") != "1" && !strings.HasPrefix(dir, `\\`) {
-		if abs, err := filepath.Abs(dir); err == nil && len(abs) >= 2 && abs[1] == ':' {
+		if bare := strings.TrimSuffix(dir, `\`); len(bare) == 2 && bare[1] == ':' {
+			mountPoint = bare
+		} else if abs, err := filepath.Abs(dir); err == nil && len(abs) >= 2 && abs[1] == ':' {
 			mountPoint = `\\.\` + abs
 		}
 	}

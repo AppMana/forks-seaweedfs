@@ -46,7 +46,10 @@ type S3ApiServerOption struct {
 	Masters                   []pb.ServerAddress // For filer discovery
 	Port                      int
 	Config                    string
-	DomainName                string
+	// ConfigReloadInterval is how often Config is polled for content changes.
+	// 0 disables the watcher, leaving SIGHUP as the only reload trigger.
+	ConfigReloadInterval time.Duration
+	DomainName           string
 	AllowedOrigins            []string
 	BucketsPath               string
 	GrpcDialOption            grpc.DialOption
@@ -395,13 +398,17 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	}
 
 	if option.Config != "" {
+		// SIGHUP and the file watcher share one reload path, so an operator
+		// signalling the process and the watcher noticing a changed file do
+		// exactly the same thing.
 		grace.OnReload(func() {
-			if err := s3ApiServer.iam.loadS3ApiConfigurationFromFile(option.Config); err != nil {
+			if err := s3ApiServer.iam.ReloadStaticConfigFile(option.Config); err != nil {
 				glog.Errorf("fail to load config file %s: %v", option.Config, err)
-			} else {
-				glog.V(1).Infof("Loaded %d identities from config file %s", len(s3ApiServer.iam.identities), option.Config)
 			}
 		})
+		// Pick up changes without a SIGHUP too, so a mounted ConfigMap/Secret
+		// can be edited in place and take effect with no restart and no signal.
+		s3ApiServer.iam.startStaticConfigWatcher(option.Config, option.ConfigReloadInterval)
 	}
 
 	// Refresh the JWT signing keys on SIGHUP so an operator can rotate them

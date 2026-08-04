@@ -90,6 +90,14 @@ type IdentityAccessManagement struct {
 	// staticIdentityNames tracks identity names loaded from the static config file
 	// These identities are immutable and cannot be updated by dynamic configuration
 	staticIdentityNames map[string]bool
+
+	// fileIdentityNames tracks the identity names that came from the -s3.config
+	// file specifically, a subset of staticIdentityNames. staticIdentityNames
+	// also picks up identities declared via environment variables (see
+	// loadS3ApiConfigurationFromEnv), which a config-file reload must not touch.
+	// Knowing which names the file itself owns is what lets a reload drop an
+	// identity that was deleted from the file without disturbing the others.
+	fileIdentityNames map[string]bool
 }
 
 type Identity struct {
@@ -342,11 +350,36 @@ func NewIdentityAccessManagementWithStore(option *S3ApiServerOption, filerClient
 // stays gated on whether any static identity exists, so an advanced-IAM file
 // with no inline identities (OIDC/STS only) keeps the dynamic store live.
 func (iam *IdentityAccessManagement) markStaticIdentities(config *iam_pb.S3ApiConfiguration) {
+	iam.markStaticIdentitiesFromSource(config, false)
+}
+
+// markStaticIdentitiesFromSource is markStaticIdentities with a record of
+// whether the config came from the -s3.config file. When it did, the file is
+// authoritative over the set of names it owns, so a name it no longer lists
+// stops being static and is released. Names that became static some other way
+// (environment variables) are never released here, which is why file ownership
+// is tracked separately from staticIdentityNames.
+func (iam *IdentityAccessManagement) markStaticIdentitiesFromSource(config *iam_pb.S3ApiConfiguration, fromStaticFile bool) {
 	iam.m.Lock()
 	defer iam.m.Unlock()
 	if iam.staticIdentityNames == nil {
 		iam.staticIdentityNames = make(map[string]bool)
 	}
+
+	if fromStaticFile {
+		fileNames := make(map[string]bool, len(config.Identities))
+		for _, ident := range config.Identities {
+			fileNames[ident.Name] = true
+		}
+		// Release names this file used to own but no longer lists.
+		for name := range iam.fileIdentityNames {
+			if !fileNames[name] {
+				delete(iam.staticIdentityNames, name)
+			}
+		}
+		iam.fileIdentityNames = fileNames
+	}
+
 	for _, ident := range config.Identities {
 		iam.staticIdentityNames[ident.Name] = true
 	}
@@ -513,8 +546,9 @@ func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFile(fileName str
 	// every load so a reload protects newly added identities too, not just the
 	// set present at startup, and push the updated set into the credential
 	// manager so reloaded identities still show up in listings and survive
-	// later dynamic merges.
-	iam.markStaticIdentities(config)
+	// later dynamic merges. fromStaticFile=true also records which names this
+	// file owns, so a later reload can drop the ones it stops listing.
+	iam.markStaticIdentitiesFromSource(config, true)
 	iam.updateCredentialManagerStaticIdentities()
 	return nil
 }
@@ -806,7 +840,43 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 	for k, v := range iam.staticIdentityNames {
 		staticNames[k] = v
 	}
+	fileNames := make(map[string]bool)
+	for k, v := range iam.fileIdentityNames {
+		fileNames[k] = v
+	}
 	iam.m.RUnlock()
+
+	// A reload of the static config file is authoritative over the identities
+	// that file owns, so one deleted from the file must actually disappear.
+	// Upstream's merge is purely additive (it only ever adds or updates), which
+	// means a revoked credential would keep working until the process restarted
+	// -- the opposite of what a credential rotation is for. Only names this file
+	// previously owned are candidates: identities from the filer or from
+	// environment variables are untouched.
+	if fromStaticFile {
+		configuredNames := make(map[string]bool, len(config.Identities))
+		for _, ident := range config.Identities {
+			configuredNames[ident.Name] = true
+		}
+		var remaining []*Identity
+		for _, existing := range identities {
+			if fileNames[existing.Name] && !configuredNames[existing.Name] {
+				glog.V(0).Infof("removing identity %s: no longer in the config file", existing.Name)
+				delete(nameToIdentity, existing.Name)
+				for _, cred := range existing.Credentials {
+					if accessKeyIdent[cred.AccessKey] == existing {
+						delete(accessKeyIdent, cred.AccessKey)
+					}
+				}
+				if identityAnonymous == existing {
+					identityAnonymous = nil
+				}
+				continue
+			}
+			remaining = append(remaining, existing)
+		}
+		identities = remaining
+	}
 
 	// Process accounts from dynamic config (can add new accounts)
 	for _, account := range config.Accounts {

@@ -132,7 +132,7 @@ func newReadAtScenarioFixture(tb testing.TB, numChunks, chunkSize int, latency t
 	readerAt := &ChunkReadAt{
 		chunkViews:    chunkViews,
 		fileSize:      int64(totalSize),
-		readerCache:   NewReaderCache(readerCacheCapacity, alwaysMissChunkCache{}, lookupFn),
+		readerCache:   NewReaderCache(readerCacheCapacity, alwaysMissChunkCache{}, lookupFn, nil),
 		readerPattern: NewReaderPattern(),
 		ctx:           ctx,
 	}

@@ -6,7 +6,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [Parameter(Mandatory = $true)][string]$TestsExe,
-    [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-compat')
+    [string]$WorkRoot = (Join-Path $env:RUNNER_TEMP 'sw-compat'),
+    [string]$MountDrive = 'X:'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,7 +21,7 @@ $env:PATH = "$winFspBin;$env:PATH"
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
 $dataDir = Join-Path $WorkRoot 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-$mnt = Join-Path $WorkRoot 'mnt'
+$mnt = $MountDrive
 
 $server = Start-Process -FilePath $WeedExe -PassThru -NoNewWindow -ArgumentList @(
     'server', '-ip=127.0.0.1', "-dir=$dataDir", '-master.volumeSizeLimitMB=64', '-volume.max=5', '-filer'
@@ -37,13 +38,18 @@ try {
         '-winfspCaseSensitive=true'
     )
     $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Date) -lt $deadline -and -not (Test-Path $mnt)) { Start-Sleep -Milliseconds 250 }
-    if (-not (Test-Path $mnt)) { throw 'mount never appeared' }
+    while ((Get-Date) -lt $deadline -and -not (Test-Path "$mnt\")) { Start-Sleep -Milliseconds 250 }
+    if (-not (Test-Path "$mnt\")) { throw 'mount never appeared' }
 
-    Push-Location $mnt
+    Push-Location "$mnt\"
     try {
         # Exclusions follow cgofuse CI plus seaweedfs specifics:
         # no reparse/stream/EA support, no fileattr beyond the basics, and
+        # delete_ex_test needs FILE_ATTRIBUTE_READONLY enforcement --
+        # it creates with FILE_ATTRIBUTE_READONLY and requires
+        # FileDispositionInformationEx to answer STATUS_CANNOT_DELETE until
+        # IGNORE_READONLY_ATTRIBUTE is passed. Same missing attribute model
+        # as the *fileattr exclusions above.
         # no per-file Windows ACL/backup-privilege model (the mount exposes
         # one configured FileSecurity descriptor for the whole volume).
         # The HostProcess mount also retains the normal Windows path-length
@@ -56,7 +62,9 @@ try {
             -reparse* -stream* -ea* `
             -create_test -create_fileattr_test -create_readonlydir_test `
             -create_backup_test -create_restore_test -create_namelen_test `
+            -querydir_namelen_test `
             -getfileattr_test -setfileinfo_test -delete_access_test `
+            -delete_ex_test `
             -rename_flipflop_test -rename_mmap_test -exec* -oplock*
         $code = $LASTEXITCODE
         Write-Host "winfsp-tests exit code: $code (advisory)"

@@ -352,7 +352,8 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 		}
 	}
 	fileMode := toOsFileMode(mode)
-	now := time.Now().Unix()
+	nowTime := time.Now()
+	now := nowTime.Unix()
 	inode = wfs.inodeToPath.AllocateInode(entryFullPath, now)
 
 	newEntry = &filer_pb.Entry{
@@ -360,8 +361,11 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 		IsDirectory: false,
 		Attributes: &filer_pb.FuseAttributes{
 			Mtime:    now,
+			MtimeNs:  int32(nowTime.Nanosecond()),
 			Crtime:   now,
+			CrtimeNs: int32(nowTime.Nanosecond()),
 			Ctime:    now,
+			CtimeNs:  int32(nowTime.Nanosecond()),
 			FileMode: uint32(fileMode),
 			Uid:      uid,
 			Gid:      gid,

@@ -47,6 +47,7 @@ type S3Options struct {
 	portGrpc                  *int
 	portIceberg               *int
 	config                    *string
+	configReloadInterval      *time.Duration
 	iamConfig                 *string
 	domainName                *string
 	allowedOrigins            *string
@@ -91,6 +92,7 @@ func init() {
 	s3StandaloneOptions.allowedOrigins = cmdS3.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
 	s3StandaloneOptions.dataCenter = cmdS3.Flag.String("dataCenter", "", "prefer to read and write to volumes in this data center")
 	s3StandaloneOptions.config = cmdS3.Flag.String("config", "", "path to the config file")
+	s3StandaloneOptions.configReloadInterval = cmdS3.Flag.Duration("config.reloadInterval", s3api.DefaultStaticConfigReloadInterval, "how often to check -config for changes and reload identities without a restart; 0 disables (SIGHUP still reloads)")
 	s3StandaloneOptions.iamConfig = cmdS3.Flag.String("iam.config", "", "path to the advanced IAM config file")
 	s3StandaloneOptions.auditLogConfig = cmdS3.Flag.String("auditLogConfig", "", "path to the audit log config file")
 	s3StandaloneOptions.tlsPrivateKey = cmdS3.Flag.String("key.file", "", "path to the TLS private key file")
@@ -338,6 +340,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		Masters:                   masterAddresses,
 		Port:                      *s3opt.port,
 		Config:                    *s3opt.config,
+		ConfigReloadInterval:      s3ConfigReloadInterval(s3opt.configReloadInterval),
 		DomainName:                *s3opt.domainName,
 		AllowedOrigins:            strings.Split(*s3opt.allowedOrigins, ","),
 		BucketsPath:               filerBucketsPath,
@@ -598,4 +601,15 @@ func (s3opt *S3Options) deriveS3AdvertisedEndpoint() string {
 		}
 	}
 	return fmt.Sprintf("%s://%s", scheme, util.JoinHostPort(host, port))
+}
+
+// s3ConfigReloadInterval resolves the -config.reloadInterval flag. The flag is
+// only registered on the standalone `weed s3` command, so the other entry
+// points that build an S3Options (weed server, weed mini) leave the pointer
+// nil; those get the default rather than a disabled watcher.
+func s3ConfigReloadInterval(v *time.Duration) time.Duration {
+	if v == nil {
+		return s3api.DefaultStaticConfigReloadInterval
+	}
+	return *v
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -174,6 +175,11 @@ func (vs *VolumeServer) VolumeEcShardsGenerate(ctx context.Context, req *volume_
 	return &volume_server_pb.VolumeEcShardsGenerateResponse{}, nil
 }
 
+func recordEcRebuild(result string, d time.Duration) {
+	stats.VolumeServerECRebuildHistogram.WithLabelValues(result).Observe(d.Seconds())
+	stats.VolumeServerECRebuildCounter.WithLabelValues(result).Inc()
+}
+
 // VolumeEcShardsRebuild generates the any of the missing .ec00 ~ .ec13 files
 func (vs *VolumeServer) VolumeEcShardsRebuild(ctx context.Context, req *volume_server_pb.VolumeEcShardsRebuildRequest) (*volume_server_pb.VolumeEcShardsRebuildResponse, error) {
 	if err := vs.CheckMaintenanceMode(); err != nil {
@@ -235,20 +241,25 @@ func (vs *VolumeServer) VolumeEcShardsRebuild(ctx context.Context, req *volume_s
 	// Rebuild missing EC files, searching all disk locations for input shards.
 	// Present input shards are verified against the bitrot sidecar (when present)
 	// and corrupt ones are regenerated; unsafe_ignore_sidecar bypasses the guard.
+	start := time.Now()
 	dataBaseFileName := path.Join(rebuildDataDir, baseFileName)
-	if generatedShardIds, err := erasure_coding.RebuildEcFiles(dataBaseFileName, erasure_coding.BackgroundECContext(), req.UnsafeIgnoreSidecar, additionalDirs...); err != nil {
+	generatedShardIds, err := erasure_coding.RebuildEcFiles(dataBaseFileName, erasure_coding.BackgroundECContext(), req.UnsafeIgnoreSidecar, additionalDirs...)
+	if err != nil {
+		recordEcRebuild("failure", time.Since(start))
 		return nil, fmt.Errorf("RebuildEcFiles %s: %v", dataBaseFileName, err)
-	} else {
-		rebuiltShardIds = generatedShardIds
 	}
+	rebuiltShardIds = generatedShardIds
 
 	indexBaseFileName := path.Join(rebuildLocation.IdxDirectory, baseFileName)
 	if !util.FileExists(indexBaseFileName+".ecx") && rebuildLocation.IdxDirectory != rebuildLocation.Directory {
 		indexBaseFileName = path.Join(rebuildLocation.Directory, baseFileName)
 	}
 	if err := erasure_coding.RebuildEcxFile(indexBaseFileName); err != nil {
+		recordEcRebuild("failure", time.Since(start))
 		return nil, fmt.Errorf("RebuildEcxFile %s: %v", indexBaseFileName, err)
 	}
+
+	recordEcRebuild("success", time.Since(start))
 
 	// Opportunistic bitrot backfill: if protection is enabled, no sidecar exists
 	// yet (a volume encoded before this feature), and this rebuilder can reach
@@ -460,7 +471,7 @@ func (vs *VolumeServer) VolumeEcShardsDelete(ctx context.Context, req *volume_se
 	// Pass 1: delete the requested shard files (and any now-orphaned per-disk bitrot
 	// sidecars) on every disk.
 	for diskId, location := range vs.store.Locations {
-		if err := deleteEcShardIdsForEachLocation(bName, location, req.ShardIds); err != nil {
+		if err := deleteEcShardIdsForEachLocation(bName, location, vs.store.Locations, req.ShardIds); err != nil {
 			glog.Errorf("deleteEcShards from disk_id:%d %s %s.%v: %v", diskId, location.Directory, bName, req.ShardIds, err)
 			return nil, err
 		}
@@ -497,7 +508,7 @@ func (vs *VolumeServer) VolumeEcShardsDelete(ctx context.Context, req *volume_se
 	return &volume_server_pb.VolumeEcShardsDeleteResponse{}, nil
 }
 
-func deleteEcShardIdsForEachLocation(bName string, location *storage.DiskLocation, shardIds []uint32) error {
+func deleteEcShardIdsForEachLocation(bName string, location *storage.DiskLocation, locations []*storage.DiskLocation, shardIds []uint32) error {
 
 	found := false
 
@@ -535,7 +546,7 @@ func deleteEcShardIdsForEachLocation(bName string, location *storage.DiskLocatio
 		if err := removeBitrotSidecars(dataBaseFilename); err != nil {
 			return err
 		}
-		if location.IdxDirectory != location.Directory {
+		if location.IdxDirectory != location.Directory && !idxSidecarInUse(bName, location.IdxDirectory, locations) {
 			if err := removeBitrotSidecars(indexBaseFilename); err != nil {
 				return err
 			}
@@ -543,6 +554,21 @@ func deleteEcShardIdsForEachLocation(bName string, location *storage.DiskLocatio
 	}
 
 	return nil
+}
+
+// One -dir.idx serves every disk, so the idx-base sidecar is shared: it stays
+// while any disk using that idx directory still holds shards of this volume.
+// A status error counts as in-use so a transient failure never strips it early.
+func idxSidecarInUse(bName string, idxDirectory string, locations []*storage.DiskLocation) bool {
+	for _, other := range locations {
+		if other.IdxDirectory != idxDirectory {
+			continue
+		}
+		if _, _, count, err := checkEcVolumeStatus(bName, other); err != nil || count > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // removeEcSharedIndexFiles removes the shared .ecx/.ecj index (and the .vif when no
@@ -716,6 +742,14 @@ func isEcDataShardFile(fileName, baseName string) bool {
 func (vs *VolumeServer) VolumeEcShardsMount(ctx context.Context, req *volume_server_pb.VolumeEcShardsMountRequest) (*volume_server_pb.VolumeEcShardsMountResponse, error) {
 
 	glog.V(0).Infof("VolumeEcShardsMount: %v", req)
+
+	// Fetch a missing .ecx from a peer first so on-disk shards that never had a
+	// local index can be mounted (issue #10104). Driven on demand by ec.rebuild.
+	// volume_id 0 recovers every orphan on this server, including volumes the
+	// master never learned about.
+	if req.RecoverMissingIndex {
+		vs.recoverMissingEcIndexes(req.VolumeId)
+	}
 
 	for _, shardId := range req.ShardIds {
 		err := vs.store.MountEcShards(req.Collection, needle.VolumeId(req.VolumeId), erasure_coding.ShardId(shardId), req.SourceDiskType)

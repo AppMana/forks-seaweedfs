@@ -15,6 +15,7 @@ import (
 	"github.com/seaweedfs/raft"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -203,20 +204,9 @@ func (ms *MasterServer) Statistics(ctx context.Context, req *master_pb.Statistic
 		return nil, raft.NotLeaderError
 	}
 
-	if req.Replication == "" {
-		req.Replication = ms.option.DefaultReplicaPlacement
-	}
-	replicaPlacement, err := super_block.NewReplicaPlacementFromString(req.Replication)
-	if err != nil {
-		return nil, err
-	}
-	ttl, err := needle.ReadTTL(req.Ttl)
-	if err != nil {
-		return nil, err
-	}
-
-	volumeLayout := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, ttl, types.ToDiskType(req.DiskType))
-	stats := volumeLayout.Stats()
+	// an empty collection means all collections, and a named collection covers
+	// all its layouts, so used size matches the topology-wide total size below
+	stats := ms.Topo.CollectionVolumeStats(req.Collection)
 	totalSize := ms.Topo.GetDiskUsages().GetMaxVolumeCount() * int64(ms.option.VolumeSizeLimitMB) * 1024 * 1024
 	resp := &master_pb.StatisticsResponse{
 		TotalSize: uint64(totalSize),
@@ -323,18 +313,33 @@ func (ms *MasterServer) VolumeMarkReadonly(ctx context.Context, req *master_pb.V
 
 	replicaPlacement, _ := super_block.NewReplicaPlacementFromByte(byte(req.ReplicaPlacement))
 	vl := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, needle.LoadTTLFromUint32(req.Ttl), types.ToDiskType(req.DiskType))
-	dataNodes := ms.Topo.Lookup(req.Collection, needle.VolumeId(req.VolumeId))
+	vid := needle.VolumeId(req.VolumeId)
+	dataNodes := ms.Topo.Lookup(req.Collection, vid)
 
+	found := false
 	for _, dn := range dataNodes {
 		if dn.Ip == req.Ip && dn.Port == int(req.Port) {
+			found = true
 			if req.IsReadonly {
-				vid := needle.VolumeId(req.VolumeId)
 				vl.SetVolumeReadOnly(dn, vid)
 				if pending := vl.GetPendingSize(vid); pending > 0 {
 					glog.V(0).Infof("volume %d marked readonly with %d pending bytes", vid, pending)
 				}
 			} else {
-				vl.SetVolumeWritable(dn, needle.VolumeId(req.VolumeId))
+				vl.SetVolumeWritable(dn, vid)
+			}
+		}
+	}
+
+	// A vacuum worker marks the volume writable after a successful commit. If the
+	// index lost it meanwhile (e.g. a disconnect race during the vacuum), the loop
+	// found nothing to update; re-register it from the node that still holds it so
+	// LookupVolume stops returning "not found".
+	if !found && !req.IsReadonly {
+		if dn := ms.Topo.LookupDataNodeByAddress(pb.NewServerAddress(req.Ip, int(req.Port), 0)); dn != nil {
+			if vi, err := dn.GetVolumesById(vid); err == nil {
+				ms.Topo.RegisterVolumeLayout(vi, dn)
+				glog.V(0).Infof("volume %d re-registered from %s:%d, was missing from the lookup index at mark-writable", vid, req.Ip, req.Port)
 			}
 		}
 	}

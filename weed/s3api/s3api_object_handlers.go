@@ -25,6 +25,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -362,6 +363,13 @@ func (s3a *S3ApiServer) hasChildren(ctx context.Context, bucket, prefix string) 
 	return true
 }
 
+// isBareDirectory reports whether entry is a directory carrying no object data of its own.
+// Such a path is not an S3 object: GET/HEAD answer 404 like AWS does for a prefix, and
+// Hadoop-style clients then discover the directory through their LIST fallback.
+func isBareDirectory(entry *filer_pb.Entry) bool {
+	return entry != nil && entry.IsDirectory && filer.FileSize(entry) == 0
+}
+
 // checkDirectoryObject checks if the object is a directory object (ends with "/") and if it exists
 // Returns: (entry, isDirectoryObject, error)
 // - entry: the directory entry if found and is a directory
@@ -427,10 +435,17 @@ func (s3a *S3ApiServer) serveDirectoryContent(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Set content type - use stored MIME type or default
+	// Set content type - use stored MIME type or default. A directory without a stored
+	// mime and without data of its own answers application/x-directory, the marker type
+	// Hadoop-style clients (e.g. flink-s3-fs-presto) require to classify the path as a
+	// directory; defaulting to octet-stream makes them treat it as a 0-byte file.
 	contentType := entry.Attributes.Mime
 	if contentType == "" {
-		contentType = "application/octet-stream"
+		if entry.IsDirectoryKeyObject() {
+			contentType = "application/octet-stream"
+		} else {
+			contentType = s3_constants.DirectoryMimeType
+		}
 	}
 	w.Header().Set("Content-Type", contentType)
 
@@ -684,7 +699,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
 				// .versions/ doesn't exist (confirmed not found), check regular path for null version
 				regularEntry, regularErr := s3a.getEntry(bucketDir, normalizedObject)
-				if regularErr == nil && regularEntry != nil {
+				if regularErr == nil && regularEntry != nil && !isBareDirectory(regularEntry) {
 					// Found object at regular path - this is the null version
 					entry = regularEntry
 					targetVersionId = "null"
@@ -782,6 +797,13 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 	if objectEntryForSSE == nil {
 		glog.Errorf("GetObjectHandler: objectEntryForSSE is nil for %s/%s (should not happen)", bucket, object)
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	// A bare directory path is not an object: 404 like AWS instead of an empty 200,
+	// so Hadoop-style clients fall back to LIST discovery. HEAD and ranged GET already 404.
+	if !strings.HasSuffix(object, "/") && isBareDirectory(objectEntryForSSE) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
 		return
 	}
 
@@ -1168,6 +1190,12 @@ func (s3a *S3ApiServer) createLookupFileIdFunction() func(context.Context, strin
 
 // streamFromVolumeServersWithSSE handles streaming with inline SSE decryption
 func (s3a *S3ApiServer) streamFromVolumeServersWithSSE(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, sseType string, bucket, object, versionId string) error {
+	if entry.RemoteEntry != nil && entry.RemoteEntry.RemoteSize > 0 {
+		// inline content is served locally without chunks
+		hit := !entry.IsInRemoteOnly() || len(entry.Content) > 0
+		stats.RecordRemoteCacheRead(stats.RemoteCacheSourceS3, bucket, hit)
+	}
+
 	// If not encrypted, use fast path without decryption
 	if sseType == "" || sseType == "None" {
 		return s3a.streamFromVolumeServers(w, r, entry, sseType, bucket, object, versionId)
@@ -2070,6 +2098,9 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 			if algoName, ok := entry.Extended[s3_constants.ExtChecksumAlgorithm]; ok {
 				if checksumVal, ok := entry.Extended[s3_constants.ExtChecksumValue]; ok {
 					w.Header().Set(string(algoName), string(checksumVal))
+					if checksumType, ok := entry.Extended[s3_constants.ExtChecksumType]; ok && len(checksumType) > 0 {
+						w.Header().Set(s3_constants.AmzChecksumType, string(checksumType))
+					}
 				}
 			}
 		}
@@ -2209,7 +2240,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
 				// .versions/ doesn't exist (confirmed not found), check regular path for null version
 				regularEntry, regularErr := s3a.getEntry(bucketDir, normalizedObject)
-				if regularErr == nil && regularEntry != nil {
+				if regularErr == nil && regularEntry != nil && !isBareDirectory(regularEntry) {
 					// Found object at regular path - this is the null version
 					entry = regularEntry
 					targetVersionId = "null"
@@ -2348,7 +2379,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 		if objectEntryForSSE.Attributes != nil {
 			isZeroByteFile := objectEntryForSSE.Attributes.FileSize == 0 && !objectEntryForSSE.IsDirectory
 			// A directory with data (a promoted file) is retrievable; empty directories 404 for LIST fallback.
-			if objectEntryForSSE.IsDirectory && filer.FileSize(objectEntryForSSE) == 0 {
+			if isBareDirectory(objectEntryForSSE) {
 				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
 				return
 			}

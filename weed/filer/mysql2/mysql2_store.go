@@ -58,6 +58,9 @@ func (store *MysqlStore2) initialize(createTable, upsertQuery string, enableUpse
 	maxLifetimeSeconds int, interpolateParams bool) (err error) {
 
 	store.SupportBucketTable = true
+	if createTable == "" {
+		createTable = mysql.DefaultCreateTableQuery
+	}
 	if !enableUpsert {
 		upsertQuery = ""
 	} else if upsertQuery == "" {
@@ -65,7 +68,7 @@ func (store *MysqlStore2) initialize(createTable, upsertQuery string, enableUpse
 	}
 	gen := &mysql.SqlGenMysql{
 		CreateTableSqlTemplate: createTable,
-		DropTableSqlTemplate:   "DROP TABLE `%s`",
+		DropTableSqlTemplate:   "DROP TABLE IF EXISTS `%s`",
 		UpsertQueryTemplate:    upsertQuery,
 	}
 	store.SqlGenerator = gen

@@ -79,11 +79,15 @@ type S3Bucket struct {
 	LastModified       time.Time `json:"last_modified"`
 	Quota              int64     `json:"quota"`                // Quota in bytes, 0 means no quota
 	QuotaEnabled       bool      `json:"quota_enabled"`        // Whether quota is enabled
+	ReadOnly           bool      `json:"read_only"`            // Whether the bucket path is read-only in filer.conf (e.g. quota enforcement)
 	VersioningStatus   string    `json:"versioning_status"`    // Versioning status: "" (never enabled), "Enabled", or "Suspended"
 	ObjectLockEnabled  bool      `json:"object_lock_enabled"`  // Whether object lock is enabled
 	ObjectLockMode     string    `json:"object_lock_mode"`     // Object lock mode: "GOVERNANCE" or "COMPLIANCE"
 	ObjectLockDuration int32     `json:"object_lock_duration"` // Default retention duration in days
 	Owner              string    `json:"owner,omitempty"`      // Bucket owner identity; empty means admin-only access
+
+	LifecycleRuleCount    int `json:"lifecycle_rule_count"`
+	LifecycleEnabledCount int `json:"lifecycle_enabled_count"`
 }
 
 type S3Object struct {
@@ -97,6 +101,27 @@ type S3Object struct {
 type BucketDetails struct {
 	Bucket    S3Bucket  `json:"bucket"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type BucketLifecycleRule struct {
+	ID                              string            `json:"id,omitempty"`
+	Status                          string            `json:"status"`
+	Prefix                          string            `json:"prefix,omitempty"`
+	Tags                            map[string]string `json:"tags,omitempty"`
+	SizeGreaterThan                 int64             `json:"size_greater_than,omitempty"`
+	SizeLessThan                    int64             `json:"size_less_than,omitempty"`
+	ExpirationDays                  int               `json:"expiration_days,omitempty"`
+	ExpirationDate                  string            `json:"expiration_date,omitempty"`
+	ExpiredObjectDeleteMarker       bool              `json:"expired_object_delete_marker,omitempty"`
+	NoncurrentVersionExpirationDays int               `json:"noncurrent_version_expiration_days,omitempty"`
+	NewerNoncurrentVersions         int               `json:"newer_noncurrent_versions,omitempty"`
+	AbortMultipartDays              int               `json:"abort_multipart_days,omitempty"`
+}
+
+type BucketLifecycle struct {
+	Bucket string                `json:"bucket"`
+	Rules  []BucketLifecycleRule `json:"rules"`
+	XML    string                `json:"xml,omitempty"`
 }
 
 // ObjectStoreUser is defined in admin_data.go

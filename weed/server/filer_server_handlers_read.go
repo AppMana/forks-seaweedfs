@@ -193,6 +193,12 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if entry.Remote != nil && entry.Remote.RemoteSize > 0 {
+		// inline content is served locally without chunks
+		hit := !entry.IsInRemoteOnly() || len(entry.Content) > 0
+		stats.RecordRemoteCacheRead(stats.RemoteCacheSourceFiler, fs.filer.DetectBucket(entry.FullPath), hit)
+	}
+
 	ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
 		if offset+size <= int64(len(entry.Content)) {
 			return func(writer io.Writer) error {
@@ -254,5 +260,16 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func (fs *FilerServer) maybeGetVolumeReadJwtAuthorizationToken(fileId string) string {
-	return string(security.GenJwtForVolumeServer(fs.volumeGuard.ReadSigningKey(), fs.volumeGuard.ReadExpiresAfterSec(), fileId))
+	// Generate a read JWT for volume server access. If the dedicated
+	// read key (jwt.signing.read.key) is not configured, fall back to the
+	// general signing key (jwt.signing.key) so the proxy can still
+	// authenticate to volume servers that require JWT.
+	key := fs.volumeGuard.ReadSigningKey()
+	if len(key) == 0 {
+		key = fs.volumeGuard.SigningKey()
+	}
+	if len(key) == 0 {
+		return ""
+	}
+	return string(security.GenJwtForVolumeServer(key, fs.volumeGuard.ReadExpiresAfterSec(), fileId))
 }

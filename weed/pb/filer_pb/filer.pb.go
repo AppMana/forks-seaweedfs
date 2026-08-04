@@ -552,8 +552,11 @@ type RemoteEntry struct {
 	RemoteETag        string                 `protobuf:"bytes,3,opt,name=remote_e_tag,json=remoteETag,proto3" json:"remote_e_tag,omitempty"`
 	RemoteMtime       int64                  `protobuf:"varint,4,opt,name=remote_mtime,json=remoteMtime,proto3" json:"remote_mtime,omitempty"`
 	RemoteSize        int64                  `protobuf:"varint,5,opt,name=remote_size,json=remoteSize,proto3" json:"remote_size,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// unset when the remote listing does not report encodings (S3);
+	// empty when the remote object authoritatively has none
+	RemoteContentEncoding *string `protobuf:"bytes,6,opt,name=remote_content_encoding,json=remoteContentEncoding,proto3,oneof" json:"remote_content_encoding,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *RemoteEntry) Reset() {
@@ -619,6 +622,13 @@ func (x *RemoteEntry) GetRemoteSize() int64 {
 		return x.RemoteSize
 	}
 	return 0
+}
+
+func (x *RemoteEntry) GetRemoteContentEncoding() string {
+	if x != nil && x.RemoteContentEncoding != nil {
+		return *x.RemoteContentEncoding
+	}
+	return ""
 }
 
 type Entry struct {
@@ -1476,21 +1486,22 @@ func (x *WriteCondition) GetClauses() []*WriteCondition_Clause {
 // several RPCs. Data-bearing writes (entries with chunks) should be written
 // before the transaction; mutations here are metadata-scoped.
 type ObjectMutation struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Type           ObjectMutation_Type    `protobuf:"varint,1,opt,name=type,proto3,enum=filer_pb.ObjectMutation_Type" json:"type,omitempty"`
-	Directory      string                 `protobuf:"bytes,2,opt,name=directory,proto3" json:"directory,omitempty"`
-	Name           string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`                                                                                                            // entry name for DELETE / PATCH_EXTENDED / RECOMPUTE_LATEST (the pointer entry)
-	Entry          *Entry                 `protobuf:"bytes,4,opt,name=entry,proto3" json:"entry,omitempty"`                                                                                                          // full entry for PUT
-	SetExtended    map[string][]byte      `protobuf:"bytes,5,rep,name=set_extended,json=setExtended,proto3" json:"set_extended,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // PATCH_EXTENDED: keys to set
-	DeleteExtended []string               `protobuf:"bytes,6,rep,name=delete_extended,json=deleteExtended,proto3" json:"delete_extended,omitempty"`                                                                  // PATCH_EXTENDED: keys to remove
-	IsDeleteData   bool                   `protobuf:"varint,7,opt,name=is_delete_data,json=isDeleteData,proto3" json:"is_delete_data,omitempty"`                                                                     // DELETE: also delete chunk data
-	IsRecursive    bool                   `protobuf:"varint,8,opt,name=is_recursive,json=isRecursive,proto3" json:"is_recursive,omitempty"`                                                                          // DELETE: recurse into a directory
-	Recompute      *Recompute             `protobuf:"bytes,9,opt,name=recompute,proto3" json:"recompute,omitempty"`                                                                                                  // RECOMPUTE_LATEST parameters
-	SetContent     bool                   `protobuf:"varint,10,opt,name=set_content,json=setContent,proto3" json:"set_content,omitempty"`                                                                            // PATCH_EXTENDED: replace Entry.content with content
-	Content        []byte                 `protobuf:"bytes,11,opt,name=content,proto3" json:"content,omitempty"`                                                                                                     // PATCH_EXTENDED: new Entry.content when set_content
-	TouchMtime     bool                   `protobuf:"varint,12,opt,name=touch_mtime,json=touchMtime,proto3" json:"touch_mtime,omitempty"`                                                                            // PATCH_EXTENDED: set the entry's Mtime to now (e.g. a metadata-replace copy)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Type              ObjectMutation_Type    `protobuf:"varint,1,opt,name=type,proto3,enum=filer_pb.ObjectMutation_Type" json:"type,omitempty"`
+	Directory         string                 `protobuf:"bytes,2,opt,name=directory,proto3" json:"directory,omitempty"`
+	Name              string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`                                                                                                            // entry name for DELETE / PATCH_EXTENDED / RECOMPUTE_LATEST (the pointer entry)
+	Entry             *Entry                 `protobuf:"bytes,4,opt,name=entry,proto3" json:"entry,omitempty"`                                                                                                          // full entry for PUT
+	SetExtended       map[string][]byte      `protobuf:"bytes,5,rep,name=set_extended,json=setExtended,proto3" json:"set_extended,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // PATCH_EXTENDED: keys to set
+	DeleteExtended    []string               `protobuf:"bytes,6,rep,name=delete_extended,json=deleteExtended,proto3" json:"delete_extended,omitempty"`                                                                  // PATCH_EXTENDED: keys to remove
+	IsDeleteData      bool                   `protobuf:"varint,7,opt,name=is_delete_data,json=isDeleteData,proto3" json:"is_delete_data,omitempty"`                                                                     // DELETE: also delete chunk data
+	IsRecursive       bool                   `protobuf:"varint,8,opt,name=is_recursive,json=isRecursive,proto3" json:"is_recursive,omitempty"`                                                                          // DELETE: recurse into a directory
+	Recompute         *Recompute             `protobuf:"bytes,9,opt,name=recompute,proto3" json:"recompute,omitempty"`                                                                                                  // RECOMPUTE_LATEST parameters
+	SetContent        bool                   `protobuf:"varint,10,opt,name=set_content,json=setContent,proto3" json:"set_content,omitempty"`                                                                            // PATCH_EXTENDED: replace Entry.content with content
+	Content           []byte                 `protobuf:"bytes,11,opt,name=content,proto3" json:"content,omitempty"`                                                                                                     // PATCH_EXTENDED: new Entry.content when set_content
+	TouchMtime        bool                   `protobuf:"varint,12,opt,name=touch_mtime,json=touchMtime,proto3" json:"touch_mtime,omitempty"`                                                                            // PATCH_EXTENDED: set the entry's Mtime to now (e.g. a metadata-replace copy)
+	RemoveEmptyParent bool                   `protobuf:"varint,13,opt,name=remove_empty_parent,json=removeEmptyParent,proto3" json:"remove_empty_parent,omitempty"`                                                     // DELETE: also remove the parent directory when the delete leaves it empty (best-effort)
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ObjectMutation) Reset() {
@@ -1603,6 +1614,13 @@ func (x *ObjectMutation) GetContent() []byte {
 func (x *ObjectMutation) GetTouchMtime() bool {
 	if x != nil {
 		return x.TouchMtime
+	}
+	return false
+}
+
+func (x *ObjectMutation) GetRemoveEmptyParent() bool {
+	if x != nil {
+		return x.RemoveEmptyParent
 	}
 	return false
 }
@@ -6810,7 +6828,7 @@ const file_filer_proto_rawDesc = "" +
 	"\x0esnapshot_ts_ns\x18\x06 \x01(\x03R\fsnapshotTsNs\"b\n" +
 	"\x13ListEntriesResponse\x12%\n" +
 	"\x05entry\x18\x01 \x01(\v2\x0f.filer_pb.EntryR\x05entry\x12$\n" +
-	"\x0esnapshot_ts_ns\x18\x02 \x01(\x03R\fsnapshotTsNs\"\xc8\x01\n" +
+	"\x0esnapshot_ts_ns\x18\x02 \x01(\x03R\fsnapshotTsNs\"\xa1\x02\n" +
 	"\vRemoteEntry\x12!\n" +
 	"\fstorage_name\x18\x01 \x01(\tR\vstorageName\x120\n" +
 	"\x15last_local_sync_ts_ns\x18\x02 \x01(\x03R\x11lastLocalSyncTsNs\x12 \n" +
@@ -6818,7 +6836,9 @@ const file_filer_proto_rawDesc = "" +
 	"remoteETag\x12!\n" +
 	"\fremote_mtime\x18\x04 \x01(\x03R\vremoteMtime\x12\x1f\n" +
 	"\vremote_size\x18\x05 \x01(\x03R\n" +
-	"remoteSize\"\x89\x04\n" +
+	"remoteSize\x12;\n" +
+	"\x17remote_content_encoding\x18\x06 \x01(\tH\x00R\x15remoteContentEncoding\x88\x01\x01B\x1a\n" +
+	"\x18_remote_content_encoding\"\x89\x04\n" +
 	"\x05Entry\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
 	"\fis_directory\x18\x02 \x01(\bR\visDirectory\x12+\n" +
@@ -6928,7 +6948,7 @@ const file_filer_proto_rawDesc = "" +
 	"\x13IF_UNMODIFIED_SINCE\x10\x05\x12\x15\n" +
 	"\x11IF_MODIFIED_SINCE\x10\x06\x12\x19\n" +
 	"\x15IF_EXTENDED_NOT_EQUAL\x10\a\x12\x1c\n" +
-	"\x18IF_EXTENDED_TIME_ELAPSED\x10\b\"\xf2\x04\n" +
+	"\x18IF_EXTENDED_TIME_ELAPSED\x10\b\"\xa2\x05\n" +
 	"\x0eObjectMutation\x121\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1d.filer_pb.ObjectMutation.TypeR\x04type\x12\x1c\n" +
 	"\tdirectory\x18\x02 \x01(\tR\tdirectory\x12\x12\n" +
@@ -6944,7 +6964,8 @@ const file_filer_proto_rawDesc = "" +
 	"setContent\x12\x18\n" +
 	"\acontent\x18\v \x01(\fR\acontent\x12\x1f\n" +
 	"\vtouch_mtime\x18\f \x01(\bR\n" +
-	"touchMtime\x1a>\n" +
+	"touchMtime\x12.\n" +
+	"\x13remove_empty_parent\x18\r \x01(\bR\x11removeEmptyParent\x1a>\n" +
 	"\x10SetExtendedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"E\n" +
@@ -7710,6 +7731,7 @@ func file_filer_proto_init() {
 	if File_filer_proto != nil {
 		return
 	}
+	file_filer_proto_msgTypes[4].OneofWrappers = []any{}
 	file_filer_proto_msgTypes[84].OneofWrappers = []any{
 		(*StreamMutateEntryRequest_CreateRequest)(nil),
 		(*StreamMutateEntryRequest_UpdateRequest)(nil),

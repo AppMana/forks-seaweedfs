@@ -24,6 +24,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -65,6 +67,29 @@ func isValidDirective(value string) bool {
 // hasPrefixFold reports whether s starts with prefix, ignoring case.
 func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+// classifyCopySourceError maps a copy-source lookup to an S3 error: a missing
+// or directory source is NoSuchKey like AWS, but a transient store error
+// becomes a retryable 5xx so a resumable copy/commit survives a blip.
+func classifyCopySourceError(entry *filer_pb.Entry, err error) s3err.ErrorCode {
+	if err == nil {
+		if entry == nil || entry.IsDirectory {
+			return s3err.ErrNoSuchKey
+		}
+		if deleteMarker, ok := entry.Extended[s3_constants.ExtDeleteMarkerKey]; ok && string(deleteMarker) == "true" {
+			return s3err.ErrNoSuchKey
+		}
+		return s3err.ErrNone
+	}
+	if errors.Is(err, filer_pb.ErrNotFound) || status.Code(err) == codes.NotFound ||
+		errors.Is(err, errInvalidVersionID) || errors.Is(err, ErrDeleteMarker) {
+		return s3err.ErrNoSuchKey
+	}
+	if isTransientFilerError(err) {
+		return s3err.ErrServiceUnavailable
+	}
+	return s3err.ErrInternalError
 }
 
 func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request) {
@@ -144,13 +169,19 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	srcVersioningState, err := s3a.getVersioningState(srcBucket)
 	if err != nil {
 		glog.Errorf("Error checking versioning state for source bucket %s: %v", srcBucket, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+		// A missing source bucket is NoSuchBucket like AWS; a store error must
+		// stay retryable, matching the destination-bucket lookup.
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			return
+		}
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
 
 	entry, err := s3a.resolveCopySourceEntry(srcBucket, srcObject, srcVersionId, srcVersioningState)
-	if err != nil || entry.IsDirectory {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+	if errCode := classifyCopySourceError(entry, err); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
@@ -216,8 +247,8 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		routeInPlace := owner != "" && dstVersioningState == "" && !mimeChanged
 		selfCopyBody := func() s3err.ErrorCode {
 			currentEntry, currentErr := s3a.resolveCopySourceEntry(srcBucket, srcObject, srcVersionId, srcVersioningState)
-			if currentErr != nil || currentEntry.IsDirectory {
-				return s3err.ErrInvalidCopySource
+			if errCode := classifyCopySourceError(currentEntry, currentErr); errCode != s3err.ErrNone {
+				return errCode
 			}
 			if errCode := s3a.validateConditionalCopyHeaders(r, currentEntry); errCode != s3err.ErrNone {
 				return errCode
@@ -336,7 +367,8 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	// to preserve the encryption header filtering. Fixes GitHub #7562.
 	processedMetadata, tagErr := processMetadataBytes(r.Header, dstEntry.Extended, replaceMeta, replaceTagging)
 	if tagErr != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+		glog.Errorf("CopyObjectHandler ValidateTags error %s: %v", r.URL, tagErr)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidTag)
 		return
 	}
 
@@ -828,12 +860,22 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
 		return
 	}
+	if partID < 1 {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
+		return
+	}
 
 	// Get detailed versioning state for source bucket
 	srcVersioningState, err := s3a.getVersioningState(srcBucket)
 	if err != nil {
 		glog.Errorf("Error checking versioning state for source bucket %s: %v", srcBucket, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+		// A missing source bucket is NoSuchBucket like AWS; a store error must
+		// stay retryable, matching the destination-bucket lookup.
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			return
+		}
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
 
@@ -856,8 +898,8 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		entry, err = s3a.getEntry(dir, name)
 	}
 
-	if err != nil || entry.IsDirectory {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+	if errCode := classifyCopySourceError(entry, err); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 

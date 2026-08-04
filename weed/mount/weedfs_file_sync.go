@@ -169,7 +169,7 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	if !isOverQuota {
 		if err := fh.dirtyPages.FlushData(); err != nil {
 			glog.Errorf("%v doFlush: %v", fileFullPath, err)
-			return fuse.EIO
+			return writeErrorToFuseStatus(err)
 		}
 	}
 

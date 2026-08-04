@@ -32,7 +32,8 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		return s
 	}
 
-	now := time.Now().Unix()
+	nowTime := time.Now()
+	now := nowTime.Unix()
 
 	dirFullPath, code := wfs.inodeToPath.GetPath(in.NodeId)
 	if code != fuse.OK {
@@ -52,8 +53,11 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		IsDirectory: true,
 		Attributes: &filer_pb.FuseAttributes{
 			Mtime:    now,
+			MtimeNs:  int32(nowTime.Nanosecond()),
 			Crtime:   now,
+			CrtimeNs: int32(nowTime.Nanosecond()),
 			Ctime:    now,
+			CtimeNs:  int32(nowTime.Nanosecond()),
 			FileMode: uint32(os.ModeDir) | in.Mode,
 			Uid:      in.Uid,
 			Gid:      in.Gid,

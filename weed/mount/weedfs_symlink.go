@@ -29,7 +29,8 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 	}
 	entryFullPath := dirPath.Child(name)
 
-	now := time.Now().Unix()
+	nowTime := time.Now()
+	now := nowTime.Unix()
 	// Pre-allocate the mount's local inode so the filer stores the same
 	// object identity we report to the kernel below. Without this, the filer
 	// assigns its own inode and subsequent cached reads would disagree with
@@ -42,8 +43,11 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 			IsDirectory: false,
 			Attributes: &filer_pb.FuseAttributes{
 				Mtime:         now,
+				MtimeNs:       int32(nowTime.Nanosecond()),
 				Crtime:        now,
+				CrtimeNs:      int32(nowTime.Nanosecond()),
 				Ctime:         now,
+				CtimeNs:       int32(nowTime.Nanosecond()),
 				FileMode:      uint32(os.FileMode(0777) | os.ModeSymlink),
 				Uid:           header.Uid,
 				Gid:           header.Gid,

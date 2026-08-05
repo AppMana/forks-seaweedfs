@@ -194,6 +194,16 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 			dataFile, err = os.Open(v.FileName(".dat"))
 			v.noWriteOrDelete = true
 		}
+		// err from the OpenFile/Open above was assigned and never checked. Under
+		// descriptor exhaustion the open fails and dataFile is nil, which
+		// NewDiskFile then dereferences -- a SIGSEGV that takes the whole volume
+		// server down rather than failing this one volume. Observed 2026-08-05:
+		// a Synology volume server running with DSM's default 1024-descriptor
+		// limit hit "socket: too many open files" during a replication pass and
+		// segfaulted, leaving 359 volumes under-replicated.
+		if err != nil {
+			return fmt.Errorf("open Volume Data file %s: %w", v.FileName(".dat"), err)
+		}
 		v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
 		if fileSize >= super_block.SuperBlockSize {
 			alreadyHasSuperBlock = true

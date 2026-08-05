@@ -24,6 +24,13 @@ type DiskFile struct {
 }
 
 func NewDiskFile(f *os.File) *DiskFile {
+	// Defence in depth for the caller that forgets to check its open error:
+	// a nil *os.File here used to segfault inside f.Stat(), killing the whole
+	// volume server for one bad volume. glog.Fatalf still exits, but it exits
+	// with a message naming the cause instead of a nil-pointer stack trace.
+	if f == nil {
+		glog.Fatalf("NewDiskFile called with a nil file handle (open failed; check descriptor limits)")
+	}
 	stat, err := f.Stat()
 	if err != nil {
 		glog.Fatalf("stat file %s: %v", f.Name(), err)

@@ -288,6 +288,21 @@ func GetWritableRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOpt
 		return
 	}
 
+	// A master that does not know the volume reports it as an error alongside an
+	// empty location list (see findVolumeLocation, which sets both). That is a
+	// different fact from "this volume has lost replicas": on a multi-master
+	// cluster it means a stale or otherwise wrong peer answered, since lookups
+	// are load balanced across all masters. Conflating the two hid a master
+	// whose volume location map had frozen and made every write to volumes it
+	// had never learned about fail as though they were under-replicated.
+	if lookupResult.Error != "" {
+		// Drop the cache so the next attempt re-queries; a different master may answer.
+		operation.InvalidateVolumeIdLocationCache(volumeId.String())
+		err = fmt.Errorf("replicating lookup for volume %d answered %q by master %s: the volume is unknown to that master, not necessarily under-replicated",
+			volumeId, lookupResult.Error, masterFn(context.Background()))
+		return
+	}
+
 	if v != nil {
 		// has one local and has remote replications
 		copyCount := v.ReplicaPlacement.GetCopyCount()

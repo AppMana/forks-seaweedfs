@@ -586,6 +586,14 @@ func buildTruncatedNextMarker(requestDir, prefix, nextMarker string, lastEntryWa
 	return nextMarker
 }
 
+// surfaceEmptyDirectories reports whether an empty directory should be returned
+// as a zero-byte "<dir>/" marker for a trailing-slash prefix probe. Nil-safe:
+// several tests construct an S3ApiServer without options, and the AWS-compatible
+// answer is the default anyway.
+func (s3a *S3ApiServer) surfaceEmptyDirectories() bool {
+	return s3a != nil && s3a.option != nil && s3a.option.SurfaceEmptyDirectories
+}
+
 type listDirectoryRequest struct {
 	dir                string
 	prefix             string
@@ -756,9 +764,14 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 					// clients that detect directories by listing it under its own "<dir>/"
 					// prefix. Surface it as a directory marker for that explicit probe,
 					// identical to a directory created via PutObject with a trailing "/", so
-					// tools like hadoop-aws can find it. Plain listings are left untouched, so
-					// empty directories left behind by deleted objects are not shown as keys.
-					if explicitDirProbe && !isKeyObject && !childEmitted && !cursor.isTruncated && entry.Attributes != nil {
+					// tools like hadoop-aws can find it.
+					//
+					// Opt-in, because real S3 answers such a probe with KeyCount 0 once the
+					// objects under the prefix are gone, and the synthesised key ends in "/".
+					// A client walking a tree with trailing-slash prefixes then gets a key
+					// whose basename is empty; docker/distribution's upload purger indexes
+					// file[0] on it and panics. See SurfaceEmptyDirectories.
+					if s3a.surfaceEmptyDirectories() && explicitDirProbe && !isKeyObject && !childEmitted && !cursor.isTruncated && entry.Attributes != nil {
 						entry.Attributes.Mime = s3_constants.FolderMimeType
 						eachEntryFn(dir, entry)
 					}

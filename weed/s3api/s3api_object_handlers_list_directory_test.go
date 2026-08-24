@@ -69,9 +69,14 @@ func TestDirectoryListedAsCommonPrefix(t *testing.T) {
 // MIME) must be visible to S3 clients that detect directories by listing under the
 // "<dir>/" prefix. Such a directory is surfaced as a directory marker, identical to
 // one created via PutObject with a trailing "/".
+//
+// This now requires SurfaceEmptyDirectories. It is off by default because real S3
+// returns KeyCount 0 for an emptied prefix and the synthesised key ends in "/",
+// which breaks clients that walk trees with trailing-slash prefixes. See
+// s3api_list_empty_directory_marker_compat_test.go.
 func TestEmptyDirectorySurfacedAsMarker(t *testing.T) {
 	s3a := &S3ApiServer{
-		option: &S3ApiServerOption{BucketsPath: "/buckets"},
+		option: &S3ApiServerOption{BucketsPath: "/buckets", SurfaceEmptyDirectories: true},
 	}
 
 	emptyDir := &filer_pb.Entry{

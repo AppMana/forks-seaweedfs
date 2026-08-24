@@ -69,6 +69,21 @@ type S3ApiServerOption struct {
 	ExternalUrl               string // external URL clients use, for signature verification behind a reverse proxy
 	DefaultFileMode           uint32 // default file permission mode for S3 uploads (e.g. 0660, 0644)
 	CacheSizeMB               int64  // in-memory chunk cache capacity in MB for the shared ReaderCache; 0 disables
+	// SurfaceEmptyDirectories makes a listing whose prefix ends in "/" report a
+	// real but empty directory as a zero-byte directory marker, so clients that
+	// probe "<dir>/" to test existence (hadoop-aws getFileStatus, Spark) can see
+	// directories created out of band via mount, mkdir or the filer API.
+	//
+	// Off by default because real S3 cannot produce such a key: it has no
+	// directories, so a prefix whose objects were all deleted simply returns
+	// KeyCount 0. Clients that walk a tree with trailing-slash prefixes assume
+	// every returned key has a non-empty basename, and a synthesised "<dir>/"
+	// key breaks them. docker/distribution's upload purger does
+	// `_, file := path.Split(key); if file[0] == '_'` and panics outright with
+	// "index out of range [0] with length 0", which took Harbor's registry down
+	// on 2026-08-24. Enable only when no S3 client of this gateway walks
+	// prefixes that way.
+	SurfaceEmptyDirectories bool
 }
 
 // s3ChunkCacheChunkSizeMB is the assumed chunk size (in MiB) used to convert

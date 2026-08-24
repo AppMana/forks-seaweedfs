@@ -155,6 +155,62 @@ type MasterClient struct {
 	OnPeerUpdateLock     sync.RWMutex
 	OnLockRingUpdate     func(update *master_pb.LockRingUpdate)
 	OnLockRingUpdateLock sync.RWMutex
+
+	// peerUpdates hands ClusterNodeUpdate off to a single worker goroutine so a
+	// slow or stuck callback can never stall the receive loop. OnPeerUpdate is
+	// caller-supplied and does real work: the master's implementation takes
+	// Topo.RaftServerAccessLock and, on the removal path, makes a blocking Ping
+	// to the peer being removed. Calling it inline from the loop that owns
+	// stream.Recv() means one blocked callback freezes every later
+	// VolumeLocation update forever, and the vidMap silently stops tracking new
+	// volumes while raft keeps working. gRPC keepalive cannot detect that: the
+	// goroutine is blocked in application code, not in the transport.
+	peerUpdates     chan peerUpdate
+	peerUpdatesOnce sync.Once
+}
+
+// peerUpdate is a ClusterNodeUpdate queued for the worker, carrying the time it
+// was received so callbacks observe arrival time rather than dequeue time.
+type peerUpdate struct {
+	update    *master_pb.ClusterNodeUpdate
+	startFrom time.Time
+}
+
+// peerUpdateQueueSize bounds the handoff queue. A healthy callback drains this
+// far faster than the master produces cluster node updates; a wedged one fills
+// it, and updates are then dropped with a warning rather than applying
+// backpressure to the receive loop, which is the failure being fixed.
+const peerUpdateQueueSize = 128
+
+// startPeerUpdateWorker lazily starts the single worker that invokes
+// OnPeerUpdate. One goroutine preserves the order the master sent updates in.
+func (mc *MasterClient) startPeerUpdateWorker() {
+	mc.peerUpdatesOnce.Do(func() {
+		mc.peerUpdates = make(chan peerUpdate, peerUpdateQueueSize)
+		go func() {
+			for pu := range mc.peerUpdates {
+				mc.OnPeerUpdateLock.RLock()
+				fn := mc.OnPeerUpdate
+				mc.OnPeerUpdateLock.RUnlock()
+				if fn != nil {
+					fn(pu.update, pu.startFrom)
+				}
+			}
+		}()
+	})
+}
+
+// queuePeerUpdate enqueues an update for the worker. It never blocks: if the
+// queue is full the update is dropped, because stalling here would reintroduce
+// the very wedge this indirection exists to prevent.
+func (mc *MasterClient) queuePeerUpdate(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
+	mc.startPeerUpdateWorker()
+	select {
+	case mc.peerUpdates <- peerUpdate{update: update, startFrom: startFrom}:
+	default:
+		glog.Warningf("%s.%s peer update queue full, dropping update for %s.%s %s (a previous OnPeerUpdate is not returning)",
+			mc.FilerGroup, mc.clientType, update.FilerGroup, update.NodeType, update.Address)
+	}
 }
 
 func NewMasterClient(grpcDialOption grpc.DialOption, filerGroup string, clientType string, clientHost pb.ServerAddress, clientDataCenter string, rack string, masters pb.ServerDiscovery) *MasterClient {
@@ -306,18 +362,20 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 			if resp.ClusterNodeUpdate != nil {
 				update := resp.ClusterNodeUpdate
 				mc.OnPeerUpdateLock.RLock()
-				if mc.OnPeerUpdate != nil {
-					if update.FilerGroup == mc.FilerGroup {
-						if update.IsAdd {
-							glog.V(0).Infof("+ %s@%s noticed %s.%s %s\n", mc.clientType, mc.clientHost, update.FilerGroup, update.NodeType, update.Address)
-						} else {
-							glog.V(0).Infof("- %s@%s noticed %s.%s %s\n", mc.clientType, mc.clientHost, update.FilerGroup, update.NodeType, update.Address)
-						}
-						stats.MasterClientConnectCounter.WithLabelValues(stats.OnPeerUpdate).Inc()
-						mc.OnPeerUpdate(update, time.Now())
-					}
-				}
+				hasCallback := mc.OnPeerUpdate != nil
 				mc.OnPeerUpdateLock.RUnlock()
+				if hasCallback && update.FilerGroup == mc.FilerGroup {
+					if update.IsAdd {
+						glog.V(0).Infof("+ %s@%s noticed %s.%s %s\n", mc.clientType, mc.clientHost, update.FilerGroup, update.NodeType, update.Address)
+					} else {
+						glog.V(0).Infof("- %s@%s noticed %s.%s %s\n", mc.clientType, mc.clientHost, update.FilerGroup, update.NodeType, update.Address)
+					}
+					stats.MasterClientConnectCounter.WithLabelValues(stats.OnPeerUpdate).Inc()
+					// Handed to a worker rather than called here: this goroutine
+					// owns stream.Recv(), and a callback that blocks would stop
+					// all further volume location updates.
+					mc.queuePeerUpdate(update, time.Now())
+				}
 			}
 			if resp.LockRingUpdate != nil {
 				update := resp.LockRingUpdate

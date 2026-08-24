@@ -59,6 +59,7 @@ type S3Options struct {
 	metricsHttpPort           *int
 	metricsHttpIp             *string
 	allowDeleteBucketNotEmpty *bool
+	surfaceEmptyDirectories   *bool
 	auditLogConfig            *string
 	localFilerSocket          *string
 	dataCenter                *string
@@ -104,6 +105,7 @@ func init() {
 	s3StandaloneOptions.metricsHttpIp = cmdS3.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	cmdS3.Flag.Bool("allowEmptyFolder", true, "deprecated, ignored. Empty folder cleanup is now automatic.")
 	s3StandaloneOptions.allowDeleteBucketNotEmpty = cmdS3.Flag.Bool("allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	s3StandaloneOptions.surfaceEmptyDirectories = cmdS3.Flag.Bool("surfaceEmptyDirectories", false, "list a real but empty directory as a zero-byte <dir>/ marker when the prefix ends in '/'. Off by default: real S3 returns no keys for an emptied prefix, and the synthesised key has an empty basename, which breaks clients that walk trees with trailing-slash prefixes (e.g. docker/distribution's upload purger). Enable for hadoop-aws/Spark getFileStatus probes")
 	s3StandaloneOptions.localFilerSocket = cmdS3.Flag.String("localFilerSocket", "", "local filer socket path")
 	s3StandaloneOptions.localSocket = cmdS3.Flag.String("localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
 	s3StandaloneOptions.idleTimeout = cmdS3.Flag.Int("idleTimeout", 120, "connection idle seconds")
@@ -347,6 +349,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		BucketsPath:               filerBucketsPath,
 		GrpcDialOption:            grpcDialOption,
 		AllowDeleteBucketNotEmpty: *s3opt.allowDeleteBucketNotEmpty,
+		SurfaceEmptyDirectories:   surfaceEmptyDirectoriesValue(s3opt.surfaceEmptyDirectories),
 		LocalFilerSocket:          localFilerSocket,
 		DataCenter:                *s3opt.dataCenter,
 		FilerGroup:                filerGroup,
@@ -616,4 +619,11 @@ func s3ConfigReloadInterval(v *time.Duration) time.Duration {
 		return s3api.DefaultStaticConfigReloadInterval
 	}
 	return *v
+}
+
+// surfaceEmptyDirectoriesValue reads the opt-in flag, tolerating a nil pointer
+// for callers that build S3ApiServerOption without going through the s3 command
+// (the filer embeds this server and does not register the flag).
+func surfaceEmptyDirectoriesValue(v *bool) bool {
+	return v != nil && *v
 }

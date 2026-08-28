@@ -184,10 +184,15 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 
 	var count int
 	var memoryCost types.Size
+	var downloadLimitHandled bool
 	readOption.AttemptMetaOnly, readOption.MustMetaOnly = shouldAttemptStreamWrite(hasVolume, ext, r)
-	onReadSizeFn := func(size types.Size) {
+	onReadSizeFn := func(size types.Size) error {
+		if !vs.reserveDownloadSize(w, r, int64(size)) {
+			downloadLimitHandled = true
+			return fmt.Errorf("download admission rejected")
+		}
 		memoryCost = size
-		atomic.AddInt64(&vs.inFlightDownloadDataSize, int64(memoryCost))
+		return nil
 	}
 
 	if hasVolume {
@@ -202,6 +207,9 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 			vs.inFlightDownloadDataLimitCond.Broadcast()
 		}
 	}()
+	if downloadLimitHandled {
+		return
+	}
 
 	if err != nil && err != storage.ErrorDeleted && hasVolume {
 		glog.V(4).Infof("read needle: %v", err)

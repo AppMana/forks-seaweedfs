@@ -382,7 +382,7 @@ func (s *Store) UnloadEcVolume(vid needle.VolumeId) {
 	}
 }
 
-func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadSizeFn func(size types.Size)) (int, error) {
+func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadSizeFn func(size types.Size) error) (int, error) {
 	for _, location := range s.Locations {
 		if localEcVolume, found := location.FindEcVolume(vid); found {
 
@@ -395,7 +395,9 @@ func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadS
 			}
 
 			if onReadSizeFn != nil {
-				onReadSizeFn(size)
+				if err := onReadSizeFn(size); err != nil {
+					return 0, err
+				}
 			}
 
 			glog.V(3).Infof("read ec volume %d offset %d size %d intervals:%+v", vid, offset.ToActualOffset(), size, intervals)

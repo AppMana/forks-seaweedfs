@@ -18,7 +18,7 @@ import (
 const PagedReadLimit = 1024 * 1024
 
 // read fills in Needle content by looking up n.Id from NeedleMapper
-func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSizeFn func(size Size)) (count int, err error) {
+func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSizeFn func(size Size) error) (count int, err error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 
@@ -44,7 +44,9 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 		return 0, nil
 	}
 	if onReadSizeFn != nil {
-		onReadSizeFn(readSize)
+		if err := onReadSizeFn(readSize); err != nil {
+			return 0, err
+		}
 	}
 	if readOption != nil && readOption.AttemptMetaOnly && readSize > PagedReadLimit {
 		readOption.VolumeRevision = v.SuperBlock.CompactionRevision

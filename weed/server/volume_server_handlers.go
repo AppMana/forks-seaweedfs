@@ -1,6 +1,7 @@
 package weed_server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -45,15 +46,13 @@ security settings:
 //   - No limit configured → return true (proceed normally)
 //   - Within limit → return true (proceed normally)
 //   - Over limit + has replicas → proxy to replica, return false (already handled)
-//   - Over limit + no replicas → wait with timeout:
-//   - Timeout → send 429 response, return false (already handled)
-//   - Cancelled → send 499 response, return false (already handled)
-//   - Capacity available → return true (proceed normally)
+//   - At limit + no replicas → proceed to the size-aware atomic reservation
+//     performed after the needle size is known
 func (vs *VolumeServer) checkDownloadLimit(w http.ResponseWriter, r *http.Request) bool {
 	inFlightDownloadSize := atomic.LoadInt64(&vs.inFlightDownloadDataSize)
 	stats.VolumeServerInFlightDownloadSize.Set(float64(inFlightDownloadSize))
 
-	if vs.concurrentDownloadLimit == 0 || inFlightDownloadSize <= vs.concurrentDownloadLimit {
+	if vs.concurrentDownloadLimit == 0 || inFlightDownloadSize < vs.concurrentDownloadLimit {
 		return true // no limit configured or within limit - proceed normally
 	}
 
@@ -66,8 +65,9 @@ func (vs *VolumeServer) checkDownloadLimit(w http.ResponseWriter, r *http.Reques
 		return false // handled by proxy
 	}
 
-	// Wait with timeout
-	return vs.waitForDownloadSlot(w, r)
+	// The precise request size is not known until the needle index lookup.
+	// reserveDownloadSize performs the hard, atomic admission at that point.
+	return true
 }
 
 // tryProxyToReplica attempts to proxy the request to a replica server if the volume has replication.
@@ -95,41 +95,65 @@ func (vs *VolumeServer) tryProxyToReplica(w http.ResponseWriter, r *http.Request
 	return false // no proxy available
 }
 
-// waitForDownloadSlot waits for available download capacity with timeout.
-//
-// This function implements a blocking wait mechanism with timeout for download capacity.
-// It continuously checks if download capacity becomes available and handles timeout
-// and cancellation scenarios appropriately.
-//
-// Returns:
-//   - true:  Download capacity became available, request should proceed
-//   - false: Request failed (timeout or cancellation), error response already sent
-//
-// HTTP Status Codes:
-//   - 429 Too Many Requests: Wait timeout exceeded
-//   - 499 Client Closed Request: Request cancelled by client
-func (vs *VolumeServer) waitForDownloadSlot(w http.ResponseWriter, r *http.Request) bool {
-	timerDownload := time.NewTimer(vs.inflightDownloadDataTimeout)
-	defer timerDownload.Stop()
-
-	inFlightDownloadSize := atomic.LoadInt64(&vs.inFlightDownloadDataSize)
-	for inFlightDownloadSize > vs.concurrentDownloadLimit {
-		switch util.WaitWithTimeout(r.Context(), vs.inFlightDownloadDataLimitCond, timerDownload) {
-		case http.StatusTooManyRequests:
-			err := fmt.Errorf("request %s because inflight download data %d > %d, and wait timeout",
-				r.URL.Path, inFlightDownloadSize, vs.concurrentDownloadLimit)
-			glog.V(1).Infof("too many requests: %v", err)
-			writeJsonError(w, r, http.StatusTooManyRequests, err)
-			return false
-		case util.HttpStatusCancelled:
-			glog.V(1).Infof("request %s cancelled from %s: %v", r.URL.Path, r.RemoteAddr, r.Context().Err())
-			w.WriteHeader(util.HttpStatusCancelled)
+// tryReserveDataSize atomically checks and charges a request. A single request
+// larger than the configured limit is allowed only when it is the sole request;
+// this avoids deadlocking valid large objects while still bounding concurrency.
+func tryReserveDataSize(counter *int64, limit, size int64) bool {
+	if size < 0 {
+		size = 0
+	}
+	for {
+		current := atomic.LoadInt64(counter)
+		if limit > 0 && (current > limit || (current != 0 && size > limit-current)) {
 			return false
 		}
-		inFlightDownloadSize = atomic.LoadInt64(&vs.inFlightDownloadDataSize)
-		stats.VolumeServerInFlightDownloadSize.Set(float64(inFlightDownloadSize))
+		if atomic.CompareAndSwapInt64(counter, current, current+size) {
+			return true
+		}
 	}
-	return true
+}
+
+func reserveDataSize(ctx context.Context, counter *int64, limit, size int64, timeout time.Duration) int {
+	if tryReserveDataSize(counter, limit, size) {
+		return http.StatusOK
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return util.HttpStatusCancelled
+		case <-timer.C:
+			return http.StatusTooManyRequests
+		case <-ticker.C:
+			if tryReserveDataSize(counter, limit, size) {
+				return http.StatusOK
+			}
+		}
+	}
+}
+
+func (vs *VolumeServer) reserveDownloadSize(w http.ResponseWriter, r *http.Request, size int64) bool {
+	status := reserveDataSize(r.Context(), &vs.inFlightDownloadDataSize,
+		vs.concurrentDownloadLimit, size, vs.inflightDownloadDataTimeout)
+	stats.VolumeServerInFlightDownloadSize.Set(float64(atomic.LoadInt64(&vs.inFlightDownloadDataSize)))
+	if status == http.StatusOK {
+		return true
+	}
+	stats.VolumeServerHandlerCounter.WithLabelValues(stats.DownloadLimitCond).Inc()
+	if status == util.HttpStatusCancelled {
+		glog.V(1).Infof("request %s cancelled from %s: %v", r.URL.Path, r.RemoteAddr, r.Context().Err())
+		w.WriteHeader(status)
+		return false
+	}
+	err := fmt.Errorf("request %s needs %d bytes with inflight download data %d and limit %d",
+		r.URL.Path, size, atomic.LoadInt64(&vs.inFlightDownloadDataSize), vs.concurrentDownloadLimit)
+	glog.V(1).Infof("too many requests: %v", err)
+	writeJsonError(w, r, status, err)
+	return false
 }
 
 // checkUploadLimit handles upload concurrency limiting with timeout.
@@ -142,64 +166,26 @@ func (vs *VolumeServer) waitForDownloadSlot(w http.ResponseWriter, r *http.Reque
 //     or successfully waited for capacity)
 //   - false: Request failed (timeout or cancellation), error response already sent
 //
-// Special Handling:
-//   - Replication requests (type=replicate) bypass upload limits
-//   - No upload limit configured (concurrentUploadLimit=0) allows all uploads
-func (vs *VolumeServer) checkUploadLimit(w http.ResponseWriter, r *http.Request) bool {
-	// exclude the replication from the concurrentUploadLimitMB
-	if vs.concurrentUploadLimit == 0 || r.URL.Query().Get("type") == "replicate" {
+// Replication is included: excluding it permits a repair storm to bypass the
+// memory guard precisely when the cluster is recovering from a failed server.
+func (vs *VolumeServer) checkUploadLimit(w http.ResponseWriter, r *http.Request, size int64) bool {
+	status := reserveDataSize(r.Context(), &vs.inFlightUploadDataSize,
+		vs.concurrentUploadLimit, size, vs.inflightUploadDataTimeout)
+	stats.VolumeServerInFlightUploadSize.Set(float64(atomic.LoadInt64(&vs.inFlightUploadDataSize)))
+	if status == http.StatusOK {
 		return true
 	}
-
-	inFlightUploadDataSize := atomic.LoadInt64(&vs.inFlightUploadDataSize)
-	stats.VolumeServerInFlightUploadSize.Set(float64(inFlightUploadDataSize))
-
-	if inFlightUploadDataSize <= vs.concurrentUploadLimit {
-		return true
+	stats.VolumeServerHandlerCounter.WithLabelValues(stats.UploadLimitCond).Inc()
+	if status == util.HttpStatusCancelled {
+		glog.V(1).Infof("request cancelled from %s: %v", r.RemoteAddr, r.Context().Err())
+		writeJsonError(w, r, status, r.Context().Err())
+		return false
 	}
-
-	return vs.waitForUploadSlot(w, r)
-}
-
-// waitForUploadSlot waits for available upload capacity with timeout.
-//
-// Returns:
-//   - true:  Upload capacity became available, request should proceed
-//   - false: Request failed (timeout or cancellation), error response already sent
-//
-// HTTP Status Codes:
-//   - 429 Too Many Requests: Wait timeout exceeded
-//   - 499 Client Closed Request: Request cancelled by client
-func (vs *VolumeServer) waitForUploadSlot(w http.ResponseWriter, r *http.Request) bool {
-	var timerUpload *time.Timer
-	inFlightUploadDataSize := atomic.LoadInt64(&vs.inFlightUploadDataSize)
-
-	for inFlightUploadDataSize > vs.concurrentUploadLimit {
-		if timerUpload == nil {
-			timerUpload = time.NewTimer(vs.inflightUploadDataTimeout)
-			defer timerUpload.Stop()
-		}
-
-		glog.V(4).Infof("wait because inflight upload data %d > %d", inFlightUploadDataSize, vs.concurrentUploadLimit)
-		stats.VolumeServerHandlerCounter.WithLabelValues(stats.UploadLimitCond).Inc()
-
-		switch util.WaitWithTimeout(r.Context(), vs.inFlightUploadDataLimitCond, timerUpload) {
-		case http.StatusTooManyRequests:
-			err := fmt.Errorf("reject because inflight upload data %d > %d, and wait timeout",
-				inFlightUploadDataSize, vs.concurrentUploadLimit)
-			glog.V(1).Infof("too many requests: %v", err)
-			writeJsonError(w, r, http.StatusTooManyRequests, err)
-			return false
-		case util.HttpStatusCancelled:
-			glog.V(1).Infof("request cancelled from %s: %v", r.RemoteAddr, r.Context().Err())
-			writeJsonError(w, r, util.HttpStatusCancelled, r.Context().Err())
-			return false
-		}
-
-		inFlightUploadDataSize = atomic.LoadInt64(&vs.inFlightUploadDataSize)
-		stats.VolumeServerInFlightUploadSize.Set(float64(inFlightUploadDataSize))
-	}
-	return true
+	err := fmt.Errorf("upload needs %d bytes with inflight upload data %d and limit %d",
+		size, atomic.LoadInt64(&vs.inFlightUploadDataSize), vs.concurrentUploadLimit)
+	glog.V(1).Infof("too many requests: %v", err)
+	writeJsonError(w, r, status, err)
+	return false
 }
 
 // handleGetRequest processes GET/HEAD requests with download limiting.
@@ -231,12 +217,16 @@ func (vs *VolumeServer) handleGetRequest(w http.ResponseWriter, r *http.Request)
 // status codes (429 for timeout, 499 for cancellation).
 func (vs *VolumeServer) handleUploadRequest(w http.ResponseWriter, r *http.Request) {
 	contentLength := getContentLength(r)
+	if contentLength <= 0 {
+		// ParseUpload caps an individual request at 256 MiB. Reserve that bound
+		// for chunked requests whose Content-Length is unknown.
+		contentLength = 256 * 1024 * 1024
+	}
 
-	if !vs.checkUploadLimit(w, r) {
+	if !vs.checkUploadLimit(w, r, contentLength) {
 		return
 	}
 
-	atomic.AddInt64(&vs.inFlightUploadDataSize, contentLength)
 	defer func() {
 		atomic.AddInt64(&vs.inFlightUploadDataSize, -contentLength)
 		if vs.concurrentUploadLimit != 0 {

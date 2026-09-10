@@ -2,6 +2,7 @@ package empty_folder_cleanup
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -363,7 +364,7 @@ func (efc *EmptyFolderCleaner) deleteFolder(ctx context.Context, folder string) 
 func (efc *EmptyFolderCleaner) getBucketCleanupPolicy(ctx context.Context, folder string) (bucketPath string, autoRemove bool, source string, attrValue string, err error) {
 	bucketPath, ok := util.ExtractBucketPath(efc.bucketPath, folder, true)
 	if !ok {
-		return "", true, "default", "<not_bucket_path>", nil
+		return "", false, "default", "<not_bucket_path>", nil
 	}
 
 	now := time.Now()
@@ -377,7 +378,7 @@ func (efc *EmptyFolderCleaner) getBucketCleanupPolicy(ctx context.Context, folde
 
 	attrs, err := efc.filer.GetEntryAttributes(ctx, util.FullPath(bucketPath))
 	if err != nil {
-		return "", true, "", "", err
+		return "", false, "", "", err
 	}
 
 	autoRemove, attrValue = autoRemoveEmptyFoldersEnabled(attrs)
@@ -396,22 +397,48 @@ func (efc *EmptyFolderCleaner) getBucketCleanupPolicy(ctx context.Context, folde
 	return bucketPath, autoRemove, "filer", attrValue, nil
 }
 
-func autoRemoveEmptyFoldersEnabled(attrs map[string][]byte) (bool, string) {
-	if attrs == nil {
-		return true, "<no_attrs>"
+// OnBucketPolicyUpdate drops the cached cleanup policy of a bucket whose entry
+// was rewritten, so a policy change is honored on the next check instead of
+// after cacheExpiry. Paths that are not bucket roots are ignored.
+func (efc *EmptyFolderCleaner) OnBucketPolicyUpdate(bucketPath string) {
+	if efc.bucketPath == "" {
+		return
 	}
+	if extracted, ok := util.ExtractBucketPath(efc.bucketPath, bucketPath, false); !ok || extracted != bucketPath {
+		return
+	}
+	efc.mu.Lock()
+	delete(efc.bucketCleanupPolicies, bucketPath)
+	efc.mu.Unlock()
+}
 
+// SetBucketAllowEmptyFolders records on a bucket entry whether empty implicit
+// folders are kept (true) or removed by the cleaner (false).
+func SetBucketAllowEmptyFolders(entry *filer_pb.Entry, allowEmptyFolders bool) {
+	if entry.Extended == nil {
+		entry.Extended = make(map[string][]byte)
+	}
+	entry.Extended[s3_constants.ExtAllowEmptyFolders] = []byte(strconv.FormatBool(allowEmptyFolders))
+}
+
+// autoRemoveEmptyFoldersEnabled reports whether a bucket opted in to removal
+// of empty implicit folders. Only an explicit "false" opts in: a bucket that
+// never carried the attribute holds real directories that its clients rely on
+// (CSI volumes and other mounts), so those are kept. Buckets created through
+// the S3 API are stamped "false" at creation to keep S3 implicit-folder
+// semantics.
+func autoRemoveEmptyFoldersEnabled(attrs map[string][]byte) (bool, string) {
 	value, found := attrs[s3_constants.ExtAllowEmptyFolders]
 	if !found {
-		return true, "<missing>"
+		return false, "<missing>"
 	}
 
 	text := strings.TrimSpace(string(value))
 	if text == "" {
-		return true, "<empty>"
+		return false, "<empty>"
 	}
 
-	return !strings.EqualFold(text, "true"), text
+	return strings.EqualFold(text, "false"), text
 }
 
 // isUnderPath checks if child is under parent path

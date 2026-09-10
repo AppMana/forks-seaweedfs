@@ -51,6 +51,10 @@ func (wfs *WFS) saveEntry(path util.FullPath, entry *filer_pb.Entry) (code fuse.
 		return fuseStatus
 	}
 
+	if string(path) == wfs.option.FilerMountRootPath {
+		wfs.invalidateStoredRootEntry()
+	}
+
 	event := resp.GetMetadataEvent()
 	if event == nil {
 		event = metadataUpdateEvent(parentDir, entry)

@@ -62,6 +62,11 @@ func (f *Filer) onEmptyFolderCleanupEvents(event *filer_pb.SubscribeMetadataResp
 		f.EmptyFolderCleaner.OnCreateEvent(directory, message.NewEntry.Name, message.NewEntry.IsDirectory)
 	}
 
+	// An in-place rewrite of a bucket entry may carry a new cleanup policy.
+	if filer_pb.IsUpdate(event) && directory == f.DirBucketsPath && message.NewEntry != nil && message.NewEntry.IsDirectory {
+		f.EmptyFolderCleaner.OnBucketPolicyUpdate(string(util.NewFullPath(directory, message.NewEntry.Name)))
+	}
+
 	// Handle rename/move events
 	if filer_pb.IsRename(event) {
 		// Treat the old location as a delete

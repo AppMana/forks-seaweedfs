@@ -6,11 +6,34 @@ import (
 	"path"
 	"strings"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer/empty_folder_cleanup"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
+
+// ensureMountRoot creates the mount root on the filer when it does not exist
+// yet and leaves an existing one untouched. A plain CreateEntry rewrites an
+// existing entry, which reset the bucket's mode, owner and extended
+// attributes on every mount start. A bucket created here is a volume, so it
+// keeps its empty directories.
+func ensureMountRoot(ctx context.Context, filerClient filer_pb.FilerClient, mountRoot, bucketRootPath string) error {
+	entry, err := filer_pb.GetEntry(ctx, filerClient, util.FullPath(mountRoot))
+	if err != nil && err != filer_pb.ErrNotFound {
+		return err
+	}
+	if entry != nil {
+		return nil
+	}
+	parent, name := util.FullPath(mountRoot).DirAndName()
+	bucketPath, isBucketRootMount := bucketPathForMountRoot(mountRoot, bucketRootPath)
+	return filer_pb.Mkdir(ctx, filerClient, parent, name, func(entry *filer_pb.Entry) {
+		if isBucketRootMount && bucketPath == path.Clean(mountRoot) {
+			empty_folder_cleanup.SetBucketAllowEmptyFolders(entry, true)
+		}
+	})
+}
 
 func ensureBucketAllowEmptyFolders(ctx context.Context, filerClient filer_pb.FilerClient, mountRoot, bucketRootPath string) error {
 	bucketPath, isBucketRootMount := bucketPathForMountRoot(mountRoot, bucketRootPath)

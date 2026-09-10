@@ -7,6 +7,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -44,6 +45,12 @@ func (m *mockFilerOps) IsDirectoryKeyObject(_ context.Context, p util.FullPath) 
 		return false, nil
 	}
 	return m.isDirKeyObjFn(p)
+}
+
+// optedInBucketAttrs models a bucket created through the S3 API, which is
+// stamped to opt in to implicit-folder cleanup.
+func optedInBucketAttrs(_ util.FullPath) (map[string][]byte, error) {
+	return map[string][]byte{s3_constants.ExtAllowEmptyFolders: []byte("false")}, nil
 }
 
 func Test_isUnderPath(t *testing.T) {
@@ -170,6 +177,7 @@ func TestEmptyFolderCleaner_executeCleanup_skipsMultipartUploads(t *testing.T) {
 	mock := &mockFilerOps{
 		countFn:  func(util.FullPath) (int, error) { return 0, nil },
 		deleteFn: func(p util.FullPath) error { deleted = append(deleted, string(p)); return nil },
+		attrsFn:  optedInBucketAttrs,
 	}
 
 	cleaner := &EmptyFolderCleaner{
@@ -208,16 +216,24 @@ func Test_autoRemoveEmptyFoldersEnabled(t *testing.T) {
 		attrValue string
 	}{
 		{
-			name:      "no attrs defaults enabled",
+			name:      "no attrs keeps folders",
 			attrs:     nil,
-			enabled:   true,
-			attrValue: "<no_attrs>",
+			enabled:   false,
+			attrValue: "<missing>",
 		},
 		{
-			name:      "missing key defaults enabled",
+			name:      "missing key keeps folders",
 			attrs:     map[string][]byte{},
-			enabled:   true,
+			enabled:   false,
 			attrValue: "<missing>",
+		},
+		{
+			name: "empty value keeps folders",
+			attrs: map[string][]byte{
+				s3_constants.ExtAllowEmptyFolders: []byte("  "),
+			},
+			enabled:   false,
+			attrValue: "<empty>",
 		},
 		{
 			name: "allow-empty disables cleanup",
@@ -228,12 +244,20 @@ func Test_autoRemoveEmptyFoldersEnabled(t *testing.T) {
 			attrValue: "true",
 		},
 		{
-			name: "explicit false keeps cleanup enabled",
+			name: "explicit false opts in to cleanup",
 			attrs: map[string][]byte{
-				s3_constants.ExtAllowEmptyFolders: []byte("false"),
+				s3_constants.ExtAllowEmptyFolders: []byte("False"),
 			},
 			enabled:   true,
-			attrValue: "false",
+			attrValue: "False",
+		},
+		{
+			name: "unrecognized value keeps folders",
+			attrs: map[string][]byte{
+				s3_constants.ExtAllowEmptyFolders: []byte("yes"),
+			},
+			enabled:   false,
+			attrValue: "yes",
 		},
 	}
 
@@ -247,6 +271,114 @@ func Test_autoRemoveEmptyFoldersEnabled(t *testing.T) {
 				t.Fatalf("expected attrValue=%q, got %q", tt.attrValue, attrValue)
 			}
 		})
+	}
+}
+
+func TestSetBucketAllowEmptyFolders_roundTrip(t *testing.T) {
+	entry := &filer_pb.Entry{Name: "bucket", IsDirectory: true}
+
+	SetBucketAllowEmptyFolders(entry, false)
+	if enabled, value := autoRemoveEmptyFoldersEnabled(entry.Extended); !enabled || value != "false" {
+		t.Fatalf("stamping false should opt the bucket in to cleanup, got enabled=%v value=%q", enabled, value)
+	}
+
+	SetBucketAllowEmptyFolders(entry, true)
+	if enabled, value := autoRemoveEmptyFoldersEnabled(entry.Extended); enabled || value != "true" {
+		t.Fatalf("stamping true should keep folders, got enabled=%v value=%q", enabled, value)
+	}
+}
+
+func newPolicyTestCleaner(t *testing.T, mock *mockFilerOps) *EmptyFolderCleaner {
+	t.Helper()
+	lockRing := lock_manager.NewLockRing(5 * time.Second)
+	lockRing.SetSnapshot([]pb.ServerAddress{"filer1:8888"}, 0)
+	return &EmptyFolderCleaner{
+		filer:                 mock,
+		lockRing:              lockRing,
+		host:                  "filer1:8888",
+		bucketPath:            "/buckets",
+		enabled:               true,
+		folderCounts:          make(map[string]*folderState),
+		bucketCleanupPolicies: make(map[string]*bucketCleanupPolicyState),
+		cleanupQueue:          NewCleanupQueue(1000, time.Minute),
+		maxCountCheck:         1000,
+		cacheExpiry:           time.Minute,
+		processorSleep:        time.Second,
+		stopCh:                make(chan struct{}),
+	}
+}
+
+// A bucket that never carried the policy attribute holds real directories
+// (CSI volumes, weed shell, mounts): the cleaner must leave them alone even
+// when they are empty at the filer.
+func TestEmptyFolderCleaner_executeCleanup_missingPolicyKeepsFolder(t *testing.T) {
+	var deleted []string
+	attrLookups := 0
+	mock := &mockFilerOps{
+		countFn: func(_ util.FullPath) (int, error) { return 0, nil },
+		deleteFn: func(path util.FullPath) error {
+			deleted = append(deleted, string(path))
+			return nil
+		},
+		attrsFn: func(path util.FullPath) (map[string][]byte, error) {
+			attrLookups++
+			return nil, nil
+		},
+	}
+	cleaner := newPolicyTestCleaner(t, mock)
+
+	cleaner.executeCleanup("/buckets/pvc-volume/build/libs", "buildSrc.jar")
+
+	if len(deleted) != 0 {
+		t.Fatalf("expected the folder to be kept, got deletions %v", deleted)
+	}
+	if attrLookups != 1 {
+		t.Fatalf("expected one bucket attribute lookup, got %d", attrLookups)
+	}
+}
+
+// A mount that starts on an S3 bucket stamps the keep policy; the cached
+// opt-in from before the stamp must not outlive the bucket entry update.
+func TestEmptyFolderCleaner_OnBucketPolicyUpdate_invalidatesCachedPolicy(t *testing.T) {
+	var deleted []string
+	allow := []byte("false")
+	mock := &mockFilerOps{
+		countFn: func(_ util.FullPath) (int, error) { return 0, nil },
+		deleteFn: func(path util.FullPath) error {
+			deleted = append(deleted, string(path))
+			return nil
+		},
+		attrsFn: func(path util.FullPath) (map[string][]byte, error) {
+			return map[string][]byte{s3_constants.ExtAllowEmptyFolders: allow}, nil
+		},
+	}
+	cleaner := newPolicyTestCleaner(t, mock)
+
+	cleaner.executeCleanup("/buckets/shared/folder1", "a")
+	if len(deleted) != 1 {
+		t.Fatalf("expected the opted-in bucket's folder to be deleted, got %v", deleted)
+	}
+
+	// The bucket flips to keep-folders (a mount stamped it) while the cached
+	// verdict is still fresh.
+	allow = []byte("true")
+	cleaner.executeCleanup("/buckets/shared/folder2", "b")
+	if len(deleted) != 2 {
+		t.Fatalf("cached policy should still apply before invalidation, got %v", deleted)
+	}
+
+	cleaner.OnBucketPolicyUpdate("/buckets/shared")
+	cleaner.executeCleanup("/buckets/shared/folder3", "c")
+	if len(deleted) != 2 {
+		t.Fatalf("expected the updated policy to keep folder3, got %v", deleted)
+	}
+
+	// Updates to entries that are not bucket roots leave the cache alone.
+	allow = []byte("false")
+	cleaner.OnBucketPolicyUpdate("/buckets/shared/folder3")
+	cleaner.executeCleanup("/buckets/shared/folder4", "d")
+	if len(deleted) != 2 {
+		t.Fatalf("a non-bucket path must not invalidate the cached policy, got %v", deleted)
 	}
 }
 
@@ -764,6 +896,7 @@ func TestEmptyFolderCleaner_processCleanupQueue_onlyProcessesAgedItems(t *testin
 			deleted = append(deleted, string(path))
 			return nil
 		},
+		attrsFn: optedInBucketAttrs,
 	}
 
 	maxAge := 100 * time.Millisecond
@@ -873,6 +1006,7 @@ func TestEmptyFolderCleaner_executeCleanup_directoryMarker(t *testing.T) {
 					deleted = append(deleted, string(path))
 					return nil
 				},
+				attrsFn: optedInBucketAttrs,
 				isDirKeyObjFn: func(path util.FullPath) (bool, error) {
 					return tc.isDirKeyObj, nil
 				},

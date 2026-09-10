@@ -151,6 +151,9 @@ func (f *Filer) triggerLocalEmptyFolderCleanup(oldEntry, newEntry *Entry) {
 			f.EmptyFolderCleaner.OnDeleteEvent(oldDir, oldName, oldEntry.IsDirectory(), eventTime)
 			// Treat new location as create
 			f.EmptyFolderCleaner.OnCreateEvent(newDir, newName, newEntry.IsDirectory())
+		} else if newDir == f.DirBucketsPath && newEntry.IsDirectory() {
+			// An in-place rewrite of a bucket entry may carry a new cleanup policy.
+			f.EmptyFolderCleaner.OnBucketPolicyUpdate(string(newEntry.FullPath))
 		}
 	}
 }

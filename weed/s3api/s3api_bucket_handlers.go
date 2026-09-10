@@ -20,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/empty_folder_cleanup"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/lifecycle_xml"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
@@ -316,6 +317,9 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 
 		// Set bucket owner
 		setBucketOwner(r)(entry)
+
+		// S3 folders are implicit: opt the bucket in to empty-folder cleanup.
+		empty_folder_cleanup.SetBucketAllowEmptyFolders(entry, false)
 
 		// Persist a requested non-default ACL so GetBucketAcl and idempotent
 		// recreation observe it (private is the default and is not stored).
@@ -700,6 +704,7 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 	if err := s3a.mkdir(s3a.option.BucketsPath, bucket, func(entry *filer_pb.Entry) {
 		bucketCrtime = entry.Attributes.Crtime
 		setBucketOwner(r)(entry)
+		empty_folder_cleanup.SetBucketAllowEmptyFolders(entry, false)
 	}); err != nil {
 		// In case of a race condition where another request created the bucket
 		// in the meantime, check for existence before returning an error.

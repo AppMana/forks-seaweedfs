@@ -12,6 +12,7 @@ import (
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -211,12 +212,22 @@ type WFS struct {
 	// lockClient is the DLM client for cross-mount write coordination.
 	// Non-nil only when EnableDistributedLock is true.
 	lockClient *cluster.LockClient
+
+	// storedRoot is the filer's entry for the mount root, fetched on demand.
+	// The root's parent is outside the mount, so no cached directory listing
+	// ever holds it; without this the mount only knows a synthetic root and
+	// every root rewrite (mtime touch, chmod, xattr) erased the bucket's
+	// extended attributes and quota on the filer.
+	storedRootMu      sync.Mutex
+	storedRoot        *filer_pb.Entry
+	storedRootFetched time.Time
 }
 
 const (
 	defaultDirHotWindow    = 2 * time.Second
 	defaultDirHotThreshold = 64
 	defaultDirIdleEvict    = 10 * time.Minute
+	storedRootValidity     = time.Second
 )
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -612,17 +623,7 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 
 	// return a valid entry for the mount root
 	if string(fullpath) == wfs.option.FilerMountRootPath {
-		return &filer_pb.Entry{
-			Name:        name,
-			IsDirectory: true,
-			Attributes: &filer_pb.FuseAttributes{
-				Mtime:    wfs.option.MountMtime.Unix(),
-				FileMode: uint32(wfs.option.MountMode),
-				Uid:      wfs.option.MountUid,
-				Gid:      wfs.option.MountGid,
-				Crtime:   wfs.option.MountCtime.Unix(),
-			},
-		}, fuse.OK
+		return wfs.rootEntry(name), fuse.OK
 	}
 
 	entry, status := wfs.lookupEntry(fullpath)
@@ -630,6 +631,67 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 		return nil, status
 	}
 	return entry.ToProtoEntry(), fuse.OK
+}
+
+// rootEntry returns the entry the mount presents for its root. The kernel
+// sees the mount point's owner and mode for the root (setRootAttr), so those
+// attributes come from the mount options; everything else the filer stores
+// for the root (extended attributes, quota, times) is carried along so a
+// rewrite of the root does not erase it.
+func (wfs *WFS) rootEntry(name string) *filer_pb.Entry {
+	entry := &filer_pb.Entry{
+		Name:        name,
+		IsDirectory: true,
+		Attributes: &filer_pb.FuseAttributes{
+			Mtime:    wfs.option.MountMtime.Unix(),
+			FileMode: uint32(wfs.option.MountMode),
+			Uid:      wfs.option.MountUid,
+			Gid:      wfs.option.MountGid,
+			Crtime:   wfs.option.MountCtime.Unix(),
+		},
+	}
+	stored := wfs.storedRootEntry()
+	if stored == nil {
+		return entry
+	}
+	stored.Name = name
+	stored.IsDirectory = true
+	if stored.Attributes == nil {
+		stored.Attributes = &filer_pb.FuseAttributes{}
+	}
+	stored.Attributes.FileMode = entry.Attributes.FileMode
+	stored.Attributes.Uid = entry.Attributes.Uid
+	stored.Attributes.Gid = entry.Attributes.Gid
+	return stored
+}
+
+// storedRootEntry returns a copy of the filer's entry for the mount root, or
+// nil when the filer has none. The entry is refetched after
+// storedRootValidity and after every save of the root.
+func (wfs *WFS) storedRootEntry() *filer_pb.Entry {
+	wfs.storedRootMu.Lock()
+	defer wfs.storedRootMu.Unlock()
+	if wfs.storedRootFetched.IsZero() || time.Since(wfs.storedRootFetched) > storedRootValidity {
+		entry, err := filer_pb.GetEntry(context.Background(), wfs, util.FullPath(wfs.option.FilerMountRootPath))
+		if err != nil && err != filer_pb.ErrNotFound {
+			// Keep the last known entry rather than presenting a root without
+			// its attributes on a transient filer error.
+			glog.V(1).Infof("load mount root %s: %v", wfs.option.FilerMountRootPath, err)
+		} else {
+			wfs.storedRoot = entry
+			wfs.storedRootFetched = time.Now()
+		}
+	}
+	if wfs.storedRoot == nil {
+		return nil
+	}
+	return proto.Clone(wfs.storedRoot).(*filer_pb.Entry)
+}
+
+func (wfs *WFS) invalidateStoredRootEntry() {
+	wfs.storedRootMu.Lock()
+	wfs.storedRootFetched = time.Time{}
+	wfs.storedRootMu.Unlock()
 }
 
 // lookupDirtyHandleEntry preserves the path visibility of an open file whose

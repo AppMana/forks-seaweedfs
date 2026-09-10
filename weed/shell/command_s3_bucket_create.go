@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer/empty_folder_cleanup"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
@@ -93,11 +94,11 @@ func (c *commandS3BucketCreate) Do(args []string, commandEnv *CommandEnv, writer
 			},
 		}
 
+		// S3 folders are implicit: opt the bucket in to empty-folder cleanup.
+		empty_folder_cleanup.SetBucketAllowEmptyFolders(entry, false)
+
 		// Set bucket owner if specified
 		if owner != "" {
-			if entry.Extended == nil {
-				entry.Extended = make(map[string][]byte)
-			}
 			entry.Extended[s3_constants.AmzIdentityId] = []byte(owner)
 		}
 

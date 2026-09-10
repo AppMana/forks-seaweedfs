@@ -18,6 +18,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 type createEntryTestServer struct {
@@ -34,6 +35,12 @@ type createEntryTestServer struct {
 	createStarted chan struct{}
 	allowCreate   chan struct{}
 	startOnce     sync.Once
+	// rootEntry, when set, is served for lookups of rootDirectory/rootName:
+	// the filer's stored entry for the mount root (a bucket).
+	rootDirectory string
+	rootName      string
+	rootEntry     *filer_pb.Entry
+	updates       []*filer_pb.UpdateEntryRequest
 }
 
 type createEntrySnapshot struct {
@@ -86,13 +93,35 @@ func (s *createEntryTestServer) CreateEntry(ctx context.Context, req *filer_pb.C
 }
 
 func (s *createEntryTestServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updates = append(s.updates, proto.Clone(req).(*filer_pb.UpdateEntryRequest))
+	if s.rootEntry != nil && req.GetDirectory() == s.rootDirectory && req.GetEntry().GetName() == s.rootName {
+		// The filer replaces the whole entry on update.
+		s.rootEntry = proto.Clone(req.GetEntry()).(*filer_pb.Entry)
+	}
 	return &filer_pb.UpdateEntryResponse{}, nil
+}
+
+func (s *createEntryTestServer) rootUpdates() []*filer_pb.UpdateEntryRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*filer_pb.UpdateEntryRequest
+	for _, update := range s.updates {
+		if update.GetDirectory() == s.rootDirectory && update.GetEntry().GetName() == s.rootName {
+			out = append(out, update)
+		}
+	}
+	return out
 }
 
 func (s *createEntryTestServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.rootEntry != nil && req.GetDirectory() == s.rootDirectory && req.GetName() == s.rootName {
+		return &filer_pb.LookupDirectoryEntryResponse{Entry: proto.Clone(s.rootEntry).(*filer_pb.Entry)}, nil
+	}
 	if _, exists := s.entries[req.GetDirectory()+"/"+req.GetName()]; !exists {
 		return &filer_pb.LookupDirectoryEntryResponse{}, nil
 	}
@@ -130,6 +159,13 @@ func (s *createEntryTestServer) creates() int {
 
 func newCreateTestWFS(t *testing.T) (*WFS, *createEntryTestServer) {
 	t.Helper()
+	return newCreateTestWFSWithRoot(t, "/")
+}
+
+// newCreateTestWFSWithRoot builds a WFS whose filer mount root is mountRoot,
+// the way a CSI bucket mount uses -filer.path=/buckets/<pvc>.
+func newCreateTestWFSWithRoot(t *testing.T, mountRoot string) (*WFS, *createEntryTestServer) {
+	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -141,6 +177,7 @@ func newCreateTestWFS(t *testing.T) (*WFS, *createEntryTestServer) {
 
 	server := pb.NewGrpcServer()
 	testServer := &createEntryTestServer{}
+	testServer.rootDirectory, testServer.rootName = util.FullPath(mountRoot).DirAndName()
 	filer_pb.RegisterSeaweedFilerServer(server, testServer)
 	go server.Serve(listener)
 	t.Cleanup(server.Stop)
@@ -150,7 +187,7 @@ func newCreateTestWFS(t *testing.T) (*WFS, *createEntryTestServer) {
 		t.Fatalf("create uid/gid mapper: %v", err)
 	}
 
-	root := util.FullPath("/")
+	root := util.FullPath(mountRoot)
 	option := &Option{
 		ChunkSizeLimit:     1024,
 		ConcurrentReaders:  1,
@@ -159,7 +196,7 @@ func newCreateTestWFS(t *testing.T) (*WFS, *createEntryTestServer) {
 			pb.NewServerAddressWithGrpcPort("127.0.0.1:1", listener.Addr().(*net.TCPAddr).Port),
 		},
 		GrpcDialOption:         grpc.WithTransportCredentials(insecure.NewCredentials()),
-		FilerMountRootPath:     "/",
+		FilerMountRootPath:     mountRoot,
 		MountUid:               99,
 		MountGid:               100,
 		MountMode:              0o777,
@@ -197,6 +234,111 @@ func newCreateTestWFS(t *testing.T) (*WFS, *createEntryTestServer) {
 	})
 
 	return wfs, testServer
+}
+
+func newBucketRootEntry(name string) *filer_pb.Entry {
+	return &filer_pb.Entry{
+		Name:        name,
+		IsDirectory: true,
+		Attributes: &filer_pb.FuseAttributes{
+			FileMode: uint32(0o777) | uint32(os.ModeDir),
+			Crtime:   1700000000,
+			Mtime:    1700000000,
+			Inode:    4242,
+		},
+		Extended: map[string][]byte{
+			"Seaweed-X-Amz-Allow-Empty-Folders": []byte("true"),
+			XATTR_PREFIX + "user.owner":         []byte("ci"),
+		},
+		Quota: 42,
+	}
+}
+
+// A root-level mutation touches the mount root's mtime on the filer. The
+// mount only knows a synthetic root entry, so the rewrite used to drop the
+// bucket's extended attributes, including the flag that keeps the
+// empty-folder cleaner away from CSI volumes.
+func TestRootTouchPreservesBucketAttributes(t *testing.T) {
+	wfs, testServer := newCreateTestWFSWithRoot(t, "/buckets/pvc-test")
+	testServer.rootEntry = newBucketRootEntry("pvc-test")
+
+	in := &fuse.MkdirIn{
+		InHeader: fuse.InHeader{
+			NodeId: 1,
+			Caller: fuse.Caller{Owner: fuse.Owner{Uid: 123, Gid: 456}},
+		},
+		Mode: 0o755,
+	}
+	if status := wfs.Mkdir(make(chan struct{}), in, "child", &fuse.EntryOut{}); status != fuse.OK {
+		t.Fatalf("Mkdir status = %v, want OK", status)
+	}
+
+	updates := testServer.rootUpdates()
+	if len(updates) == 0 {
+		t.Fatal("expected the root directory mtime touch to update the bucket entry")
+	}
+	for _, update := range updates {
+		entry := update.GetEntry()
+		if got := string(entry.GetExtended()["Seaweed-X-Amz-Allow-Empty-Folders"]); got != "true" {
+			t.Fatalf("root update dropped the bucket policy attribute, extended = %v", entry.GetExtended())
+		}
+		if got := string(entry.GetExtended()[XATTR_PREFIX+"user.owner"]); got != "ci" {
+			t.Fatalf("root update dropped a bucket xattr, extended = %v", entry.GetExtended())
+		}
+		if entry.GetQuota() != 42 {
+			t.Fatalf("root update dropped the bucket quota, got %d", entry.GetQuota())
+		}
+		if entry.GetAttributes().GetUid() != 99 || entry.GetAttributes().GetGid() != 100 {
+			t.Fatalf("root update should keep the mount's owner, got uid/gid %d/%d", entry.GetAttributes().GetUid(), entry.GetAttributes().GetGid())
+		}
+		if entry.GetAttributes().GetMtime() < time.Now().Add(-time.Minute).Unix() {
+			t.Fatalf("root update should stamp a current mtime, got %d", entry.GetAttributes().GetMtime())
+		}
+	}
+}
+
+func TestRootSetXAttrKeepsBucketAttributes(t *testing.T) {
+	wfs, testServer := newCreateTestWFSWithRoot(t, "/buckets/pvc-test")
+	testServer.rootEntry = newBucketRootEntry("pvc-test")
+
+	status := wfs.SetXAttr(make(chan struct{}), &fuse.SetXAttrIn{
+		InHeader: fuse.InHeader{NodeId: 1},
+	}, "user.build", []byte("jr8lm"))
+	if status != fuse.OK {
+		t.Fatalf("SetXAttr status = %v, want OK", status)
+	}
+
+	updates := testServer.rootUpdates()
+	if len(updates) != 1 {
+		t.Fatalf("expected one root update, got %d", len(updates))
+	}
+	extended := updates[0].GetEntry().GetExtended()
+	if got := string(extended[XATTR_PREFIX+"user.build"]); got != "jr8lm" {
+		t.Fatalf("new xattr missing from root update, extended = %v", extended)
+	}
+	if got := string(extended["Seaweed-X-Amz-Allow-Empty-Folders"]); got != "true" {
+		t.Fatalf("root xattr update dropped the bucket policy attribute, extended = %v", extended)
+	}
+	if got := string(extended[XATTR_PREFIX+"user.owner"]); got != "ci" {
+		t.Fatalf("root xattr update dropped an existing xattr, extended = %v", extended)
+	}
+
+	// The stored root is re-read after a save, so a later xattr operation
+	// sees its own write.
+	if removeStatus := wfs.RemoveXAttr(make(chan struct{}), &fuse.InHeader{NodeId: 1}, "user.owner"); removeStatus != fuse.OK {
+		t.Fatalf("RemoveXAttr status = %v, want OK", removeStatus)
+	}
+	updates = testServer.rootUpdates()
+	if len(updates) != 2 {
+		t.Fatalf("expected two root updates, got %d", len(updates))
+	}
+	extended = updates[1].GetEntry().GetExtended()
+	if _, still := extended[XATTR_PREFIX+"user.owner"]; still {
+		t.Fatalf("removed xattr still present in root update, extended = %v", extended)
+	}
+	if got := string(extended[XATTR_PREFIX+"user.build"]); got != "jr8lm" {
+		t.Fatalf("earlier xattr lost across root updates, extended = %v", extended)
+	}
 }
 
 func TestCreateCreatesAndOpensFile(t *testing.T) {

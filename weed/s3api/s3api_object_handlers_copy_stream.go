@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -143,6 +144,40 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 	mw := multipart.NewWriter(pipeWriter)
 	contentType := mw.FormDataContentType()
 
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", mime.FormatMediaType("form-data",
+		map[string]string{"name": "file", "filename": ""}))
+	h.Set("Idempotency-Key", dstUrl)
+	if bodyIsGzipped {
+		h.Set("Content-Encoding", "gzip")
+	}
+
+	// The destination must learn the upload's size up front. A volume
+	// server admits uploads against a byte budget and, for a chunked POST
+	// whose size it cannot know, reserves the per-request ceiling
+	// (256 MiB) instead of the real size; a few streamed copies then fill
+	// the whole budget and the rest wait until they time out. The body is
+	// the multipart framing plus the wire bytes the source announced, so
+	// measure the framing through a scratch writer on the same boundary.
+	var contentLength int64 = -1
+	if srcResp.ContentLength >= 0 {
+		var framing bytes.Buffer
+		fmw := multipart.NewWriter(&framing)
+		if err := fmw.SetBoundary(mw.Boundary()); err != nil {
+			pipeReader.CloseWithError(err)
+			return fmt.Errorf("multipart boundary: %w", err)
+		}
+		if _, err := fmw.CreatePart(h); err != nil {
+			pipeReader.CloseWithError(err)
+			return fmt.Errorf("multipart framing: %w", err)
+		}
+		if err := fmw.Close(); err != nil {
+			pipeReader.CloseWithError(err)
+			return fmt.Errorf("multipart framing: %w", err)
+		}
+		contentLength = int64(framing.Len()) + srcResp.ContentLength
+	}
+
 	go func() {
 		// CloseWithError on the writer end propagates the failure to the
 		// HTTP transport reading from pipeReader, which then aborts the
@@ -151,14 +186,6 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		defer func() {
 			pipeWriter.CloseWithError(producerErr)
 		}()
-
-		h := make(textproto.MIMEHeader)
-		h.Set("Content-Disposition", mime.FormatMediaType("form-data",
-			map[string]string{"name": "file", "filename": ""}))
-		h.Set("Idempotency-Key", dstUrl)
-		if bodyIsGzipped {
-			h.Set("Content-Encoding", "gzip")
-		}
 
 		fw, err := mw.CreatePart(h)
 		if err != nil {
@@ -187,6 +214,13 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		return fmt.Errorf("create POST request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentType)
+	if contentLength >= 0 {
+		// With ContentLength set the transport sends a Content-Length
+		// header and fails the request if the producer delivers a
+		// different number of bytes, so a truncated source read cannot
+		// commit a short chunk.
+		req.ContentLength = contentLength
+	}
 	if dstJwt != "" {
 		req.Header.Set("Authorization", security.BearerPrefix+string(dstJwt))
 	}

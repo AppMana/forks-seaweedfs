@@ -61,6 +61,9 @@ type commandVolumeFsck struct {
 	verifyNeedle              *bool
 	filerSigningKey           string
 	unresolvedManifestEntries atomic.Int64
+	// readNeedleMeta returns a needle's append time as the volume server
+	// reads it at the copied index offset; tests replace it.
+	readNeedleMeta func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) (appendAtNs uint64, err error)
 }
 
 func (c *commandVolumeFsck) Name() string {
@@ -731,30 +734,30 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		return
 	}
 
-	var orphanFileCount uint64
+	var orphanFileCount, staleNeedleCount uint64
 	if err = volumeFileIdDb.AscendingVisit(func(n needle_map.NeedleValue) error {
 		if n.Size.IsDeleted() {
 			return nil
 		}
 		if !vinfo.isEcVolume && (cutoffFrom > 0 || modifyFrom > 0) {
-			return operation.WithVolumeServerClient(false, vinfo.server, c.env.option.GrpcDialOption,
-				func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-					resp, err := volumeServerClient.ReadNeedleMeta(context.Background(), &volume_server_pb.ReadNeedleMetaRequest{
-						VolumeId: volumeId,
-						NeedleId: types.NeedleIdToUint64(n.Key),
-						Offset:   n.Offset.ToActualOffset(),
-						Size:     int32(n.Size),
-					})
-					if err != nil {
-						return fmt.Errorf("read needle meta with id %d from volume %d: %v", n.Key, volumeId, err)
-					}
-					if (modifyFrom == 0 || modifyFrom <= resp.AppendAtNs) && (cutoffFrom == 0 || resp.AppendAtNs <= cutoffFrom) {
-						orphanFileIds = append(orphanFileIds, n.Key.FileId(volumeId))
-						orphanFileCount++
-						orphanDataSize += uint64(n.Size)
-					}
-					return nil
-				})
+			appendAtNs, readErr := c.needleAppendAtNs(vinfo.server, volumeId, n)
+			if readErr != nil {
+				// The index was copied before this read; a vacuum commit or a
+				// delete in between moves or removes the needle, so the copied
+				// offset no longer describes it. That needle's state is unknown
+				// and it stays out of the orphan set; the run goes on.
+				staleNeedleCount++
+				if *c.verbose {
+					fmt.Fprintf(c.writer, "volume %d needle %d changed under fsck: %v\n", volumeId, n.Key, readErr)
+				}
+				return nil
+			}
+			if (modifyFrom == 0 || modifyFrom <= appendAtNs) && (cutoffFrom == 0 || appendAtNs <= cutoffFrom) {
+				orphanFileIds = append(orphanFileIds, n.Key.FileId(volumeId))
+				orphanFileCount++
+				orphanDataSize += uint64(n.Size)
+			}
+			return nil
 		} else {
 			if vinfo.isEcVolume && (cutoffFrom > 0 || modifyFrom > 0) {
 				if *c.verbose {
@@ -776,9 +779,37 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\tentries:%d\torphan:%d\t%.2f%%\t%dB\n",
 			dataNodeId, volumeId, orphanFileCount+inUseCount, orphanFileCount, pct, orphanDataSize)
 	}
+	if staleNeedleCount > 0 {
+		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\t%d needle(s) changed under fsck (vacuum or delete in progress), left out of the orphan set; rerun to include them\n",
+			dataNodeId, volumeId, staleNeedleCount)
+	}
 
 	return
 
+}
+
+// needleAppendAtNs reads one needle's append time from its volume server at
+// the offset the copied index recorded.
+func (c *commandVolumeFsck) needleAppendAtNs(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) (uint64, error) {
+	if c.readNeedleMeta != nil {
+		return c.readNeedleMeta(server, volumeId, n)
+	}
+	var appendAtNs uint64
+	err := operation.WithVolumeServerClient(false, server, c.env.option.GrpcDialOption,
+		func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+			resp, err := volumeServerClient.ReadNeedleMeta(context.Background(), &volume_server_pb.ReadNeedleMetaRequest{
+				VolumeId: volumeId,
+				NeedleId: types.NeedleIdToUint64(n.Key),
+				Offset:   n.Offset.ToActualOffset(),
+				Size:     int32(n.Size),
+			})
+			if err != nil {
+				return fmt.Errorf("read needle meta with id %d from volume %d: %v", n.Key, volumeId, err)
+			}
+			appendAtNs = resp.AppendAtNs
+			return nil
+		})
+	return appendAtNs, err
 }
 
 type VInfo struct {

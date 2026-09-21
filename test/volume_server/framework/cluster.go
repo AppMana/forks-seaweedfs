@@ -20,6 +20,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/test/testutil"
 	"github.com/seaweedfs/seaweedfs/test/volume_server/matrix"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 const (
@@ -39,11 +40,12 @@ type Cluster struct {
 	testingTB testing.TB
 	profile   matrix.Profile
 
-	weedBinary string
-	baseDir    string
-	configDir  string
-	logsDir    string
-	keepLogs   bool
+	weedBinary   string
+	volumeBinary string
+	baseDir      string
+	configDir    string
+	logsDir      string
+	keepLogs     bool
 
 	masterPort     int
 	masterGrpcPort int
@@ -77,6 +79,13 @@ func StartSingleVolumeClusterWithDataDirs(t testing.TB, profile matrix.Profile, 
 	weedBinary, err := FindOrBuildWeedBinary()
 	if err != nil {
 		t.Fatalf("resolve weed binary: %v", err)
+	}
+	volumeBinary := weedBinary
+	if override := os.Getenv("WEED_VOLUME_BINARY"); override != "" {
+		if !filepath.IsAbs(override) || !isExecutableFile(override) {
+			t.Fatalf("WEED_VOLUME_BINARY must be an absolute executable path: %s", override)
+		}
+		volumeBinary = override
 	}
 
 	baseDir, keepLogs, err := newWorkDir()
@@ -120,6 +129,7 @@ func StartSingleVolumeClusterWithDataDirs(t testing.TB, profile matrix.Profile, 
 		testingTB:      t,
 		profile:        profile,
 		weedBinary:     weedBinary,
+		volumeBinary:   volumeBinary,
 		baseDir:        baseDir,
 		configDir:      configDir,
 		logsDir:        logsDir,
@@ -208,6 +218,17 @@ func (c *Cluster) RestartVolumeServer() {
 	}
 }
 
+// RestartVolumeServerWithBinary preserves test volumes while upgrading or
+// rolling back just this process. It never replaces a running executable.
+func (c *Cluster) RestartVolumeServerWithBinary(binary string) {
+	c.testingTB.Helper()
+	if !filepath.IsAbs(binary) || !isExecutableFile(binary) {
+		c.testingTB.Fatalf("replacement binary must be an absolute executable path: %s", binary)
+	}
+	c.volumeBinary = binary
+	c.RestartVolumeServer()
+}
+
 // StopVolumeServer kills the volume server but leaves the master and data
 // dirs alone. Pair with RestartVolumeServer or Stop.
 func (c *Cluster) StopVolumeServer() {
@@ -221,6 +242,7 @@ func (c *Cluster) startMaster(dataDir string) error {
 	if err != nil {
 		return err
 	}
+	defer logFile.Close()
 
 	args := []string{
 		"-config_dir=" + c.configDir,
@@ -246,6 +268,7 @@ func (c *Cluster) startVolume(dataDirs []string) error {
 	if err != nil {
 		return err
 	}
+	defer logFile.Close()
 
 	maxPerDir := make([]string, len(dataDirs))
 	for i := range dataDirs {
@@ -276,7 +299,11 @@ func (c *Cluster) startVolume(dataDirs []string) error {
 		args = append(args, "-inflightDownloadDataTimeout="+c.profile.InflightDownloadTimeout.String())
 	}
 
-	c.volumeCmd = exec.Command(c.weedBinary, args...)
+	binary := c.volumeBinary
+	if binary == "" {
+		binary = c.weedBinary
+	}
+	c.volumeCmd = exec.Command(binary, args...)
 	c.volumeCmd.Dir = c.baseDir
 	c.volumeCmd.Stdout = logFile
 	c.volumeCmd.Stderr = logFile
@@ -388,14 +415,19 @@ func FindOrBuildWeedBinary() (string, error) {
 			return
 		}
 
-		binDir := filepath.Join(os.TempDir(), "seaweedfs_volume_server_it_bin")
-		if err := os.MkdirAll(binDir, 0o755); err != nil {
-			weedBinaryErr = fmt.Errorf("create binary directory %s: %w", binDir, err)
+		binDir, err := os.MkdirTemp("", "seaweedfs_volume_server_it_bin_")
+		if err != nil {
+			weedBinaryErr = fmt.Errorf("create binary directory: %w", err)
 			return
 		}
 		binPath := filepath.Join(binDir, "weed")
 
-		cmd := exec.Command("go", "build", "-o", binPath, ".")
+		args := []string{"build", "-o", binPath}
+		if types.OffsetSize == 5 {
+			args = append(args, "-tags", "5BytesOffset")
+		}
+		args = append(args, ".")
+		cmd := exec.Command("go", args...)
 		cmd.Dir = filepath.Join(repoRoot, "weed")
 		var out bytes.Buffer
 		cmd.Stdout = &out

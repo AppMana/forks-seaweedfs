@@ -622,7 +622,7 @@ func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformati
 			vl.RegisterVolume(&v, dn)
 			vl.EnsureCorrectWritables(&v)
 		}
-		if vl.UpdateVolumeSize(v.Id, v.Size, v.CompactRevision) {
+		if vl.UpdateVolumeSizeFromReplicas(v.Id) {
 			vl.AdjustActiveVolumeCountAfterRecovery(v.Id)
 		}
 	}

@@ -1,6 +1,7 @@
 package topology
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -243,4 +244,37 @@ func TestPlanRackAwareGrowth_EvenDistributionAcrossUnevenDCs(t *testing.T) {
 func restoreCopyCounts(copy1, copy2 uint32) {
 	VolumeGrowStrategy.Copy1Count = copy1
 	VolumeGrowStrategy.Copy2Count = copy2
+}
+
+func TestGrowth020AcrossFourRacks(t *testing.T) {
+	old := VolumeGrowStrategy.Copy3Count
+	defer func() { VolumeGrowStrategy.Copy3Count = old }()
+	VolumeGrowStrategy.Copy3Count = 1
+	layout := `{
+	"dc1": {
+		"r1": {"a": {"volumes": [{"id": 1, "size": SIZE, "replication": "020"}], "limit": 500}},
+		"r2": {"b": {"volumes": [{"id": 1, "size": SIZE, "replication": "020"}], "limit": 500}},
+		"r3": {"c": {"volumes": [{"id": 1, "size": SIZE, "replication": "020"}], "limit": 500}},
+		"nas": {"d": {"volumes": [], "limit": 700}}
+	}}`
+	for _, tc := range []struct {
+		size  string
+		count int
+	}{{"1000", 0}, {"29500", 1}} {
+		topo := setupWithLimit(t, strings.ReplaceAll(layout, "SIZE", tc.size), 30000)
+		rp, _ := super_block.NewReplicaPlacementFromString("020")
+		vl := topo.GetVolumeLayout("", rp, needle.EMPTY_TTL, types.HardDriveType)
+		if vl.GrowthStep(2) != 1 {
+			t.Fatal("background growth ignored copy_3=1")
+		}
+		plans := vl.PlanRackAwareGrowth(topo.ListDCAndRacks(), 0, 2)
+		if len(plans) != tc.count {
+			t.Fatalf("size %s: got %+v, want %d plans", tc.size, plans, tc.count)
+		}
+		for _, p := range plans {
+			if p.WritableVolumeCount != 1 || p.Rack != "" {
+				t.Fatalf("expected one logical ID / three replicas, got %+v", p)
+			}
+		}
+	}
 }

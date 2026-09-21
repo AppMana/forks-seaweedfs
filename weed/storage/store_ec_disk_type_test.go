@@ -23,10 +23,9 @@ import (
 // locations and then invoke MountEcShards — this mirrors the real
 // VolumeEcShardsCopy → VolumeEcShardsMount sequence and avoids racing
 // with the startup-scan publish (which uses the location's disk type
-// and would otherwise pollute the captured slice). The returned slice
-// is appended to only by the goroutine; tests should not race against
-// it directly — use waitForShardMsg instead.
-func setupECStoreWithMixedDisks(t *testing.T) (store *Store, drainedShardMsgs *[]*master_pb.VolumeEcShardInformationMessage, vid needle.VolumeId, collection string, plant func()) {
+// and would otherwise pollute captured messages). The channel synchronizes
+// the background receiver with test assertions.
+func setupECStoreWithMixedDisks(t *testing.T) (store *Store, drainedShardMsgs <-chan *master_pb.VolumeEcShardInformationMessage, vid needle.VolumeId, collection string, plant func()) {
 	t.Helper()
 	tempDir := t.TempDir()
 	hddDir := filepath.Join(tempDir, "hdd")
@@ -56,14 +55,20 @@ func setupECStoreWithMixedDisks(t *testing.T) (store *Store, drainedShardMsgs *[
 		diskIOProbeConfig,
 	)
 
-	captured := []*master_pb.VolumeEcShardInformationMessage{}
-	drainedShardMsgs = &captured
+	captured := make(chan *master_pb.VolumeEcShardInformationMessage, 16)
+	drainedShardMsgs = captured
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
 		for {
 			select {
 			case msg := <-store.NewEcShardsChan:
-				captured = append(captured, msg)
+				select {
+				case captured <- msg:
+				case <-done:
+					return
+				}
 			case <-store.NewVolumesChan:
 			case <-store.DeletedVolumesChan:
 			case <-store.DeletedEcShardsChan:
@@ -76,6 +81,7 @@ func setupECStoreWithMixedDisks(t *testing.T) (store *Store, drainedShardMsgs *[
 	t.Cleanup(func() {
 		store.Close()
 		close(done)
+		<-exited
 	})
 
 	// Caller invokes plant() after the store exists; this mirrors a
@@ -114,21 +120,22 @@ func setupECStoreWithMixedDisks(t *testing.T) (store *Store, drainedShardMsgs *[
 	return store, drainedShardMsgs, vid, collection, plant
 }
 
-// waitForShardMsg returns the first captured mount message for vid, polling
-// briefly because the goroutine reads asynchronously from MountEcShards.
-func waitForShardMsg(t *testing.T, captured *[]*master_pb.VolumeEcShardInformationMessage, vid needle.VolumeId) *master_pb.VolumeEcShardInformationMessage {
+// waitForShardMsg waits for a captured mount message without racing a slice.
+func waitForShardMsg(t *testing.T, captured <-chan *master_pb.VolumeEcShardInformationMessage, vid needle.VolumeId) *master_pb.VolumeEcShardInformationMessage {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, msg := range *captured {
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case msg := <-captured:
 			if msg.Id == uint32(vid) {
 				return msg
 			}
+		case <-deadline.C:
+			t.Fatalf("no NewEcShardsChan message captured for volume %d within 2s", vid)
+			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("no NewEcShardsChan message captured for volume %d within 2s", vid)
-	return nil
 }
 
 // findHeartbeatShard returns the EC-shard heartbeat entry for vid.

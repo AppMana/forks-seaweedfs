@@ -68,9 +68,11 @@ func TestReadNeedMetaWithWritesAndUpdates(t *testing.T) {
 	expectedLastUpdateTime := uint64(1000000000000)
 	for i := 0; i < 30; i++ {
 		testNeedle := new(needle.Needle)
-		testNeedle.Id = types.Uint64ToNeedleId(uint64(i + 1%20))
+		testNeedle.Id = types.Uint64ToNeedleId(uint64((i + 1) % 20))
 		testNeedle.Flags = 0x08
-		v.readNeedleMetaAt(testNeedle, writeInfos[i].offset, writeInfos[i].size)
+		if err := v.readNeedleMetaAt(testNeedle, writeInfos[i].offset, writeInfos[i].size); err != nil {
+			t.Fatalf("read needle metadata %d: %v", i, err)
+		}
 		actualLastModifiedTime := testNeedle.LastModified
 		if writeInfos[i].size != 0 {
 			assert.Equal(t, expectedLastUpdateTime, actualLastModifiedTime, "The two words should be the same.")
@@ -116,9 +118,11 @@ func TestReadNeedMetaWithDeletesThenWrites(t *testing.T) {
 	expectedLastUpdateTime := uint64(1000000000000)
 	for i := 0; i < 10; i++ {
 		testNeedle := new(needle.Needle)
-		testNeedle.Id = types.Uint64ToNeedleId(uint64(i + 1%5))
+		testNeedle.Id = types.Uint64ToNeedleId(uint64((i + 1) % 5))
 		testNeedle.Flags = 0x08
-		v.readNeedleMetaAt(testNeedle, writeInfos[i].offset, writeInfos[i].size)
+		if err := v.readNeedleMetaAt(testNeedle, writeInfos[i].offset, writeInfos[i].size); err != nil {
+			t.Fatalf("read needle metadata %d: %v", i, err)
+		}
 		actualLastModifiedTime := testNeedle.LastModified
 		if writeInfos[i].size != 0 {
 			assert.Equal(t, expectedLastUpdateTime, actualLastModifiedTime, "The two words should be the same.")

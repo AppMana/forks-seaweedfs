@@ -16,10 +16,9 @@ import (
 // fsck copies a volume's index and then asks the volume server for each
 // candidate orphan's append time at the copied offset. A vacuum that commits
 // in between rewrites the volume, so the copied offsets go stale and the
-// read fails for that needle. That is one needle whose state changed under
-// the check, not a reason to abandon the run: the needle is left out of the
-// orphan set (conservative) and counted.
-func TestFsckSkipsNeedlesWhoseIndexWentStale(t *testing.T) {
+// read fails for that needle. The scan is incomplete: do not label arbitrary
+// RPC/disk failures as a confirmed vacuum race, or permit a subsequent purge.
+func TestFsckRejectsIncompleteNeedleMetadata(t *testing.T) {
 	tempFolder := t.TempDir()
 	const dataNodeId = "dn1"
 	const volumeId = uint32(7)
@@ -65,16 +64,16 @@ func TestFsckSkipsNeedlesWhoseIndexWentStale(t *testing.T) {
 	vinfo := VInfo{server: pb.ServerAddress("dn1:8080"), collection: "b"}
 
 	inUse, orphans, orphanBytes, err := c.oneVolumeFileIdsSubtractFilerFileIds(dataNodeId, volumeId, &vinfo, 0, 5000)
-	if err != nil {
-		t.Fatalf("a stale needle must not fail the volume: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("incomplete metadata must fail closed: %v", err)
 	}
 	if inUse != 1 {
 		t.Fatalf("in use %d, want 1", inUse)
 	}
-	if len(orphans) != 1 || !strings.HasPrefix(orphans[0], "7,") || orphanBytes != 100 {
-		t.Fatalf("orphans %v (%d bytes), want only needle 2", orphans, orphanBytes)
+	if len(orphans) != 0 || orphanBytes != 0 {
+		t.Fatalf("incomplete scan returned actionable orphans %v (%d bytes)", orphans, orphanBytes)
 	}
-	if !strings.Contains(out.String(), "1 needle") || !strings.Contains(out.String(), "changed under fsck") {
+	if !strings.Contains(out.String(), "1 needle") || !strings.Contains(out.String(), "unknown") {
 		t.Fatalf("the skipped needle must be reported, got:\n%s", out.String())
 	}
 }

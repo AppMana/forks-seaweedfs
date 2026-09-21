@@ -271,6 +271,9 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(collectModifyFromAtNs), uint64(collectCutoffFromAtNs)); err != nil {
 			return fmt.Errorf("findExtraChunksInVolumeServers: %w", err)
 		}
+		if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 {
+			return fmt.Errorf("incomplete fsck: %d entries have unresolved chunk manifests; no purge was authorized", unresolved)
+		}
 	}
 
 	return nil
@@ -474,6 +477,7 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 		if len(skippedVolumeIds) > 0 {
 			sort.Slice(skippedVolumeIds, func(i, j int) bool { return skippedVolumeIds[i] < skippedVolumeIds[j] })
 			fmt.Fprintf(c.writer, "skipped purge on %d volume(s): %v\n", len(skippedVolumeIds), skippedVolumeIds)
+			return fmt.Errorf("incomplete purge on volumes %v", skippedVolumeIds)
 		}
 	}
 
@@ -742,13 +746,11 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		if !vinfo.isEcVolume && (cutoffFrom > 0 || modifyFrom > 0) {
 			appendAtNs, readErr := c.needleAppendAtNs(vinfo.server, volumeId, n)
 			if readErr != nil {
-				// The index was copied before this read; a vacuum commit or a
-				// delete in between moves or removes the needle, so the copied
-				// offset no longer describes it. That needle's state is unknown
-				// and it stays out of the orphan set; the run goes on.
+				// This may be a stale index, but can also be an I/O or RPC
+				// failure. Finish collecting diagnostics, then fail closed.
 				staleNeedleCount++
 				if *c.verbose {
-					fmt.Fprintf(c.writer, "volume %d needle %d changed under fsck: %v\n", volumeId, n.Key, readErr)
+					fmt.Fprintf(c.writer, "volume %d needle %d metadata unknown: %v\n", volumeId, n.Key, readErr)
 				}
 				return nil
 			}
@@ -780,8 +782,9 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 			dataNodeId, volumeId, orphanFileCount+inUseCount, orphanFileCount, pct, orphanDataSize)
 	}
 	if staleNeedleCount > 0 {
-		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\t%d needle(s) changed under fsck (vacuum or delete in progress), left out of the orphan set; rerun to include them\n",
+		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\t%d needle(s) have unknown metadata; scan incomplete, refusing purge; investigate and rerun\n",
 			dataNodeId, volumeId, staleNeedleCount)
+		return inUseCount, nil, 0, fmt.Errorf("incomplete fsck for volume %d: %d needle metadata reads failed", volumeId, staleNeedleCount)
 	}
 
 	return
@@ -893,6 +896,7 @@ func (c *commandVolumeFsck) purgeFileIdsForOneVolume(volumeId uint32, fileIds []
 		for _, result := range results {
 			if result.Error != "" {
 				fmt.Fprintf(c.writer, "purge error: %s\n", result.Error)
+				err = fmt.Errorf("incomplete purge for volume %d: %s", volumeId, result.Error)
 			}
 		}
 	}

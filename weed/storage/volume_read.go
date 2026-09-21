@@ -90,6 +90,7 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 func (v *Volume) readNeedleMetaAt(n *needle.Needle, offset int64, size int32) (err error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
+	expectedID := n.Id
 	// read deleted needle meta data
 	if size < 0 {
 		size = 0
@@ -100,6 +101,9 @@ func (v *Volume) readNeedleMetaAt(n *needle.Needle, offset int64, size int32) (e
 	}
 	if err != nil {
 		return err
+	}
+	if n.Id != expectedID {
+		return fmt.Errorf("needle identity mismatch at offset %d: found %d, expected %d", offset, n.Id, expectedID)
 	}
 	return nil
 }

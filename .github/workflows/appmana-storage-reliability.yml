@@ -1,0 +1,97 @@
+name: AppMana storage reliability gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: 'Optional full baseline commit SHA; otherwise use repository variable'
+        type: string
+        required: false
+  push:
+    branches: [master, main, 'merge/**']
+    paths: ['weed/**', 'test/volume_server/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+  pull_request:
+    paths: ['weed/**', 'test/volume_server/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+
+permissions:
+  contents: read
+
+# Update repository variables after release qualification; never silently use
+# HEAD~1 or a moving branch as a compatibility baseline. See README.md.
+env:
+  BASELINE_REF: ${{ inputs.baseline_ref || vars.SEAWEEDFS_RELIABILITY_BASELINE_REF }}
+  GO_FUSE_REF: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+  STORAGE_BUILD_TAGS: 5BytesOffset
+  STORAGE_UNIT_TEST_TIMEOUT: 10m
+  STORAGE_PROCESS_TEST_TIMEOUT: 5m
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  large-disk-regressions:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: seaweedfs
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          path: seaweedfs
+      - name: Validate explicit compatibility inputs
+        run: |
+          for name in BASELINE_REF GO_FUSE_REF; do
+            if [[ ! "${!name}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::$name must be a full commit SHA. Configure the repository variables documented in README.md."
+              exit 1
+            fi
+          done
+          baseline_sha=$(git rev-parse --verify --end-of-options "${BASELINE_REF}^{commit}")
+          candidate_sha=$(git rev-parse HEAD)
+          if [ "$baseline_sha" = "$candidate_sha" ]; then
+            echo "::error::Baseline and candidate are identical; this would not test an upgrade."
+            exit 1
+          fi
+          printf 'BASELINE_SHA=%s\nCANDIDATE_SHA=%s\n' "$baseline_sha" "$candidate_sha" >> "$GITHUB_ENV"
+          printf 'Baseline: `%s`\n\nCandidate: `%s`\n\nGo-FUSE: `%s`\n' "$baseline_sha" "$candidate_sha" "$GO_FUSE_REF" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@v7
+        with:
+          repository: AppMana/forks-go-fuse
+          ref: ${{ env.GO_FUSE_REF }}
+          path: forks-go-fuse
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: seaweedfs/go.mod
+          cache-dependency-path: seaweedfs/go.sum
+      - name: Race-tested production offset format
+        run: >-
+          go test -short -tags "$STORAGE_BUILD_TAGS" -race -count=1 -timeout="$STORAGE_UNIT_TEST_TIMEOUT"
+          ./weed/storage ./weed/topology ./weed/shell ./weed/server
+      - name: Build explicit baseline and candidate
+        run: |
+          # Both worktrees resolve ../forks-go-fuse to the pinned checkout.
+          git worktree add --detach "$GITHUB_WORKSPACE/seaweed-baseline" "$BASELINE_SHA"
+          (cd "$GITHUB_WORKSPACE/seaweed-baseline" && go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$BASELINE_SHA" -o "$RUNNER_TEMP/weed-baseline" ./weed)
+          go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
+          "$RUNNER_TEMP/weed-baseline" version
+          "$RUNNER_TEMP/weed-candidate" version
+      - name: Admission and baseline-to-candidate rollback
+        env:
+          WEED_BINARY: ${{ runner.temp }}/weed-candidate
+          WEED_VOLUME_BINARY: ${{ runner.temp }}/weed-baseline
+          WEED_CANDIDATE_BINARY: ${{ runner.temp }}/weed-candidate
+          VOLUME_SERVER_IT_KEEP_LOGS: '1'
+        run: |
+          # Admission must exercise the candidate, not the initial baseline.
+          WEED_VOLUME_BINARY="$WEED_CANDIDATE_BINARY" go test -tags "$STORAGE_BUILD_TAGS" -count=1 -timeout="$STORAGE_PROCESS_TEST_TIMEOUT" ./test/volume_server/http -run '^TestUploadLimitTimeoutIncludesReplication$'
+          go test -tags "$STORAGE_BUILD_TAGS" -count=1 -timeout="$STORAGE_PROCESS_TEST_TIMEOUT" ./test/volume_server/grpc -run '^TestVolumeBinaryUpgradeVacuumRollback$'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: storage-reliability-process-logs
+          path: /tmp/seaweedfs_volume_server_it_*/logs/
+          if-no-files-found: warn
+          retention-days: 14

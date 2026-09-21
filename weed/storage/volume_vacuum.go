@@ -102,10 +102,10 @@ func (v *Volume) CompactByVolumeData(opts *CompactOptions) error {
 		return fmt.Errorf("volume %d needle map is nil", v.Id)
 	}
 	if err := v.DataBackend.Sync(); err != nil {
-		glog.V(0).Infof("compact failed to sync volume %d", v.Id)
+		return fmt.Errorf("compact sync volume %d data: %w", v.Id, err)
 	}
 	if err := nm.Sync(); err != nil {
-		glog.V(0).Infof("compact failed to sync volume idx %d", v.Id)
+		return fmt.Errorf("compact sync volume %d index: %w", v.Id, err)
 	}
 
 	opts.destDatPath = v.FileName(".cpd")
@@ -144,10 +144,10 @@ func (v *Volume) CompactByIndex(opts *CompactOptions) error {
 		return fmt.Errorf("volume %d needle map is nil", v.Id)
 	}
 	if err := v.DataBackend.Sync(); err != nil {
-		glog.V(0).Infof("compact2 failed to sync volume dat %d: %v", v.Id, err)
+		return fmt.Errorf("compact2 sync volume %d data: %w", v.Id, err)
 	}
 	if err := nm.Sync(); err != nil {
-		glog.V(0).Infof("compact2 failed to sync volume idx %d: %v", v.Id, err)
+		return fmt.Errorf("compact2 sync volume %d index: %w", v.Id, err)
 	}
 
 	opts.srcDatPath = v.FileName(".dat")
@@ -188,8 +188,16 @@ func (v *Volume) CommitCompact() error {
 	stats.VolumeServerVolumeGauge.WithLabelValues(v.Collection, "volume").Dec()
 
 	var e error
+	var replayErr error
 	if e = v.makeupDiff(v.FileName(".cpd"), v.FileName(".cpx"), v.FileName(".dat"), v.FileName(".idx")); e != nil {
+		replayErr = e
 		glog.V(0).Infof("makeupDiff in CommitCompact volume %d failed %v", v.Id, e)
+		// The temporary map describes the abandoned compacted generation, not
+		// the original files we are about to reload. Reusing it loses tail writes.
+		if v.tmpNm != nil {
+			v.tmpNm.Close()
+			v.tmpNm = nil
+		}
 		e = os.Remove(v.FileName(".cpd"))
 		if e != nil {
 			return e
@@ -217,10 +225,10 @@ func (v *Volume) CommitCompact() error {
 
 	glog.V(3).Infof("Loading volume %d commit file...", v.Id)
 	if e = v.load(true, false, v.needleMapKind, 0, v.Version()); e != nil {
-		return e
+		return errors.Join(replayErr, e)
 	}
 	glog.V(3).Infof("Finish committing volume %d", v.Id)
-	return nil
+	return replayErr
 }
 
 // writeCompactCommitMarker writes and fsyncs the .cpc marker, then fsyncs the
@@ -525,11 +533,15 @@ func (v *Volume) makeupDiff(newDatFileName, newIdxFileName, oldDatFileName, oldI
 				v.checkReadWriteError(err)
 				return fmt.Errorf("ReadNeedleBlob %s key %d offset %d size %d failed: %w", oldDatFile.Name(), key, increIdxEntry.offset.ToActualOffset(), increIdxEntry.size, err)
 			}
-			dstDatBackend.Write(needleBytes)
+			if n, writeErr := dstDatBackend.Write(needleBytes); writeErr != nil {
+				return fmt.Errorf("write compacted needle %d: %w", key, writeErr)
+			} else if n != len(needleBytes) {
+				return fmt.Errorf("write compacted needle %d: %w", key, io.ErrShortWrite)
+			}
 			if err := dstDatBackend.Sync(); err != nil {
 				return fmt.Errorf("cannot sync needle %s: %v", dstDatBackend.File.Name(), err)
 			}
-			util.Uint32toBytes(idxEntryBytes[8:12], uint32(offset/NeedlePaddingSize))
+			idxEntryBytes = needle_map.ToBytes(key, ToOffset(offset), increIdxEntry.size)
 		} else { //deleted needle
 			//fakeDelNeedle's default Data field is nil
 			fakeDelNeedle := new(needle.Needle)

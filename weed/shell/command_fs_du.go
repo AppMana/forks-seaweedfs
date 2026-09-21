@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -45,8 +46,8 @@ func (c *commandFsDu) Do(args []string, commandEnv *CommandEnv, writer io.Writer
 		return err
 	}
 
-	if commandEnv.isDirectory(path) {
-		path = path + "/"
+	if strings.HasSuffix(path, "/") || commandEnv.isDirectory(path) {
+		path = strings.TrimRight(path, "/") + "/"
 	}
 
 	var blockCount, byteCount uint64
@@ -73,10 +74,11 @@ func duTraverseDirectory(writer io.Writer, filerClient filer_pb.FilerClient, dir
 				subDir = "/" + entry.Name
 			}
 			numBlock, numByte, err := duTraverseDirectory(writer, filerClient, subDir, "")
-			if err == nil {
-				blockCount += numBlock
-				byteCount += numByte
+			if err != nil {
+				return fmt.Errorf("incomplete disk usage for %s: %w", subDir, err)
 			}
+			blockCount += numBlock
+			byteCount += numByte
 		} else {
 			fileBlockCount = uint64(len(entry.GetChunks()))
 			fileByteCount = filer.FileSize(entry)

@@ -100,7 +100,7 @@ func TestScrubVolumeData(t *testing.T) {
 			}
 			defer datFile.Close()
 
-			idxFile, err := os.OpenFile(tc.indexPath, os.O_RDONLY, 0)
+			idxFile, err := openScrubFixtureIndex(t, tc.indexPath)
 			if err != nil {
 				t.Fatalf("failed to open index file: %v", err)
 			}
@@ -128,6 +128,42 @@ func TestScrubVolumeData(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Checked-in scrub fixtures use the 4-byte-offset index format. Translate
+// records into a temporary 5-byte index for production-format tests; the data,
+// tombstones and intentional corruption remain unchanged. Never rewrite the
+// repository fixture or silently interpret a 16-byte row as a 17-byte row.
+func openScrubFixtureIndex(t *testing.T, path string) (*os.File, error) {
+	t.Helper()
+	if types.OffsetSize == 4 {
+		return os.Open(path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data)%16 != 0 {
+		return nil, fmt.Errorf("4-byte fixture %s has incomplete index row", path)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "scrub-5byte-*.idx")
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(data); i += 16 {
+		row := append([]byte(nil), data[i:i+12]...)
+		row = append(row, 0) // high offset byte follows the low four bytes
+		row = append(row, data[i+12:i+16]...)
+		if _, err := f.Write(row); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // TestScrubVolumeData_IgnoresOffset0Tombstone: a remote-tier delete appends an

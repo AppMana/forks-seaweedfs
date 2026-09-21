@@ -239,6 +239,47 @@ func (vl *VolumeLayout) rememberOversizedVolume(v *storage.VolumeInfo, dn *DataN
 func (vl *VolumeLayout) UpdateVolumeSize(vid needle.VolumeId, reportedSize uint64, compactRevision uint32) (recoveredToWritable bool) {
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
+	return vl.updateVolumeSizeLocked(vid, reportedSize, compactRevision)
+}
+
+// UpdateVolumeSizeFromReplicas uses the largest registered replica for
+// placement. Replica heartbeats arrive independently; alternating old and new
+// compaction generations must not repeatedly reset a shared size estimate.
+// Only reset pending-byte accounting once every registered replica agrees on
+// the compaction generation. Until then, retain the conservative maximum.
+func (vl *VolumeLayout) UpdateVolumeSizeFromReplicas(vid needle.VolumeId) bool {
+	vl.accessLock.Lock()
+	defer vl.accessLock.Unlock()
+	locations := vl.vid2location[vid]
+	if locations == nil || locations.Length() == 0 {
+		return false
+	}
+	var size uint64
+	var revision uint32
+	mixed := false
+	for i, dn := range locations.list {
+		v, err := dn.GetVolumesById(vid)
+		if err != nil {
+			return false
+		}
+		if v.Size > size {
+			size = v.Size
+		}
+		if i == 0 {
+			revision = v.CompactRevision
+		} else if revision != v.CompactRevision {
+			mixed = true
+		}
+	}
+	if mixed {
+		if st := vl.sizeTracking[vid]; st != nil {
+			revision = st.compactRevision
+		}
+	}
+	return vl.updateVolumeSizeLocked(vid, size, revision)
+}
+
+func (vl *VolumeLayout) updateVolumeSizeLocked(vid needle.VolumeId, reportedSize uint64, compactRevision uint32) (recoveredToWritable bool) {
 
 	now := time.Now()
 	st := vl.sizeTracking[vid]
@@ -721,6 +762,12 @@ type RackGrowPlan struct {
 	WritableVolumeCount uint32
 }
 
+// GrowthStep limits background growth to the configured logical-volume batch.
+// Explicit client requests for a larger writable pool remain separate.
+func (vl *VolumeLayout) GrowthStep(stepCount uint32) uint32 {
+	return min(stepCount, VolumeGrowthCountForCopies(vl.rp.GetCopyCount()))
+}
+
 // PlanRackAwareGrowth returns the grow actions needed so every location that
 // can serve writes keeps a non-crowded writable volume. stepCount is the
 // default per-event increment.
@@ -733,9 +780,7 @@ type RackGrowPlan struct {
 // master.volume_growth.copy_N reduces periodic growth.
 func (vl *VolumeLayout) PlanRackAwareGrowth(dcs map[NodeId][]NodeId, lastGrowCount, stepCount uint32) (plans []RackGrowPlan) {
 	writables := vl.CloneWritableVolumes()
-	if c := VolumeGrowthCountForCopies(vl.rp.GetCopyCount()); c < stepCount {
-		stepCount = c
-	}
+	stepCount = vl.GrowthStep(stepCount)
 	growOncePerDc := vl.rp.DiffRackCount > 0
 	// Spread lastGrowCount evenly across all grow targets. Summing every rack
 	// up front keeps the divisor global, so DCs with different rack counts do

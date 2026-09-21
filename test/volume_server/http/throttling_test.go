@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +56,7 @@ func (r *pausableReader) Read(p []byte) (int, error) {
 	return int(n), nil
 }
 
-func TestUploadLimitTimeoutAndReplicateBypass(t *testing.T) {
+func TestUploadLimitTimeoutIncludesReplication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -70,6 +71,9 @@ func TestUploadLimitTimeoutAndReplicateBypass(t *testing.T) {
 	const blockedUploadSize = 2 * 1024 * 1024 // over 1MB P8 upload limit
 
 	unblockFirstUpload := make(chan struct{})
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(unblockFirstUpload) }) }
+	defer unblock()
 	firstUploadDone := make(chan error, 1)
 	firstFID := framework.NewFileID(volumeID, 880001, 0x1A2B3C4D)
 	go func() {
@@ -108,8 +112,8 @@ func TestUploadLimitTimeoutAndReplicateBypass(t *testing.T) {
 		t.Fatalf("replicate request failed: %v", err)
 	}
 	_ = framework.ReadAllAndClose(t, replicateResp)
-	if replicateResp.StatusCode != http.StatusCreated {
-		t.Fatalf("replicate request expected 201 bypassing limit, got %d", replicateResp.StatusCode)
+	if replicateResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("replication must share admission budget: expected 429, got %d", replicateResp.StatusCode)
 	}
 
 	normalFID := framework.NewFileID(volumeID, 880003, 0x9C0D1E2F)
@@ -130,11 +134,20 @@ func TestUploadLimitTimeoutAndReplicateBypass(t *testing.T) {
 		t.Fatalf("normal upload expected 429 while limit blocked, got %d", normalResp.StatusCode)
 	}
 
-	close(unblockFirstUpload)
+	unblock()
 	select {
-	case <-firstUploadDone:
+	case err := <-firstUploadDone:
+		if err != nil {
+			t.Fatalf("first upload failed: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for blocked upload to finish")
+	}
+	// A rejected replica write must not leak its reservation.
+	recoveryResp := framework.UploadBytes(t, framework.NewHTTPClient(), clusterHarness.VolumeAdminURL(), replicateFID+"?type=replicate", []byte("replicate"))
+	_ = framework.ReadAllAndClose(t, recoveryResp)
+	if recoveryResp.StatusCode != http.StatusCreated {
+		t.Fatalf("replication did not recover: %d", recoveryResp.StatusCode)
 	}
 }
 

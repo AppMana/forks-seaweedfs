@@ -67,6 +67,7 @@ func (ms *MasterServer) ProcessGrowRequest() {
 					continue
 				}
 				writable, crowded := vl.GetWritableVolumeCount()
+				growthStep := vl.GrowthStep(volumeGrowStepCount)
 				mustGrow := int(lastGrowCount) - writable
 				vgr := vlc.ToVolumeGrowRequest()
 				underReplicated := vl.CountUnderReplicatedVolumes()
@@ -84,8 +85,8 @@ func (ms *MasterServer) ProcessGrowRequest() {
 							_, err = ms.VolumeGrow(ctx, vgr)
 						}
 					}
-				case lastGrowCount > 0 && writable < int(lastGrowCount*2) && float64(crowded+volumeGrowStepCount) > float64(writable)*topology.VolumeGrowStrategy.Threshold:
-					vgr.WritableVolumeCount = volumeGrowStepCount
+				case lastGrowCount > 0 && growthStep > 0 && writable < int(lastGrowCount*2) && float64(crowded+int(growthStep)) > float64(writable)*topology.VolumeGrowStrategy.Threshold:
+					vgr.WritableVolumeCount = growthStep
 					_, err = ms.VolumeGrow(ctx, vgr)
 				}
 				if err != nil {

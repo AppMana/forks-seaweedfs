@@ -122,9 +122,9 @@ links before explicit `Apply`. Windows tests share the same native topology
 boundary and use generated RPC requests for execution timeouts. Assertions
 about SeaweedFS durability and WinFsp remain in this repository.
 
-This migration currently uses the `feature/native-typed-sdk` SDK worktree in a
-Go workspace. The released requirement in `vm/go.mod` predates these APIs;
-independent published dependency pinning is still pending. Set
+The VM module pins published Labcontainers commit `9fea7eee373a`; no local SDK
+workspace is required. Run `GOWORK=off go test ./...` from `test/storage_lab/vm`
+to verify the published dependency. Set
 `LABCONTAINERS_CONTAINERLAB` to an absolute CLI path built with that SDK's
 `scripts/build-containerlab.sh`; recovery needs its pinned native patches.
 The runner does not replace the host's Containerlab installation. Native
@@ -222,15 +222,14 @@ reads and Ubuntu image ID
 
 For native Windows storage regressions, build the existing suite with
 `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -tags 5BytesOffset -o /absolute/storage.test.exe ./weed/storage`.
-Use the same temporary Go workspace as the VM runner (include this module and
-the pinned Labcontainers checkout), then run:
+With the published SDK pin, run from the repository root:
 
 ```sh
 SEAWEEDFS_WINDOWS_LIVE=1 \
 SEAWEEDFS_WINDOWS_STORAGE_TEST=/absolute/storage.test.exe \
 LABCONTAINERS_LABD=/absolute/labcontainers/bin/labd \
 LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
-go test ./test/storage_lab/vm -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
+GOWORK=off go -C test/storage_lab/vm test . -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
 ```
 
 The harness boots a new isolated Windows VM, uploads the compiled tests, and
@@ -252,10 +251,10 @@ SEAWEEDFS_WINFSP_MSI=/absolute/winfsp.msi \
 SEAWEEDFS_GIT_INSTALLER=/absolute/git-installer.exe \
 LABCONTAINERS_LABD=/absolute/labcontainers/bin/labd \
 LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
-go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
+GOWORK=off go -C test/storage_lab/vm test . -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
 ```
 
-Use the same temporary Go workspace described above. This runs the existing
+This runs the existing
 `hack/appmana/mount-smoke.ps1` scenarios for 20 iterations each, checks Git LFS
 prerequisites and all 32 modified assets, and rejects missing completion markers.
 The test logs input hashes and retains combined scenario stdout/stderr under the

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import selectors
@@ -18,6 +19,73 @@ SUITES = {
     "admission": "^TestUploadLimitTimeoutIncludesReplication$",
     "synology-bootstrap": "^Test",
 }
+
+# Reviewed minimum inventories, deliberately independent of discovery from the
+# test binary: deleting or renaming a required test must fail qualification.
+REQUIRED_TESTS = {
+    'storage': '''
+TestCompactAbortsOnSourceSyncFailure
+TestVacuumStableLiveDatasetHasBoundedGrowth
+TestMakeupDiffRelocatesLargeOffsets
+TestCommitCompactReportsReplayFailure
+TestVacuumStableLiveDatasetHasBoundedAllocatedBlocks
+TestReconcileAfterBothRenamesInvalidatesOldLevelDB
+TestReconcileCacheInvalidationFailureRetainsMarker
+TestVacuumPreservesIntactDataWithBadIndex
+TestConcurrentWriteCrossesOffsetBoundary
+TestReconcileNoOpWhenEachDiskIsSelfContained
+TestCommitCompactDeletionTailKeepsWritable
+TestCompactByIndex_RejectsDanglingNeedle
+TestCompactByIndex_ConcurrentWriteDoesNotFailIntegrityCheck
+TestReconcileRollForwardMarkerOnly
+TestReconcileRollForwardPartialRename
+TestReconcileRollBackNoMarker
+TestReconcileSkipsLoadedVolumeMidVacuum
+TestApplyCompactSwapMissingTempFilesPreservesLive
+'''.split(),
+    'migration': ['TestVolumeBinaryUpgradeVacuumRollback'],
+    'admission': ['TestUploadLimitTimeoutIncludesReplication'],
+    'enospc': ['TestCompactENOSPCPreservesOriginal', 'TestVolumePreallocateENOSPCFailsCreation'],
+    'synology-bootstrap': '''
+TestMaterializeWeed_NoImageNoOp
+TestMaterializeWeed_ExtractsBinary
+TestMaterializeWeed_TopLayerWins
+TestMaterializeWeed_WhiteoutHides
+TestMaterializeWeed_DigestPinMismatch
+TestMaterializeWeed_CacheHitOffline
+TestMaterializeWeed_MultipleBinaries
+TestMaterializeWeed_MultiArchIndex
+TestRenderArgs_BasicShape
+TestValidate_Defaults
+TestValidate_Required
+TestInstanceConfig_Offsets
+TestInstanceConfig_SingleInstanceUnchanged
+TestValidate_InstancesDefaultAndBounds
+TestValidate_MasterServiceSatisfiesRequirement
+TestValidate_NeitherSeaweedNameNorMasterService
+TestDiscoverMasters_FromMasterServiceNoCRD
+TestDiscoverMasters_HeadlessServiceUsesIPNotDNSName
+TestDiscoverMasters_DefaultsToServiceDNSNotPodIPs
+TestDiscoverMasters_MasterServiceMissingEndpoints
+TestDiscoverMasters_FromHeadlessFallback
+TestDiscoverMasters_FromService
+TestDiscoverMasters_PortFallback
+TestMaterializeMTLS
+TestMaterializeMTLS_NoOpWhenSecretNameEmpty
+'''.split(),
+}
+
+
+def assess_results(suite, output, exit_code, boundary):
+    passed = set(re.findall(r'^--- PASS: (Test\w+) \([^\n]*\)$', output, re.MULTILINE))
+    required = set(REQUIRED_TESTS[suite])
+    missing = sorted(required - passed)
+    complete = (exit_code == 0 and not missing and boundary in output
+                and '--- SKIP:' not in output and '--- FAIL:' not in output
+                and re.search(r'^PASS$', output, re.MULTILINE) is not None)
+    return {'status': 'passed' if complete else 'failed',
+            'required_tests': sorted(required), 'passed_tests': sorted(passed),
+            'missing_tests': missing}
 
 # Runs in the SAME sandbox as the tests. A missing boundary is a fatal error.
 PROBE = r'''
@@ -169,9 +237,8 @@ def main():
         report['exit_code'] = exit_code
         output = (results / 'test.log').read_text(errors='replace')
         # Go returns success when -run matches nothing or a gate is skipped.
-        report['status'] = ('passed' if exit_code == 0
-                            and '--- PASS:' in output and '--- SKIP:' not in output
-                            and 'PASS: sandbox boundary probe' in output else 'failed')
+        report.update(assess_results(args.suite, output, exit_code,
+                                     'PASS: sandbox boundary probe'))
     finally:
         # Only this invocation's random unit, never a production service/PID.
         subprocess.run(['sudo', '-n', 'systemctl', 'stop', unit],

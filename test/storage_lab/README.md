@@ -203,6 +203,13 @@ then run broader suites. Do not weaken an assertion merely to accept the old
 behavior. Reviewed mutants continuously verify that the tests still go red if
 each fixed behavior is removed.
 
+Namespace and native-filesystem runners require the reviewed minimum test
+inventories in `run.py`, not merely one PASS line. Their manifests record
+required, passed and missing tests. Update an inventory deliberately when a
+test is renamed or added; never regenerate it from the candidate binary,
+which would silently accept a missing regression. Any skip, failed test,
+missing final PASS, nonzero exit or missing isolation probe rejects the run.
+
 | Target | Existing infrastructure to reuse | Still required before release |
 | --- | --- | --- |
 | Linux | Namespace/native-filesystem runners; volume-server harness; Labcontainers four-VM ext4/XFS/Btrfs vacuum crash recovery | Exact-phase barriers, broader filesystem fault/migration matrix, allocation accounting, CSI, injected EIO, 24-hour soak |

@@ -208,6 +208,9 @@ jobs:
           printf 'VM baseline: `%s`\n\nVM candidate: `%s`\n\nLabcontainers: `%s`\n\nVM image: `%s`\n' "$baseline_sha" "$candidate_sha" "$LABCONTAINERS_REF" "$LABCONTAINERS_VM_IMAGE" >> "$GITHUB_STEP_SUMMARY"
       - name: Unit-test the Labcontainers VM harness
         run: |
+          native_cli="$GITHUB_WORKSPACE/labcontainers/bin/containerlab-recovery"
+          bash "$GITHUB_WORKSPACE/labcontainers/scripts/build-containerlab.sh" "$native_cli"
+          echo "LABCONTAINERS_CONTAINERLAB=$native_cli" >> "$GITHUB_ENV"
           vm_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-vm-work.XXXXXXXX")
           (cd "$vm_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           GOWORK="$vm_work/go.work" go test ./test/storage_lab/vm/...

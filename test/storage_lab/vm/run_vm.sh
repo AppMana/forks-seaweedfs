@@ -13,6 +13,13 @@ test -f "$labcontainers_source/go.mod" || {
   exit 2
 }
 
+: "${LABCONTAINERS_CONTAINERLAB:?Set an absolute path to the SDK-qualified Containerlab CLI (including its native recovery patches)}"
+case "$LABCONTAINERS_CONTAINERLAB" in
+  /*) test -x "$LABCONTAINERS_CONTAINERLAB" ;;
+  *) echo "LABCONTAINERS_CONTAINERLAB must be an absolute executable path" >&2; exit 2 ;;
+esac
+export LABCONTAINERS_CONTAINERLAB
+
 if [ -n "${LABCONTAINERS_REF:-}" ]; then
   case "$LABCONTAINERS_REF" in
     *[!0-9a-fA-F]*|'') echo "LABCONTAINERS_REF must be a full 40-character commit SHA" >&2; exit 2 ;;

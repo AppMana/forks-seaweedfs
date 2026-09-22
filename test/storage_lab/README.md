@@ -115,6 +115,36 @@ The latter is **not** whole-cluster rolling-upgrade qualification.
 
 ## Labcontainers four-VM fault runner
 
+The native-SDK migration constructs Containerlab `core.Config`, node, and link
+objects directly; callers no longer render topology YAML. Crash/stop recovery
+reviews native `core.ApplyResult` and rejects changes to unrelated nodes or
+links before explicit `Apply`. Windows tests share the same native topology
+boundary and use generated RPC requests for execution timeouts. Assertions
+about SeaweedFS durability and WinFsp remain in this repository.
+
+This migration currently uses the `feature/native-typed-sdk` SDK worktree in a
+Go workspace. The released requirement in `vm/go.mod` predates these APIs;
+independent published dependency pinning is still pending. Set
+`LABCONTAINERS_CONTAINERLAB` to an absolute CLI path built with that SDK's
+`scripts/build-containerlab.sh`; recovery needs its pinned native patches.
+The runner does not replace the host's Containerlab installation. Native
+topology objects explicitly require preloaded node images (`Never` pull policy).
+
+Network bootstrap inputs now stay with run evidence so `--keep` does not delete
+files needed for later recovery. Failed kept runs record the daemon socket and
+state root in `manifest.json`. The remaining handwritten guest network-config
+encoder is not yet migrated to schema-generated objects; topology migration
+alone is not completion of the code-only interface work.
+
+Local migration verification on 2026-09-22 passed the four-VM ext4 `power-loss`
+scenario using SDK `141d1ff` and candidate SHA-256
+`63bc25cad9800fd4211cc58cecc2616fee05f5360356f2a124099c957e6931ee`.
+Evidence: `/tmp/seaweedfs-vm-lab-results-2461738833/manifest.json` and its
+`events.jsonl`. The native plan recreated only `volume1` and its switch link;
+all three replicas retained the acknowledged sequence-1001 digest after
+recovery. Cleanup removed this run's runtime resources. This is not Windows,
+whole-matrix, or Kubernetes networking qualification.
+
 `vm/run_vm.sh` uses the shared Labcontainers SDK instead of maintaining another
 VM lifecycle implementation. Every invocation creates a controller VM, three
 rack-separated volume-server VMs, three new 2 GiB data disks, and an internal

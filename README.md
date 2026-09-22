@@ -79,9 +79,11 @@ Secrets and variables → Actions → Variables:
 | --- | --- | --- |
 | `SEAWEEDFS_RELIABILITY_BASELINE_REF` | Full 40-character commit SHA for the source compatibility baseline | Change deliberately when the baseline is promoted; keep the previous deployed release in the upgrade/rollback matrix. Do not use `HEAD~1`, a branch, or `latest`. |
 | `SEAWEEDFS_RELIABILITY_GO_FUSE_REF` | Full commit SHA for `AppMana/forks-go-fuse`, required by the local `go.mod` replacement | Change only alongside a reviewed and tested dependency upgrade. Both test builds use this pinned sibling. |
-| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Use a published, qualified commit containing explicit crashes and peer bridge restoration (locally tested: `a0b41e1c5123fc129ea7a02c8a091b847c8312cb`). Publish the commit before selecting it in Actions. Never point this at a moving branch. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Must include explicit crashes, peer bridge restoration and `ExecWithTimeout` (introduced in local commit `6f89daa3da9f6739270ab6e36c1cbbd101c5ae12`). Publish and qualify the commit before selecting it in Actions. Never point this at a moving branch. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE` | Qualified Ubuntu VM image reference including `@sha256:<64 hex>` | Build from the pinned source, publish and preload it on the dedicated runner, and update only after its live KVM smoke test passes. Mutable tags are rejected. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Windows VM image including `@sha256:<64 hex>` | Preload the licensed image on the same dedicated runner. Run the native Windows core regressions and Labcontainers NTFS crash test before promotion. |
+| `SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256` | Absolute runner-local WinFsp MSI path and SHA-256 | Preload the reviewed installer. The VM gate verifies its hash before staging it offline. |
+| `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH` / `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256` | Absolute runner-local Git for Windows installer path and SHA-256 | Preload the reviewed installer including Git LFS; update path and digest together after qualification. Missing/mismatched installers fail the VM gate. |
 
 The initial baseline is `9ec822e2d634abc36eb2a113d0ddb4a844970873` (the audited
 4.40 fork source), and the initial Go-FUSE pin is
@@ -96,6 +98,10 @@ gh variable set SEAWEEDFS_RELIABILITY_GO_FUSE_REF --repo AppMana/forks-seaweedfs
 gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_SHA"
 gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_VM_IMAGE_AT_DIGEST"
 gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE --repo AppMana/forks-seaweedfs --body "$WINDOWS_IMAGE_AT_DIGEST"
+gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_WINFSP_MSI_PATH"
+gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_MSI_SHA256"
+gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_INSTALLER_PATH"
+gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_INSTALLER_SHA256"
 gh variable list --repo AppMana/forks-seaweedfs
 ```
 

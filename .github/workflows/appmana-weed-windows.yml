@@ -33,6 +33,9 @@ jobs:
       - name: Vet (linux)
         working-directory: forks-seaweedfs
         run: go vet -copylocks=false -tags 5BytesOffset ./weed/mount/... ./weed/command/
+      - name: Windows smoke harness rejects failed prerequisites
+        shell: pwsh
+        run: ./forks-seaweedfs/hack/appmana/mount-smoke-contract-test.ps1
       - name: Cross-compile gate (windows/amd64, large disk)
         working-directory: forks-seaweedfs
         run: |

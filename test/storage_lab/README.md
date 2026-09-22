@@ -56,6 +56,15 @@ not identify a dirty build. A skipped gate or a regex matching no tests is a
 failure, not a green qualification. These suites are selected regression gates,
 not the entire project's tests.
 
+For release provenance, build from a clean standalone clone and verify
+`go version -m` contains the expected `vcs.revision` and `vcs.modified=false`.
+The Go 1.26 toolchain used in this lab recognizes a `.git` directory but not
+the `.git` file in a linked worktree, so `-buildvcs=true` alone did not stamp
+those worktree builds. Also record the pinned sibling go-fuse SHA and clean
+status: the main module's VCS stamp does not identify a local replacement.
+Embed the full source SHA in `version.COMMIT`, and retain the artifact hash.
+Rebuilding changes the tested artifact identity and requires fresh qualification.
+
 ## Failure reproduction and release gates
 
 The unchanged upstream `TestConcurrentWriteCrossesOffsetBoundary` must fail if
@@ -192,6 +201,42 @@ The harness boots a new isolated Windows VM, uploads the compiled tests, and
 requires every selected test to be listed and pass without skips. This verifies
 core NTFS behavior; WinFsp mounts, CSI, and packaged service upgrades are separate
 runtime gates. Labcontainers also provides `TestLiveWindows` for NTFS crash persistence.
+
+For WinFsp/Git runtime coverage in a disposable Windows VM, supply the candidate
+and offline installers from the host (the guest has no external network):
+
+```sh
+SEAWEEDFS_WINDOWS_MOUNT_LIVE=1 \
+SEAWEEDFS_WINDOWS_WEED=/absolute/weed.exe \
+SEAWEEDFS_WINFSP_MSI=/absolute/winfsp.msi \
+SEAWEEDFS_GIT_INSTALLER=/absolute/git-installer.exe \
+LABCONTAINERS_LABD=/absolute/labcontainers/bin/labd \
+LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
+go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
+```
+
+Use the same temporary Go workspace described above. This runs the existing
+`hack/appmana/mount-smoke.ps1` scenarios for 20 iterations each, checks Git LFS
+prerequisites and all 32 modified assets, and rejects missing completion markers.
+The test logs input hashes and retains combined scenario stdout/stderr under the
+printed results directory (`RUNNER_TEMP` in CI, system temp otherwise). Guest
+weed/server log directories are not yet exported. Archive the complete Go test
+output as well. A skipped opt-in
+test is not qualification. Pin installer hashes and VM image digests for release
+evidence; a local `latest` image run is exploratory only. The harness contract
+test (`pwsh -File hack/appmana/mount-smoke-contract-test.ps1`) injects prerequisite
+failures without starting a VM and runs in the existing Windows build workflow.
+An intermittent LFS object-move failure has been observed in this lab; a later
+successful run does not resolve it or qualify Windows deployment.
+
+The dedicated `vm-fault-gates` Actions job also runs this test with preloaded,
+hash-checked installers (variables are listed in the root README). Its pinned
+Labcontainers commit must include `ExecWithTimeout` (introduced in `6f89daa`),
+as well as crash and bridge restoration support. Guest scenarios have explicit
+eight-minute execution limits; a timeout remains a failure and triggers a
+bounded attempt to recover partial output before destroying the VM.
+The 40-minute parent context and 45-minute Go timeout accommodate readiness,
+installation, both scenarios, and cleanup; do not shorten only the outer timeout.
 
 The core regressions are normal Go tests under `weed/storage`, `weed/shell`, and
 `weed/storage/needle`; they run in the existing large-disk race suite even when

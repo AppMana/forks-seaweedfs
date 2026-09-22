@@ -417,6 +417,16 @@ guards and transport fix and must not serve as final qualification, regardless
 of its workload pass count. Repeat with a VM container image containing the
 rebuilt guest helper (rebuilding `labd` alone is insufficient), and retain
 installation/version evidence; do not replace a live helper.
+The corrected local image used for the guarded follow-up is
+`labcontainers/windows-server-2022:lfs-qga-reap-da40c93`, image ID
+`sha256:c8e5f67da19c9a74321360a886816d9d23b2c84bef0ccc61c86565eb0577b986`.
+It retains the earlier Windows disk and changes only the Linux-side helper,
+built from clean labcontainers commit `da40c93958683244369f970e8841f89b98fc9e8f`
+with SHA-256 `2367dd4d41242ab7382cba106a724340a98a4a6e43a4344dea978b935d05e05a`.
+The helper-only recipe is preserved in labcontainers' existing Windows image
+directory as `Dockerfile.helper`; its README explains the required base image,
+source revision and helper hash arguments. The cleanup regressions were RED
+before each fix, then passed with the guest-agent race suite and full Go suite.
 The runner requires adjacent `.manifest.txt` and `.source.patch` files,
 validates the DLL/patch hashes and baseline/candidate distinction, and retains
 both with the VM results. The manifest records the source revision, recipe and

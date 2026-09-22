@@ -360,7 +360,12 @@ func (h *harness) provisionVolume(name string, binary []byte, format bool) error
 	if err := h.execOK(name, "sh", "-ec", command); err != nil {
 		return fmt.Errorf("start %s: %w", name, err)
 	}
-	return h.waitOK(name, 2*time.Minute, "python3", "-c", "import urllib.request; urllib.request.urlopen('http://"+ip+":8080/status', timeout=2).read()")
+	if err := h.waitOK(name, 2*time.Minute, "python3", "-c", "import urllib.request; urllib.request.urlopen('http://"+ip+":8080/status', timeout=2).read()"); err != nil {
+		log, _ := h.output(name, "tail", "-100", "/var/log/seaweedfs/volume.log")
+		_ = os.WriteFile(filepath.Join(h.cfg.results, name+"-startup.log"), []byte(log), 0o600)
+		return fmt.Errorf("%s readiness: %w; volume log: %s", name, err, log)
+	}
+	return nil
 }
 
 func (h *harness) waitReplicas(fid string) error {
@@ -480,7 +485,7 @@ func (h *harness) powerLoss(fid, victim string) error {
 	if err := h.verify(fid, sequence); err != nil {
 		return fmt.Errorf("pre-cut replica convergence: %w", err)
 	}
-	if err := h.lab.Node(victim).PowerOff(h.ctx); err != nil {
+	if err := h.lab.Node(victim).Crash(h.ctx); err != nil {
 		return err
 	}
 	if err := h.lab.Node(victim).Start(h.ctx); err != nil {
@@ -558,11 +563,16 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	if err := h.execOK(controller, "sh", "-ec", "nohup sh -c '/opt/weed shell -master=192.0.2.10:9333 < /opt/vacuum.shell' >/tmp/vacuum-power.log 2>&1 </dev/null & echo $! >/tmp/vacuum-power.pid"); err != nil {
 		return err
 	}
-	if err := h.waitOK(victim, 90*time.Second, "sh", "-ec", "find /mnt/volume -name '*.cpd' -type f | grep -q ."); err != nil {
-		return errors.New("vacuum copy marker was not observed; no power-loss claim made")
-	}
-	if err := h.lab.Node(victim).PowerOff(h.ctx); err != nil {
-		return err
+	ref := &labv1.NodeRef{SessionId: h.lab.ID(), Node: victim}
+	result, err := h.lab.RunTimeline(h.ctx,
+		&labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{
+			Exec:        &labv1.ExecRequest{Node: ref, Argv: []string{"sh", "-ec", "find /mnt/volume -name '*.cpd' -type f | grep -q ."}, TimeoutMillis: 5000},
+			RetryMillis: 100, TimeoutMillis: 90000,
+		}}},
+		&labv1.TimelineAction{Action: &labv1.TimelineAction_Lifecycle{Lifecycle: &labv1.LifecycleRequest{Node: ref, Action: labv1.LifecycleAction_CRASH}}},
+	)
+	if err != nil || result.GetCompleted() != 2 {
+		return fmt.Errorf("vacuum copy marker was not observed and power cut: completed=%d: %w", result.GetCompleted(), err)
 	}
 	if err := h.lab.Node(victim).Start(h.ctx); err != nil {
 		return err
@@ -576,5 +586,13 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	if err := h.waitReplicas(fid); err != nil {
 		return err
 	}
-	return h.verify(fid, 1159)
+	if err := h.verify(fid, 1159); err != nil {
+		return err
+	}
+	for _, liveFID := range liveFIDs[1:] {
+		if err := h.verify(liveFID, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }

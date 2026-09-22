@@ -23,6 +23,7 @@ env:
   GO_FUSE_REF: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
   LABCONTAINERS_REF: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF }}
   LABCONTAINERS_VM_IMAGE: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE }}
+  LABCONTAINERS_WINDOWS_IMAGE: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE }}
   STORAGE_BUILD_TAGS: 5BytesOffset
   STORAGE_UNIT_TEST_TIMEOUT: 10m
   STORAGE_PROCESS_TEST_TIMEOUT: 5m
@@ -222,6 +223,21 @@ jobs:
           "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario power-loss
           "$runner" --candidate "$candidate" --baseline "$baseline" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario migration
           "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario vacuum-power-loss
+      - name: Native Windows core storage regressions
+        env:
+          SEAWEEDFS_WINDOWS_LIVE: '1'
+          SEAWEEDFS_WINDOWS_STORAGE_TEST: ${{ runner.temp }}/windows-storage.test.exe
+          LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
+        run: |
+          [[ "$LABCONTAINERS_WINDOWS_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]
+          docker image inspect "$LABCONTAINERS_WINDOWS_IMAGE" >/dev/null
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -tags "$STORAGE_BUILD_TAGS" -o "$SEAWEEDFS_WINDOWS_STORAGE_TEST" ./weed/storage
+          (cd "$GITHUB_WORKSPACE/labcontainers" && make build)
+          windows_work=$(mktemp -d "$RUNNER_TEMP/windows-work.XXXXXXXX")
+          (cd "$windows_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
+          export GOWORK="$windows_work/go.work"
+          go test ./test/storage_lab/vm -list '^TestWindowsStorageLab$' | grep -Fx TestWindowsStorageLab
+          go test ./test/storage_lab/vm -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
       - uses: actions/upload-artifact@v7
         if: always()
         with:

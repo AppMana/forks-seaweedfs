@@ -328,6 +328,15 @@ setting or a replacement qualification gate. With the variable unset the
 runner leaves the WinFsp default unchanged. `provenance.txt` retains the input
 artifact hashes, image reference, and selected experimental mode alongside
 the test results; the dependency transcript records the applied registry value.
+The driver-side comparison also reproduced the defect with the unchanged
+native executable: cycle 39 (zero-based), query 86, after 112.32 seconds.
+Both DOS forms failed while same-handle GUID/NT queries succeeded, and the
+matching GUID had no mount points. The VM transcript verified mode 1 before
+execution. Results are in `/tmp/seaweedfs-windows-mount-results-327889120`;
+`mount-manager.log` SHA-256 is
+`09b3ca72e0fa4d3cebc1f9ee95df9dcaed9b136e38798f54ec994631842662bf`.
+Switching to driver-side registration is therefore not a fix. Investigate
+the shared mount lifecycle rather than recommending this registry setting.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

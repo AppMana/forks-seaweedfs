@@ -361,6 +361,16 @@ Its executable SHA-256 was
 That executable predates the exact reparse readback and matched NT-target
 control. Treat it only as exploratory evidence, not a fix or a controlled
 comparison; use the audited control/treatment executable for causal testing.
+The matched NT-target rewrite control reproduced the failure on zero-based
+cycle 38, query 221, in 109.72 seconds. Its persisted target had been read back
+and its sentinel checked; the first failing DOS query still had successful
+same-handle GUID/NT alternatives and no matching mount point. Results:
+`/tmp/seaweedfs-windows-mount-results-2285140162`; log SHA-256
+`8c80f6a02f02423a2c28fa4d8a1f75033baf8019bb6a67821a79a7e1df21442a`.
+The controlled executable SHA-256 is
+`17e08df5e917d73ab5fb28a20dea3c6db5e639b05a3a1127393b4d397d0fd975`.
+Thus preparatory identity queries and rewriting a junction are not sufficient
+to prevent the defect. Compare GUID treatment with this same executable.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

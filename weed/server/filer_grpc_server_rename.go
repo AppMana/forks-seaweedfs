@@ -145,11 +145,27 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 	for _, event := range metadataEvents {
 		eventCtx, sink := filer.WithMetadataEventSink(ctx)
 		event.notify(fs.filer, eventCtx, req.Signatures)
-		if logged := sink.Last(); logged != nil {
-			responses = append(responses, &filer_pb.StreamRenameEntryResponse{
-				Directory: logged.Directory, EventNotification: logged.EventNotification, TsNs: logged.TsNs,
-			})
+		logged := sink.Last()
+		if logged == nil {
+			// Internal metadata-log files deliberately do not log themselves.
+			// Still acknowledge their committed namespace change, but do not
+			// invent a log position for an event that was never logged.
+			directory, _ := event.oldEntry.FullPath.DirAndName()
+			newParent := ""
+			if event.newEntry != nil {
+				newParent, _ = event.newEntry.FullPath.DirAndName()
+			}
+			logged = &filer_pb.SubscribeMetadataResponse{
+				Directory: directory,
+				EventNotification: &filer_pb.EventNotification{
+					OldEntry: event.oldEntry.ToProtoEntry(), NewEntry: event.newEntry.ToProtoEntry(),
+					NewParentPath: newParent, DeleteChunks: event.deleteChunks, Signatures: req.Signatures,
+				},
+			}
 		}
+		responses = append(responses, &filer_pb.StreamRenameEntryResponse{
+			Directory: logged.Directory, EventNotification: logged.EventNotification, TsNs: logged.TsNs,
+		})
 	}
 	for _, response := range responses {
 		if err := stream.Send(response); err != nil {

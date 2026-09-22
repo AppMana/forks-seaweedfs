@@ -300,6 +300,21 @@ The patch distinguishes `filepath.Abs`, `CreateFile`, and
 DOS/GUID/NT names, with normalized and opened-name flags, on the same handle.
 It always returns the original error: these probes are observations, not retries
 that turn a failed workload green. Do not deploy this diagnostic client.
+
+The hard-link-safe instrumented run at
+`/tmp/seaweedfs-windows-mount-results-2253016600` reproduced the real failure:
+cycle 1 passed, cycle 2 failed `lfs install --local`. For both the repository
+directory and `.git`, `GetFinalPathNameByHandle` flags 0 and 8 (DOS paths)
+returned error 3, while flags 1/9 (GUID paths) and 2/10 (NT device paths)
+succeeded on the same open handle. This localizes this occurrence to DOS
+drive/mount-path translation, not a missing `.git` entry or failed open.
+It does not yet identify the responsible registration/translation defect.
+Cycle 2's ETL SHA-256 is
+`a0afe6e315f5ef53f5591443d160e58b9cfaa6c2d97ccd5c8e6ed11b1a5e550d`;
+decoded XML ZIP SHA-256 is
+`d4cdda3b42c979e6b44048030011c3cfc6db34c6230d2e4d38f76d8db0b27d95`.
+The full WinFsp trace and scenario failure text were also retained. Keep this
+result separate from the original object-move failure until causality is proven.
 The optional native executable adds 512 create/chmod/write/close/mkdir/rename
 transactions per pair, including uppercase `.GIT` paths and exact final object
 content checks. The Actions gate builds and requires this executable, runs five

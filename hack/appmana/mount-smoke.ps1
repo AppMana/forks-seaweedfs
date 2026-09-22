@@ -65,18 +65,40 @@ function Invoke-GitAtomicRenameTest([string]$mnt) {
 function Invoke-GitLfsTempMetadataTest([string]$mnt) {
     $gitRepo = Join-Path $mnt 'git-lfs-temp-metadata'
     New-Item -ItemType Directory -Path $gitRepo | Out-Null
-    & git -C $gitRepo init | Out-Null
-    & git -C $gitRepo config user.name 'AppMana mount smoke'
-    & git -C $gitRepo config user.email 'mount-smoke@appmana.invalid'
-    & git -C $gitRepo lfs install --local | Out-Null
-    & git -C $gitRepo lfs track '*.lfs' | Out-Null
+    # PowerShell does not throw on native nonzero exit codes. Missing LFS
+    # must not silently turn this into an ordinary Git status test.
+    function Invoke-CheckedGit([string[]]$GitArgs) {
+        $savedPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $lines = & git -C $gitRepo @GitArgs 2>&1
+            $code = $LASTEXITCODE
+            if ($code -ne 0) {
+                Write-Host ($lines | Out-String)
+                & git -C $gitRepo lfs logs last 2>&1 | ForEach-Object { Write-Host $_ }
+            }
+        } finally { $ErrorActionPreference = $savedPreference }
+        Assert ($code -eq 0) "Git LFS prerequisite: $($GitArgs -join ' ')"
+        return ($code -eq 0)
+    }
+    if (-not (Invoke-CheckedGit @('init'))) { return }
+    if (-not (Invoke-CheckedGit @('config', 'user.name', 'AppMana mount smoke'))) { return }
+    if (-not (Invoke-CheckedGit @('config', 'user.email', 'mount-smoke@appmana.invalid'))) { return }
+    if (-not (Invoke-CheckedGit @('lfs', 'version'))) { return }
+    if (-not (Invoke-CheckedGit @('lfs', 'install', '--local'))) { return }
+    if (-not (Invoke-CheckedGit @('lfs', 'track', '*.lfs'))) { return }
+    $attribute = & git -C $gitRepo check-attr filter -- asset-1.lfs
+    $attributeExit = $LASTEXITCODE
+    $usesLfs = $attributeExit -eq 0 -and ($attribute -join "`n") -match '^asset-1\.lfs: filter: lfs$'
+    Assert $usesLfs 'Git LFS filter is active'
+    if (-not $usesLfs) { return }
 
     1..32 | ForEach-Object {
         [IO.File]::WriteAllText((Join-Path $gitRepo "asset-$_.lfs"), "initial-$($_)-$('x' * 4096)")
     }
-    & git -C $gitRepo add .
-    & git -C $gitRepo commit -m 'seed lfs assets' | Out-Null
-    Assert ($LASTEXITCODE -eq 0) 'Git LFS seed commit succeeds'
+    if (-not (Invoke-CheckedGit @('add', '.'))) { return }
+    if (-not (Invoke-CheckedGit @('commit', '-m', 'seed lfs assets'))) { return }
+    Assert $true 'Git LFS seed commit succeeds'
 
     for ($iteration = 1; $iteration -le $GitIterations; $iteration++) {
         1..32 | ForEach-Object {
@@ -96,6 +118,9 @@ function Invoke-GitLfsTempMetadataTest([string]$mnt) {
         }
         Assert ($statusExitCode -eq 0) "Git LFS status iteration $iteration can chmod newly-created filter temp files"
         if ($statusExitCode -ne 0) { break }
+        $modifiedPaths = @($statusOutputLines | Where-Object { "$_" -match '^ M asset-\d+\.lfs$' })
+        Assert ($modifiedPaths.Count -eq 32) "Git LFS status iteration $iteration reports all 32 modified assets"
+        if ($modifiedPaths.Count -ne 32) { break }
     }
 }
 

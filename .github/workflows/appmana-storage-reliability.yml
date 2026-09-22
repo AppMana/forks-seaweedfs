@@ -9,9 +9,9 @@ on:
         required: false
   push:
     branches: [master, main, 'merge/**']
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
   pull_request:
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
 
 permissions:
   contents: read
@@ -146,7 +146,7 @@ jobs:
     # Containerlab 0.79.0, and the pinned Labcontainers VM image. It must not
     # have routes or credentials for production networks.
     runs-on: [self-hosted, linux, x64, kvm, seaweedfs-lab]
-    timeout-minutes: 150
+    timeout-minutes: 240
     defaults:
       run:
         working-directory: seaweedfs
@@ -241,10 +241,38 @@ jobs:
           export GOWORK="$windows_work/go.work"
           go test ./test/storage_lab/vm -list '^TestWindowsStorageLab$' | grep -Fx TestWindowsStorageLab
           go test ./test/storage_lab/vm -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
+      - name: Isolated Windows WinFsp Git and LFS regressions
+        env:
+          SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'
+          SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
+          SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
+          WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 }}
+          SEAWEEDFS_GIT_INSTALLER: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH }}
+          GIT_INSTALLER_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 }}
+          LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
+        run: |
+          set -euo pipefail
+          for hash in "$WINFSP_MSI_SHA256" "$GIT_INSTALLER_SHA256"; do
+            [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          done
+          [[ "$SEAWEEDFS_WINFSP_MSI" = /* && "$SEAWEEDFS_GIT_INSTALLER" = /* ]]
+          printf '%s  %s\n' "$WINFSP_MSI_SHA256" "$SEAWEEDFS_WINFSP_MSI" | sha256sum -c -
+          printf '%s  %s\n' "$GIT_INSTALLER_SHA256" "$SEAWEEDFS_GIT_INSTALLER" | sha256sum -c -
+          candidate_sha=$(git rev-parse HEAD)
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
+          windows_work=$(mktemp -d "$RUNNER_TEMP/windows-mount-work.XXXXXXXX")
+          (cd "$windows_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
+          export GOWORK="$windows_work/go.work"
+          go test ./test/storage_lab/vm -list '^TestWindowsMountLab$' | grep -Fx TestWindowsMountLab
+          go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-test.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: storage-reliability-vm-lab-results
-          path: /tmp/seaweedfs-vm-lab-results-*/
+          path: |
+            /tmp/seaweedfs-vm-lab-results-*/
+            /tmp/seaweedfs-windows-mount-results-*/
+            ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
+            ${{ runner.temp }}/windows-mount-test.log
           if-no-files-found: error
           retention-days: 14

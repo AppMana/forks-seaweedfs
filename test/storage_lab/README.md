@@ -353,6 +353,14 @@ identity queries, reparse read, rewrite, readback, and sentinel check, but write
 the original NT target. Both modes verify the exact substitute name after the
 write. This controls for query priming and effects of rewriting the junction;
 neither mode changes the first-failure behavior of the DOS path assertions.
+The initial exploratory GUID rewrite passed 64 cycles in 182.07 seconds
+(`/tmp/seaweedfs-windows-mount-results-1337781947`, log SHA-256
+`484a66d04441feb70cd40934b5598eddf8885a370b126ea2072bbe65062a2d81`).
+Its executable SHA-256 was
+`520af4f2ac807aec00302ef2732514ff9270dc43dfa83b89c9bf08174fd730fe`.
+That executable predates the exact reparse readback and matched NT-target
+control. Treat it only as exploratory evidence, not a fix or a controlled
+comparison; use the audited control/treatment executable for causal testing.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

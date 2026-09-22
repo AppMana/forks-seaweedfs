@@ -400,7 +400,11 @@ and a freshly built native test. The runner stages it next to the test rather
 than replacing the installed DLL, and the native probe verifies its actual
 loaded module path. Missing verification or fallback to the installed DLL
 fails the run. This mode cannot be combined with junction or registration
-interventions and is rejected outside the isolated scenario. Retain both
+interventions. For real Git scenarios, the runner supplies
+`-ExpectedWinFspDll` to the smoke script, which inspects the actual SeaweedFS
+mount process's loaded modules before exercising Git. Missing, duplicate,
+uninspectable or wrong-path modules fail the run and invoke existing cleanup.
+Every scenario must emit the module-verification marker. Retain both
 the build directory and VM results as the provenance chain.
 The runner requires adjacent `.manifest.txt` and `.source.patch` files,
 validates the DLL/patch hashes and baseline/candidate distinction, and retains
@@ -429,6 +433,21 @@ This is exploratory source-build RED evidence, not a formal matched-build
 comparison or a fix. That manual DLL predates the manifested deterministic
 recipe and uses a different lab resource label. Use clean manifested builds
 with identical recipes for the baseline/candidate comparison.
+The deterministic clean baseline (`c0a63935...`, full hash above) reproduced
+RED on zero-based cycle 51, query 91 (149.16 seconds native), using the same
+`a01eaef1...` native executable. DOS queries failed while GUID/NT queries still
+succeeded and the GUID volume had no mount points. Results:
+`/tmp/seaweedfs-windows-mount-results-3975497209`; log SHA-256
+`060031b74728d02b44782d5a8e6001ac2910875d6494c0e0f1c877daceb969e1`.
+Its manifest matches the first GUID-source candidate's recipe, shim, epoch
+and tool versions. Candidate DLL SHA-256:
+`1ea9a10d34f2c6cd057e4233918061801bf39347e040f6d122f210dd058ff40e`;
+source patch SHA-256:
+`327b33cbce75c9c7b77294125994391814df383168366141094653bd2c53e72a`.
+The first attempt to run that candidate
+(`/tmp/seaweedfs-windows-mount-results-1188166966`) failed during installer
+staging, before the native test ran; it is infrastructure evidence, not a
+candidate RED or GREEN result.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

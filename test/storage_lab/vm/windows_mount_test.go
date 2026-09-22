@@ -63,8 +63,8 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION must be 1 or nt-control and requires the isolated default-registration experiment")
 	}
 	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
-	if labDLL != "" && (!isolateMountManager || guidJunction != "" || registrationMode != "") {
-		t.Fatal("SEAWEEDFS_WINDOWS_WINFSP_DLL requires the isolated probe without test interventions")
+	if labDLL != "" && (guidJunction != "" || registrationMode != "") {
+		t.Fatal("SEAWEEDFS_WINDOWS_WINFSP_DLL cannot be combined with test interventions")
 	}
 	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
 	if labDLL != "" {
@@ -182,7 +182,7 @@ $mode=Get-ItemPropertyValue -LiteralPath $key -Name MountUseMountmgrFromFSD;
 if($mode -ne 1){throw 'WinFsp registration mode was not applied'};
 Write-Output "EXPERIMENT: MountUseMountmgrFromFSD=$mode"`
 	}
-	if isolateMountManager && registrationMode == "" {
+	if (isolateMountManager || labDLL != "") && registrationMode == "" {
 		setup += `; $settings=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\WinFsp';
 $property=$settings.PSObject.Properties['MountUseMountmgrFromFSD'];
 if($null -eq $property){Write-Output 'CONTROL: MountUseMountmgrFromFSD absent (default 0)'}
@@ -236,6 +236,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			caseName := fmt.Sprintf("%s-%02d", scenario, repetition)
 			guestLog := `C:\lab\` + caseName + `.log`
 			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; exit $LASTEXITCODE`
+			if labDLL != "" {
+				command = strings.Replace(command, " -TestCase ", ` -ExpectedWinFspDll C:\lab\winfsp-x64.dll -TestCase `, 1)
+			}
 			if trace {
 				command = strings.Replace(command, " -TraceSummary ", " -TraceSummary -Trace -EtwFileIO ", 1)
 			}
@@ -289,6 +292,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 				t.Fatal(err)
 			}
 			t.Log(output)
+			if labDLL != "" && !strings.Contains(output, "verified mount process lab WinFsp DLL:") {
+				t.Fatal("SeaweedFS mount process did not verify the requested lab DLL was loaded")
+			}
 			if r.GetExitCode() != 0 || strings.Contains(output, "FAIL:") {
 				t.Fatalf("%s failed: exit %d", scenario, r.GetExitCode())
 			}

@@ -11,6 +11,7 @@ param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [string]$ServerWeedExe,
     [string]$WinFspTestExe,
+    [string]$ExpectedWinFspDll,
     [string]$WorkRoot,
     [int]$LargeFileMB = 100,
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
@@ -35,6 +36,17 @@ function Assert([bool]$cond, [string]$what) {
         Write-Host "FAIL: $what" -ForegroundColor Red
         $script:failures++
     }
+}
+
+function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
+    $process = Get-Process -Id $TargetProcessId -ErrorAction Stop
+    $modules = @($process.Modules | Where-Object { $_.ModuleName -ieq 'winfsp-x64.dll' })
+    if ($modules.Count -ne 1 -or
+        -not [string]::Equals([IO.Path]::GetFullPath($modules[0].FileName),
+            [IO.Path]::GetFullPath($ExpectedPath), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Mount process $TargetProcessId did not load requested WinFsp DLL $ExpectedPath"
+    }
+    Write-Host "verified mount process lab WinFsp DLL: $($modules[0].FileName)"
 }
 
 function Invoke-GitAtomicRenameTest([string]$mnt) {
@@ -335,6 +347,7 @@ try {
     }
     Write-Host '== server up; mounting'
     $mount = Start-Mount $mnt $cacheDir $logDir 'mount1'
+    if ($ExpectedWinFspDll) { Assert-WinFspModule $mount.Id $ExpectedWinFspDll }
 
     if ($TestCase -eq 'NamespaceCoherence') {
         Invoke-NamespaceCoherenceTest $mnt
@@ -422,6 +435,7 @@ try {
     $cache2 = Join-Path $WorkRoot 'cache2'  # fresh cache: no local masking
     New-Item -ItemType Directory -Force -Path $cache2 | Out-Null
     $mount2 = Start-Mount $mnt $cache2 $logDir 'mount2'
+    if ($ExpectedWinFspDll) { Assert-WinFspModule $mount2.Id $ExpectedWinFspDll }
     Assert ((Get-Content "$mnt\append.txt").Count -eq 2) 'append.txt survives remount'
     Assert ((Get-Item "$mnt\large.bin").Length -eq 1MB) 'large.bin truncation survives remount'
     Assert (-not (Test-Path "$mnt\victim.txt")) 'deleted file stays deleted after remount'
@@ -435,6 +449,7 @@ try {
     $cacheB = Join-Path $WorkRoot 'cacheB'
     New-Item -ItemType Directory -Force -Path $cacheB | Out-Null
     $mountB = Start-Mount $mntB $cacheB $logDir 'mountB'
+    if ($ExpectedWinFspDll) { Assert-WinFspModule $mountB.Id $ExpectedWinFspDll }
     Set-Content -Path "$mnt\c2o.txt" -Value 'version-one' -NoNewline
     $deadline = (Get-Date).AddSeconds(10); $seen = $false
     while ((Get-Date) -lt $deadline) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -24,6 +25,10 @@ func TestGitLfsObjectRename(t *testing.T) {
 			root := filepath.Join(base, fmt.Sprintf("case-%d", index))
 			if err := os.MkdirAll(filepath.Join(root, ".git", "lfs", "tmp"), 0755); err != nil {
 				t.Fatal(err)
+			}
+			if spelling == ".GIT" {
+				// Git LFS canonicalizes the whole repository prefix, not only .git.
+				root = strings.ToUpper(root)
 			}
 			lfs := filepath.Join(root, spelling, "lfs")
 			objects := make(map[string][]byte)

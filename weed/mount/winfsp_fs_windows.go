@@ -270,12 +270,19 @@ func (a *winfspFS) Unlink(path string) int {
 	return toWinErrno(a.wfs.Unlink(nil, &hdr, name))
 }
 
-func (a *winfspFS) Rename(oldpath string, newpath string) int {
+func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 	defer track(opRename)()
+	stage := "resolve source"
+	defer func() {
+		if result != 0 {
+			glog.V(1).Infof("winfsp rename failed at %s: %q => %q: errno %d", stage, oldpath, newpath, result)
+		}
+	}()
 	oldParent, oldName, st := a.resolveExistingParent(oldpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
+	stage = "resolve destination parent"
 	newParent, newName, st := a.resolveParent(newpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -284,6 +291,7 @@ func (a *winfspFS) Rename(oldpath string, newpath string) int {
 		oldIno, _, oldStatus := a.lookupChild(oldParent, oldName)
 		newIno, canonicalNewName, newStatus := a.lookupChild(newParent, newName)
 		if oldStatus != fuse.OK {
+			stage = "recheck source"
 			return toWinErrno(oldStatus)
 		}
 		switch newStatus {
@@ -295,6 +303,7 @@ func (a *winfspFS) Rename(oldpath string, newpath string) int {
 			}
 		case fuse.ENOENT:
 		default:
+			stage = "lookup destination"
 			return toWinErrno(newStatus)
 		}
 	}
@@ -303,6 +312,7 @@ func (a *winfspFS) Rename(oldpath string, newpath string) int {
 		Newdir:   newParent,
 		// Flags 0 == overwrite allowed, matching Windows ReplaceIfExists.
 	}
+	stage = "core rename"
 	return toWinErrno(a.wfs.Rename(nil, &in, oldName, newName))
 }
 

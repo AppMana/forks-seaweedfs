@@ -229,6 +229,8 @@ not a complete recursive archive). Archive the complete Go test output as well.
 `SEAWEEDFS_WINDOWS_MOUNT_REPEATS` defaults to 1 and accepts 1..20 fresh scenario
 pairs within the existing 40-minute harness budget; raising the repeat count
 does not extend that budget. Verbosity defaults to 0 and accepts 0..4.
+For a targeted diagnostic run, `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO` selects either
+`GitAtomicRenamePrimed` or `GitLfsTempMetadata`; omit it for the complete gate.
 The optional native executable adds 512 create/chmod/write/close/mkdir/rename
 transactions per pair, including uppercase `.GIT` paths and exact final object
 content checks. The Actions gate builds and requires this executable, runs five
@@ -252,6 +254,22 @@ prove the rename failed. Inspect source and destination before retrying; do not
 delete a destination or assume an old lock file is disposable based on that
 error. These tests do not establish that the original LFS object-move failure
 has the same cause, nor qualify Synology packaging or cluster deployment.
+The timestamp-fixed candidate subsequently reproduced the original LFS failure
+on the fourth fresh LFS workload: the seed `git add` failed moving an object
+with Windows `ERROR_FILE_NOT_FOUND`, despite logged source creation and
+destination-directory creation. No matching filer rename request was logged.
+The standalone native probe had passed 1,536 object transactions beforehand;
+neither that nor a subsequent clean-build single-cycle pass closes this blocker.
+Further deterministic regressions cover a separate cache failure:
+`TestSaveEntryNoChangeAckPreservesCaseFoldListing` exercises the real no-event
+`UpdateEntry` acknowledgment fallback, which previously deleted a live `.git`
+cache entry at an equal timestamp and made `.GIT` lookup fail. In-place updates
+must fence both halves as writes; only actual renames/deletes may remove the old
+path at its existing version. Directory updates with omitted `NewParentPath`
+must also preserve children. These tests fail on the pre-fix source and pass
+with the cache correction; the captured LFS failure's causal link remains
+provisional until runtime verification. Failure-only `winfsp rename failed at`
+diagnostics at verbosity 1 identify which rename stage rejects a request.
 
 The dedicated `vm-fault-gates` Actions job also runs this test with preloaded,
 hash-checked installers (variables are listed in the root README). Its pinned

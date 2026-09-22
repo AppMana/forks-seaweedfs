@@ -25,6 +25,15 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("retained results: %s", resultDir)
+	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
+	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
+		switch scenario {
+		case "GitAtomicRenamePrimed", "GitLfsTempMetadata":
+			scenarios = []string{scenario}
+		default:
+			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO must be GitAtomicRenamePrimed or GitLfsTempMetadata")
+		}
+	}
 	repeats := 1
 	if value := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_REPEATS"); value != "" {
 		repeats, err = strconv.Atoi(value)
@@ -120,7 +129,7 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		t.Fatalf("dependency installation exit %d", r.GetExitCode())
 	}
 	for repetition := 1; repetition <= repeats; repetition++ {
-		for _, scenario := range []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"} {
+		for _, scenario := range scenarios {
 			caseName := fmt.Sprintf("%s-%02d", scenario, repetition)
 			guestLog := `C:\lab\` + caseName + `.log`
 			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; exit $LASTEXITCODE`

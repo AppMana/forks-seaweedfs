@@ -28,10 +28,10 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "GitAtomicRenamePrimed", "GitLfsTempMetadata":
+		case "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle":
 			scenarios = []string{scenario}
 		default:
-			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO must be GitAtomicRenamePrimed or GitLfsTempMetadata")
+			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO must be GitAtomicRenamePrimed, GitLfsTempMetadata or MountManagerDirectoryLifecycle")
 		}
 	}
 	repeats := 1
@@ -53,21 +53,25 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 		verbosity = value
 	}
-	inputs := map[string]string{
-		`C:\lab\weed.exe`:          os.Getenv("SEAWEEDFS_WINDOWS_WEED"),
-		`C:\lab\winfsp.msi`:        os.Getenv("SEAWEEDFS_WINFSP_MSI"),
-		`C:\lab\git-installer.exe`: os.Getenv("SEAWEEDFS_GIT_INSTALLER"),
-		`C:\lab\mount-smoke.ps1`:   filepath.Join("..", "..", "..", "hack", "appmana", "mount-smoke.ps1"),
+	isolateMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle"
+	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
+	if !isolateMountManager {
+		inputs[`C:\lab\weed.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_WEED")
+		inputs[`C:\lab\git-installer.exe`] = os.Getenv("SEAWEEDFS_GIT_INSTALLER")
+		inputs[`C:\lab\mount-smoke.ps1`] = filepath.Join("..", "..", "..", "hack", "appmana", "mount-smoke.ps1")
 	}
-	if trace {
+	if trace && !isolateMountManager {
 		inputs[`C:\lab\seaweed-fileio.wprp`] = filepath.Join("..", "..", "..", "hack", "appmana", "seaweed-fileio.wprp")
 	}
-	if diagnosticLFS := os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC"); diagnosticLFS != "" {
+	if diagnosticLFS := os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC"); diagnosticLFS != "" && !isolateMountManager {
 		inputs[`C:\lab\git-lfs-diagnostic.exe`] = diagnosticLFS
 		inputs[`C:\lab\install-lab-git-lfs.ps1`] = filepath.Join("..", "..", "..", "hack", "appmana", "install-lab-git-lfs.ps1")
 	}
 	if nativeTest := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST"); nativeTest != "" {
 		inputs[`C:\lab\winfsp.test.exe`] = nativeTest
+	}
+	if isolateMountManager && os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") == "" {
+		t.Fatal("mount-manager isolation test requires SEAWEEDFS_WINDOWS_WINFSP_TEST")
 	}
 	artifacts := map[string][]byte{}
 	for target, path := range inputs {
@@ -130,13 +134,15 @@ Write-Output "SETUP $(Get-Date -Format o): WinFsp install starting";
 $p=Start-Process msiexec.exe -ArgumentList '/i','C:\lab\winfsp.msi','/qn','/norestart','INSTALLLEVEL=1000' -Wait -PassThru;
 Write-Output "SETUP $(Get-Date -Format o): WinFsp install exit $($p.ExitCode)";
 if($p.ExitCode -notin @(0,3010)){throw "WinFsp installer exit $($p.ExitCode)"};
-if(-not(Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)){throw 'WinFsp service absent'};
-Write-Output "SETUP $(Get-Date -Format o): Git install starting";
+if(-not(Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)){throw 'WinFsp service absent'}`
+	if !isolateMountManager {
+		setup += `; Write-Output "SETUP $(Get-Date -Format o): Git install starting";
 $p=Start-Process 'C:\lab\git-installer.exe' -ArgumentList '/VERYSILENT','/NORESTART','/SP-','/SUPPRESSMSGBOXES' -Wait -PassThru;
 Write-Output "SETUP $(Get-Date -Format o): Git install exit $($p.ExitCode)";
 if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 & 'C:\Program Files\Git\cmd\git.exe' --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
-	if os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC") != "" {
+	}
+	if os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC") != "" && !isolateMountManager {
 		setup += `; & C:\lab\install-lab-git-lfs.ps1 -GitRoot 'C:\Program Files\Git' -Candidate C:\lab\git-lfs-diagnostic.exe; $env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & git --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; & git lfs version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
 	}
 	setup += `; Write-Output "SETUP $(Get-Date -Format o): complete"; Stop-Transcript`
@@ -147,6 +153,18 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	t.Log(string(r.GetStdout()), string(r.GetStderr()))
 	if r.GetExitCode() != 0 {
 		t.Fatalf("dependency installation exit %d", r.GetExitCode())
+	}
+	if isolateMountManager {
+		result, runErr := n.ExecWithTimeout(ctx, 6*time.Minute, ps, "-NoProfile", "-Command", `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^TestMountManagerDirectoryLifecycle$' '-test.v' '-test.count=1' '-test.timeout=5m'; exit $LASTEXITCODE`)
+		output := string(result.GetStdout()) + string(result.GetStderr())
+		if err := os.WriteFile(filepath.Join(resultDir, "mount-manager.log"), []byte(fmt.Sprintf("execution error: %v\n%s", runErr, output)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(output)
+		if runErr != nil || result.GetExitCode() != 0 || strings.Contains(output, "SKIP") || !strings.Contains(output, "--- PASS: TestMountManagerDirectoryLifecycle") || !strings.Contains(output, "cycle=63: 256 DOS-path queries succeeded") {
+			t.Fatalf("mount-manager isolation test failed: %v exit=%d", runErr, result.GetExitCode())
+		}
+		return
 	}
 	for repetition := 1; repetition <= repeats; repetition++ {
 		for _, scenario := range scenarios {

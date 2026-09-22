@@ -11,6 +11,10 @@ on:
         description: 'Capture ETW FileIO and WinFsp debug evidence in disposable Windows VMs'
         type: boolean
         default: false
+      windows_mount_manager_probe:
+        description: 'Run the isolated native mount-manager stress test before Windows qualification'
+        type: boolean
+        default: false
   push:
     branches: [master, main, 'merge/**']
     paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
@@ -256,6 +260,7 @@ jobs:
           SEAWEEDFS_WINDOWS_MOUNT_REPEATS: '5'
           SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY: '1'
           SEAWEEDFS_WINDOWS_MOUNT_TRACE: ${{ inputs.windows_trace && '1' || '0' }}
+          WINDOWS_MOUNT_MANAGER_PROBE: ${{ inputs.windows_mount_manager_probe && '1' || '0' }}
           SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/windows-winfsp.test.exe
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
           SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
@@ -279,6 +284,9 @@ jobs:
           export GOWORK="$windows_work/go.work"
           go test ./test/storage_lab/vm -list '^TestWindowsMountLab$' | grep -Fx TestWindowsMountLab
           go test ./test/storage_lab/vm -run '^TestWindowsArtifact' -count=1
+          if [[ "$WINDOWS_MOUNT_MANAGER_PROBE" == '1' ]]; then
+            SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-manager-test.log"
+          fi
           go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-test.log"
       - uses: actions/upload-artifact@v7
         if: always()

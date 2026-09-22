@@ -290,6 +290,22 @@ with real hard links (RED before the unlink fix, GREEN afterward) and runs in CI
 This lab-only setup defect is separate from the original unmodified-client
 filesystem failure; the latter remains unresolved.
 
+To isolate the mount layer from both SeaweedFS metadata and Git, build the
+Windows `test/winfsp` executable and select
+`SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle` with
+`SEAWEEDFS_WINDOWS_WINFSP_TEST` pointing to that executable. The existing VM
+runner needs only the WinFsp MSI and native executable, installs WinFsp and
+executes `TestMountManagerDirectoryLifecycle`: 64 minimal cgofuse directory
+mounts, each checked 256 times for a DOS canonical path that reaches that
+cycle's unique virtual sentinel. Readiness also requires the sentinel, so an
+underlying NTFS directory cannot satisfy the test. The first failed query fails
+the test; alternative path
+flags and mount listings are diagnostic only. This mode never starts weed or
+Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
+It is a component-isolation experiment, not the full Windows qualification gate.
+The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
+instead of) the regular Windows qualification gate. It defaults off.
+
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of
 that exact source, apply the patch with `git apply`, then build:
@@ -320,6 +336,20 @@ decoded XML ZIP SHA-256 is
 `d4cdda3b42c979e6b44048030011c3cfc6db34c6230d2e4d38f76d8db0b27d95`.
 The full WinFsp trace and scenario failure text were also retained. Keep this
 result separate from the original object-move failure until causality is proven.
+The next traced reproduction, at
+`/tmp/seaweedfs-windows-mount-results-1471069418`, failed cycle 3 with the same
+DOS/GUID/NT split. Before unmount, `mountvol` listed the matching GUID volume
+with `NO MOUNT POINTS`, while `fsutil reparsepoint query` showed that the lab's
+mount junction still targeted the corresponding live NT device volume. Thus
+the reverse mount mapping was absent even though the junction and volume
+remained present. Cycle 3 ETL SHA-256:
+`01516d3d3810fecea34aa2b779e5220ca65c6ece8428b7c11e408cc269f06778`.
+An untraced 20-cycle attempt at
+`/tmp/seaweedfs-windows-mount-results-1767952802` stopped on the first failure
+in cycle 3 (`lfs track *.lfs`, 320 seconds total), again with successful GUID/NT
+queries, failed DOS queries, an intact junction, and no registered mount point
+for the matching GUID volume. Thus ETW/WinFsp debug capture is not necessary
+to trigger the defect. No failed workload was retried into a pass.
 
 The official Git LFS 3.8.0 comparison completed five traced LFS-only cycles
 successfully in `/tmp/seaweedfs-windows-mount-results-735008305` (1116 seconds).

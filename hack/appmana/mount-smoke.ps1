@@ -16,6 +16,7 @@ param(
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
     [switch]$Trace,
     [switch]$TraceSummary,
+    [switch]$EtwFileIO,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
     [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
@@ -75,6 +76,7 @@ function Invoke-GitLfsTempMetadataTest([string]$mnt) {
             $lines = & git -C $gitRepo @GitArgs 2>&1
             $code = $LASTEXITCODE
             if ($code -ne 0) {
+                Write-Host ("GIT FAILURE UTC={0} exit={1} command={2}" -f [DateTime]::UtcNow.ToString('O'), $code, ($GitArgs -join ' '))
                 Write-Host ($lines | Out-String)
                 & git -C $gitRepo lfs logs last 2>&1 | ForEach-Object { Write-Host $_ }
             }
@@ -313,7 +315,15 @@ $server = Start-Process @serverStartArgs
 $mount = $null
 $mount2 = $null
 $mountB = $null
+$etwStarted = $false
 try {
+    if ($EtwFileIO) {
+        # Memory mode bounds capture size. Never cancel an unrelated recording;
+        # a busy recorder or missing profile is a failed diagnostic prerequisite.
+        & wpr.exe -start "$(Join-Path $PSScriptRoot 'seaweed-fileio.wprp')!SeaweedFileIO"
+        if ($LASTEXITCODE -ne 0) { throw "WPR FileIO start failed: $LASTEXITCODE" }
+        $etwStarted = $true
+    }
     foreach ($port in 9333, 8080, 8888) {
         if (-not (Wait-Tcp $port)) { throw "weed server port $port never came up" }
     }
@@ -437,6 +447,11 @@ try {
 
     Stop-Mount $mount2 $mnt
 } finally {
+    $etwStopFailed = $false
+    if ($etwStarted) {
+        & wpr.exe -stop (Join-Path $logDir 'fileio.etl')
+        if ($LASTEXITCODE -ne 0) { Write-Error "WPR FileIO stop failed: $LASTEXITCODE" -ErrorAction Continue; $etwStopFailed = $true }
+    }
     foreach ($activeMount in @($mountB, $mount2, $mount)) {
         if ($null -ne $activeMount -and -not $activeMount.HasExited) {
             try {
@@ -459,6 +474,7 @@ try {
             try { $server.Kill(); $server.WaitForExit(5000) | Out-Null } catch {}
         }
     }
+    if ($etwStopFailed) { throw 'ETW recording could not be flushed; diagnostic run failed' }
 }
 
 if ($failures -gt 0) {

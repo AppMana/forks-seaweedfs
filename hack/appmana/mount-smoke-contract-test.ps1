@@ -64,6 +64,26 @@ try {
         }
     }
     Write-Host "PASS: all $($cases.Count) LFS harness contract cases"
+    # Exercise the real finally block: an early exit in a scenario must not
+    # turn a failed WPR flush into success, and cleanup must still run.
+    $traceTry = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.TryStatementAst] -and
+        $null -ne $node.Finally -and $node.Finally.Extent.Text.Contains('$etwStopFailed')
+    }, $true)
+    if (-not $traceTry) { throw 'Missing ETW cleanup block' }
+    $body = $traceTry.Finally.Extent.Text
+    $cleanup = [scriptblock]::Create($body.Substring(1, $body.Length - 2))
+    function wpr.exe { $global:LASTEXITCODE = $script:wprExit }
+    $etwStarted = $true
+    $logDir = $root
+    $mount = $mount2 = $mountB = $null
+    $server = [pscustomobject]@{ HasExited = $true }
+    foreach ($script:wprExit in @(0, 1)) {
+        $threw = $false
+        try { . $cleanup 2>$null } catch { $threw = $true }
+        if ($threw -ne ($script:wprExit -ne 0)) { throw "Incorrect WPR cleanup outcome for $script:wprExit" }
+    }
+    Write-Host 'PASS: ETW cleanup accepts successful flush and rejects failed flush'
 } finally {
     # Only this script's newly created temporary fixtures, never mounted data.
     Remove-Item -LiteralPath $root -Recurse -Force

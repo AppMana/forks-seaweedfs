@@ -42,6 +42,10 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 	}
 	verbosity := "0"
+	trace := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_TRACE") == "1"
+	if value := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_TRACE"); value != "" && value != "0" && value != "1" {
+		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_TRACE must be 0 or 1")
+	}
 	if value := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY"); value != "" {
 		v, parseErr := strconv.Atoi(value)
 		if parseErr != nil || v < 0 || v > 4 {
@@ -54,6 +58,12 @@ func TestWindowsMountLab(t *testing.T) {
 		`C:\lab\winfsp.msi`:        os.Getenv("SEAWEEDFS_WINFSP_MSI"),
 		`C:\lab\git-installer.exe`: os.Getenv("SEAWEEDFS_GIT_INSTALLER"),
 		`C:\lab\mount-smoke.ps1`:   filepath.Join("..", "..", "..", "hack", "appmana", "mount-smoke.ps1"),
+	}
+	if trace {
+		inputs[`C:\lab\seaweed-fileio.wprp`] = filepath.Join("..", "..", "..", "hack", "appmana", "seaweed-fileio.wprp")
+	}
+	if diagnosticLFS := os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC"); diagnosticLFS != "" {
+		inputs[`C:\lab\git-lfs-diagnostic.exe`] = diagnosticLFS
 	}
 	if nativeTest := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST"); nativeTest != "" {
 		inputs[`C:\lab\winfsp.test.exe`] = nativeTest
@@ -102,7 +112,7 @@ func TestWindowsMountLab(t *testing.T) {
 	defer func() {
 		diagnosticCtx, stop := context.WithTimeout(context.Background(), time.Minute)
 		defer stop()
-		logs, logErr := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\smoke-*\logs\* -File -ErrorAction SilentlyContinue | ForEach-Object { Write-Output ("FILE: " + $_.FullName); Get-Content -LiteralPath $_.FullName -Tail 2000 }`)
+		logs, logErr := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\smoke-*\logs\* -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.log','.txt' } | ForEach-Object { Write-Output ("FILE: " + $_.FullName); Get-Content -LiteralPath $_.FullName -Tail 2000 }`)
 		if writeErr := os.WriteFile(filepath.Join(resultDir, "guest-logs.txt"), []byte(fmt.Sprintf("collection error: %v\nexit: %d\n%s\n%s", logErr, logs.GetExitCode(), logs.GetStdout(), logs.GetStderr())), 0600); writeErr != nil {
 			t.Error(writeErr)
 		}
@@ -120,6 +130,9 @@ if(-not(Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)){throw 'WinFs
 $p=Start-Process 'C:\lab\git-installer.exe' -ArgumentList '/VERYSILENT','/NORESTART','/SP-','/SUPPRESSMSGBOXES' -Wait -PassThru;
 if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 & 'C:\Program Files\Git\cmd\git.exe' --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
+	if os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC") != "" {
+		setup += `; $targets=@(Get-ChildItem 'C:\Program Files\Git' -Filter git-lfs.exe -Recurse -File); if($targets.Count -eq 0){throw 'installed Git LFS not found'}; foreach($target in $targets){Copy-Item -LiteralPath C:\lab\git-lfs-diagnostic.exe -Destination $target.FullName -Force}; $env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & git lfs version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
+	}
 	r, err := n.ExecWithTimeout(ctx, 5*time.Minute, ps, "-NoProfile", "-NonInteractive", "-Command", setup)
 	if err != nil {
 		t.Fatal(err)
@@ -133,10 +146,42 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			caseName := fmt.Sprintf("%s-%02d", scenario, repetition)
 			guestLog := `C:\lab\` + caseName + `.log`
 			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; exit $LASTEXITCODE`
+			if trace {
+				command = strings.Replace(command, " -TraceSummary ", " -TraceSummary -Trace -EtwFileIO ", 1)
+			}
 			if os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") != "" {
 				command = strings.Replace(command, " -TestCase ", ` -WinFspTestExe C:\lab\winfsp.test.exe -TestCase `, 1)
 			}
 			r, err := n.ExecWithTimeout(ctx, 8*time.Minute, ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command)
+			if trace {
+				decodeCtx, finishDecode := context.WithTimeout(context.Background(), time.Minute)
+				decoded, decodeErr := n.ExecWithTimeout(decodeCtx, 55*time.Second, ps, "-NoProfile", "-Command", `$ErrorActionPreference='Stop'; & tracerpt.exe 'C:\lab\smoke-`+caseName+`\logs\fileio.etl' -of XML -o 'C:\lab\smoke-`+caseName+`\logs\fileio.xml' -y; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; Compress-Archive -LiteralPath 'C:\lab\smoke-`+caseName+`\logs\fileio.xml' -DestinationPath 'C:\lab\smoke-`+caseName+`\logs\fileio.xml.zip'`)
+				finishDecode()
+				if decodeErr != nil || decoded.GetExitCode() != 0 {
+					t.Errorf("%s ETW decode: %v exit %d: %s", caseName, decodeErr, decoded.GetExitCode(), decoded.GetStderr())
+				}
+				for _, artifact := range []string{"fileio.etl", "fileio.xml.zip", "mount1-winfsp-trace.log"} {
+					traceCtx, stop := context.WithTimeout(context.Background(), 4*time.Minute)
+					data, traceErr := readWindowsArtifact(`C:\lab\smoke-`+caseName+`\logs\`+artifact, func(command string) ([]byte, error) {
+						result, execErr := n.ExecWithTimeout(traceCtx, 30*time.Second, ps, "-NoProfile", "-Command", "$ErrorActionPreference='Stop'; "+command)
+						if execErr != nil {
+							return nil, execErr
+						}
+						if result.GetExitCode() != 0 {
+							return nil, fmt.Errorf("trace download exit %d: %s", result.GetExitCode(), result.GetStderr())
+						}
+						return result.GetStdout(), nil
+					})
+					stop()
+					if traceErr != nil {
+						t.Errorf("%s %s evidence: %v", caseName, artifact, traceErr)
+					} else if writeErr := os.WriteFile(filepath.Join(resultDir, caseName+"-"+artifact), data, 0600); writeErr != nil {
+						t.Error(writeErr)
+					} else {
+						t.Logf("trace artifact=%s-%s bytes=%d sha256=%s", caseName, artifact, len(data), sha(data))
+					}
+				}
+			}
 			if err != nil {
 				// Use a separate bounded context to salvage diagnostics even when the
 				// scenario context expired. The RPC error remains a test failure.

@@ -7,6 +7,10 @@ on:
         description: 'Optional full baseline commit SHA; otherwise use repository variable'
         type: string
         required: false
+      windows_trace:
+        description: 'Capture ETW FileIO and WinFsp debug evidence in disposable Windows VMs'
+        type: boolean
+        default: false
   push:
     branches: [master, main, 'merge/**']
     paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
@@ -44,6 +48,10 @@ jobs:
         with:
           fetch-depth: 0
           path: seaweedfs
+      - name: Windows trace tooling contracts
+        run: |
+          python3 -m unittest discover -s hack/appmana -p 'test_analyze_fileio.py'
+          pwsh -NoProfile -File hack/appmana/mount-smoke-contract-test.ps1
       - name: Validate explicit compatibility inputs
         run: |
           for name in BASELINE_REF GO_FUSE_REF; do
@@ -246,6 +254,7 @@ jobs:
           SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'
           SEAWEEDFS_WINDOWS_MOUNT_REPEATS: '5'
           SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY: '1'
+          SEAWEEDFS_WINDOWS_MOUNT_TRACE: ${{ inputs.windows_trace && '1' || '0' }}
           SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/windows-winfsp.test.exe
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
           SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
@@ -268,6 +277,7 @@ jobs:
           (cd "$windows_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           export GOWORK="$windows_work/go.work"
           go test ./test/storage_lab/vm -list '^TestWindowsMountLab$' | grep -Fx TestWindowsMountLab
+          go test ./test/storage_lab/vm -run '^TestWindowsArtifact' -count=1
           go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-test.log"
       - uses: actions/upload-artifact@v7
         if: always()

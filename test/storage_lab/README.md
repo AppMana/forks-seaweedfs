@@ -238,6 +238,10 @@ input SHA-256 and client version, and leaves the default bundled client unchange
 when the variable is absent. This override can also select an official release
 for a controlled A/B run; label those results separately from instrumented runs.
 Keep the SeaweedFS binary, WinFsp installer, VM image, and workload fixed.
+Dependency setup records `C:\lab\dependency-install.log`, including installer
+stage timestamps and exit codes; the failure collector retains its tail when
+the guest agent is responsive. A setup timeout is an infrastructure failure,
+not a reproduced LFS failure or a passing qualification.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

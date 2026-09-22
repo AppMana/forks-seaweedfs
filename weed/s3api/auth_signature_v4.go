@@ -38,6 +38,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	weed_iam "github.com/seaweedfs/seaweedfs/weed/iam"
+	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
@@ -323,6 +324,7 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 		pathForSignature = r.URL.Path
 	}
 	forwardedPrefix := r.Header.Get("X-Forwarded-Prefix")
+	var matchedHost string
 	for i, hostCandidate := range extractHostHeaderCandidates(r, iam.externalHost) {
 		if i > 0 && !replaceSignedHostHeader(extractedSignedHeaders, hostCandidate) {
 			break
@@ -333,23 +335,37 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 			cleanedPath := buildPathWithForwardedPrefix(forwardedPrefix, pathForSignature)
 			calculatedSignature, errCode = verify(cleanedPath)
 			if errCode == s3err.ErrNone {
-				return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
+				matchedHost = hostCandidate
+				break
 			}
 		}
 
 		// 10. Verify with the original path
 		calculatedSignature, errCode = verify(pathForSignature)
 		if errCode == s3err.ErrNone {
-			return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
+			matchedHost = hostCandidate
+			break
 		}
 
 		// 11. Retry with decoded path if signature used raw path encoding
 		if decodedPath, decodeErr := url.PathUnescape(pathForSignature); decodeErr == nil && decodedPath != pathForSignature {
 			calculatedSignature, errCode = verify(decodedPath)
 			if errCode == s3err.ErrNone {
-				return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
+				matchedHost = hostCandidate
+				break
 			}
 		}
+	}
+
+	if matchedHost != "" {
+		if signedBucket, ok := bucketFromVirtualHost(matchedHost, iam.domain); ok {
+			if routedBucket, _ := s3_constants.GetBucketAndObject(r); routedBucket != "" && routedBucket != signedBucket {
+				glog.V(2).Infof("reject %s %s: signed host %q implies bucket %q but routed to %q",
+					r.Method, r.URL.Path, matchedHost, signedBucket, routedBucket)
+				return nil, nil, "", nil, s3err.ErrAccessDenied
+			}
+		}
+		return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
 	}
 
 	return nil, nil, "", nil, errCode
@@ -469,6 +485,14 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 		PrincipalArn: sessionInfo.Principal,
 		PolicyNames:  sessionInfo.Policies, // Populate PolicyNames for IAM authorization
 		Claims:       claims,               // Populate Claims for policy variable substitution
+	}
+	// ParentUser is set only for OIDC-federated sessions (see
+	// AssumeRoleWithWebIdentity), so it gates the audit identity claim: without
+	// it the request context's sub is the opaque session subject injected by
+	// ValidateJWTWithClaims, not the OIDC subject, and must not be surfaced as
+	// an authoritative identity.
+	if sessionInfo.ParentUser != "" {
+		identity.IdentityClaim = sts.ResolveIdentityClaim(sessionInfo.RequestContext)
 	}
 
 	glog.V(2).Infof("Successfully validated STS session token for principal: %s, assumed role user: %s",
@@ -757,12 +781,12 @@ func parseSignedHeaderList(signedHeadersValue string) ([]string, s3err.ErrorCode
 	return signedHeaders, s3err.ErrNone
 }
 
-func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.Header) s3err.ErrorCode {
+func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.Header) (*Identity, s3err.ErrorCode) {
 
 	// Parse credential tag.
 	credHeader, err := parseCredentialHeader("Credential=" + formValues.Get("X-Amz-Credential"))
 	if err != s3err.ErrNone {
-		return err
+		return nil, err
 	}
 
 	identity, cred, found := iam.lookupByAccessKey(credHeader.accessKey)
@@ -775,19 +799,19 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 		glog.Warningf("InvalidAccessKeyId (POST policy): attempted key '%s' not found. Available keys: %d, Auth enabled: %v",
 			credHeader.accessKey, availableKeyCount, iam.isAuthEnabled)
 
-		return s3err.ErrInvalidAccessKeyID
+		return nil, s3err.ErrInvalidAccessKeyID
 	}
 
 	// Check service account expiration
 	if cred.isCredentialExpired() {
 		glog.V(2).Infof("Service account credential %s has expired (expiration: %d, now: %d)",
 			credHeader.accessKey, cred.Expiration, time.Now().Unix())
-		return s3err.ErrAccessDenied
+		return nil, s3err.ErrAccessDenied
 	}
 
 	bucket := formValues.Get("bucket")
 	if !identity.CanDo(s3_constants.ACTION_WRITE, bucket, "") {
-		return s3err.ErrAccessDenied
+		return nil, s3err.ErrAccessDenied
 	}
 
 	// Get signing key.
@@ -798,9 +822,9 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 
 	// Verify signature.
 	if !compareSignatureV4(newSignature, formValues.Get("X-Amz-Signature")) {
-		return s3err.ErrSignatureDoesNotMatch
+		return nil, s3err.ErrSignatureDoesNotMatch
 	}
-	return s3err.ErrNone
+	return identity, s3err.ErrNone
 }
 
 // sigV4PayloadHashHeader is x-amz-content-sha256. It participates in the
@@ -888,14 +912,16 @@ func extractHostHeader(r *http.Request, externalHost string) string {
 }
 
 // extractHostHeaderCandidates returns the host values the client may have signed, most
-// likely first. When externalHost is set (from s3.externalUrl), it is the only candidate.
-// Otherwise, the host is reconstructed from X-Forwarded-* headers or the request Host.
+// likely first. externalHost (from s3.externalUrl) leads when set, but the hosts derived
+// from X-Forwarded-* headers or the request Host still follow it, so clients that reach
+// the gateway directly rather than through the proxy keep verifying.
 // When X-Forwarded-Host carries no port, the true client port is ambiguous: a proxy that
 // kept the Host header makes the r.Host port right, one that rewrote it makes
 // X-Forwarded-Port right, and a client on the scheme's default port signed no port at all.
 func extractHostHeaderCandidates(r *http.Request, externalHost string) []string {
+	var candidates []string
 	if externalHost != "" {
-		return []string{externalHost}
+		candidates = append(candidates, externalHost)
 	}
 
 	forwardedHost := r.Header.Get("X-Forwarded-Host")
@@ -968,7 +994,6 @@ func extractHostHeaderCandidates(r *http.Request, externalHost string) []string 
 		}
 	}
 
-	var candidates []string
 	for _, port := range ports {
 		candidate := joinSignedHost(host, port, scheme)
 		if !slices.Contains(candidates, candidate) {
@@ -976,6 +1001,33 @@ func extractHostHeaderCandidates(r *http.Request, externalHost string) []string 
 		}
 	}
 	return candidates
+}
+
+func bucketFromVirtualHost(host, domainConfig string) (string, bool) {
+	if domainConfig == "" {
+		return "", false
+	}
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	h = strings.ToLower(h)
+	pathStyleDomains, virtualHostDomains := classifyDomainNames(strings.Split(domainConfig, ","))
+	for _, domain := range pathStyleDomains {
+		if h == strings.ToLower(strings.TrimSpace(domain)) {
+			return "", false
+		}
+	}
+	for _, domain := range virtualHostDomains {
+		suffix := "." + strings.ToLower(strings.TrimSpace(domain))
+		if strings.HasSuffix(h, suffix) {
+			bucket := h[:len(h)-len(suffix)]
+			if bucket != "" {
+				return bucket, true
+			}
+		}
+	}
+	return "", false
 }
 
 // joinSignedHost renders host:port the way AWS SDKs sign it: default ports are stripped

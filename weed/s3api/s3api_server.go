@@ -43,30 +43,32 @@ import (
 )
 
 type S3ApiServerOption struct {
-	Filers                    []pb.ServerAddress
-	Masters                   []pb.ServerAddress // For filer discovery
-	Port                      int
-	Config                    string
+	Filers  []pb.ServerAddress
+	Masters []pb.ServerAddress // For filer discovery
+	Port    int
+	Config  string
 	// ConfigReloadInterval is how often Config is polled for content changes.
 	// 0 disables the watcher, leaving SIGHUP as the only reload trigger.
-	ConfigReloadInterval time.Duration
-	DomainName           string
+	ConfigReloadInterval      time.Duration
+	DomainName                string
 	AllowedOrigins            []string
 	BucketsPath               string
 	GrpcDialOption            grpc.DialOption
 	AllowDeleteBucketNotEmpty bool
+	AutoCreateBucket          bool // create the bucket on upload if it does not exist
 	LocalFilerSocket          string
 	DataCenter                string
 	FilerGroup                string
 	IamConfig                 string // Advanced IAM configuration file path
 	ConcurrentUploadLimit     int64
 	ConcurrentFileUploadLimit int64
-	EnableIam                 bool // Enable embedded IAM API on the same port
-	IamReadOnly               bool // Disable IAM write operations on this server
-	Cipher                    bool // encrypt data on volume servers
+	EnableIam                 bool   // Enable embedded IAM API on the same port
+	IamReadOnly               bool   // Disable IAM write operations on this server
+	Cipher                    bool   // encrypt data on volume servers
+	Ip                        string // address advertised to the cluster; empty falls back to BindIp
 	BindIp                    string
 	GrpcPort                  int
-	ExternalUrl               string // external URL clients use, for signature verification behind a reverse proxy
+	ExternalUrl               string // external URL clients use, tried first during signature verification behind a reverse proxy
 	DefaultFileMode           uint32 // default file permission mode for S3 uploads (e.g. 0660, 0644)
 	CacheSizeMB               int64  // in-memory chunk cache capacity in MB for the shared ReaderCache; 0 disables
 	// SurfaceEmptyDirectories makes a listing whose prefix ends in "/" report a
@@ -84,6 +86,10 @@ type S3ApiServerOption struct {
 	// on 2026-08-24. Enable only when no S3 client of this gateway walks
 	// prefixes that way.
 	SurfaceEmptyDirectories bool
+	MaxMB                   int32 // filer's -maxMB, read from the filer configuration at startup
+	// AllowUntrustedRemoteEndpoints lets a read of a remote-only object dial a
+	// mounted endpoint that resolves to a loopback / private / metadata host.
+	AllowUntrustedRemoteEndpoints bool
 }
 
 // s3ChunkCacheChunkSizeMB is the assumed chunk size (in MiB) used to convert
@@ -113,8 +119,12 @@ type S3ApiServer struct {
 	inFlightDataLimitCond *sync.Cond
 	embeddedIam           *EmbeddedIamApi // Embedded IAM API server (when enabled)
 	stsHandlers           *STSHandlers    // STS HTTP handlers for AssumeRoleWithWebIdentity
-	cipher                bool            // encrypt data on volume servers
-	newObjectWriteLock    func(bucket, object string) objectWriteLock
+	// icebergCredentialRole is the role the Iceberg catalog assumes to vend
+	// table-scoped credentials; empty leaves vending off.
+	icebergCredentialRole     string
+	icebergCredentialDuration int64
+	cipher                    bool // encrypt data on volume servers
+	newObjectWriteLock        func(bucket, object string) objectWriteLock
 	// objectWriteLockClient resolves a key's owner filer for route-by-key.
 	objectWriteLockClient *cluster.LockClient
 	// unreachableOwners holds owners (pb.ServerAddress -> expiry time.Time) whose
@@ -147,6 +157,30 @@ const (
 
 func NewS3ApiServer(router *mux.Router, option *S3ApiServerOption) (s3ApiServer *S3ApiServer, err error) {
 	return NewS3ApiServerWithStore(router, option, "")
+}
+
+// advertisedHost is the address this server registers with the master, which is
+// how peers reach it — IAM changes are pushed to it over gRPC. It must be the
+// advertised -ip, not the bind address: binding 0.0.0.0 and registering the
+// auto-detected interface makes those pushes dial a host that may not route
+// back here at all (a VPN address, a container-internal IP), and the push then
+// fails silently after a 10s deadline.
+func (option *S3ApiServerOption) advertisedHost() string {
+	if option.Ip != "" && !isWildcardHost(option.Ip) {
+		return option.Ip
+	}
+	if option.BindIp != "" && !isWildcardHost(option.BindIp) {
+		return option.BindIp
+	}
+	return util.DetectedHostAddress()
+}
+
+// isWildcardHost reports whether host is an unspecified address (0.0.0.0, ::,
+// [::]) — one that accepts connections but tells a peer nothing about where to
+// reach us. Host names parse as nil and are addresses in their own right.
+func isWildcardHost(host string) bool {
+	ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+	return ip != nil && ip.IsUnspecified()
 }
 
 func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, explicitStore string) (s3ApiServer *S3ApiServer, err error) {
@@ -191,10 +225,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		for i, addr := range option.Masters {
 			masterMap[fmt.Sprintf("master%d", i)] = addr
 		}
-		clientHost := option.BindIp
-		if clientHost == "0.0.0.0" || clientHost == "" {
-			clientHost = util.DetectedHostAddress()
-		}
+		clientHost := option.advertisedHost()
 		masterClient = wdclient.NewMasterClient(option.GrpcDialOption, option.FilerGroup, cluster.S3Type, pb.ServerAddress(util.JoinHostPort(clientHost, option.GrpcPort)), option.DataCenter, "", *pb.NewServiceDiscoveryFromMap(masterMap))
 		// Build the object-write lock client and subscribe to the master's
 		// lock-ring updates BEFORE starting the master loop, so the initial
@@ -347,6 +378,15 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	// stored at CreateMultipartUpload time, so that UploadPart/UploadPartCopy
 	// policy conditions on s3:x-amz-server-side-encryption evaluate correctly.
 	policyEngine.MultipartSSELookup = s3ApiServer.getMultipartSSEAlgorithm
+
+	// Advanced-IAM authorization evaluates the bucket-policy:<bucket> mirror
+	// before any handler runs, so the auth path has to be what triggers the
+	// lazy bucket load (and with it the mirror backfill): a grant carried
+	// only by a not-yet-mirrored policy would otherwise deny forever, and
+	// the denied request never reaches the handlers that load the bucket.
+	iam.primeBucketForIAM = func(bucket string) {
+		s3ApiServer.getBucketConfig(bucket)
+	}
 
 	// Initialize advanced IAM system if config is provided or explicitly enabled
 	if option.IamConfig != "" || option.EnableIam {
@@ -704,6 +744,11 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 			s3err.WriteErrorResponse(w, r, s3err.ErrServiceUnavailable)
 			return
 		}
+		// AssumeRoleWithWebIdentity/WithLDAPIdentity carry no SigV4 caller, so
+		// identity may be nil here; the STS handlers record their own caller.
+		if identity != nil {
+			r = r.WithContext(recordIdentityInContext(r, identity))
+		}
 		s3a.stsHandlers.HandleSTSRequest(w, r)
 	} else {
 		// IAM
@@ -715,28 +760,13 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 
 		// Store identity in context
 		// Always set identity in context when non-nil to ensure downstream handlers have access
-		ctx := r.Context()
-		if identity.Name != "" {
-			ctx = SetIdentityNameInContext(ctx, identity.Name)
-		}
-		ctx = SetIdentityInContext(ctx, identity)
-		r = r.WithContext(ctx)
+		r = r.WithContext(recordIdentityInContext(r, identity))
 
-		targetUserName := r.Form.Get("UserName")
-
-		// Check permissions based on action type
-		isSelfServiceAction := iamRequiresAdminForOthers(action)
-		isActingOnSelf := targetUserName == "" || targetUserName == identity.Name
-
-		// Permission check is required for all actions except for self-service actions
-		// performed on the user's own identity.
-		if !(isSelfServiceAction && isActingOnSelf) {
-			if !identity.isAdmin() {
-				if s3a.iam.VerifyActionPermission(r, identity, Action("iam:"+action), "arn:aws:iam:::*", "") != s3err.ErrNone {
-					s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
-					return
-				}
-			}
+		// UserName comes from the body only, the same place DoActions reads it
+		// from, so the authorized target and the acted-on target cannot differ.
+		if s3a.iam.AuthorizeIamAction(r, identity, action, iamTargetUserName(action, r)) != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+			return
 		}
 
 		// Call Limit middleware + DoActions
@@ -839,6 +869,9 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		// DeleteObjectTagging
 		bucket.Methods(http.MethodDelete).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteObjectTaggingHandler, ACTION_TAGGING)), "DELETE")).Queries("tagging", "")
 
+		// RenameObject
+		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.RenameObjectHandler, ACTION_WRITE)), "PUT")).Queries("renameObject", "")
+
 		// PutObjectACL
 		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectAclHandler, ACTION_WRITE_ACP)), "PUT")).Queries("acl", "")
 		// PutObjectRetention
@@ -891,9 +924,9 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		// GetBucketPolicy
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketPolicyHandler, ACTION_READ)), "GET")).Queries("policy", "")
 		// PutBucketPolicy
-		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketPolicyHandler, ACTION_WRITE)), "PUT")).Queries("policy", "")
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketPolicyHandler, ACTION_PUT_BUCKET_POLICY)), "PUT")).Queries("policy", "")
 		// DeleteBucketPolicy
-		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketPolicyHandler, ACTION_WRITE)), "DELETE")).Queries("policy", "")
+		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketPolicyHandler, ACTION_DELETE_BUCKET_POLICY)), "DELETE")).Queries("policy", "")
 
 		// GetBucketCors
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketCorsHandler, ACTION_READ)), "GET")).Queries("cors", "")
@@ -924,6 +957,12 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketAccelerateConfigurationHandler, ACTION_READ)), "GET")).Queries("accelerate", "")
 		// GetBucketLogging
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketLoggingHandler, ACTION_READ)), "GET")).Queries("logging", "")
+		// GetBucketNotificationConfiguration
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketNotificationConfigurationHandler, ACTION_READ)), "GET")).Queries("notification", "")
+		// GetBucketReplication
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketReplicationHandler, ACTION_READ)), "GET")).Queries("replication", "")
+		// GetBucketWebsite
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketWebsiteHandler, ACTION_READ)), "GET")).Queries("website", "")
 
 		// GetBucketVersioning
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketVersioningHandler, ACTION_READ)), "GET")).Queries("versioning", "")
@@ -977,6 +1016,13 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		//DeleteBucketOwnershipControls
 		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.DeleteBucketOwnershipControls, ACTION_ADMIN), "DELETE")).Queries("ownershipControls", "")
 
+		// SeaweedFS extension: bucket quota subresource
+		// PUT /{bucket}?seaweedfs-quota — set bucket quota (s3:PutBucketQuota)
+		// GET /{bucket}?seaweedfs-quota — get bucket quota (s3:GetBucketQuota)
+		// Authenticated via SigV4, authorized via dedicated IAM permissions.
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketQuotaHandler, ACTION_PUT_BUCKET_QUOTA)), "PUT")).Queries("seaweedfs-quota", "")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketQuotaHandler, ACTION_GET_BUCKET_QUOTA)), "GET")).Queries("seaweedfs-quota", "")
+
 		// raw buckets
 
 		// PostPolicy
@@ -994,8 +1040,14 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		// DeleteBucket
 		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketHandler, ACTION_DELETE_BUCKET)), "DELETE"))
 
-		// ListObjectsV1 (Legacy)
+		// ListObjectsV1 (Legacy). This is the catch-all GET on a bucket, so a
+		// subresource with no route of its own would be answered with a listing.
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.AuthWithPublicRead(func(w http.ResponseWriter, r *http.Request) {
+			if subresource, found := unroutedBucketSubresource(r); found {
+				glog.V(1).Infof("unimplemented bucket subresource ?%s", subresource)
+				s3err.WriteErrorResponse(w, r, s3err.ErrNotImplemented)
+				return
+			}
 			limitedHandler, _ := s3a.cb.Limit(s3a.ListObjectsV1Handler, ACTION_LIST)
 			limitedHandler(w, r)
 		}, ACTION_LIST), "LIST"))

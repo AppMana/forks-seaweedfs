@@ -54,7 +54,7 @@ func (wfs *WFS) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		Pid:     in.Lk.Pid,
 		IsFlock: in.LkFlags&fuse.FUSE_LK_FLOCK != 0,
 	}
-	if lk.Typ == fUnlck {
+	if lk.Typ == f_UNLCK {
 		return wfs.posixLocks.SetLk(in.NodeId, lk)
 	}
 	return wfs.posixLocks.SetLkw(in.NodeId, lk, cancel)

@@ -12,7 +12,7 @@ import (
 type lockRange struct {
 	Start uint64 // inclusive byte offset
 	End   uint64 // inclusive; math.MaxUint64 means "to EOF"
-	Typ   uint32 // syscall F_RDLCK or F_WRLCK
+	Typ   uint32 // f_RDLCK or f_WRLCK
 	Owner uint64 // FUSE lock owner (from LkIn.Owner)
 	Pid   uint32 // PID of lock holder (for GetLk reporting)
 	// flock and fcntl locks have different ownership and close semantics.
@@ -126,7 +126,7 @@ func findConflict(locks []lockRange, proposed lockRange) (lockRange, bool) {
 		if !rangesOverlap(h.Start, h.End, proposed.Start, proposed.End) {
 			continue
 		}
-		if h.Typ == fRdlck && proposed.Typ == fRdlck {
+		if h.Typ == f_RDLCK && proposed.Typ == f_RDLCK {
 			continue
 		}
 		return h, true
@@ -303,7 +303,7 @@ func (plt *PosixLockTable) GetLk(inode uint64, proposed lockRange, out *fuse.LkO
 	for {
 		il := plt.getInodeLocks(inode)
 		if il == nil {
-			out.Lk.Typ = fUnlck
+			out.Lk.Typ = f_UNLCK
 			return
 		}
 		il.mu.Lock()
@@ -323,7 +323,7 @@ func (plt *PosixLockTable) GetLk(inode uint64, proposed lockRange, out *fuse.LkO
 			out.Lk.Typ = conflict.Typ
 			out.Lk.Pid = conflict.Pid
 		} else {
-			out.Lk.Typ = fUnlck
+			out.Lk.Typ = f_UNLCK
 		}
 		return
 	}
@@ -333,7 +333,7 @@ func (plt *PosixLockTable) GetLk(inode uint64, proposed lockRange, out *fuse.LkO
 // For unlock (F_UNLCK): removes locks in the given range for the owner.
 // For lock: returns fuse.EAGAIN if a conflict exists, fuse.OK on success.
 func (plt *PosixLockTable) SetLk(inode uint64, lk lockRange) fuse.Status {
-	if lk.Typ == fUnlck {
+	if lk.Typ == f_UNLCK {
 		il := plt.getInodeLocks(inode)
 		if il == nil {
 			return fuse.OK
@@ -375,7 +375,7 @@ func (plt *PosixLockTable) SetLk(inode uint64, lk lockRange) fuse.Status {
 // SetLkw attempts a blocking lock. It waits until the lock can be acquired
 // or the cancel channel is closed.
 func (plt *PosixLockTable) SetLkw(inode uint64, lk lockRange, cancel <-chan struct{}) fuse.Status {
-	if lk.Typ == fUnlck {
+	if lk.Typ == f_UNLCK {
 		return plt.SetLk(inode, lk)
 	}
 

@@ -17,14 +17,15 @@ use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::warn;
+use tracing::{error, info, warn};
 
-#[cfg(test)]
 use crate::storage::idx;
 use crate::storage::needle::needle::{self, get_actual_size, Needle, NeedleError};
+use crate::storage::needle_map::sorted_file::SortedFileNeedleMap;
 use crate::storage::needle_map::{CompactNeedleMap, NeedleMap, NeedleMapKind, RedbNeedleMap};
 use crate::storage::super_block::{ReplicaPlacement, SuperBlock, SUPER_BLOCK_SIZE};
 use crate::storage::types::*;
+use crate::storage::volume_open::open_volume_file;
 
 // ============================================================================
 // Errors
@@ -90,6 +91,33 @@ fn is_skippable_needle_read_error(e: &VolumeError) -> bool {
         VolumeError::Needle(NeedleError::TailTooShort) => true,
         VolumeError::SizeMismatch => true,
         _ => false,
+    }
+}
+
+/// Reports whether the compacted .dat is short of the live bytes the
+/// pre-compaction index snapshot expected.
+fn exceeds_expected_compacted_size(expected_live_bytes: u64, dst_dat_size: u64) -> bool {
+    expected_live_bytes > dst_dat_size
+}
+
+/// Returns true for I/O errors that indicate faulty storage media, not
+/// transient/network failures. On Unix this is EIO; on Windows it covers
+/// ERROR_CRC and ERROR_IO_DEVICE, which the kernel returns for failing disks.
+pub fn is_storage_io_error(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        return e.raw_os_error() == Some(libc::EIO);
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_CRC: i32 = 23;
+        const ERROR_IO_DEVICE: i32 = 1117;
+        return e.raw_os_error() == Some(ERROR_CRC)
+            || e.raw_os_error() == Some(ERROR_IO_DEVICE);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -193,6 +221,10 @@ pub struct VifEcShardConfig {
     /// so a read served from a different run's shard is rejected.
     #[serde(default, rename = "encodeTsNs", with = "string_or_i64")]
     pub encode_ts_ns: i64,
+    /// Uniform block layout: each shard is a single contiguous block of this
+    /// many bytes. 0 = legacy 1GiB/1MiB two-tier layout.
+    #[serde(default, rename = "blockSize", with = "string_or_i64")]
+    pub block_size: i64,
 }
 
 /// Serde-compatible representation of OldVersionVolumeInfo for legacy .vif JSON deserialization.
@@ -227,6 +259,7 @@ impl OldVersionVifVolumeInfo {
             expire_at_sec: self.destroy_time,
             read_only: self.read_only,
             ec_shard_config: None,
+            read_only_can_delete: false,
         }
     }
 }
@@ -255,6 +288,8 @@ pub struct VifVolumeInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub ec_shard_config: Option<VifEcShardConfig>,
+    #[serde(default, rename = "readOnlyCanDelete")]
+    pub read_only_can_delete: bool,
 }
 
 impl VifVolumeInfo {
@@ -284,7 +319,9 @@ impl VifVolumeInfo {
                 data_shards: c.data_shards,
                 parity_shards: c.parity_shards,
                 encode_ts_ns: c.encode_ts_ns,
+                block_size: c.block_size,
             }),
+            read_only_can_delete: pb.read_only_can_delete,
         }
     }
 
@@ -315,8 +352,10 @@ impl VifVolumeInfo {
                     data_shards: c.data_shards,
                     parity_shards: c.parity_shards,
                     encode_ts_ns: c.encode_ts_ns,
+                    block_size: c.block_size,
                 }
             }),
+            read_only_can_delete: self.read_only_can_delete,
         }
     }
 }
@@ -502,6 +541,12 @@ pub struct Volume {
     dat_file: Option<File>,
     remote_dat_file: Option<RemoteDatFile>,
     nm: Option<NeedleMap>,
+    /// Make the next .dat or .idx flush fail, so tests can exercise the durable
+    /// write's failure paths without a real disk fault.
+    #[cfg(test)]
+    fail_fsync_for_test: bool,
+    #[cfg(test)]
+    fail_idx_sync_for_test: bool,
     needle_map_kind: NeedleMapKind,
     data_file_access_control: Arc<DataFileAccessControl>,
 
@@ -529,6 +574,11 @@ pub struct Volume {
     /// Tracks the last I/O error (EIO) for volume health monitoring.
     /// Uses Mutex for interior mutability so reads (&self) can clear/set it.
     last_io_error: Mutex<Option<String>>,
+    /// Consecutive EIO count; reset on success or non-EIO errors.
+    io_error_count: std::sync::atomic::AtomicI32,
+    /// Sticky quarantine flag set after sustained EIO; cleared only by
+    /// explicit recovery (mirrors Go's markIoQuarantined).
+    io_error_quarantined: std::sync::atomic::AtomicBool,
 
     /// Protobuf VolumeInfo for tiered storage (.vif file).
     pub volume_info: PbVolumeInfo,
@@ -576,6 +626,10 @@ impl Volume {
             collection: collection.to_string(),
             dat_file: None,
             remote_dat_file: None,
+            #[cfg(test)]
+            fail_fsync_for_test: false,
+            #[cfg(test)]
+            fail_idx_sync_for_test: false,
             nm: None,
             needle_map_kind,
             data_file_access_control: Arc::new(DataFileAccessControl::default()),
@@ -595,6 +649,8 @@ impl Volume {
             is_compacting: false,
             compaction_byte_per_second: 0,
             last_io_error: Mutex::new(None),
+            io_error_count: std::sync::atomic::AtomicI32::new(0),
+            io_error_quarantined: std::sync::atomic::AtomicBool::new(false),
             volume_info: PbVolumeInfo::default(),
             has_remote_file: false,
         };
@@ -614,6 +670,10 @@ impl Volume {
             collection: collection.to_string(),
             dat_file: None,
             remote_dat_file: None,
+            #[cfg(test)]
+            fail_fsync_for_test: false,
+            #[cfg(test)]
+            fail_idx_sync_for_test: false,
             nm: None,
             needle_map_kind: NeedleMapKind::InMemory,
             data_file_access_control: Arc::new(DataFileAccessControl::default()),
@@ -629,6 +689,8 @@ impl Volume {
             is_compacting: false,
             compaction_byte_per_second: 0,
             last_io_error: Mutex::new(None),
+            io_error_count: std::sync::atomic::AtomicI32::new(0),
+            io_error_quarantined: std::sync::atomic::AtomicBool::new(false),
             volume_info: PbVolumeInfo::default(),
             has_remote_file: false,
         }
@@ -684,7 +746,11 @@ impl Volume {
         let has_volume_info_file = self.load_vif()?;
 
         if self.volume_info.read_only && !self.has_remote_file {
-            self.no_write_or_delete = true;
+            if self.volume_info.read_only_can_delete {
+                self.no_write_can_delete = true;
+            } else {
+                self.no_write_or_delete = true;
+            }
         }
 
         if self.has_remote_file {
@@ -706,12 +772,12 @@ impl Volume {
             let metadata = fs::metadata(&dat_path)?;
 
             // Try to open read-write; fall back to read-only
-            match OpenOptions::new().read(true).write(true).open(&dat_path) {
+            match open_volume_file(OpenOptions::new().read(true).write(true), &dat_path) {
                 Ok(file) => {
                     self.dat_file = Some(file);
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    self.dat_file = Some(File::open(&dat_path)?);
+                    self.dat_file = Some(open_volume_file(OpenOptions::new().read(true), &dat_path)?);
                     self.no_write_or_delete = true;
                 }
                 Err(e) => return Err(e.into()),
@@ -732,11 +798,10 @@ impl Volume {
             if let Some(parent) = Path::new(&dat_path).parent() {
                 fs::create_dir_all(parent)?;
             }
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&dat_path)?;
+            let file = open_volume_file(
+                OpenOptions::new().read(true).write(true).create(true),
+                &dat_path,
+            )?;
             if preallocate > 0 {
                 preallocate_file(&file, preallocate);
             }
@@ -771,6 +836,47 @@ impl Volume {
         }
 
         if also_load_index {
+            // Adjust for existing volumes with .idx together with .dat files:
+            // an index already beside the data keeps serving after --dir.idx
+            // named a different directory.
+            if self.dir_idx != self.dir
+                && Path::new(&format!("{}.idx", self.data_file_name())).exists()
+            {
+                self.dir_idx = self.dir.clone();
+            }
+
+            // A changed --dir.idx leaves the new directory without an index.
+            // The .dat still holds every row, so rebuild rather than mount the
+            // volume with every needle invisible.
+            if !self.has_remote_file
+                && !Path::new(&self.file_name(".idx")).exists()
+                && self.current_dat_file_size()? > SUPER_BLOCK_SIZE as u64
+            {
+                self.rebuild_idx_file()?;
+                info!(
+                    volume_id = self.id.0,
+                    idx = %self.file_name(".idx"),
+                    "rebuilt the index from the data file"
+                );
+            }
+
+            // Recover rows that deletes on a tiered read-only volume overwrote
+            // at the front of .idx. Best effort: a volume that cannot be
+            // repaired is still servable for everything the surviving rows
+            // index.
+            match self.repair_idx_head_tombstones() {
+                Ok(0) => {}
+                Ok(restored) => info!(
+                    volume_id = self.id.0,
+                    restored, "recovered overwritten .idx rows from .dat"
+                ),
+                Err(e) => warn!(
+                    volume_id = self.id.0,
+                    error = %e,
+                    "recover overwritten .idx rows"
+                ),
+            }
+
             self.load_index()?;
 
             // Match Go: CheckVolumeDataIntegrity after loading index (volume_loading.go L154-159)
@@ -784,6 +890,7 @@ impl Volume {
                         "volumeDataIntegrityChecking failed"
                     );
                 }
+                self.recover_last_modified_ts();
 
                 // Structural check: no .idx entry may reference bytes past the
                 // end of .dat. The needle map's load walk above already
@@ -845,7 +952,12 @@ impl Volume {
             fs::create_dir_all(parent)?;
         }
 
-        if use_redb {
+        // Go picks the sorted-file map for both read-only modes, which is every
+        // cloud-tiered volume: the index stays on disk in .sdx instead of in
+        // RAM, and nothing is held open between lookups.
+        if self.use_sorted_index() {
+            self.load_index_sorted_file(&idx_path)?;
+        } else if use_redb {
             self.load_index_redb(&idx_path)?;
         } else {
             self.load_index_inmemory(&idx_path)?;
@@ -854,12 +966,83 @@ impl Volume {
         Ok(())
     }
 
+    /// Whether this volume's index belongs in a `.sdx`. Mirrors Go's
+    /// `v.noWriteOrDelete || v.noWriteCanDelete` branch in volume_loading.go —
+    /// a tiered volume is always the second of the two.
+    fn use_sorted_index(&self) -> bool {
+        self.no_write_or_delete || self.no_write_can_delete
+    }
+
+    /// Load the on-disk sorted index for a read-only or cloud-tiered volume.
+    fn load_index_sorted_file(&mut self, idx_path: &str) -> Result<(), VolumeError> {
+        if !Path::new(idx_path).exists() {
+            // Missing .idx with existing .dat could orphan needles
+            let dat_path = self.file_name(".dat");
+            if Path::new(&dat_path).exists() {
+                let dat_size = fs::metadata(&dat_path).map(|m| m.len()).unwrap_or(0);
+                if dat_size > SUPER_BLOCK_SIZE as u64 {
+                    warn!(
+                        volume_id = self.id.0,
+                        ".idx file missing but .dat exists with data; needles may be orphaned"
+                    );
+                }
+            }
+            // Go opens .idx with O_CREATE only where deletes are allowed; an
+            // empty index yields an empty .sdx and a volume that still mounts.
+            // A volume that takes neither writes nor deletes must not write
+            // here, since its index directory can sit on a read-only mount.
+            if !self.no_write_or_delete {
+                File::create(idx_path)?;
+            }
+        }
+        // Building .sdx writes to the index directory. Where that cannot be
+        // done — a read-only mount, a full disk — keep this volume's index in
+        // memory rather than failing the load and taking its data offline.
+        match SortedFileNeedleMap::open(&self.index_file_name(), self.version()) {
+            Ok(nm) => {
+                self.nm = Some(NeedleMap::SortedFile(nm));
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    volume_id = self.id.0,
+                    error = %e,
+                    "cannot build the sorted index; keeping this volume's index in memory"
+                );
+                match self.load_index_inmemory(idx_path) {
+                    Ok(()) => Ok(()),
+                    // Where deletes are allowed the in-memory loader opens .idx
+                    // read-write, which fails on the same directory that just
+                    // refused the .sdx. Give up the deletes rather than the
+                    // volume: without a writer no tombstone could be recorded
+                    // anyway, so refusing them is the honest answer, and a
+                    // remount on a writable directory restores them.
+                    Err(retry_err) if !self.no_write_or_delete => {
+                        warn!(
+                            volume_id = self.id.0,
+                            error = %retry_err,
+                            "cannot open the index for write; serving this volume without deletes"
+                        );
+                        self.no_write_or_delete = true;
+                        // Deletes are gone with the writer, so stop advertising
+                        // them: leaving no_write_can_delete set would report
+                        // this volume as delete-capable in metrics and mode
+                        // checks while every delete is refused.
+                        self.no_write_can_delete = false;
+                        self.load_index_inmemory(idx_path)
+                    }
+                    Err(retry_err) => Err(retry_err),
+                }
+            }
+        }
+    }
+
     /// Load index using in-memory CompactNeedleMap.
     fn load_index_inmemory(&mut self, idx_path: &str) -> Result<(), VolumeError> {
         if self.no_write_or_delete {
             // Open read-only
             if Path::new(&idx_path).exists() {
-                let mut idx_file = File::open(&idx_path)?;
+                let mut idx_file = open_volume_file(OpenOptions::new().read(true), idx_path)?;
                 let nm = CompactNeedleMap::load_from_idx(&mut idx_file, self.version())?;
                 self.nm = Some(NeedleMap::InMemory(nm));
             } else {
@@ -878,13 +1061,12 @@ impl Volume {
             }
         } else {
             // Open read-write (create if missing)
-            let idx_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&idx_path)?;
+            let idx_file = open_volume_file(
+                OpenOptions::new().read(true).write(true).create(true),
+                idx_path,
+            )?;
 
-            let idx_size = idx_file.metadata()?.len();
+            let idx_size = trim_torn_idx_tail(&idx_file, idx_path)?;
             let mut idx_reader = io::BufReader::new(&idx_file);
             let mut nm = CompactNeedleMap::load_from_idx(&mut idx_reader, self.version())?;
 
@@ -904,12 +1086,20 @@ impl Volume {
     fn load_index_redb(&mut self, idx_path: &str) -> Result<(), VolumeError> {
         // The redb database file is stored alongside the volume files
         let rdb_path = self.file_name(".rdb");
+        // One redb database per volume: keep its page cache small, or the
+        // process grows by up to redb's 1 GiB default per volume (#11179).
+        let cache_bytes = self.needle_map_kind.redb_cache_bytes();
 
         if self.no_write_or_delete {
             // Open read-only
             if Path::new(&idx_path).exists() {
-                let mut idx_file = File::open(&idx_path)?;
-                let nm = RedbNeedleMap::load_from_idx(&rdb_path, &mut idx_file, self.version())?;
+                let mut idx_file = open_volume_file(OpenOptions::new().read(true), idx_path)?;
+                let nm = RedbNeedleMap::load_from_idx(
+                    &rdb_path,
+                    &mut idx_file,
+                    self.version(),
+                    cache_bytes,
+                )?;
                 self.nm = Some(NeedleMap::Redb(nm));
             } else {
                 // Missing .idx with existing .dat could orphan needles
@@ -923,19 +1113,23 @@ impl Volume {
                         );
                     }
                 }
-                self.nm = Some(NeedleMap::Redb(RedbNeedleMap::new(&rdb_path)?));
+                self.nm = Some(NeedleMap::Redb(RedbNeedleMap::new(&rdb_path, cache_bytes)?));
             }
         } else {
             // Open read-write (create if missing)
-            let idx_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&idx_path)?;
+            let idx_file = open_volume_file(
+                OpenOptions::new().read(true).write(true).create(true),
+                idx_path,
+            )?;
 
-            let idx_size = idx_file.metadata()?.len();
+            let idx_size = trim_torn_idx_tail(&idx_file, idx_path)?;
             let mut idx_reader = io::BufReader::new(&idx_file);
-            let mut nm = RedbNeedleMap::load_from_idx(&rdb_path, &mut idx_reader, self.version())?;
+            let mut nm = RedbNeedleMap::load_from_idx(
+                &rdb_path,
+                &mut idx_reader,
+                self.version(),
+                cache_bytes,
+            )?;
 
             // Re-open for append-only writes
             let write_file = OpenOptions::new()
@@ -990,7 +1184,11 @@ impl Volume {
         Ok(())
     }
 
-    fn read_exact_at_backend(&self, buf: &mut [u8], offset: u64) -> Result<(), VolumeError> {
+    pub(crate) fn read_exact_at_backend(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<(), VolumeError> {
         if let Some(dat_file) = self.dat_file.as_ref() {
             #[cfg(unix)]
             {
@@ -1126,7 +1324,7 @@ impl Volume {
     ) -> Result<i32, VolumeError> {
         let _guard = self.data_file_access_control.read_lock();
         let nm = self.nm_or_not_found()?;
-        let nv = nm.get(n.id).ok_or(VolumeError::NotFound)?;
+        let nv = nm.get(n.id)?.ok_or(VolumeError::NotFound)?;
 
         if nv.offset.is_zero() {
             return Err(VolumeError::NotFound);
@@ -1368,7 +1566,7 @@ impl Volume {
     ) -> Result<NeedleStreamInfo, VolumeError> {
         let _guard = self.data_file_access_control.read_lock();
         let nm = self.nm_or_not_found()?;
-        let nv = nm.get(n.id).ok_or(VolumeError::NotFound)?;
+        let nv = nm.get(n.id)?.ok_or(VolumeError::NotFound)?;
 
         if nv.offset.is_zero() {
             return Err(VolumeError::NotFound);
@@ -1470,7 +1668,7 @@ impl Volume {
         needle_id: NeedleId,
     ) -> Result<(u64, u16), VolumeError> {
         let nm = self.nm_or_not_found()?;
-        let nv = nm.get(needle_id).ok_or(VolumeError::NotFound)?;
+        let nv = nm.get(needle_id)?.ok_or(VolumeError::NotFound)?;
         if nv.offset.is_zero() {
             return Err(VolumeError::NotFound);
         }
@@ -1493,23 +1691,85 @@ impl Volume {
     // ---- Write ----
 
     /// Write a needle to the volume (synchronous path).
+    ///
+    /// With `fsync` the write is only reported successful once both the .dat
+    /// record and the .idx row that indexes it are on disk, so an ack survives a
+    /// crash rather than sitting in the page cache. The two flushes fail
+    /// differently: a failed .dat flush happens before anything is published, so
+    /// it takes its own append back off the end and nobody else's, while a
+    /// failed .idx flush cannot be undone and stops the volume taking writes.
     pub fn write_needle(
         &mut self,
         n: &mut Needle,
         check_cookie: bool,
+        fsync: bool,
     ) -> Result<(u64, Size, bool), VolumeError> {
         let _guard = self.data_file_access_control.write_lock();
         if self.is_read_only() {
             return Err(VolumeError::ReadOnly);
         }
 
-        self.do_write_request(n, check_cookie)
+        self.do_write_request(n, check_cookie, fsync)
+    }
+
+    /// Flush the .dat, the first half of a durable write. The .idx is flushed
+    /// separately by flush_idx once the row is published; the two are split so
+    /// nothing is indexed before the bytes it points at are down.
+    fn flush_dat(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_fsync_for_test {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected fsync failure",
+            ));
+        }
+        match self.dat_file.as_ref() {
+            Some(dat_file) => dat_file.sync_all(),
+            None => Err(io::Error::new(io::ErrorKind::Other, "dat file not open")),
+        }
+    }
+
+    /// Flush the .idx, the second half of a durable write. load() rebuilds the
+    /// map from .idx, not from .dat, so the row has to be down before the write
+    /// is acked: lose it and the volume comes back with a .dat tail the
+    /// integrity check cannot account for, and loads read only.
+    ///
+    /// By the time this runs the row is published and cannot be taken back -
+    /// undoing it would mean writing to a disk that is already failing, and
+    /// would leave an .idx row pointing past a truncated .dat. So a failure
+    /// stops the volume taking writes instead: nothing more gets appended past a
+    /// record whose index may not survive, and the master routes writes
+    /// elsewhere once the volume heartbeats read only.
+    fn flush_idx(&mut self) -> Result<(), VolumeError> {
+        #[cfg(test)]
+        if self.fail_idx_sync_for_test {
+            let e = io::Error::new(io::ErrorKind::Other, "injected idx sync failure");
+            self.no_write_or_delete = true;
+            return Err(VolumeError::Io(e));
+        }
+        let synced = match self.nm.as_ref() {
+            Some(nm) => nm.sync(),
+            None => Ok(()),
+        };
+        if let Err(e) = synced {
+            self.check_read_write_error(Some(&e));
+            self.no_write_or_delete = true;
+            tracing::error!(
+                "volume {}: failed to flush the index after a durable write, \
+                 marking read only: {}",
+                self.id.0,
+                e
+            );
+            return Err(VolumeError::Io(e));
+        }
+        Ok(())
     }
 
     fn do_write_request(
         &mut self,
         n: &mut Needle,
         check_cookie: bool,
+        fsync: bool,
     ) -> Result<(u64, Size, bool), VolumeError> {
         // TTL inheritance from volume (matching Go's writeNeedle2)
         {
@@ -1529,12 +1789,23 @@ impl Volume {
         // Dedup check (matches Go: n.DataSize = oldNeedle.DataSize on dedup)
         if let Some(old_data_size) = self.is_file_unchanged(n) {
             n.data_size = old_data_size;
+            // Nothing to append, but the write this matched may have been
+            // non-durable, and the caller is asking for the content to be on
+            // disk. Its .idx row can be sitting in the page cache too, so both
+            // files get flushed exactly as they would for a fresh append.
+            if fsync {
+                self.flush_dat().map_err(|e| {
+                    self.check_read_write_error(Some(&e));
+                    VolumeError::Io(e)
+                })?;
+                self.flush_idx()?;
+            }
             return Ok((0, Size(n.data_size as i32), true));
         }
 
         // Cookie validation for existing needle (matches Go: check whenever nm.Get returns ok)
         if let Some(nm) = &self.nm {
-            if let Some(nv) = nm.get(n.id) {
+            if let Some(nv) = nm.get(n.id)? {
                 let mut existing = Needle::default();
                 // Read only the header to check cookie
                 self.read_needle_header_unlocked(&mut existing, nv.offset.to_actual_offset())?;
@@ -1553,30 +1824,138 @@ impl Volume {
 
         // Append to .dat file
         let (offset, _body_size, _actual_size) = self.append_needle(n)?;
+
+        // Nothing is published until the bytes are down: an index entry for an
+        // unflushed append would resolve past the end of the file after a crash,
+        // and undoing it afterwards would double-count the volume's metrics.
+        if fsync {
+            if let Err(e) = self.flush_dat() {
+                self.check_read_write_error(Some(&e));
+                let truncated = match self.dat_file.as_ref() {
+                    Some(dat_file) => dat_file.set_len(offset),
+                    None => Ok(()),
+                };
+                if let Err(te) = truncated {
+                    // The rejected record is still on the end. A later append
+                    // would bury it mid-file, where the .dat tail check cannot
+                    // see it, so stop taking writes instead.
+                    self.no_write_or_delete = true;
+                    tracing::error!(
+                        "volume {}: failed to truncate back to {} after a failed fsync, \
+                         marking read only: {}",
+                        self.id.0,
+                        offset,
+                        te
+                    );
+                }
+                return Err(VolumeError::Io(e));
+            }
+        }
+
         self.last_append_at_ns = n.append_at_ns;
 
         // Update needle map (uses n.size = full body size, matching Go's nm.Put)
-        let should_update = if let Some(nm) = &self.nm {
-            match nm.get(n.id) {
-                Some(nv) => (nv.offset.to_actual_offset() as u64) < offset,
-                None => true,
+        let prior = match self.nm.as_ref() {
+            Some(nm) => nm.get(n.id),
+            None => Ok(None),
+        };
+        let should_update = match prior {
+            Ok(Some(nv)) => (nv.offset.to_actual_offset() as u64) < offset,
+            Ok(None) => true,
+            Err(e) => {
+                if fsync {
+                    // Leaves the same durable-but-unindexed record a failed put
+                    // below does, so it gets the same treatment.
+                    self.no_write_or_delete = true;
+                    tracing::error!(
+                        "volume {}: failed to read the prior mapping for a durable write at {}, \
+                         marking read only: {}",
+                        self.id.0,
+                        offset,
+                        e
+                    );
+                }
+                return Err(VolumeError::Io(e));
             }
-        } else {
-            true
         };
 
         if should_update {
-            if let Some(nm) = &mut self.nm {
-                nm.put(n.id, Offset::from_actual_offset(offset as i64), n.size)?;
+            let indexed = match self.nm.as_mut() {
+                Some(nm) => nm.put(n.id, Offset::from_actual_offset(offset as i64), n.size),
+                None => Ok(()),
+            };
+            if let Err(e) = indexed {
+                if fsync {
+                    // The record is already down but nothing indexes it, the
+                    // same state a failed .idx flush leaves behind, so it gets
+                    // the same treatment rather than another write on top.
+                    self.no_write_or_delete = true;
+                    tracing::error!(
+                        "volume {}: failed to index a durable write at {}, \
+                         marking read only: {}",
+                        self.id.0,
+                        offset,
+                        e
+                    );
+                }
+                return Err(VolumeError::Io(e));
             }
+        }
+
+        if fsync {
+            self.flush_idx()?;
         }
 
         if self.last_modified_ts_seconds < n.last_modified {
             self.last_modified_ts_seconds = n.last_modified;
         }
 
+        let checkpoint_ok = self.maybe_checkpoint_index(fsync);
+
+        // Clear the EIO streak only after the full write (data + flush +
+        // index + checkpoint) succeeds, so a failed fsync or checkpoint
+        // does not get its EIO erased by the success reset.
+        if checkpoint_ok {
+            self.check_read_write_error(None);
+        }
+
         // Return Size(n.DataSize) as the logical size, matching Go's doWriteRequest
         Ok((offset, Size(n.data_size as i32), false))
+    }
+
+    /// Take the index checkpoint the needle map asked for, data first: the
+    /// checkpoint makes the index durable, and an index row that outlives
+    /// the bytes it points at loads read-only (see load()). A failed .dat
+    /// flush therefore skips the checkpoint; the map keeps asking, so it is
+    /// retried on the next write.
+    ///
+    /// When `idx_already_synced` is true the .idx has already been fsynced by
+    /// `flush_idx` on the fsync=true write path, so the checkpoint skips its
+    /// own .idx fsync to avoid a redundant one.
+    fn maybe_checkpoint_index(&mut self, idx_already_synced: bool) -> bool {
+        let due = self.nm.as_ref().is_some_and(|nm| nm.checkpoint_due());
+        if !due {
+            return true;
+        }
+        if let Err(e) = self.flush_dat() {
+            self.check_read_write_error(Some(&e));
+            tracing::warn!(
+                "volume {}: skipping index checkpoint, .dat flush failed: {}",
+                self.id.0,
+                e
+            );
+            return false;
+        }
+        let checkpointed = match self.nm.as_mut() {
+            Some(nm) => nm.checkpoint(!idx_already_synced),
+            None => Ok(()),
+        };
+        if let Err(e) = checkpointed {
+            self.check_read_write_error(Some(&e));
+            tracing::warn!("volume {}: index checkpoint failed: {}", self.id.0, e);
+            return false;
+        }
+        true
     }
 
     fn read_needle_header_unlocked(&self, n: &mut Needle, offset: i64) -> Result<(), VolumeError> {
@@ -1597,7 +1976,17 @@ impl Volume {
         }
 
         if let Some(nm) = &self.nm {
-            if let Some(nv) = nm.get(n.id) {
+            let existing = match nm.get(n.id) {
+                Ok(existing) => existing,
+                Err(e) => {
+                    // Not a lookup miss: the index could not be read. Report
+                    // "unknown" so the caller writes the needle again rather
+                    // than treating an unreadable index as proof of a change.
+                    warn!(volume_id = self.id.0, error = %e, "needle map lookup failed");
+                    return None;
+                }
+            };
+            if let Some(nv) = existing {
                 if !nv.offset.is_zero() && nv.size.is_valid() {
                     let mut old = Needle::default();
                     let mut ro = ReadOption::default();
@@ -1649,7 +2038,6 @@ impl Volume {
             self.check_read_write_error(Some(&e));
             return Err(VolumeError::Io(e));
         }
-        self.check_read_write_error(None);
 
         Ok((offset, n.size, actual_size))
     }
@@ -1667,7 +2055,10 @@ impl Volume {
 
     fn do_delete_request(&mut self, n: &mut Needle) -> Result<Size, VolumeError> {
         let (found, size, _stored_offset) = if let Some(nm) = &self.nm {
-            if let Some(nv) = nm.get(n.id) {
+            // Propagate: acknowledging the delete as a no-op because the index
+            // could not be read would drop the tombstone on the floor while the
+            // caller believes the needle is gone.
+            if let Some(nv) = nm.get(n.id)? {
                 if !nv.size.is_deleted() {
                     (true, nv.size, nv.offset)
                 } else {
@@ -1701,6 +2092,13 @@ impl Volume {
         // Update index
         if let Some(nm) = &mut self.nm {
             nm.delete(n.id, Offset::from_actual_offset(offset as i64))?;
+        }
+        let checkpoint_ok = self.maybe_checkpoint_index(false);
+
+        // Clear the EIO streak after a successful delete (tombstone append +
+        // index update + checkpoint), mirroring do_write_request.
+        if checkpoint_ok {
+            self.check_read_write_error(None);
         }
 
         Ok(size)
@@ -1738,6 +2136,10 @@ impl Volume {
         self.no_write_or_delete
     }
 
+    pub fn set_no_write_or_delete(&mut self, value: bool) {
+        self.no_write_or_delete = value;
+    }
+
     pub fn is_no_write_can_delete(&self) -> bool {
         self.no_write_can_delete
     }
@@ -1768,6 +2170,26 @@ impl Volume {
             .saturating_sub(self.last_modified_ts_seconds)
             / 60;
         (ttl_minutes as u64) < lived_minutes
+    }
+
+    /// When this volume's data becomes garbage, counted from its last write.
+    /// Counting from the current time instead let every .vif rewrite — a
+    /// read-only mark, a tier upload, an EC encode — hand an already expiring
+    /// volume another full TTL. Zero when the volume has no TTL. Mirrors Go's
+    /// ExpireAtSec.
+    pub fn expire_at_sec(&self) -> u64 {
+        let ttl_seconds = self.super_block.ttl.to_seconds();
+        if ttl_seconds == 0 {
+            return 0;
+        }
+        let mut last_write_sec = self.last_modified_ts_seconds;
+        if last_write_sec == 0 {
+            last_write_sec = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+        last_write_sec + ttl_seconds
     }
 
     pub fn is_expired_long_enough(&self, max_delay_minutes: u32) -> bool {
@@ -1813,7 +2235,7 @@ impl Volume {
                 continue;
             }
 
-            let Some(nv) = nm.get(key) else {
+            let Some(nv) = nm.get(key)? else {
                 offset += total_size;
                 continue;
             };
@@ -1899,6 +2321,128 @@ impl Volume {
         }
     }
 
+    /// Bounds the work a vacuumed volume's recovery does, where key order makes
+    /// every write a candidate for the newest one. A volume with more live
+    /// needles than this keeps the .dat mtime: reading a subset could recover a
+    /// timestamp older than the newest write and expire data still inside its
+    /// TTL, so a scan that will not fit declines instead of guessing.
+    const VACUUMED_LAST_WRITE_SCAN_ENTRIES: usize = 1 << 16;
+
+    /// Point the TTL clock at the newest write recorded in the volume, replacing
+    /// the .dat mtime the loader starts from. A delete appends a tombstone and
+    /// vacuum rewrites the .dat wholesale, so the mtime moves without any write
+    /// ever landing: every restart of a volume taking delete traffic re-armed
+    /// is_expired() for another full TTL and the volume was never reclaimed.
+    /// Mirrors Go's recoverLastModifiedTs.
+    fn recover_last_modified_ts(&mut self) {
+        if self.super_block.ttl.minutes() == 0 {
+            return;
+        }
+        match self.find_last_write_append_at_ns() {
+            Ok(0) => {}
+            Ok(append_at_ns) => self.last_modified_ts_seconds = append_at_ns / 1_000_000_000,
+            Err(e) => warn!(
+                volume_id = self.id.0,
+                error = %e,
+                "recover the last write from the index"
+            ),
+        }
+    }
+
+    /// Scan the .idx backwards for the newest write — an entry that is not a
+    /// deletion tombstone — and return that needle's append timestamp. The .idx
+    /// and the .dat share an order, so an append-ordered volume answers with the
+    /// first write the scan reaches. Vacuum rewrites both in key order, which
+    /// tracks write order only because the master issues keys increasing: an
+    /// overwrite keeps its original, lower key, so a vacuumed volume has to take
+    /// the maximum over every write it indexes. Returns 0 when the .idx holds
+    /// nothing but tombstones, when a vacuumed volume holds more needles than
+    /// the scan budget, or for a volume older than version 3, whose needles
+    /// carry no append timestamp. Mirrors Go's findLastWriteAppendAtNs.
+    fn find_last_write_append_at_ns(&self) -> Result<u64, VolumeError> {
+        let version = self.version();
+        if version != VERSION_3 {
+            return Ok(0);
+        }
+        let idx_path = self.file_name(".idx");
+        let idx_size = fs::metadata(&idx_path).map(|m| m.len()).unwrap_or(0) as i64;
+        if idx_size == 0 || idx_size % NEEDLE_MAP_ENTRY_SIZE as i64 != 0 {
+            return Ok(0);
+        }
+        let scan_every_write = self.super_block.compaction_revision > 0;
+        let mut entry_budget = Self::VACUUMED_LAST_WRITE_SCAN_ENTRIES;
+        let mut last_write_append_at_ns = 0u64;
+        let mut idx_file = File::open(&idx_path)?;
+        let mut block = vec![0u8; NEEDLE_MAP_ENTRY_SIZE * idx::ROWS_TO_READ];
+        let mut end = idx_size;
+        while end > 0 {
+            let start = (end - block.len() as i64).max(0);
+            let entries = &mut block[..(end - start) as usize];
+            idx_file.seek(SeekFrom::Start(start as u64))?;
+            idx_file.read_exact(entries)?;
+            for entry in entries.chunks_exact(NEEDLE_MAP_ENTRY_SIZE).rev() {
+                let (key, offset, size) = idx_entry_from_bytes(entry);
+                if offset.is_zero() || size.is_deleted() {
+                    continue;
+                }
+                let Some(needle_offset) =
+                    self.find_needle_offset(offset.to_actual_offset(), key, size)
+                else {
+                    continue;
+                };
+                last_write_append_at_ns = last_write_append_at_ns
+                    .max(self.read_needle_append_at_ns(needle_offset, size)?);
+                if !scan_every_write {
+                    return Ok(last_write_append_at_ns);
+                }
+                entry_budget -= 1;
+                if entry_budget == 0 {
+                    warn!(
+                        volume_id = self.id.0,
+                        budget = Self::VACUUMED_LAST_WRITE_SCAN_ENTRIES,
+                        "too many needles to scan for the last write, keeping the .dat mtime"
+                    );
+                    return Ok(0);
+                }
+            }
+            end = start;
+        }
+        Ok(last_write_append_at_ns)
+    }
+
+    /// The .dat offset holding the needle an .idx entry describes, or None when
+    /// no needle there matches it. A .dat past MAX_POSSIBLE_VOLUME_SIZE wraps the
+    /// offsets in its .idx, so the needle can sit one volume size further in;
+    /// verify_needle_integrity retries the same way. Mirrors Go's
+    /// findNeedleOffset.
+    fn find_needle_offset(&self, actual_offset: i64, key: NeedleId, size: Size) -> Option<i64> {
+        for at in [
+            actual_offset,
+            actual_offset + MAX_POSSIBLE_VOLUME_SIZE as i64,
+        ] {
+            let mut header = [0u8; NEEDLE_HEADER_SIZE];
+            if self.read_exact_at_backend(&mut header, at as u64).is_err() {
+                continue;
+            }
+            let (_, needle_id, needle_size) = Needle::parse_header(&header);
+            if needle_id == key && needle_size == size {
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    /// Read the append timestamp a version 3 needle carries past its checksum.
+    fn read_needle_append_at_ns(&self, actual_offset: i64, size: Size) -> Result<u64, VolumeError> {
+        let ts_offset = actual_offset as u64
+            + NEEDLE_HEADER_SIZE as u64
+            + size.0 as u64
+            + NEEDLE_CHECKSUM_SIZE as u64;
+        let mut ts = [0u8; TIMESTAMP_SIZE];
+        self.read_exact_at_backend(&mut ts, ts_offset)?;
+        Ok(u64::from_be_bytes(ts))
+    }
+
     /// .idx file position of the entry whose needle is physically last in the
     /// .dat (highest offset). The common case — an append-ordered .idx — is
     /// resolved in O(1): the last entry's on-disk end equals the .dat size. A
@@ -1949,11 +2493,13 @@ impl Volume {
     }
 
     /// Verify the live needle at the .dat tail: its header must match the
-    /// .idx entry and the .dat must end exactly at its on-disk end. Extra
-    /// bytes mean an unindexed trailing record (a torn append); appending
-    /// after one would place the next needle at an offset the 8-byte .idx
-    /// encoding may not represent, so the volume is quarantined read-only
-    /// instead. Mirrors Go's verifyNeedleIntegrity.
+    /// .idx entry and, on v3, the .dat must end exactly at its on-disk end.
+    /// Extra bytes mean an unindexed trailing record (a torn append);
+    /// appending after one would place the next needle at an offset the
+    /// 8-byte .idx encoding may not represent, so the volume is quarantined
+    /// read-only instead. Mirrors Go's verifyNeedleIntegrity, whose tail
+    /// check is v3-only -- a v1/v2 volume Go serves read-write must not go
+    /// read-only here.
     fn verify_needle_integrity(
         &mut self,
         actual_offset: i64,
@@ -1992,15 +2538,13 @@ impl Volume {
             )));
         }
 
-        if version == VERSION_3 {
-            let ts_offset =
-                checked_offset as u64 + NEEDLE_HEADER_SIZE as u64 + size.0 as u64 + 4; // skip checksum
-            let mut ts_buf = [0u8; 8];
-            self.read_exact_at_backend(&mut ts_buf, ts_offset)?;
-            let ts = u64::from_be_bytes(ts_buf);
-            if ts > 0 {
-                self.last_append_at_ns = ts;
-            }
+        if version != VERSION_3 {
+            return Ok(());
+        }
+
+        let ts = self.read_needle_append_at_ns(checked_offset, size)?;
+        if ts > 0 {
+            self.last_append_at_ns = ts;
         }
 
         self.verify_dat_ends_at(checked_offset + get_actual_size(size, version))
@@ -2272,37 +2816,43 @@ impl Volume {
         if let Some(ref mut nm) = self.nm {
             nm.put(key, offset, size).map_err(VolumeError::Io)?;
         }
+        self.maybe_checkpoint_index(false);
         Ok(())
     }
 
-    /// Mark this volume as read-only (no writes or deletes).
-    /// If `persist` is true, the readonly state is saved to the .vif file.
+    /// Mark this volume as read-only (no writes or deletes) and persist.
     pub fn set_read_only(&mut self) -> Result<(), VolumeError> {
-        self.no_write_or_delete = true;
-        self.save_vif()
+        self.set_read_only_persist(false, true)
     }
 
     /// Mark this volume as read-only, optionally persisting to .vif.
-    pub fn set_read_only_persist(&mut self, persist: bool) -> Result<(), VolumeError> {
-        self.no_write_or_delete = true;
+    /// With `can_delete`, deletes still land so expiring data drains the volume.
+    pub fn set_read_only_persist(
+        &mut self,
+        can_delete: bool,
+        persist: bool,
+    ) -> Result<(), VolumeError> {
+        if can_delete && !self.has_remote_file {
+            // deletes append tombstones to .idx; a read-only boot attached no writer
+            self.attach_idx_writer_if_missing()?;
+        }
+        self.no_write_or_delete = !can_delete;
+        if can_delete {
+            self.no_write_can_delete = true;
+        } else if !self.has_remote_file {
+            // downgrading a canDelete mark; remote volumes keep their derived flag
+            self.no_write_can_delete = false;
+        }
         if persist {
             self.save_vif()?;
         }
         Ok(())
     }
 
-    /// Mark this volume as writable (allow writes and deletes).
-    ///
-    /// If the volume booted with .vif ReadOnly=true, `load_index` built the
-    /// needle map without an .idx writer attached, so subsequent puts would
-    /// silently skip the on-disk append and only mutate in-memory state —
-    /// surviving until the next restart, then vanishing. Re-attach a writer
-    /// here so writes persist again.
-    pub fn set_writable(&mut self) -> Result<(), VolumeError> {
-        // Attach the writer (if missing) before flipping the flag — otherwise
-        // a transient open/metadata failure would leave the volume marked
-        // writable with no .idx writer, and subsequent puts would silently
-        // skip the on-disk append and vanish on the next restart.
+    /// Attach an append-only .idx writer when missing (read-only boot). Runs
+    /// before any flag flips so a failure cannot leave puts silently skipping
+    /// the on-disk append.
+    fn attach_idx_writer_if_missing(&mut self) -> Result<(), VolumeError> {
         let needs_idx_writer = self
             .nm
             .as_ref()
@@ -2315,33 +2865,104 @@ impl Volume {
                 .append(true)
                 .create(true)
                 .open(&idx_path)?;
-            let idx_size = write_file.metadata()?.len();
+            let idx_size = trim_torn_idx_tail(&write_file, &idx_path)?;
             if let Some(ref mut nm) = self.nm {
                 nm.set_idx_file(Box::new(write_file), idx_size);
             }
         }
+        Ok(())
+    }
+
+    /// Mark this volume as writable (allow writes and deletes).
+    ///
+    /// If the volume booted with .vif ReadOnly=true, `load_index` built the
+    /// needle map without an .idx writer attached, so subsequent puts would
+    /// silently skip the on-disk append and only mutate in-memory state —
+    /// surviving until the next restart, then vanishing. Re-attach a writer
+    /// here so writes persist again.
+    pub fn set_writable(&mut self) -> Result<(), VolumeError> {
+        let was_no_write_or_delete = self.no_write_or_delete;
+        let was_no_write_can_delete = self.no_write_can_delete;
         self.no_write_or_delete = false;
+        // Remote-tiered volumes must stay no_write_can_delete regardless of marks.
+        if !self.has_remote_file {
+            self.no_write_can_delete = false;
+        }
+
+        // Everything below keys off the flags above, so it runs with the volume
+        // already marked writable. Any failure has to put them back: a volume
+        // advertising writable whose needle map cannot reach .idx acknowledges
+        // writes that are gone after a restart.
+        if let Err(e) = self.publish_writable() {
+            self.no_write_or_delete = was_no_write_or_delete;
+            self.no_write_can_delete = was_no_write_can_delete;
+            return Err(e);
+        }
+        self.reset_io_error_state();
+        Ok(())
+    }
+
+    /// The steps that must all succeed before a volume can be left marked
+    /// writable: swap out the read-only map, attach the .idx writer, persist the
+    /// mark. Split out so set_writable has one rollback point rather than three.
+    fn publish_writable(&mut self) -> Result<(), VolumeError> {
+        self.reconcile_index_mode()?;
+        self.attach_idx_writer_if_missing()?;
         self.save_vif()
     }
 
-    /// Recompute the Go-style write/delete mode from the current remote tier state.
-    pub fn refresh_remote_write_mode(&mut self) {
+    /// Swap the read-only sorted map for the configured writable one once the
+    /// current mode says the volume is no longer read-only. Mirrors Go's
+    /// reopenIdxForWrite, and is the reason a volume that stops being read-only
+    /// can accept writes at all: SortedFileNeedleMap::put always fails, so
+    /// publishing a writable volume without this leaves every write appending to
+    /// .dat and then failing to index it. A no-op unless the map is the sorted
+    /// one and the flags have already moved.
+    fn reconcile_index_mode(&mut self) -> Result<(), VolumeError> {
+        let wants_sorted = self.use_sorted_index();
+        let has_sorted = matches!(self.nm, Some(NeedleMap::SortedFile(_)));
+        if wants_sorted == has_sorted {
+            return Ok(());
+        }
+        // Both directions matter. Tiering DOWN has to trade the read-only
+        // sorted map for a writable one before the volume is published as
+        // writable. Tiering UP has to install the sorted map, or a volume
+        // tiered while the server runs keeps its whole index in RAM and its
+        // .idx descriptor pinned until the next restart — the cost this map
+        // exists to avoid.
+        //
+        // load_index only publishes self.nm once the new map is built, so a
+        // failure leaves the previous map in place and the caller can recover.
+        self.load_index()
+    }
+
+    /// Recompute the Go-style write/delete mode from the current remote tier
+    /// state, and bring the needle map in line with it — a volume that stops
+    /// being remote also stops using the read-only sorted index.
+    ///
+    /// If the map cannot be rebuilt the volume is pinned read-only rather than
+    /// published as writable with an index that rejects every put; a restart
+    /// recovers it.
+    pub fn refresh_remote_write_mode(&mut self) -> Result<(), VolumeError> {
         self.has_remote_file = !self.volume_info.files.is_empty();
         if self.has_remote_file {
             self.no_write_can_delete = true;
             self.no_write_or_delete = false;
-        } else {
+        } else if !self.volume_info.read_only_can_delete {
+            // only clear the remoteness-derived flag, not an operator mark
             self.no_write_can_delete = false;
         }
+        if let Err(e) = self.reconcile_index_mode() {
+            self.no_write_or_delete = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Open the local .dat as the data backend, dropping any remote backend, so reads
     /// are served from local disk. Mirrors Go's swapToLocalDatBackend after a tier-down.
     pub(crate) fn open_local_dat_backend(&mut self) -> Result<(), VolumeError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.dat_path())?;
+        let file = open_volume_file(OpenOptions::new().read(true).write(true), self.dat_path())?;
         self.remote_dat_file = None;
         self.dat_file = Some(file);
         Ok(())
@@ -2365,10 +2986,14 @@ impl Volume {
             if let Ok(vif_info) = serde_json::from_str::<VifVolumeInfo>(&content) {
                 let pb_info = vif_info.to_pb();
                 if pb_info.read_only {
-                    self.no_write_or_delete = true;
+                    if pb_info.read_only_can_delete {
+                        self.no_write_can_delete = true;
+                    } else {
+                        self.no_write_or_delete = true;
+                    }
                 }
                 self.volume_info = pb_info;
-                self.refresh_remote_write_mode();
+                self.refresh_remote_write_mode()?;
                 if self.volume_info.version == 0 {
                     self.volume_info.version = Version::current().0 as u32;
                 }
@@ -2397,7 +3022,7 @@ impl Volume {
                     self.no_write_or_delete = true;
                 }
                 self.volume_info = pb_info;
-                self.refresh_remote_write_mode();
+                self.refresh_remote_write_mode()?;
                 if self.volume_info.version == 0 {
                     self.volume_info.version = Version::current().0 as u32;
                 }
@@ -2430,7 +3055,7 @@ impl Volume {
 
     /// Save volume info to .vif file in protobuf-JSON format (Go-compatible).
     /// Matches Go's SaveVolumeInfo: checks writability before writing and propagates errors.
-    fn save_vif(&self) -> Result<(), VolumeError> {
+    fn save_vif(&mut self) -> Result<(), VolumeError> {
         let vif_path = self.vif_path();
 
         // Match Go: if file exists but is not writable, return an error
@@ -2445,17 +3070,18 @@ impl Volume {
             }
         }
 
+        // remoteness-derived no_write_can_delete is not an operator mark; sync
+        // volume_info so refresh_remote_write_mode sees a real mark
+        let marked_can_delete =
+            self.no_write_can_delete && !self.has_remote_file && !self.no_write_or_delete;
+        self.volume_info.read_only = self.no_write_or_delete || marked_can_delete;
+        self.volume_info.read_only_can_delete = marked_can_delete;
         let mut vif = VifVolumeInfo::from_pb(&self.volume_info);
-        vif.read_only = self.no_write_or_delete;
 
         // Match Go's SaveVolumeInfo: compute ExpireAtSec from TTL
-        let ttl_seconds = self.super_block.ttl.to_seconds();
-        if ttl_seconds > 0 {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            vif.expire_at_sec = now + ttl_seconds;
+        let expire_at_sec = self.expire_at_sec();
+        if expire_at_sec > 0 {
+            vif.expire_at_sec = expire_at_sec;
         }
 
         let content = serde_json::to_string_pretty(&vif)
@@ -2467,16 +3093,15 @@ impl Volume {
     /// Save full VolumeInfo to .vif file (for tiered storage).
     /// Matches Go's SaveVolumeInfo which computes ExpireAtSec from TTL.
     pub fn save_volume_info(&mut self) -> Result<(), VolumeError> {
-        self.volume_info.read_only = self.no_write_or_delete;
+        let marked_can_delete =
+            self.no_write_can_delete && !self.has_remote_file && !self.no_write_or_delete;
+        self.volume_info.read_only = self.no_write_or_delete || marked_can_delete;
+        self.volume_info.read_only_can_delete = marked_can_delete;
 
         // Compute ExpireAtSec from TTL (matches Go's SaveVolumeInfo)
-        let ttl_seconds = self.super_block.ttl.to_seconds();
-        if ttl_seconds > 0 {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.volume_info.expire_at_sec = now + ttl_seconds;
+        let expire_at_sec = self.expire_at_sec();
+        if expire_at_sec > 0 {
+            self.volume_info.expire_at_sec = expire_at_sec;
         }
 
         let vif = VifVolumeInfo::from_pb(&self.volume_info);
@@ -2713,10 +3338,38 @@ impl Volume {
         needle_blob: &[u8],
         size: Size,
     ) -> Result<(), VolumeError> {
+        // nm.put on a read-only volume fails only after the blob is appended to .dat.
+        if self.is_read_only() {
+            return Err(VolumeError::ReadOnly);
+        }
+
+        // size indexes the needle and places the v3 append timestamp, so a caller using
+        // the payload-only DataSize corrupts both, silently until the needle is read back.
+        if needle_blob.len() < NEEDLE_HEADER_SIZE {
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "needle {} blob of {} bytes is shorter than a needle header",
+                    needle_id.0,
+                    needle_blob.len()
+                ),
+            )));
+        }
+        let (_, _, header_size) = Needle::parse_header(needle_blob);
+        if header_size != size {
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "needle {} size {} does not match its blob header size {}",
+                    needle_id.0, size.0, header_size.0
+                ),
+            )));
+        }
+
         // Dedup check: if the same needle already exists with matching content, skip the write.
         // Matches Go's WriteNeedleBlob which reads existing needle and compares cookie+checksum+data.
         if let Some(nm) = &self.nm {
-            if let Some(nv) = nm.get(needle_id) {
+            if let Some(nv) = nm.get(needle_id)? {
                 if nv.size == size {
                     let version = self.version();
                     // Read existing needle from disk
@@ -2799,6 +3452,7 @@ impl Volume {
         if let Some(ref mut nm) = self.nm {
             nm.put(needle_id, offset, size)?;
         }
+        self.maybe_checkpoint_index(false);
 
         Ok(())
     }
@@ -2934,7 +3588,7 @@ impl Volume {
         // Collect live entries from needle map (sorted ascending)
         let nm = self.nm.as_ref().ok_or(VolumeError::NotInitialized)?;
         let mut entries: Vec<(NeedleId, Offset, Size)> = Vec::new();
-        for (id, nv) in nm.iter_entries() {
+        for (id, nv) in nm.iter_entries().map_err(VolumeError::Io)? {
             if nv.offset.is_zero() || nv.size.is_deleted() {
                 continue;
             }
@@ -2944,6 +3598,7 @@ impl Volume {
 
         let mut skipped_needles: u64 = 0;
         let mut skipped_data_bytes: u64 = 0;
+        let mut expected_live_bytes: u64 = 0;
         for (id, offset, size) in entries {
             // Progress callback
             if !progress_fn(offset.to_actual_offset()) {
@@ -3007,6 +3662,11 @@ impl Volume {
                 }
             }
 
+            // Tally the live bytes from the frozen snapshot this loop copied
+            // from, not the live needle map. Unreadable needles return before
+            // this point, so no further skipped-byte adjustment is needed.
+            expected_live_bytes += size.0 as u64;
+
             // Write needle to destination
             let bytes = n.write_bytes(version);
             dst.write_all(&bytes)?;
@@ -3026,6 +3686,21 @@ impl Volume {
         }
 
         dst.sync_all()?;
+
+        if self.super_block.ttl.is_empty() {
+            let dst_dat_size = dst.metadata()?.len();
+            if exceeds_expected_compacted_size(expected_live_bytes, dst_dat_size) {
+                let _ = fs::remove_file(&cpd_path);
+                let _ = fs::remove_file(&cpx_path);
+                return Err(VolumeError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "volume {} unexpected new data size: {} does not match expected live content size {} from the pre-compaction snapshot",
+                        self.id.0, dst_dat_size, expected_live_bytes
+                    ),
+                )));
+            }
+        }
 
         // Save new index
         new_nm.save_to_idx(&cpx_path)?;
@@ -3406,15 +4081,87 @@ impl Volume {
     }
 
     pub fn close(&mut self) {
-        if let Some(ref dat_file) = self.dat_file {
-            let _ = dat_file.sync_all();
-        }
+        let dat_synced = if let Some(ref dat_file) = self.dat_file {
+            dat_file.sync_all().is_ok()
+        } else {
+            true
+        };
         self.dat_file = None;
         self.remote_dat_file = None;
-        if let Some(ref nm) = self.nm {
-            let _ = nm.sync();
+        // When the .dat flushed, checkpoint the index so the next load starts
+        // from the recorded .idx size. When it did not, skip the checkpoint:
+        // a durable index pointing past an unflushed .dat tail would make the
+        // reload's max_needle_end check mark the volume read-only. Without the
+        // checkpoint, META_IDX_SIZE stays at the last successful one and the
+        // reload replays the uncheckpointed tail (redb flushes on drop).
+        if let Some(ref mut nm) = self.nm {
+            if dat_synced {
+                nm.close();
+            } else {
+                tracing::warn!(
+                    "volume {}: .dat sync failed on close, skipping index checkpoint",
+                    self.id.0
+                );
+                nm.close_without_checkpoint();
+            }
         }
         self.nm = None;
+    }
+
+    /// Move this volume's `.idx` (and `.sdx` when present) from its current
+    /// index directory into `new_idx_dir`, then reload in place. Mirrors Go's
+    /// `Volume::RelocateIndexTo`: it is a no-op when the index is already there
+    /// or nothing is co-located to move, and is used to pull an index a decode
+    /// or reconstruct left beside the data back into the configured `-dir.idx`.
+    pub fn relocate_index_to(&mut self, new_idx_dir: &str) -> Result<(), VolumeError> {
+        let _guard = self.data_file_access_control.write_lock();
+
+        if self.dir_idx == new_idx_dir {
+            return Ok(());
+        }
+        let old_base = volume_file_name(&self.dir_idx, &self.collection, self.id);
+        let old_idx = format!("{old_base}.idx");
+        if !Path::new(&old_idx).exists() {
+            return Ok(()); // nothing co-located to move
+        }
+        let new_base = volume_file_name(new_idx_dir, &self.collection, self.id);
+        let new_idx = format!("{new_base}.idx");
+
+        // Close the index and data handles before moving the index file.
+        let version = self.version();
+        self.close();
+
+        if let Err(e) = rename_or_copy(&old_idx, &new_idx) {
+            // Reopen against the old dir so the volume is not left down; surface
+            // a failed reopen since it leaves the volume unusable until reload.
+            if let Err(reopen) = self.load(true, false, 0, version) {
+                error!(
+                    "relocate volume {}: reopen after failed .idx move: {}",
+                    self.id, reopen
+                );
+            }
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("relocate index for volume {}: move .idx: {e}", self.id),
+            )));
+        }
+
+        // The .sdx is a derived sorted index; move it when present, but a
+        // failure is not fatal — drop the stale copy so a reload rebuilds it.
+        let old_sdx = format!("{old_base}.sdx");
+        if Path::new(&old_sdx).exists() {
+            let new_sdx = format!("{new_base}.sdx");
+            if let Err(e) = rename_or_copy(&old_sdx, &new_sdx) {
+                warn!(
+                    "relocate volume {}: move .sdx: {} (will rebuild)",
+                    self.id, e
+                );
+                let _ = fs::remove_file(&old_sdx);
+            }
+        }
+
+        self.dir_idx = new_idx_dir.to_string();
+        self.load(true, false, 0, version)
     }
 
     /// Remove all volume files from disk.
@@ -3488,23 +4235,25 @@ impl Volume {
             && has_ecx(&volume_file_name(&self.dir, &self.collection, self.id))
     }
 
-    /// Check if an I/O error is EIO (errno 5) and record it for health monitoring.
-    /// On success (None), clears any previously recorded EIO error.
-    /// Matches Go's `checkReadWriteError` in volume_write.go.
+    /// Check if an I/O error is a storage-media failure and record it for
+    /// health monitoring. On success (None), clears any previously recorded
+    /// EIO error. Matches Go's `checkReadWriteError` in volume_write.go.
     fn check_read_write_error(&self, err: Option<&io::Error>) {
+        use std::sync::atomic::Ordering;
         if let Some(e) = err {
-            if e.raw_os_error() == Some(5) {
-                // EIO — record it
+            if is_storage_io_error(e) {
+                self.io_error_count.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut guard) = self.last_io_error.lock() {
                     *guard = Some(e.to_string());
                 }
+                crate::metrics::STORAGE_IO_ERROR_COUNTER.inc();
+                return;
             }
-        } else {
-            // Success — clear any previous EIO
-            if let Ok(mut guard) = self.last_io_error.lock() {
-                if guard.is_some() {
-                    *guard = None;
-                }
+        }
+        self.io_error_count.store(0, Ordering::Relaxed);
+        if let Ok(mut guard) = self.last_io_error.lock() {
+            if guard.is_some() {
+                *guard = None;
             }
         }
     }
@@ -3515,11 +4264,51 @@ impl Volume {
         self.last_io_error.lock().ok()?.clone()
     }
 
+    pub fn get_io_error_state(&self) -> (Option<String>, i32, bool) {
+        use std::sync::atomic::Ordering;
+        let err = self.last_io_error.lock().ok().and_then(|g| g.clone());
+        let count = self.io_error_count.load(Ordering::Relaxed);
+        let quarantined = self.io_error_quarantined.load(Ordering::Relaxed);
+        (err, count, quarantined)
+    }
+
+    pub fn mark_io_quarantined(&self) {
+        self.io_error_quarantined
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn reset_io_error_state(&self) {
+        use std::sync::atomic::Ordering;
+        self.io_error_count.store(0, Ordering::Relaxed);
+        self.io_error_quarantined.store(false, Ordering::Relaxed);
+        if let Ok(mut guard) = self.last_io_error.lock() {
+            *guard = None;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_last_io_error_for_test(&self, err: Option<&str>) {
+        use std::sync::atomic::Ordering;
         if let Ok(mut guard) = self.last_io_error.lock() {
             *guard = err.map(|value| value.to_string());
         }
+        // Set count at/above the heartbeat tolerance (3) so the test
+        // helper reflects a sustained error, not a single transient one.
+        if err.is_some() {
+            self.io_error_count.store(3, Ordering::Relaxed);
+        } else {
+            self.io_error_count.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_fsync_for_test(&mut self, fail: bool) {
+        self.fail_fsync_for_test = fail;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_idx_sync_for_test(&mut self, fail: bool) {
+        self.fail_idx_sync_for_test = fail;
     }
 
     #[cfg(test)]
@@ -3536,7 +4325,7 @@ impl Volume {
 /// Byte offset just past the needle's on-disk record. Deletion tombstones
 /// carry TombstoneFileSize (-1) in the .idx but are written with DataSize=0,
 /// so their on-disk record is sized as 0. Mirrors Go's needleDiskEnd.
-fn needle_disk_end(offset: Offset, size: Size, version: Version) -> i64 {
+pub(crate) fn needle_disk_end(offset: Offset, size: Size, version: Version) -> i64 {
     let on_disk_size = if size.is_deleted() { Size(0) } else { size };
     offset.to_actual_offset() + get_actual_size(on_disk_size, version)
 }
@@ -3551,12 +4340,63 @@ fn size_mismatch_error(offset: i64, id: NeedleId, found: Size, expected: Size) -
     ))
 }
 
+/// Drop a partial row from the end of `.idx` and return the remaining length.
+///
+/// `.idx` is a run of fixed-size rows, and writers append at EOF: a short write
+/// leaves a partial row behind, and every row appended after it lands off
+/// alignment, so the next load parses the rest of the file as garbage. The
+/// partial row is unrecoverable either way — every loader already skips it — so
+/// removing it before anything can append is what keeps the file parseable.
+/// Go instead refuses to load a volume whose `.idx` is not a whole number of
+/// rows; trimming keeps it mountable, and the rows before the tear are intact.
+fn trim_torn_idx_tail(idx_file: &File, idx_path: &str) -> Result<u64, VolumeError> {
+    let size = idx_file.metadata()?.len();
+    let aligned = size - size % NEEDLE_MAP_ENTRY_SIZE as u64;
+    if aligned != size {
+        warn!(
+            idx = %idx_path,
+            size, aligned, "dropping a partial row from the end of the index"
+        );
+        idx_file.set_len(aligned)?;
+        idx_file.sync_all()?;
+    }
+    Ok(aligned)
+}
+
 pub fn volume_file_name(dir: &str, collection: &str, id: VolumeId) -> String {
     if collection.is_empty() {
         format!("{}/{}", dir, id.0)
     } else {
         format!("{}/{}_{}", dir, collection, id.0)
     }
+}
+
+/// Move `src` to `dst`, falling back to copy+remove when the two live on
+/// different filesystems (a real `-dir.idx` split). Mirrors Go's
+/// `RenameOrCopyFile`: any rename error other than cross-device is fatal, and a
+/// failed copy or a source that cannot be removed rolls the copy back so a
+/// failure never leaves two divergent files.
+fn rename_or_copy(src: &str, dst: &str) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.raw_os_error() != Some(libc::EXDEV) => return Err(e),
+        Err(_) => {}
+    }
+    fs::copy(src, dst)?;
+    // fsync the destination before dropping the source, matching Go's out.Sync().
+    if let Err(e) = OpenOptions::new()
+        .write(true)
+        .open(dst)
+        .and_then(|f| f.sync_all())
+    {
+        let _ = fs::remove_file(dst);
+        return Err(e);
+    }
+    if let Err(e) = fs::remove_file(src) {
+        let _ = fs::remove_file(dst);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Generate a monotonically increasing append timestamp.
@@ -3578,7 +4418,7 @@ fn get_append_at_ns(last: u64) -> u64 {
 /// durable, propagating a sync failure so the commit path can abort rather than
 /// proceed with an undurable rename or marker. A path with no openable parent is
 /// tolerated; directory fsync is unsupported on Windows, so it is a no-op there
-/// (matching the Go fsyncDir helper, which ignores that error).
+/// (matching the Go fsyncDir helper, which skips it too).
 pub(crate) fn fsync_dir(path: &str) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -3655,6 +4495,11 @@ pub fn scan_volume_file(
 
         if size.0 == 0 && _id.is_empty() {
             break; // end of valid data
+        }
+        // A negative size is a corrupt header, and body_length would advance the
+        // walk backwards from it. Go's scanners stop here by returning io.EOF.
+        if size.0 < 0 {
+            break;
         }
 
         let body_length = needle::needle_body_length(size, version);
@@ -3864,6 +4709,182 @@ mod tests {
     }
 
     #[test]
+    fn binary_search_reports_is_last_when_caller_is_caught_up() {
+        // is_last drives the caught-up heartbeat; if it stops reporting true
+        // for an up-to-date caller, the tail sender re-reads the whole volume.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut newest_ns = 0u64;
+        for id in 1..=3u64 {
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(0x12345678),
+                data: vec![b'x'; 64],
+                data_size: 64,
+                flags: 0,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            newest_ns = n.append_at_ns;
+        }
+        assert!(newest_ns > 0, "needles must carry an append timestamp");
+
+        // Caught up: asking from the newest timestamp has nothing newer.
+        let (_offset, is_last) = v.binary_search_by_append_at_ns(newest_ns).unwrap();
+        assert!(
+            is_last,
+            "a caller at the newest append_at_ns must be reported as caught up"
+        );
+
+        // And from beyond the newest, likewise.
+        let (_offset, is_last_future) = v
+            .binary_search_by_append_at_ns(newest_ns + 1_000_000_000)
+            .unwrap();
+        assert!(
+            is_last_future,
+            "a caller ahead of the newest needle must be reported as caught up"
+        );
+    }
+
+    #[test]
+    fn binary_search_does_not_report_is_last_when_data_is_newer() {
+        // Complement: a behind caller must NOT be caught up, or tailing loses data.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut first_ns = 0u64;
+        for id in 1..=3u64 {
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(0x12345678),
+                data: vec![b'y'; 64],
+                data_size: 64,
+                flags: 0,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            if id == 1 {
+                first_ns = n.append_at_ns;
+            }
+        }
+
+        let (_offset, is_last) = v.binary_search_by_append_at_ns(first_ns).unwrap();
+        assert!(
+            !is_last,
+            "a caller behind the newest needle must NOT be reported as caught up"
+        );
+    }
+
+    #[test]
+    fn binary_search_does_not_report_is_last_when_only_a_delete_is_newer() {
+        // A delete is data the tail must ship. A caught-up caller before the
+        // delete must be sent to scan from the tombstone, not handed a heartbeat.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut newest_ns = 0u64;
+        for id in 1..=3u64 {
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(0x12345678),
+                data: vec![b'z'; 64],
+                data_size: 64,
+                flags: 0,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            newest_ns = n.append_at_ns;
+        }
+        let (_offset, is_last) = v.binary_search_by_append_at_ns(newest_ns).unwrap();
+        assert!(is_last, "precondition: the caller starts caught up");
+
+        v.delete_needle(&mut Needle {
+            id: NeedleId(2),
+            cookie: Cookie(0x12345678),
+            ..Needle::default()
+        })
+        .unwrap();
+
+        let (offset, is_last) = v.binary_search_by_append_at_ns(newest_ns).unwrap();
+        assert!(
+            !is_last,
+            "a caller older than a trailing delete must NOT be reported as caught up"
+        );
+
+        // Scan and filter as volume_tail_sender does: only the tombstone is newer.
+        let shipped: Vec<u64> = v
+            .scan_raw_needles_from(offset.to_actual_offset() as u64)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, append_at_ns)| append_at_ns)
+            .filter(|&append_at_ns| append_at_ns > newest_ns)
+            .collect();
+        assert_eq!(shipped.len(), 1, "the tail must ship the tombstone");
+    }
+
+    #[test]
+    fn binary_search_on_compacted_volume_still_reports_a_later_write() {
+        // Compaction rewrites .idx in needle-id order, so append_at_ns is no
+        // longer monotonic by row: an overwritten key can sit before an older
+        // one. The caller's since_ns is the last row's timestamp, so such rows
+        // were already in the files it copied. A write made afterwards is
+        // appended as the final row, which the search cannot step past.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let write = |v: &mut Volume, id: u64, byte: u8| {
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(0x12345678),
+                data: vec![byte; 64],
+                data_size: 64,
+                flags: 0,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            n.append_at_ns
+        };
+        write(&mut v, 1, b'c');
+        let key2_ns = write(&mut v, 2, b'c');
+        let key1_ns = write(&mut v, 1, b'd'); // genuine overwrite: different data
+        assert!(
+            key1_ns > key2_ns,
+            "precondition: the overwrite must append a newer record, not dedup"
+        );
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        v.commit_compact().unwrap();
+
+        let (_offset, is_last) = v.binary_search_by_append_at_ns(key2_ns).unwrap();
+        assert!(
+            is_last,
+            "precondition: compaction ordered .idx by key, so key 2 is the final row"
+        );
+
+        let key3_ns = write(&mut v, 3, b'c');
+        let (offset, is_last) = v.binary_search_by_append_at_ns(key2_ns).unwrap();
+        assert!(
+            !is_last,
+            "a write after compaction is the final row and must not be hidden"
+        );
+        let shipped: Vec<u64> = v
+            .scan_raw_needles_from(offset.to_actual_offset() as u64)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, append_at_ns)| append_at_ns)
+            .filter(|&append_at_ns| append_at_ns > key2_ns)
+            .collect();
+        assert!(
+            shipped.contains(&key3_ns),
+            "the tail must ship the write made after compaction"
+        );
+    }
+
+    #[test]
     fn test_volume_write_read() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
@@ -3878,7 +4899,7 @@ mod tests {
             flags: 0,
             ..Needle::default()
         };
-        let (offset, size, unchanged) = v.write_needle(&mut n, true).unwrap();
+        let (offset, size, unchanged) = v.write_needle(&mut n, true, false).unwrap();
         assert!(!unchanged);
         assert!(offset > 0); // after superblock
         assert!(size.0 > 0);
@@ -3895,6 +4916,231 @@ mod tests {
         assert_eq!(read_n.cookie, Cookie(0x12345678));
     }
 
+    /// A durable write goes down the same path and lands the same data; the
+    /// flush is extra work, not different work.
+    #[test]
+    fn test_volume_write_needle_fsync() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0x12345678),
+            data: b"durable payload".to_vec(),
+            data_size: 15,
+            flags: 0,
+            ..Needle::default()
+        };
+        let (offset, _, unchanged) = v.write_needle(&mut n, true, true).unwrap();
+        assert!(!unchanged);
+        assert!(offset > 0);
+
+        let mut read_n = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        assert_eq!(v.read_needle(&mut read_n).unwrap(), 15);
+        assert_eq!(read_n.data, b"durable payload");
+
+        // rewriting the same content still dedups, so there is nothing to flush
+        let mut same = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0x12345678),
+            data: b"durable payload".to_vec(),
+            data_size: 15,
+            flags: 0,
+            ..Needle::default()
+        };
+        let (_, _, unchanged) = v.write_needle(&mut same, true, true).unwrap();
+        assert!(unchanged);
+    }
+
+    /// A durable write whose flush fails must leave nothing behind: the append
+    /// comes off the .dat and the mapping it would have replaced still stands,
+    /// with the volume's own accounting untouched.
+    #[test]
+    fn test_write_needle_failed_fsync_keeps_prior_mapping() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut kept = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0xaa),
+            data: b"first-copy".to_vec(),
+            data_size: 10,
+            ..Needle::default()
+        };
+        v.write_needle(&mut kept, true, true).unwrap();
+        let prior = v.nm.as_ref().unwrap().get(NeedleId(1)).unwrap().unwrap();
+        let dat_len_before = std::fs::metadata(v.file_name(".dat")).unwrap().len();
+        let file_count_before = v.file_count();
+        let content_size_before = v.content_size();
+
+        v.fail_next_fsync_for_test(true);
+        let mut replacement = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0xaa),
+            data: b"second-copy".to_vec(),
+            data_size: 11,
+            ..Needle::default()
+        };
+        v.write_needle(&mut replacement, true, true).unwrap_err();
+        v.fail_next_fsync_for_test(false);
+
+        assert_eq!(
+            std::fs::metadata(v.file_name(".dat")).unwrap().len(),
+            dat_len_before,
+            "the unflushed append should be off the .dat"
+        );
+        let now = v.nm.as_ref().unwrap().get(NeedleId(1)).unwrap().unwrap();
+        assert_eq!(
+            now.offset, prior.offset,
+            "the mapping should never have moved"
+        );
+        assert_eq!(now.size, prior.size);
+        assert_eq!(
+            v.file_count(),
+            file_count_before,
+            "a rejected write must not count towards the volume"
+        );
+        assert_eq!(v.content_size(), content_size_before);
+
+        let mut read_n = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        assert_eq!(v.read_needle(&mut read_n).unwrap(), 10);
+        assert_eq!(read_n.data, b"first-copy");
+    }
+
+
+    /// A durable write that dedups against an earlier non-durable one still has
+    /// to flush the index. The row that earlier write left behind can be sitting
+    /// in the page cache, so acking without flushing is the same false promise
+    /// as skipping the flush on a fresh append.
+    #[test]
+    fn test_dedup_durable_write_flushes_the_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut first = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0xaa),
+            data: b"same-content".to_vec(),
+            data_size: 12,
+            ..Needle::default()
+        };
+        v.write_needle(&mut first, true, false).unwrap();
+
+        v.fail_next_idx_sync_for_test(true);
+        let mut same = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0xaa),
+            data: b"same-content".to_vec(),
+            data_size: 12,
+            ..Needle::default()
+        };
+        let result = v.write_needle(&mut same, true, true);
+        v.fail_next_idx_sync_for_test(false);
+
+        assert!(
+            result.is_err(),
+            "a dedup hit must not be acked without flushing the index"
+        );
+        assert!(
+            v.is_read_only(),
+            "and the failed index flush quarantines the volume, dedup or not"
+        );
+    }
+
+    /// A durable write whose index flush fails leaves the .dat record down and
+    /// its row published but not guaranteed to come back. The volume stops
+    /// taking writes rather than appending more past a record whose index may
+    /// not survive a restart.
+    #[test]
+    fn test_write_needle_failed_idx_sync_quarantines_volume() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        v.fail_next_idx_sync_for_test(true);
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0xaa),
+            data: b"index-never-flushed".to_vec(),
+            data_size: 19,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, true).unwrap_err();
+        v.fail_next_idx_sync_for_test(false);
+
+        assert!(
+            v.is_read_only(),
+            "a volume whose index flush failed must stop taking writes"
+        );
+        let mut later = Needle {
+            id: NeedleId(2),
+            cookie: Cookie(0xbb),
+            data: b"should-be-refused".to_vec(),
+            data_size: 17,
+            ..Needle::default()
+        };
+        assert!(
+            matches!(
+                v.write_needle(&mut later, true, false),
+                Err(VolumeError::ReadOnly)
+            ),
+            "later writes must not append past the record whose index is in doubt"
+        );
+    }
+
+    /// Same for a needle the failed write introduced: it never becomes visible,
+    /// rather than being published and then tombstoned back out.
+    #[test]
+    fn test_write_needle_failed_fsync_publishes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let dat_len_before = std::fs::metadata(v.file_name(".dat")).unwrap().len();
+        let file_count_before = v.file_count();
+
+        v.fail_next_fsync_for_test(true);
+        let mut fresh = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(0x77),
+            data: b"never-landed".to_vec(),
+            data_size: 12,
+            ..Needle::default()
+        };
+        v.write_needle(&mut fresh, true, true).unwrap_err();
+        v.fail_next_fsync_for_test(false);
+
+        assert_eq!(
+            std::fs::metadata(v.file_name(".dat")).unwrap().len(),
+            dat_len_before
+        );
+        assert!(
+            v.nm.as_ref().unwrap().get(NeedleId(7)).unwrap().is_none(),
+            "a needle that never reached the disk must not be indexed at all"
+        );
+        assert_eq!(v.file_count(), file_count_before);
+        assert_eq!(
+            v.deleted_count(),
+            0,
+            "nothing was written, so nothing was deleted"
+        );
+
+        let mut read_n = Needle {
+            id: NeedleId(7),
+            ..Needle::default()
+        };
+        assert!(v.read_needle(&mut read_n).is_err());
+    }
+
     #[test]
     fn test_volume_write_dedup() {
         let tmp = TempDir::new().unwrap();
@@ -3908,7 +5154,7 @@ mod tests {
             data_size: 9,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
 
         // Write same needle again — should be unchanged
         let mut n2 = Needle {
@@ -3919,7 +5165,7 @@ mod tests {
             ..Needle::default()
         };
         n2.checksum = CRC::new(&n2.data);
-        let (_, _, unchanged) = v.write_needle(&mut n2, true).unwrap();
+        let (_, _, unchanged) = v.write_needle(&mut n2, true, false).unwrap();
         assert!(unchanged);
     }
 
@@ -3936,7 +5182,7 @@ mod tests {
             data_size: 9,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
         assert_eq!(v.file_count(), 1);
 
         let deleted_size = v
@@ -3982,7 +5228,7 @@ mod tests {
                     data_size: data.len() as u32,
                     ..Needle::default()
                 };
-                v.write_needle(&mut n, true).unwrap();
+                v.write_needle(&mut n, true, false).unwrap();
             }
             v.delete_needle(&mut Needle {
                 id: NeedleId(2),
@@ -4011,6 +5257,165 @@ mod tests {
         );
     }
 
+    // Reproduce the delete-traffic TTL bug: deletes append a tombstone to the
+    // .dat, which moves the file's mtime, and the loader read the TTL clock
+    // back from that mtime. A volume taking delete traffic therefore had
+    // is_expired() re-armed for another full TTL on every restart and was
+    // never reclaimed.
+    #[test]
+    fn test_ttl_clock_survives_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let ttl = crate::storage::needle::ttl::TTL::read("5m").unwrap();
+        let last_write_ns = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 2 * 60 * 60)
+            * 1_000_000_000;
+
+        let content_size = {
+            let mut v = make_ttl_volume(dir, ttl);
+            let mut written = Vec::new();
+            for i in 1..=3u64 {
+                let data = format!("data {}", i);
+                let mut n = Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(i as u32),
+                    data: data.as_bytes().to_vec(),
+                    data_size: data.len() as u32,
+                    ..Needle::default()
+                };
+                let (offset, _, _) = v.write_needle(&mut n, true, false).unwrap();
+                written.push((offset, n.size));
+            }
+            // More than one tombstone: the scan has to walk back over the whole
+            // run of them to reach a write.
+            for i in [2u64, 3] {
+                v.delete_needle(&mut Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(i as u32),
+                    ..Needle::default()
+                })
+                .unwrap();
+            }
+            v.sync_to_disk().unwrap();
+            // Backdate the writes on disk so the last one sits well outside the
+            // TTL, while the tombstones leave the .dat mtime at now.
+            for (offset, size) in written {
+                backdate_append_at_ns(&v.dat_path(), offset, size, last_write_ns);
+            }
+            v.content_size()
+        };
+
+        let v = make_ttl_volume(dir, ttl);
+        assert_eq!(v.last_modified_ts(), last_write_ns / 1_000_000_000);
+        assert!(
+            v.is_expired(content_size, 1024 * 1024),
+            "a TTL volume whose last write is 2h old must be expired after a reload"
+        );
+    }
+
+    // The one layout where a .dat's order does not track its write order:
+    // vacuum rewrites it by key, and an overwrite keeps its original, lower key.
+    // Reading the position rather than the timestamps would recover the
+    // highest-key needle's older write time and expire the volume before the
+    // overwrite has lived out its TTL.
+    #[test]
+    fn test_ttl_clock_after_vacuum_takes_newest_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let ttl = crate::storage::needle::ttl::TTL::read("5m").unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old_write_ns = (now - 2 * 60 * 60) * 1_000_000_000;
+        let new_write_ns = (now - 60) * 1_000_000_000;
+
+        let content_size = {
+            let mut v = make_ttl_volume(dir, ttl);
+            // Needle 1 is overwritten last but sorts first, so vacuum leaves it
+            // at the head of the .dat with the newest timestamp of the three.
+            for (id, append_at_ns) in [(2u64, old_write_ns), (3, old_write_ns), (1, new_write_ns)] {
+                let data = format!("data {}", id);
+                let mut n = Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(id as u32),
+                    data: data.as_bytes().to_vec(),
+                    data_size: data.len() as u32,
+                    ..Needle::default()
+                };
+                let (offset, _, _) = v.write_needle(&mut n, true, false).unwrap();
+                v.sync_to_disk().unwrap();
+                backdate_append_at_ns(&v.dat_path(), offset, n.size, append_at_ns);
+            }
+            v.compact_by_index(0, 0, |_| true).unwrap();
+            v.commit_compact().unwrap();
+            v.content_size()
+        };
+
+        let v = make_ttl_volume(dir, ttl);
+        assert_eq!(v.last_modified_ts(), new_write_ns / 1_000_000_000);
+        assert!(
+            !v.is_expired(content_size, 1024 * 1024),
+            "a volume overwritten a minute ago must not be expired after a vacuum and reload"
+        );
+    }
+
+    // Guard the destroy time an EC volume is reclaimed on: it was recomputed as
+    // now+TTL every time the .vif was written, so a read-only mark, a tier
+    // upload or an EC encode handed an already expiring volume another full TTL.
+    #[test]
+    fn test_expire_at_sec_counts_from_last_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let ttl = crate::storage::needle::ttl::TTL::read("5m").unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut v = make_ttl_volume(dir, ttl);
+        // A volume with nothing written yet has no last write to count from, and
+        // must not land in 1970 with its data due for destruction on sight.
+        assert!(v.expire_at_sec() >= now);
+
+        v.set_last_modified_ts_for_test(now - 3600);
+        let want = now - 3600 + ttl.to_seconds();
+        for pass in 0..2 {
+            v.save_volume_info().unwrap();
+            assert_eq!(
+                v.volume_info.expire_at_sec, want,
+                ".vif save {} moved the destroy time off the last write",
+                pass
+            );
+        }
+    }
+
+    fn make_ttl_volume(dir: &str, ttl: crate::storage::needle::ttl::TTL) -> Volume {
+        Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            Some(ttl),
+            0,
+            Version::current(),
+        )
+        .unwrap()
+    }
+
+    fn backdate_append_at_ns(dat_path: &str, offset: u64, size: Size, append_at_ns: u64) {
+        let ts_offset =
+            offset + NEEDLE_HEADER_SIZE as u64 + size.0 as u64 + NEEDLE_CHECKSUM_SIZE as u64;
+        let mut f = OpenOptions::new().write(true).open(dat_path).unwrap();
+        f.seek(SeekFrom::Start(ts_offset)).unwrap();
+        f.write_all(&append_at_ns.to_be_bytes()).unwrap();
+    }
+
     fn write_three_needles(dir: &str) {
         let mut v = make_test_volume(dir);
         for i in 1..=3u64 {
@@ -4022,7 +5427,7 @@ mod tests {
                 data_size: data.len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.sync_to_disk().unwrap();
     }
@@ -4066,6 +5471,54 @@ mod tests {
         );
     }
 
+    // Go's tail check is v3-only, so it serves a v1/v2 volume with an
+    // unindexed tail read-write. Checking it here flipped whole legacy disks
+    // read-only on their first boot under this server.
+    #[test]
+    fn test_integrity_skips_dat_tail_check_before_v3() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        {
+            let mut v = Volume::new(
+                dir,
+                dir,
+                "",
+                VolumeId(1),
+                NeedleMapKind::InMemory,
+                None,
+                None,
+                0,
+                VERSION_2,
+            )
+            .unwrap();
+            for i in 1..=3u64 {
+                let data = format!("data {}", i);
+                let mut n = Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(i as u32),
+                    data: data.as_bytes().to_vec(),
+                    data_size: data.len() as u32,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true, false).unwrap();
+            }
+            v.sync_to_disk().unwrap();
+        }
+
+        let dat_path = volume_file_name(dir, "", VolumeId(1)) + ".dat";
+        let mut f = OpenOptions::new().append(true).open(&dat_path).unwrap();
+        f.write_all(&[0xFFu8; 96]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let v = reload_volume(dir);
+        assert_eq!(v.version(), VERSION_2, "volume should reload as v2");
+        assert!(
+            !v.is_no_write_or_delete(),
+            "v2 volume with unindexed .dat tail must stay writable, as in Go"
+        );
+    }
+
     // Same torn tail, but with a deletion tombstone as the last indexed
     // record — the tombstone path must also verify the .dat ends at it.
     #[test]
@@ -4082,7 +5535,7 @@ mod tests {
                 data_size: data.len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
             v.delete_needle(&mut Needle {
                 id: NeedleId(1),
                 cookie: Cookie(1),
@@ -4203,7 +5656,7 @@ mod tests {
                 data_size: body.len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.sync_to_disk().unwrap();
 
@@ -4233,7 +5686,7 @@ mod tests {
             data_size: data.len() as u32,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
         v.sync_to_disk().unwrap();
 
         // Append an offset-0 logical tombstone to the on-disk .idx.
@@ -4271,7 +5724,7 @@ mod tests {
             data_size: data.len() as u32,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
         v.sync_to_disk().unwrap();
         assert!(v.dat_file_size().unwrap() > SUPER_BLOCK_SIZE as u64);
 
@@ -4304,7 +5757,7 @@ mod tests {
                 data_size: data.len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.sync_to_disk().unwrap();
 
@@ -4332,7 +5785,7 @@ mod tests {
                 data_size: data.len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
 
         assert_eq!(v.file_count(), 10);
@@ -4364,7 +5817,7 @@ mod tests {
                     data_size: data.len() as u32,
                     ..Needle::default()
                 };
-                v.write_needle(&mut n, true).unwrap();
+                v.write_needle(&mut n, true, false).unwrap();
             }
             v.sync_to_disk().unwrap();
         }
@@ -4393,6 +5846,261 @@ mod tests {
     }
 
     #[test]
+    fn test_redb_volume_close_then_reload_keeps_counters_exact() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let open = || {
+            Volume::new(
+                dir,
+                dir,
+                "",
+                VolumeId(1),
+                NeedleMapKind::Redb,
+                None,
+                None,
+                0,
+                Version::current(),
+            )
+            .unwrap()
+        };
+
+        {
+            let mut v = open();
+            for i in 1..=3 {
+                let data = format!("data {}", i);
+                let mut n = Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(i as u32),
+                    data: data.as_bytes().to_vec(),
+                    data_size: data.len() as u32,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true, false).unwrap();
+            }
+            // Volume::close is the shutdown path (store -> disk location ->
+            // volume). It must checkpoint the redb index, or the reload
+            // replays rows the table already holds and inflates the counters.
+            v.close();
+        }
+
+        let v = open();
+        assert_eq!(v.file_count(), 3);
+        assert_eq!(v.deleted_count(), 0);
+        let mut n = Needle {
+            id: NeedleId(2),
+            ..Needle::default()
+        };
+        v.read_needle(&mut n).unwrap();
+        assert_eq!(std::str::from_utf8(&n.data).unwrap(), "data 2");
+    }
+
+    #[test]
+    fn test_redb_volume_checkpoint_flushes_dat_before_index() {
+        use crate::storage::needle_map::test_support::durable_idx_size;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::Redb,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        let rdb_path = std::path::PathBuf::from(v.file_name(".rdb"));
+        let write = |v: &mut Volume, i: u64| {
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(1),
+                data: b"x".to_vec(),
+                data_size: 1,
+                ..Needle::default()
+            };
+            // fsync=false: the .dat append is not flushed by the write itself.
+            v.write_needle(&mut n, true, false).unwrap();
+        };
+        for i in 1..1000 {
+            write(&mut v, i);
+        }
+        assert_eq!(durable_idx_size(&rdb_path), None);
+
+        // The 1000th write makes an index checkpoint due. A checkpoint makes
+        // the index durable, so the volume has to flush the .dat first, and
+        // when that flush fails nothing may be checkpointed: a durable index
+        // row pointing past the end of an unflushed .dat loads read-only.
+        v.fail_next_fsync_for_test(true);
+        write(&mut v, 1000);
+        assert_eq!(durable_idx_size(&rdb_path), None);
+
+        v.fail_next_fsync_for_test(false);
+        write(&mut v, 1001);
+        assert_eq!(
+            durable_idx_size(&rdb_path),
+            Some(1001 * NEEDLE_MAP_ENTRY_SIZE as u64)
+        );
+    }
+
+    #[test]
+    fn test_relocate_index_to_moves_index_and_serves_reads() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("data");
+        let idx_dir = root.path().join("idx");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&idx_dir).unwrap();
+        let data = data_dir.to_str().unwrap();
+        let idx = idx_dir.to_str().unwrap();
+
+        // Create the volume with its index co-located in the data dir (the state
+        // an EC reconstruct leaves), write a needle, and flush.
+        let mut v = Volume::new(
+            data,
+            data,
+            "",
+            VolumeId(7),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        let payload = b"payload-across-relocate".to_vec();
+        let mut n = Needle {
+            id: NeedleId(42),
+            cookie: Cookie(0x55),
+            data: payload.clone(),
+            data_size: payload.len() as u32,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+
+        let data_idx = format!("{data}/7.idx");
+        let idx_dir_idx = format!("{idx}/7.idx");
+        assert!(
+            Path::new(&data_idx).exists(),
+            "precondition: index co-located with the data"
+        );
+
+        v.relocate_index_to(idx).unwrap();
+
+        assert!(Path::new(&idx_dir_idx).exists(), "index moved to the idx dir");
+        assert!(
+            !Path::new(&data_idx).exists(),
+            "index gone from the data dir"
+        );
+        assert_eq!(v.file_count(), 1);
+
+        // The volume reloaded in place, so the needle still reads back.
+        let mut got = Needle {
+            id: NeedleId(42),
+            ..Needle::default()
+        };
+        v.read_needle(&mut got).unwrap();
+        assert_eq!(got.data, payload, "needle content survives the relocate");
+
+        // Relocating again is a no-op: the index is already where asked.
+        v.relocate_index_to(idx).unwrap();
+        assert!(Path::new(&idx_dir_idx).exists());
+    }
+
+    #[test]
+    fn test_load_keeps_index_co_located_with_the_data() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("data");
+        let idx_dir = root.path().join("idx");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&idx_dir).unwrap();
+        let data = data_dir.to_str().unwrap();
+        let idx = idx_dir.to_str().unwrap();
+
+        let mut v = Volume::new(
+            data,
+            data,
+            "",
+            VolumeId(7),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        let payload = b"payload-beside-the-data".to_vec();
+        let mut n = Needle {
+            id: NeedleId(42),
+            cookie: Cookie(0x55),
+            data: payload.clone(),
+            data_size: payload.len() as u32,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+        drop(v);
+
+        // --dir.idx now names an empty directory: the index already beside the
+        // data keeps serving, and nothing lands in the new directory.
+        let reopened = Volume::new(
+            data,
+            idx,
+            "",
+            VolumeId(7),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        assert!(
+            Path::new(&format!("{data}/7.idx")).exists(),
+            "index stays with the data"
+        );
+        assert!(
+            !Path::new(&format!("{idx}/7.idx")).exists(),
+            "nothing written to the new idx dir"
+        );
+
+        let mut got = Needle {
+            id: NeedleId(42),
+            ..Needle::default()
+        };
+        reopened.read_needle(&mut got).unwrap();
+        assert_eq!(got.data, payload);
+    }
+
+    #[test]
+    fn test_relocate_index_to_noop_when_already_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(1),
+            data: b"x".to_vec(),
+            data_size: 1,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+
+        // Data and index share a directory, so there is nothing to move.
+        v.relocate_index_to(dir).unwrap();
+        assert!(Path::new(&format!("{dir}/1.idx")).exists());
+        let mut got = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        v.read_needle(&mut got).unwrap();
+        assert_eq!(got.data, b"x");
+    }
+
+    #[test]
     fn test_volume_cookie_mismatch() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
@@ -4405,7 +6113,7 @@ mod tests {
             data_size: 8,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
 
         // Write with wrong cookie
         let mut n2 = Needle {
@@ -4415,8 +6123,41 @@ mod tests {
             data_size: 9,
             ..Needle::default()
         };
-        let err = v.write_needle(&mut n2, true).unwrap_err();
+        let err = v.write_needle(&mut n2, true, false).unwrap_err();
         assert!(matches!(err, VolumeError::CookieMismatch(_)));
+    }
+
+    // A size disagreeing with the blob's own header indexes the needle at the wrong
+    // length and, on v3, stamps the append timestamp into the middle of the needle.
+    #[test]
+    fn test_write_needle_blob_rejects_size_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0x12345678),
+            data: b"the merged payload".to_vec(),
+            data_size: 18,
+            ..Needle::default()
+        };
+        n.checksum = CRC::new(&n.data);
+        let (offset, _, _) = v.write_needle(&mut n, true, false).unwrap();
+        let blob = v.read_needle_blob(offset as i64, n.size).unwrap();
+
+        let dat_size_before = v.dat_file_size().unwrap();
+
+        // Size(n.data_size) is what append reports, and what a caller following the
+        // payload-size convention would send.
+        let err = v
+            .write_needle_blob_and_index(NeedleId(2), &blob, Size(n.data_size as i32))
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::Io(_)), "got {err:?}");
+        assert_eq!(v.dat_file_size().unwrap(), dat_size_before);
+
+        v.write_needle_blob_and_index(NeedleId(2), &blob, n.size)
+            .unwrap();
     }
 
     #[test]
@@ -4451,7 +6192,7 @@ mod tests {
             data_size: 5,
             ..Needle::default()
         };
-        v.write_needle(&mut first, true).unwrap();
+        v.write_needle(&mut first, true, false).unwrap();
 
         let mut second = Needle {
             id: NeedleId(20),
@@ -4460,7 +6201,7 @@ mod tests {
             data_size: 6,
             ..Needle::default()
         };
-        v.write_needle(&mut second, true).unwrap();
+        v.write_needle(&mut second, true, false).unwrap();
 
         let mut first_overwrite = Needle {
             id: NeedleId(10),
@@ -4469,7 +6210,7 @@ mod tests {
             data_size: 15,
             ..Needle::default()
         };
-        v.write_needle(&mut first_overwrite, true).unwrap();
+        v.write_needle(&mut first_overwrite, true, false).unwrap();
 
         let needles = v.read_all_needles().unwrap();
         let ids: Vec<u64> = needles.iter().map(|n| u64::from(n.id)).collect();
@@ -4506,7 +6247,7 @@ mod tests {
                 data_size: format!("data-{}", i).len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         assert_eq!(v.file_count(), 3);
 
@@ -4574,6 +6315,64 @@ mod tests {
         v.cleanup_compact().unwrap();
     }
 
+    /// Guards the copy-phase integrity check against regressing into
+    /// double-subtracting skipped bytes: expected_live_bytes already excludes
+    /// needles dropped as unreadable (they continue before the tally), so the
+    /// check must compare it directly against the compacted .dat size.
+    #[test]
+    fn test_exceeds_expected_compacted_size() {
+        assert!(!exceeds_expected_compacted_size(100, 100));
+        assert!(!exceeds_expected_compacted_size(100, 150));
+        assert!(exceeds_expected_compacted_size(100, 90));
+    }
+
+    /// A write that lands on the live volume mid-copy must not trip the
+    /// post-copy integrity check. The Rust port snapshots the index entries
+    /// before the copy loop (equivalent to Go's frozen oldNm), so a concurrent
+    /// write is invisible to the tally and the check stays quiet. The write
+    /// is then replayed by makeup_diff during commit_compact.
+    #[test]
+    fn test_compact_by_index_tolerates_concurrent_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        for i in 1..=8u64 {
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: format!("data-{}", i).into_bytes(),
+                data_size: format!("data-{}", i).len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        assert!(Path::new(&v.file_name(".cpd")).exists());
+
+        // A write arriving after the snapshot but before commit must survive
+        // via makeup_diff, exactly like a concurrent write in the Go server.
+        let mut late = Needle {
+            id: NeedleId(99),
+            cookie: Cookie(99),
+            data: b"late-write".to_vec(),
+            data_size: 10,
+            ..Needle::default()
+        };
+        v.write_needle(&mut late, true, false).unwrap();
+
+        v.commit_compact().unwrap();
+
+        let mut got = Needle {
+            id: NeedleId(99),
+            cookie: Cookie(99),
+            ..Needle::default()
+        };
+        v.read_needle(&mut got).unwrap();
+        assert_eq!(got.data, b"late-write");
+    }
+
     /// Vacuum compaction must tolerate an .idx entry whose offset points past
     /// the end of the .dat file (the failure mode in issue #8928). The bad
     /// entry is silently dropped from the resulting .cpx; healthy needles
@@ -4593,7 +6392,7 @@ mod tests {
                 data_size: format!("payload-{}", i).len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.sync_to_disk().unwrap();
 
@@ -4660,7 +6459,7 @@ mod tests {
                 data_size: format!("data-{}", i).len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.sync_to_disk().unwrap();
 
@@ -4722,7 +6521,7 @@ mod tests {
             data_size: 17,
             ..Needle::default()
         };
-        v.write_needle(&mut n1, true).unwrap();
+        v.write_needle(&mut n1, true, false).unwrap();
 
         let mut n2 = Needle {
             id: NeedleId(2),
@@ -4731,7 +6530,7 @@ mod tests {
             data_size: 18,
             ..Needle::default()
         };
-        v.write_needle(&mut n2, true).unwrap();
+        v.write_needle(&mut n2, true, false).unwrap();
 
         // Get initial revision and offset for needle 1
         let initial_rev = v.super_block.compaction_revision;
@@ -4797,7 +6596,7 @@ mod tests {
             data_size: data.len() as u32,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
 
         // Read stream info
         let mut read_n = Needle {
@@ -4828,7 +6627,7 @@ mod tests {
                 data_size: 6,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
 
             let vif = VifVolumeInfo {
                 files: vec![VifRemoteFile {
@@ -4900,6 +6699,7 @@ mod tests {
                     ..Needle::default()
                 },
                 true,
+                false,
             )
             .unwrap_err();
         assert!(matches!(err, VolumeError::ReadOnly));
@@ -4920,6 +6720,641 @@ mod tests {
             .remove("s3.vif_rw_test");
     }
 
+    /// Build a volume with `needles` needles, tier it to a fake remote backend,
+    /// and reload it the way a restart would — so it comes back read-only with
+    /// its index on disk. The local .dat is left in place, matching the state a
+    /// completed tier-down download leaves behind.
+    fn reload_as_tiered(dir: &str, backend_id: &str, needles: u64) -> Volume {
+        {
+            let mut v = make_test_volume(dir);
+            for i in 1..=needles {
+                let mut n = Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(0x1234),
+                    data: format!("needle-{i}").into_bytes(),
+                    data_size: format!("needle-{i}").len() as u32,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true, false).unwrap();
+            }
+
+            let vif = VifVolumeInfo {
+                files: vec![VifRemoteFile {
+                    backend_type: "s3".to_string(),
+                    backend_id: backend_id.to_string(),
+                    key: "remote-key".to_string(),
+                    offset: 0,
+                    file_size: v.dat_file_size().unwrap(),
+                    modified_time: 123,
+                    extension: ".dat".to_string(),
+                }],
+                version: v.version().0 as u32,
+                ..VifVolumeInfo::default()
+            };
+            std::fs::write(
+                format!("{}/1.vif", dir),
+                serde_json::to_string_pretty(&vif).unwrap(),
+            )
+            .unwrap();
+
+            let tier_config = crate::remote_storage::s3_tier::S3TierConfig {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "bucket-a".to_string(),
+                endpoint: "http://127.0.0.1:1".to_string(),
+                storage_class: "STANDARD".to_string(),
+                force_path_style: true,
+            };
+            crate::remote_storage::s3_tier::global_s3_tier_registry()
+                .write()
+                .unwrap()
+                .register(
+                    format!("s3.{backend_id}"),
+                    crate::remote_storage::s3_tier::S3TierBackend::new(&tier_config),
+                );
+        }
+
+        Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap()
+    }
+
+    // Tier-down clears the remote mode and publishes the volume as writable. The
+    // map it booted with is the read-only sorted one, whose put always fails, so
+    // without a rebuild the first write appends to .dat and then cannot be
+    // indexed — leaving bytes nothing references.
+    /// A volume tiered while the server runs must install the sorted map right
+    /// then. Reconciling only on the way down left it holding the whole index
+    /// in RAM and its .idx descriptor pinned until the next restart — the cost
+    /// the sorted map exists to avoid.
+    #[test]
+    fn test_tier_up_installs_the_sorted_needle_map() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+        for i in 1..=2u64 {
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(0x1234),
+                data: format!("needle-{i}").into_bytes(),
+                data_size: format!("needle-{i}").len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        v.sync_to_disk().unwrap();
+        assert!(
+            !matches!(v.nm, Some(NeedleMap::SortedFile(_))),
+            "a local volume starts with a writable in-memory map"
+        );
+
+        // What the tier-up handler does once the .dat is uploaded: record the
+        // remote reference and reconcile the mode.
+        v.volume_info.files.push(PbRemoteFile {
+            backend_type: "s3".to_string(),
+            backend_id: "vif_tierup_test".to_string(),
+            key: "remote-key".to_string(),
+            offset: 0,
+            file_size: v.dat_file_size().unwrap(),
+            modified_time: 123,
+            extension: ".dat".to_string(),
+        });
+        v.refresh_remote_write_mode().unwrap();
+
+        assert!(v.has_remote_file);
+        assert!(
+            matches!(v.nm, Some(NeedleMap::SortedFile(_))),
+            "tier-up must install the sorted map without waiting for a restart"
+        );
+        // The index still answers, now off .sdx.
+        let nv = v
+            .nm
+            .as_ref()
+            .unwrap()
+            .get(NeedleId(1))
+            .unwrap()
+            .expect("needle 1 still resolves through the sorted index");
+        assert!(!nv.size.is_deleted());
+    }
+
+    #[test]
+    fn test_tier_down_swaps_in_a_writable_needle_map() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = reload_as_tiered(dir, "vif_tierdown_test", 2);
+        assert!(matches!(v.nm, Some(NeedleMap::SortedFile(_))));
+
+        // The tail of the tier-down handler, once the .dat is back on disk.
+        v.volume_info.files.remove(0);
+        v.refresh_remote_write_mode().unwrap();
+        v.save_volume_info().unwrap();
+        v.open_local_dat_backend().unwrap();
+
+        assert!(!v.has_remote_file);
+        assert!(!v.is_read_only(), "tier-down should publish a writable volume");
+        assert!(
+            !matches!(v.nm, Some(NeedleMap::SortedFile(_))),
+            "tier-down must swap the read-only map out before writes are allowed"
+        );
+
+        let mut n = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(0x5678),
+            data: b"after-tier-down".to_vec(),
+            data_size: 15,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, true).unwrap();
+        v.sync_to_disk().unwrap();
+        drop(v);
+
+        // Reload: the needle must come back from .idx, not just have landed in
+        // .dat as unreferenced bytes.
+        let v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        let mut probe = Needle {
+            id: NeedleId(7),
+            ..Needle::default()
+        };
+        v.read_needle(&mut probe).unwrap();
+        assert_eq!(probe.data, b"after-tier-down");
+
+        crate::remote_storage::s3_tier::global_s3_tier_registry()
+            .write()
+            .unwrap()
+            .remove("s3.vif_tierdown_test");
+    }
+
+    // A .sdx that cannot be read end to end must abort compaction. Treating the
+    // short scan as the complete live set would commit a volume missing every
+    // needle past the truncation.
+    #[test]
+    fn test_compaction_aborts_on_unreadable_sorted_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = reload_as_tiered(dir, "vif_compact_test", 4);
+        let Some(NeedleMap::SortedFile(ref nm)) = v.nm else {
+            panic!("tiered volume should search the on-disk .sdx");
+        };
+        let sdx_path = nm.db_file_name().to_string();
+
+        let sdx = OpenOptions::new().write(true).open(&sdx_path).unwrap();
+        sdx.set_len(NEEDLE_MAP_ENTRY_SIZE as u64).unwrap();
+        drop(sdx);
+        crate::storage::needle_map::file_pool::pooled_index_files().discard(&sdx_path);
+
+        let err = v
+            .compact_by_index(0, 0, |_| true)
+            .expect_err("compaction must not commit a partially scanned index");
+        assert!(
+            matches!(err, VolumeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "unexpected error: {err:?}"
+        );
+
+        crate::remote_storage::s3_tier::global_s3_tier_registry()
+            .write()
+            .unwrap()
+            .remove("s3.vif_compact_test");
+    }
+
+    // Building .sdx writes to the index directory, which a read-only volume's
+    // may not allow. Before the sorted map that volume mounted and served reads
+    // off an in-memory index; it must still do so rather than going offline.
+    #[test]
+    #[cfg(unix)]
+    fn test_read_only_volume_mounts_when_the_index_dir_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root ignores the directory mode, so there is nothing to simulate.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        {
+            let mut v = make_test_volume(&dir);
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x1234),
+                data: b"still-readable".to_vec(),
+                data_size: 14,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            v.set_read_only_persist(false, true).unwrap();
+            v.sync_to_disk().unwrap();
+        }
+
+        let set_mode = |mode: u32| {
+            let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(tmp.path(), perms).unwrap();
+        };
+        set_mode(0o555);
+
+        let loaded = Volume::new(
+            &dir,
+            &dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        );
+        set_mode(0o755); // restore before any assertion, so cleanup works
+
+        let v = loaded.expect("a read-only volume must mount without writing its index dir");
+        assert!(
+            !matches!(v.nm, Some(NeedleMap::SortedFile(_))),
+            "the .sdx could not be built, so the index should have fallen back to memory"
+        );
+        let mut probe = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        v.read_needle(&mut probe).unwrap();
+        assert_eq!(probe.data, b"still-readable");
+    }
+
+    // set_writable clears the read-only flags before it can know the .idx writer
+    // will attach. If attaching fails the flags have to go back: a volume that
+    // advertises writable while its map has no writer takes puts into memory and
+    // loses them at the next restart.
+    #[test]
+    #[cfg(unix)]
+    fn test_set_writable_rolls_back_when_the_idx_writer_cannot_attach() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root ignores the directory mode, so there is nothing to simulate.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        {
+            let mut v = make_test_volume(&dir);
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x1234),
+                data: b"before".to_vec(),
+                data_size: 6,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            v.set_read_only_persist(false, true).unwrap();
+            v.sync_to_disk().unwrap();
+        }
+
+        // A read-only mount, both halves of it: nothing new can be created in the
+        // directory, so .sdx generation fails and the index falls back to memory,
+        // and the .idx itself cannot be opened for write, so no writer attaches.
+        let set_mode = |path: &std::path::Path, mode: u32| {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
+        let idx_path = tmp.path().join("1.idx");
+        set_mode(&idx_path, 0o444);
+        set_mode(tmp.path(), 0o555);
+
+        let loaded = Volume::new(
+            &dir,
+            &dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        );
+        let marked = loaded.map(|mut v| {
+            let r = v.set_writable();
+            (v.no_write_or_delete, v.is_read_only(), v.nm.as_ref().unwrap().has_idx_writer(), r)
+        });
+        // Restore before any assertion, so cleanup works.
+        set_mode(tmp.path(), 0o755);
+        set_mode(&idx_path, 0o644);
+
+        let (no_write_or_delete, read_only, has_writer, result) = marked.unwrap();
+        assert!(
+            result.is_err(),
+            "set_writable cannot succeed without an .idx writer"
+        );
+        assert!(!has_writer, "the writer is what failed to attach");
+        assert!(
+            no_write_or_delete && read_only,
+            "a failed mark must leave the volume read-only, not writable with an index it cannot append to"
+        );
+    }
+
+    // .idx is a run of fixed-size rows and writers append at EOF, so a partial
+    // row left by a short write puts every row appended after it off alignment
+    // and the next load parses the rest as garbage. The tail has to go before
+    // anything writable attaches.
+    #[test]
+    fn test_writable_load_trims_a_torn_idx_tail() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        {
+            let mut v = make_test_volume(&dir);
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x1234),
+                data: b"first".to_vec(),
+                data_size: 5,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, true).unwrap();
+            v.sync_to_disk().unwrap();
+        }
+
+        let idx_path = tmp.path().join("1.idx");
+        let whole = std::fs::metadata(&idx_path).unwrap().len();
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&idx_path).unwrap();
+            f.write_all(&[0xcd; 5]).unwrap();
+        }
+
+        let mut v = Volume::new(
+            &dir,
+            &dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&idx_path).unwrap().len(),
+            whole,
+            "the partial row should be gone before any writer attaches"
+        );
+
+        let mut n = Needle {
+            id: NeedleId(2),
+            cookie: Cookie(0x5678),
+            data: b"second".to_vec(),
+            data_size: 6,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, true).unwrap();
+        v.sync_to_disk().unwrap();
+        drop(v);
+
+        // Both rows have to survive the round trip; a misaligned append loses
+        // the second one and garbles whatever follows it.
+        let v = Volume::new(
+            &dir,
+            &dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        for (id, want) in [(1u64, &b"first"[..]), (2u64, &b"second"[..])] {
+            let mut probe = Needle {
+                id: NeedleId(id),
+                ..Needle::default()
+            };
+            v.read_needle(&mut probe).unwrap();
+            assert_eq!(probe.data, want);
+        }
+    }
+
+    // A delete-capable read-only volume — every tiered one — takes the in-memory
+    // loader's read-write branch, which fails on the same unwritable directory
+    // that refused the .sdx. It has to end up read-only rather than offline.
+    #[test]
+    #[cfg(unix)]
+    fn test_delete_capable_volume_falls_all_the_way_back_to_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root ignores the directory mode, so there is nothing to simulate.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        {
+            let mut v = make_test_volume(&dir);
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x1234),
+                data: b"still-readable".to_vec(),
+                data_size: 14,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            v.set_read_only_persist(true, true).unwrap();
+            v.sync_to_disk().unwrap();
+        }
+
+        let set_mode = |path: &std::path::Path, mode: u32| {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
+        let idx_path = tmp.path().join("1.idx");
+        set_mode(&idx_path, 0o444);
+        set_mode(tmp.path(), 0o555);
+
+        let loaded = Volume::new(
+            &dir,
+            &dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        );
+        set_mode(tmp.path(), 0o755);
+        set_mode(&idx_path, 0o644);
+
+        let v = loaded.expect("a delete-capable volume must mount without a writable index dir");
+        assert!(
+            v.no_write_or_delete,
+            "with no writer for tombstones, deletes have to be refused outright"
+        );
+        let mut probe = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        v.read_needle(&mut probe).unwrap();
+        assert_eq!(probe.data, b"still-readable");
+    }
+
+    // Issue #10937: a volume server holding hundreds of thousands of cloud-tiered
+    // volumes ran out of descriptors because every one of them pinned its index
+    // for the life of the process. A tiered volume must search the on-disk .sdx
+    // and hold nothing open while it sits idle.
+    #[test]
+    fn test_remote_volume_index_is_on_disk_and_holds_no_descriptors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        {
+            let mut v = make_test_volume(dir);
+            for i in 1..=4u64 {
+                let mut n = Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(0x1234),
+                    data: format!("needle-{i}").into_bytes(),
+                    data_size: format!("needle-{i}").len() as u32,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true, false).unwrap();
+            }
+
+            // A writable volume does pin its .idx, which is also what proves the
+            // descriptor probe below is looking at something real.
+            if let Some(count) = crate::storage::needle_map::file_pool::open_index_fds(tmp.path()) {
+                assert!(count > 0, "a writable volume should hold its .idx open");
+            }
+
+            let vif = VifVolumeInfo {
+                files: vec![VifRemoteFile {
+                    backend_type: "s3".to_string(),
+                    backend_id: "vif_fd_test".to_string(),
+                    key: "remote-key".to_string(),
+                    offset: 0,
+                    file_size: v.dat_file_size().unwrap(),
+                    modified_time: 123,
+                    extension: ".dat".to_string(),
+                }],
+                version: v.version().0 as u32,
+                ..VifVolumeInfo::default()
+            };
+            std::fs::write(
+                format!("{}/1.vif", dir),
+                serde_json::to_string_pretty(&vif).unwrap(),
+            )
+            .unwrap();
+
+            let tier_config = crate::remote_storage::s3_tier::S3TierConfig {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "bucket-a".to_string(),
+                endpoint: "http://127.0.0.1:1".to_string(),
+                storage_class: "STANDARD".to_string(),
+                force_path_style: true,
+            };
+            crate::remote_storage::s3_tier::global_s3_tier_registry()
+                .write()
+                .unwrap()
+                .register(
+                    "s3.vif_fd_test".to_string(),
+                    crate::remote_storage::s3_tier::S3TierBackend::new(&tier_config),
+                );
+        }
+
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+
+        assert!(v.has_remote_file);
+        let Some(NeedleMap::SortedFile(ref nm)) = v.nm else {
+            panic!("tiered volume should search the on-disk .sdx, got {:?}", v.nm.is_some());
+        };
+        let idx_path = nm.index_file_name().to_string();
+        let sdx_path = nm.db_file_name().to_string();
+        assert!(Path::new(&sdx_path).exists(), "load should build the .sdx");
+
+        let drop_pooled = || {
+            crate::storage::needle_map::file_pool::pooled_index_files().discard(&idx_path);
+            crate::storage::needle_map::file_pool::pooled_index_files().discard(&sdx_path);
+        };
+
+        if crate::storage::needle_map::file_pool::open_index_fds(tmp.path()).is_some() {
+            drop_pooled();
+            assert_eq!(
+                crate::storage::needle_map::file_pool::open_index_fds(tmp.path()),
+                Some(0),
+                "a loaded tiered volume must hold no .idx/.sdx descriptor"
+            );
+        }
+
+        // Lookups still resolve, straight off .sdx.
+        assert!(!v.nm.as_ref().unwrap().get(NeedleId(3)).unwrap().unwrap().size.is_deleted());
+        assert!(v.nm.as_ref().unwrap().get(NeedleId(9)).unwrap().is_none());
+
+        // Deletes are still allowed on a tiered volume and land in .idx.
+        let idx_before = std::fs::metadata(&idx_path).unwrap().len();
+        let deleted = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(3),
+                cookie: Cookie(0x1234),
+                ..Needle::default()
+            })
+            .unwrap();
+        assert!(deleted.0 > 0);
+        assert_eq!(
+            std::fs::metadata(&idx_path).unwrap().len(),
+            idx_before + NEEDLE_MAP_ENTRY_SIZE as u64,
+            "the tombstone must be appended to the .idx tail"
+        );
+        assert!(v.nm.as_ref().unwrap().get(NeedleId(3)).unwrap().unwrap().size.is_deleted());
+
+        if crate::storage::needle_map::file_pool::open_index_fds(tmp.path()).is_some() {
+            drop_pooled();
+            assert_eq!(
+                crate::storage::needle_map::file_pool::open_index_fds(tmp.path()),
+                Some(0),
+                "reads and deletes must give their borrowed handles back"
+            );
+        }
+
+        crate::remote_storage::s3_tier::global_s3_tier_registry()
+            .write()
+            .unwrap()
+            .remove("s3.vif_fd_test");
+    }
+
     #[test]
     fn test_set_writable_keeps_remote_delete_only_mode() {
         let tmp = TempDir::new().unwrap();
@@ -4935,7 +7370,7 @@ mod tests {
             modified_time: 123,
             extension: ".dat".to_string(),
         });
-        v.refresh_remote_write_mode();
+        v.refresh_remote_write_mode().unwrap();
         v.set_writable().unwrap();
 
         assert!(v.is_read_only());
@@ -4962,8 +7397,8 @@ mod tests {
                 data_size: 7,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
-            v.set_read_only_persist(true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
+            v.set_read_only_persist(false, true).unwrap();
             v.sync_to_disk().unwrap();
         }
 
@@ -4984,12 +7419,16 @@ mod tests {
             "reloaded volume should be read-only from .vif"
         );
         assert!(
-            !v.nm.as_ref().unwrap().has_idx_writer(),
-            "read-only load should not attach an .idx writer"
+            matches!(v.nm, Some(NeedleMap::SortedFile(_))),
+            "read-only load should search the on-disk .sdx"
         );
 
         v.set_writable().unwrap();
         assert!(!v.is_read_only());
+        assert!(
+            !matches!(v.nm, Some(NeedleMap::SortedFile(_))),
+            "set_writable must swap out the read-only map, whose put always fails"
+        );
         assert!(
             v.nm.as_ref().unwrap().has_idx_writer(),
             "set_writable must reattach the .idx writer or post-restart writes vanish"
@@ -5002,7 +7441,7 @@ mod tests {
             data_size: 19,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
         v.sync_to_disk().unwrap();
 
         // Reload one more time — the .idx must contain the post-mark-writable
@@ -5026,6 +7465,180 @@ mod tests {
         };
         v.read_needle(&mut probe).unwrap();
         assert_eq!(std::str::from_utf8(&probe.data).unwrap(), "after-mark-writable");
+    }
+
+    // readOnlyCanDelete rejects writes, keeps accepting deletes, and survives
+    // a restart.
+    #[test]
+    fn test_read_only_can_delete_persists_and_keeps_deletes_working() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        {
+            let mut v = make_test_volume(dir);
+            for id in 1..=2u64 {
+                let mut n = Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(id as u32),
+                    data: b"payload".to_vec(),
+                    data_size: 7,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true, false).unwrap();
+            }
+            v.set_read_only_persist(true, true).unwrap();
+            assert!(v.no_write_can_delete);
+            assert!(!v.no_write_or_delete);
+            assert!(v.is_read_only());
+
+            let err = v
+                .write_needle(
+                    &mut Needle {
+                        id: NeedleId(3),
+                        cookie: Cookie(3),
+                        data: b"blocked".to_vec(),
+                        data_size: 7,
+                        ..Needle::default()
+                    },
+                    true,
+                    false,
+                )
+                .unwrap_err();
+            assert!(matches!(err, VolumeError::ReadOnly));
+
+            let deleted = v
+                .delete_needle(&mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(1),
+                    ..Needle::default()
+                })
+                .unwrap();
+            assert!(deleted.0 > 0, "deletes must still land");
+            v.sync_to_disk().unwrap();
+        }
+
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        assert!(v.no_write_can_delete, "state must survive a restart");
+        assert!(!v.no_write_or_delete);
+        assert!(
+            v.nm.as_ref().unwrap().has_idx_writer(),
+            "canDelete boot must attach an .idx writer for delete tombstones"
+        );
+
+        let err = v
+            .write_needle(
+                &mut Needle {
+                    id: NeedleId(4),
+                    cookie: Cookie(4),
+                    data: b"blocked".to_vec(),
+                    data_size: 7,
+                    ..Needle::default()
+                },
+                true,
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::ReadOnly));
+
+        let deleted = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(2),
+                cookie: Cookie(2),
+                ..Needle::default()
+            })
+            .unwrap();
+        assert!(deleted.0 > 0, "deletes must still land after restart");
+
+        // downgrading to plain readonly clears the canDelete flag
+        v.set_read_only_persist(false, true).unwrap();
+        assert!(v.no_write_or_delete);
+        assert!(!v.no_write_can_delete);
+
+        // -writable clears the state again.
+        v.set_writable().unwrap();
+        assert!(!v.is_read_only());
+        let mut n = Needle {
+            id: NeedleId(5),
+            cookie: Cookie(5),
+            data: b"writable-again".to_vec(),
+            data_size: 14,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+    }
+
+    // Upgrading a volume that booted plain persisted-readonly to canDelete
+    // must attach the missing .idx writer, or delete tombstones cannot append.
+    #[test]
+    fn test_read_only_can_delete_upgrade_after_readonly_boot() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        {
+            let mut v = make_test_volume(dir);
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                data: b"payload".to_vec(),
+                data_size: 7,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+            v.set_read_only_persist(false, true).unwrap();
+            v.sync_to_disk().unwrap();
+        }
+
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        assert!(v.no_write_or_delete);
+        let err = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                ..Needle::default()
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, VolumeError::ReadOnly),
+            "plain readonly must reject deletes"
+        );
+
+        v.set_read_only_persist(true, true).unwrap();
+        assert!(!v.no_write_or_delete);
+        assert!(v.no_write_can_delete);
+        assert!(
+            v.nm.as_ref().unwrap().has_idx_writer(),
+            "upgrade to canDelete must attach the .idx writer"
+        );
+        let deleted = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                ..Needle::default()
+            })
+            .unwrap();
+        assert!(deleted.0 > 0, "deletes must land once canDelete is set");
     }
 
     #[test]
@@ -5156,7 +7769,7 @@ mod tests {
                 data_size: 11,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
             v.sync_to_disk().unwrap();
             std::fs::read(v.file_name(".dat")).unwrap()
         };
@@ -5267,7 +7880,7 @@ mod tests {
             data_size: 4,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
 
         // Write a .vif file (as EC encode would)
         let vif_path = format!("{}/1.vif", dir);
@@ -5327,7 +7940,7 @@ mod tests {
             data_size: 5,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
 
         // Write .vif in data dir (as EC encode would)
         let vif_path = format!("{}/1.vif", dat_dir);
@@ -5369,7 +7982,7 @@ mod tests {
             data_size: 4,
             ..Needle::default()
         };
-        v.write_needle(&mut n, true).unwrap();
+        v.write_needle(&mut n, true, false).unwrap();
 
         let vif_path = format!("{}/1.vif", dir);
         std::fs::write(&vif_path, r#"{"version":3}"#).unwrap();
@@ -5411,7 +8024,7 @@ mod tests {
                 data_size: format!("data-{}", i).len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         for id in [2u64, 5u64] {
             let mut del = Needle {
@@ -5476,7 +8089,7 @@ mod tests {
                 data_size: format!("data-{}", i).len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.compact_by_index(0, 0, |_| true).unwrap();
 
@@ -5512,7 +8125,7 @@ mod tests {
                 data_size: format!("data-{}", i).len() as u32,
                 ..Needle::default()
             };
-            v.write_needle(&mut n, true).unwrap();
+            v.write_needle(&mut n, true, false).unwrap();
         }
         v.sync_to_disk().unwrap();
 

@@ -39,7 +39,7 @@ func noopLookupFn() wdclient.LookupFileIdFunctionType {
 func sectionReaderPatternFor(t *testing.T, mode ReaderCacheMode) *ReaderPattern {
 	t.Helper()
 
-	group, err := NewChunkGroupWithMode(noopLookupFn(), alwaysMissChunkCache{}, []*filer_pb.FileChunk{}, 1, mode)
+	group, err := NewChunkGroupWithMode(noopLookupFn(), alwaysMissChunkCache{}, []*filer_pb.FileChunk{}, 1, mode, nil, nil)
 	if err != nil {
 		t.Fatalf("NewChunkGroupWithMode(%q): %v", mode, err)
 	}
@@ -103,7 +103,7 @@ func TestReaderCacheModeAutoStillInfers(t *testing.T) {
 // NewChunkGroup is the mode-less constructor upstream code calls. It must keep
 // meaning "auto" so the fork's addition is strictly opt-in.
 func TestNewChunkGroupDefaultsToAuto(t *testing.T) {
-	group, err := NewChunkGroup(noopLookupFn(), alwaysMissChunkCache{}, []*filer_pb.FileChunk{}, 1)
+	group, err := NewChunkGroup(noopLookupFn(), alwaysMissChunkCache{}, []*filer_pb.FileChunk{}, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("NewChunkGroup: %v", err)
 	}

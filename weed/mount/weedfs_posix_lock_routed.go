@@ -94,7 +94,7 @@ func (wfs *WFS) posixLockKeyForInode(inode uint64) (string, bool) {
 	if status != fuse.OK {
 		return "", false
 	}
-	if entry, st := wfs.maybeLoadEntry(path); st == fuse.OK && entry != nil && len(entry.HardLinkId) > 0 {
+	if entry, _, st := wfs.maybeLoadEntry(path); st == fuse.OK && entry != nil && len(entry.HardLinkId) > 0 {
 		return posixLockKeyPrefix + "hl:" + hex.EncodeToString(entry.HardLinkId), true
 	}
 	return posixLockKeyPrefix + string(path), true
@@ -102,9 +102,9 @@ func (wfs *WFS) posixLockKeyForInode(inode uint64) (string, bool) {
 
 func posixLockTypeToWire(typ uint32) uint32 {
 	switch typ {
-	case fRdlck:
+	case f_RDLCK:
 		return posixlock.Read
-	case fWrlck:
+	case f_WRLCK:
 		return posixlock.Write
 	default:
 		return posixlock.Unlock
@@ -114,11 +114,11 @@ func posixLockTypeToWire(typ uint32) uint32 {
 func posixLockTypeFromWire(typ uint32) uint32 {
 	switch typ {
 	case posixlock.Read:
-		return fRdlck
+		return f_RDLCK
 	case posixlock.Write:
-		return fWrlck
+		return f_WRLCK
 	default:
-		return fUnlck
+		return f_UNLCK
 	}
 }
 
@@ -185,7 +185,7 @@ func (wfs *WFS) routedGetLk(cancel <-chan struct{}, in *fuse.LkIn, out *fuse.LkO
 		out.Lk.Start, out.Lk.End, out.Lk.Pid = c.GetStart(), c.GetEnd(), c.GetPid()
 		out.Lk.Typ = posixLockTypeFromWire(c.GetType())
 	} else {
-		out.Lk.Typ = fUnlck
+		out.Lk.Typ = f_UNLCK
 	}
 	return fuse.OK
 }

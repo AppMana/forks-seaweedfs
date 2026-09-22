@@ -44,6 +44,10 @@ func init() {
 const (
 	readbufferSize                 = 16
 	jwtFilerTokenExpirationSeconds = 300
+	// mtime is only second resolution, so a directory touched this recently is
+	// left for the next run rather than compared against a timestamp a
+	// concurrent write could share
+	directoryQuietPeriod = 5 * time.Second
 )
 
 type commandVolumeFsck struct {
@@ -64,6 +68,11 @@ type commandVolumeFsck struct {
 	// readNeedleMeta returns a needle's append time as the volume server
 	// reads it at the copied index offset; tests replace it.
 	readNeedleMeta func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) (appendAtNs uint64, err error)
+	// Test seams for purge transport; production uses MasterClient and operation.
+	volumeServers  func(volumeId uint32) (servers []pb.ServerAddress, found bool)
+	deleteFileIds  func(server pb.ServerAddress, fileIds []string) []*volume_server_pb.DeleteResult
+	purgedDirsLock sync.Mutex
+	purgedDirs     map[util.FullPath]struct{}
 }
 
 func (c *commandVolumeFsck) Name() string {
@@ -125,6 +134,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	// unresolved-manifest counter so a previous failed run can't permanently
 	// suppress -reallyDeleteFromVolume in this session.
 	c.unresolvedManifestEntries.Store(0)
+	c.purgedDirs = make(map[util.FullPath]struct{})
 
 	if err = commandEnv.confirmIsLocked(args); err != nil {
 		return
@@ -251,6 +261,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 				return fmt.Errorf("findFilerChunksMissingInVolumeServers: %w", err)
 			}
 		}
+		c.purgeEmptyDirectories()
 	} else {
 		// collect all filer file ids
 		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, false, 0, 0); err != nil {
@@ -308,7 +319,7 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 			if *c.verbose && entry.Entry.IsDirectory {
 				fmt.Fprintf(c.writer, "checking directory %s\n", util.NewFullPath(entry.Dir, entry.Entry.Name))
 			}
-			dataChunks, manifestChunks, resolveErr := filer.ResolveChunkManifest(ctx, filer.LookupFn(c.env), entry.Entry.GetChunks(), 0, math.MaxInt64)
+			dataChunks, manifestChunks, resolveErr := filer.ResolveChunkManifest(ctx, filer.LookupFn(c.env), entry.Entry.GetChunks(), 0, math.MaxInt64, nil)
 			if resolveErr != nil {
 				// Cancellation/deadline isn't manifest corruption; surface it
 				// so the BFS bails out cleanly without polluting the
@@ -376,7 +387,9 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 					fmt.Fprintf(c.writer, "%d,%x%08x %s volume not found\n", i.vid, i.fileKey, i.cookie, i.path)
 					if purgeAbsent {
 						fmt.Fprintf(c.writer, "deleting path %s after volume not found\n", i.path)
-						c.httpDelete(i.path)
+						if err := c.httpDelete(i.path); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -503,7 +516,7 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 
 // purgeOneVolume picks the orphan fids to delete for a single volume and
 // fires the delete RPC. It's split out of findExtraChunksInVolumeServers so
-// the `defer markVolumeWritable(..., false, false)` at the bottom fires
+// the `defer markVolumeWritable(context.Background(), ..., false, false)` at the bottom fires
 // between volumes — putting that defer inside the caller's for-loop would
 // leave every processed volume writable until the whole fsck run finished.
 func (c *commandVolumeFsck) purgeOneVolume(volumeId uint32, orphanReplicaFileIds map[string]int, replicaCount int, readOnlyReplicas []pb.ServerAddress) error {
@@ -525,12 +538,12 @@ func (c *commandVolumeFsck) purgeOneVolume(volumeId uint32, orphanReplicaFileIds
 
 	needleVID := needle.VolumeId(volumeId)
 	for _, server := range readOnlyReplicas {
-		if err := markVolumeWritable(c.env.option.GrpcDialOption, needleVID, server, true, false); err != nil {
+		if err := markVolumeWritable(context.Background(), c.env.option.GrpcDialOption, needleVID, server, true, false); err != nil {
 			// Replicas flipped writable earlier roll back via the defer.
 			return fmt.Errorf("mark %v writable: %v", server, err)
 		}
 		fmt.Fprintf(c.writer, "temporarily marked %d on server %v writable for forced purge\n", volumeId, server)
-		defer markVolumeWritable(c.env.option.GrpcDialOption, needleVID, server, false, false)
+		defer markVolumeWritable(context.Background(), c.env.option.GrpcDialOption, needleVID, server, false, false)
 	}
 
 	if *c.verbose {
@@ -598,7 +611,7 @@ type Item struct {
 	path    util.FullPath
 }
 
-func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleId types.NeedleId, itemPath util.FullPath)) error {
+func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleId types.NeedleId, itemPath util.FullPath) error) error {
 	fp, err := os.Open(getFilerFileIdFile(c.tempFolder, volumeId))
 	if err != nil {
 		return err
@@ -634,7 +647,9 @@ func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleI
 		}
 		item.path = util.FullPath(pathBytes)
 		needleId := types.NeedleId(item.fileKey)
-		fn(needleId, item.path)
+		if err := fn(needleId, item.path); err != nil {
+			return fmt.Errorf("process fid %d,%x%08x path %q: %w", volumeId, item.fileKey, item.cookie, item.path, err)
+		}
 	}
 	return nil
 }
@@ -650,24 +665,24 @@ func (c *commandVolumeFsck) oneVolumeFileIdsCheckOneVolume(dataNodeId string, vo
 	if err = db.LoadFromIdx(getVolumeFileIdFile(c.tempFolder, dataNodeId, volumeId)); err != nil {
 		return
 	}
-	if err = c.readFilerFileIdFile(volumeId, func(needleId types.NeedleId, itemPath util.FullPath) {
+	if err = c.readFilerFileIdFile(volumeId, func(needleId types.NeedleId, itemPath util.FullPath) error {
 		if _, found := db.Get(needleId); !found {
 			fmt.Fprintf(c.writer, "%s\n", itemPath)
 			if applyPurging {
-				c.httpDelete(itemPath)
+				return c.httpDelete(itemPath)
 			}
 		}
+		return nil
 	}); err != nil {
 		return
 	}
 	return nil
 }
 
-func (c *commandVolumeFsck) httpDelete(path util.FullPath) {
+func (c *commandVolumeFsck) httpDelete(path util.FullPath) error {
 	req, err := http.NewRequest(http.MethodDelete, "", nil)
 	if err != nil {
-		fmt.Fprintf(c.writer, "HTTP delete request error: %v\n", err)
-		return
+		return fmt.Errorf("create HTTP DELETE request for %q: %w", path, err)
 	}
 
 	req.URL = &url.URL{
@@ -687,20 +702,103 @@ func (c *commandVolumeFsck) httpDelete(path util.FullPath) {
 
 	resp, err := util_http.GetGlobalHttpClient().Do(req)
 	if err != nil {
-		fmt.Fprintf(c.writer, "DELETE fetch error: %v\n", err)
-		return
+		return fmt.Errorf("DELETE %q: %w", path, err)
 	}
 	defer resp.Body.Close()
 
-	_, err = io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Fprintf(c.writer, "DELETE response error: %v\n", err)
+	if _, err = io.ReadAll(resp.Body); err != nil {
+		return fmt.Errorf("read DELETE %q response: %w", path, err)
 	}
 
 	if *c.verbose {
 		fmt.Fprintln(c.writer, "delete response Status : ", resp.Status)
 		fmt.Fprintln(c.writer, "delete response Headers : ", resp.Header)
 	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("DELETE %q returned %s", path, resp.Status)
+	}
+	dir, _ := path.DirAndName()
+	c.purgedDirsLock.Lock()
+	c.purgedDirs[util.FullPath(dir)] = struct{}{}
+	c.purgedDirsLock.Unlock()
+	return nil
+}
+
+// purgeEmptyDirectories removes the directories emptied by the purged entries, walking up while each parent is empty too.
+func (c *commandVolumeFsck) purgeEmptyDirectories() {
+	candidates := make(map[util.FullPath]struct{})
+	c.purgedDirsLock.Lock()
+	for dir := range c.purgedDirs {
+		for d := dir; c.canPurgeDirectory(d); {
+			candidates[d] = struct{}{}
+			parent, _ := d.DirAndName()
+			d = util.FullPath(parent)
+		}
+	}
+	c.purgedDirsLock.Unlock()
+
+	dirs := make([]util.FullPath, 0, len(candidates))
+	for dir := range candidates {
+		dirs = append(dirs, dir)
+	}
+	// deepest first, so a directory is only tried once its children are gone
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+
+	for _, dir := range dirs {
+		entry, _, _, lookupErr := filer_pb.GetEntry(context.Background(), c.env, dir)
+		if lookupErr != nil && !errors.Is(lookupErr, filer_pb.ErrNotFound) {
+			fmt.Fprintf(c.writer, "lookup directory %s: %v\n", dir, lookupErr)
+			continue
+		}
+		// a directory key object is an S3 object of its own
+		if entry == nil || entry.IsDirectoryKeyObject() {
+			continue
+		}
+		// a zero mtime turns the delete's condition off, leaving nothing to hold it to
+		mtime := entry.Attributes.GetMtime()
+		if mtime <= 0 || mtime >= time.Now().Add(-directoryQuietPeriod).Unix() {
+			continue
+		}
+		if err := c.deleteEmptyDirectory(dir, mtime); err != nil {
+			if !errors.Is(err, filer.ErrNonEmptyFolder) {
+				fmt.Fprintf(c.writer, "delete empty directory %s: %v\n", dir, err)
+			}
+			continue
+		}
+		fmt.Fprintf(c.writer, "deleted empty directory %s\n", dir)
+	}
+}
+
+// deleteEmptyDirectory deletes dir unless it changed since it was looked up at mtime,
+// so a directory promoted to an S3 object meanwhile survives. The delete is not
+// recursive, leaving the filer to reject a directory that is not empty.
+func (c *commandVolumeFsck) deleteEmptyDirectory(dir util.FullPath, mtime int64) error {
+	parent, name := dir.DirAndName()
+	return c.env.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.DeleteEntry(context.Background(), &filer_pb.DeleteEntryRequest{
+			Directory:          parent,
+			Name:               name,
+			IfNotModifiedAfter: mtime,
+		})
+		if err != nil {
+			return err
+		}
+		if resp.Error != "" {
+			return filer.DeleteEntryError(resp.Error)
+		}
+		return nil
+	})
+}
+
+func (c *commandVolumeFsck) canPurgeDirectory(dir util.FullPath) bool {
+	root := c.getCollectFilerFilePath()
+	if string(dir) == root || !strings.HasPrefix(string(dir), strings.TrimSuffix(root, "/")+"/") {
+		return false
+	}
+	// deleting a bucket drops its whole collection
+	parent, _ := dir.DirAndName()
+	return string(dir) != c.bucketsPath && parent != c.bucketsPath
 }
 
 func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId string, volumeId uint32, vinfo *VInfo, modifyFrom, cutoffFrom uint64) (inUseCount uint64, orphanFileIds []string, orphanDataSize uint64, err error) {
@@ -713,7 +811,7 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		return
 	}
 
-	if err = c.readFilerFileIdFile(volumeId, func(filerNeedleId types.NeedleId, itemPath util.FullPath) {
+	if err = c.readFilerFileIdFile(volumeId, func(filerNeedleId types.NeedleId, itemPath util.FullPath) error {
 		inUseCount++
 		if *c.verifyNeedle && !vinfo.isEcVolume {
 			if needleValue, ok := volumeFileIdDb.Get(filerNeedleId); ok && !needleValue.Size.IsDeleted() {
@@ -723,7 +821,7 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 						fmt.Fprintf(c.writer, "failed to read %d:%s needle status of file %s: %+v\n",
 							volumeId, filerNeedleId.String(), itemPath, err)
 						if *c.forcePurging {
-							return
+							return nil
 						}
 					}
 				}
@@ -733,6 +831,7 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		if err = volumeFileIdDb.Delete(filerNeedleId); err != nil && *c.verbose {
 			fmt.Fprintf(c.writer, "failed to nm.delete %s(%+v): %+v", itemPath, filerNeedleId, err)
 		}
+		return nil
 	}); err != nil {
 		err = fmt.Errorf("failed to readFilerFileIdFile %+v", err)
 		return
@@ -870,38 +969,86 @@ func (c *commandVolumeFsck) collectVolumeIds() (volumeIdToServer map[string]map[
 
 func (c *commandVolumeFsck) purgeFileIdsForOneVolume(volumeId uint32, fileIds []string) (err error) {
 	fmt.Fprintf(c.writer, "purging orphan data for volume %d...\n", volumeId)
-	locations, found := c.env.MasterClient.GetLocations(volumeId)
+	var servers []pb.ServerAddress
+	var found bool
+	if c.volumeServers != nil {
+		servers, found = c.volumeServers(volumeId)
+	} else {
+		locations, locationsFound := c.env.MasterClient.GetLocations(volumeId)
+		found = locationsFound
+		for _, location := range locations {
+			servers = append(servers, location.ServerAddress())
+		}
+	}
 	if !found {
 		return fmt.Errorf("failed to find volume %d locations", volumeId)
 	}
+	if len(servers) == 0 {
+		return fmt.Errorf("incomplete purge for volume %d: no volume servers found", volumeId)
+	}
 
-	resultChan := make(chan []*volume_server_pb.DeleteResult, len(locations))
+	type serverDeleteResults struct {
+		server  pb.ServerAddress
+		results []*volume_server_pb.DeleteResult
+	}
+	resultChan := make(chan serverDeleteResults, len(servers))
 	var wg sync.WaitGroup
-	for _, location := range locations {
+	for _, server := range servers {
 		wg.Add(1)
 		go func(server pb.ServerAddress, fidList []string) {
 			defer wg.Done()
 
-			deleteResults := operation.DeleteFileIdsAtOneVolumeServer(server, c.env.option.GrpcDialOption, fidList, false)
-			if deleteResults != nil {
-				resultChan <- deleteResults
+			var deleteResults []*volume_server_pb.DeleteResult
+			if c.deleteFileIds != nil {
+				deleteResults = c.deleteFileIds(server, fidList)
+			} else {
+				deleteResults = operation.DeleteFileIdsAtOneVolumeServer(server, c.env.option.GrpcDialOption, fidList, false)
 			}
-
-		}(location.ServerAddress(), fileIds)
+			resultChan <- serverDeleteResults{server: server, results: deleteResults}
+		}(server, fileIds)
 	}
 	wg.Wait()
 	close(resultChan)
 
-	for results := range resultChan {
-		for _, result := range results {
+	expected := make(map[string]int, len(fileIds))
+	for _, fileId := range fileIds {
+		expected[fileId]++
+	}
+	var purgeErrors []error
+	for response := range resultChan {
+		seen := make(map[string]int, len(response.results))
+		for resultIndex, result := range response.results {
+			if result == nil {
+				purgeErrors = append(purgeErrors, fmt.Errorf("server %s returned nil result at index %d", response.server, resultIndex))
+				continue
+			}
+			if expected[result.FileId] == 0 {
+				purgeErrors = append(purgeErrors, fmt.Errorf("server %s returned result for unexpected file %q", response.server, result.FileId))
+				continue
+			}
+			seen[result.FileId]++
+			if seen[result.FileId] > expected[result.FileId] {
+				purgeErrors = append(purgeErrors, fmt.Errorf("server %s returned too many results for file %q", response.server, result.FileId))
+			}
 			if result.Error != "" {
-				fmt.Fprintf(c.writer, "purge error: %s\n", result.Error)
-				err = fmt.Errorf("incomplete purge for volume %d: %s", volumeId, result.Error)
+				purgeErrors = append(purgeErrors, fmt.Errorf("server %s failed to purge file %q: %s", response.server, result.FileId, result.Error))
+			} else if result.Status != http.StatusAccepted && result.Status != http.StatusNotModified {
+				purgeErrors = append(purgeErrors, fmt.Errorf("server %s returned status %d for file %q", response.server, result.Status, result.FileId))
+			}
+		}
+		for fileId, count := range expected {
+			if seen[fileId] < count {
+				purgeErrors = append(purgeErrors, fmt.Errorf("server %s returned %d of %d results for file %q", response.server, seen[fileId], count, fileId))
 			}
 		}
 	}
-
-	return
+	if len(purgeErrors) == 0 {
+		return nil
+	}
+	for _, purgeErr := range purgeErrors {
+		fmt.Fprintf(c.writer, "purge error: %s\n", purgeErr)
+	}
+	return fmt.Errorf("incomplete purge for volume %d: %w", volumeId, errors.Join(purgeErrors...))
 }
 
 func (c *commandVolumeFsck) getCollectFilerFilePath() string {

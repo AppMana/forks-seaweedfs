@@ -1,7 +1,10 @@
 [package]
 name = "weed-volume"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+# The edition needs 1.85; the dependency tree needs more. Verified with
+# `cargo +1.91.1 check --all-targets` (1.90 fails on the AWS SDK).
+rust-version = "1.91.1"
 description = "SeaweedFS Volume Server — Rust implementation"
 
 [lib]
@@ -16,6 +19,9 @@ path = "src/main.rs"
 # Disable with --no-default-features for 4-byte offsets (32GB max volume size).
 default = ["5bytes"]
 5bytes = []
+# Unstable redb cursor bulk-load for full_rebuild. Off in production.
+# Pulls redb's experimental_cursor (and therefore experimental-api-5).
+redb-experimental-cursor = ["redb/experimental_cursor"]
 
 [dependencies]
 # Async runtime
@@ -57,7 +63,7 @@ rustls-pemfile = "2"
 rusty-leveldb = "3"
 
 # Disk-backed needle map (alternative to in-memory HashMap)
-redb = "3"
+redb = "4"
 
 # Reed-Solomon erasure coding
 reed-solomon-erasure = "6"
@@ -74,6 +80,9 @@ serde_urlencoded = "0.7"
 # CRC32 — using Castagnoli polynomial (CRC32-C), matching Go's crc32.Castagnoli
 crc32c = "0.6"
 crc32fast = "1"
+
+# xxhash64 - must match Go's cespare/xxhash for the heartbeat volume digest
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # Memory-mapped files
 memmap2 = "0.9"
@@ -103,7 +112,7 @@ mime_guess = "2"
 
 # Misc
 bytes = "1"
-rand = "0.8"
+rand = "0.10"
 chrono = "0.4"
 hex = "0.4"
 parking_lot = "0.12"
@@ -134,6 +143,10 @@ tempfile = "3"
 
 [build-dependencies]
 tonic-build = "0.12"
+# Ships protoc with the build so neither CI nor a developer needs a system
+# install, and so the version is pinned rather than whatever the platform's
+# package manager happens to carry.
+protoc-bin-vendored = "3"
 
 [patch.crates-io]
 reed-solomon-erasure = { path = "vendor/reed-solomon-erasure" }

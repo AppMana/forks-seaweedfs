@@ -1,12 +1,14 @@
 package shell
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"slices"
@@ -27,7 +29,7 @@ func init() {
 }
 
 type commandVolumeFixReplication struct {
-	collectionPattern *string
+	collectionMatcher *wildcard.CollectionMatcher
 	// TODO: move parameter flags here so we don't shuffle them around via function calls.
 }
 
@@ -42,6 +44,10 @@ func (c *commandVolumeFixReplication) Help() string {
 
 	This command also finds all under-replicated volumes, and finds volume servers with free slots.
 	If the free slots satisfy the replication requirement, the volume content is copied over and mounted.
+
+	Misplaced volumes with a surplus replica have a misplaced replica deleted. Without a surplus, a
+	well-placed replica is added first and the misplaced one is trimmed on a later pass, so the volume
+	never drops below its intended replica count.
 
 	volume.fix.replication                                # do not take action
 	volume.fix.replication -apply                         # actually deleting or copying the volume files and mount the volume
@@ -65,7 +71,7 @@ func (c *commandVolumeFixReplication) HasTag(tag CommandTag) bool {
 func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	volFixReplicationCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
-	c.collectionPattern = volFixReplicationCommand.String("collectionPattern", "", "match with wildcard characters '*' and '?'")
+	collectionPattern := volFixReplicationCommand.String("collectionPattern", "", "comma-separated collection names, with '*' and '?' wildcards; empty matches all")
 	applyChanges := volFixReplicationCommand.Bool("apply", false, "apply the fix")
 	// TODO: remove this alias
 	applyChangesAlias := volFixReplicationCommand.Bool("force", false, "apply the fix (alias for -apply)")
@@ -79,6 +85,10 @@ func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, 
 
 	if err = volFixReplicationCommand.Parse(args); err != nil {
 		return nil
+	}
+
+	if c.collectionMatcher, err = wildcard.CompileCollectionMatcher(*collectionPattern); err != nil {
+		return err
 	}
 
 	handleDeprecatedForceFlag(writer, volFixReplicationCommand, applyChangesAlias, applyChanges)
@@ -121,7 +131,7 @@ func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, 
 			replica := replicas[0]
 
 			// Filter here so the termination counter matches what gets fixed; else -apply loops forever.
-			if !c.matchCollectionPattern(replica.info.Collection) {
+			if !c.collectionMatcher.Matches(replica.info.Collection) {
 				continue
 			}
 
@@ -137,14 +147,17 @@ func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, 
 				fmt.Fprintf(writer, "checking volume %d replication %s has %d replicas [%s]\n", replica.info.Id, replicaPlacement, len(replicas), strings.Join(locations, ", "))
 			}
 
-			switch {
-			case replicaPlacement.GetCopyCount() > len(replicas) || !satisfyReplicaCurrentLocation(replicaPlacement, replicas):
+			switch classifyReplicaSet(replicaPlacement, replicas) {
+			case replicaFixAddOne:
 				underReplicatedVolumeIds = append(underReplicatedVolumeIds, vid)
 				fmt.Fprintf(writer, "volume %d replication %s, but under replicated %+d\n", replica.info.Id, replicaPlacement, len(replicas))
-			case isMisplaced(replicas, replicaPlacement):
+			case replicaFixAddOneBeforeTrim:
+				underReplicatedVolumeIds = append(underReplicatedVolumeIds, vid)
+				fmt.Fprintf(writer, "volume %d replication %s is not well placed [%s], adding a well-placed replica before trimming the misplaced one\n", replica.info.Id, replicaPlacement, strings.Join(locations, ", "))
+			case replicaFixTrimMisplaced:
 				misplacedVolumeIds = append(misplacedVolumeIds, vid)
 				fmt.Fprintf(writer, "volume %d replication %s is not well placed [%s]\n", replica.info.Id, replicaPlacement, strings.Join(locations, ", "))
-			case replicaPlacement.GetCopyCount() < len(replicas):
+			case replicaFixTrimOver:
 				overReplicatedVolumeIds = append(overReplicatedVolumeIds, vid)
 				fmt.Fprintf(writer, "volume %d replication %s, but over replicated %+d\n", replica.info.Id, replicaPlacement, len(replicas))
 			}
@@ -155,6 +168,7 @@ func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, 
 			return fmt.Errorf("lock is lost")
 		}
 
+		var deletedVolumeReplicas atomic.Int64
 		ewg.Reset()
 		ewg.Add(func() error {
 			// find the most underpopulated data nodes
@@ -163,14 +177,18 @@ func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, 
 		})
 		if *doDelete {
 			ewg.Add(func() error {
-				return c.deleteOneVolume(commandEnv, writer, *applyChanges, *doCheck, overReplicatedVolumeIds, volumeReplicas, allLocations, pickOneReplicaToDelete)
+				deleted, err := c.deleteOneVolume(commandEnv, writer, *applyChanges, *doCheck, overReplicatedVolumeIds, volumeReplicas, pickOneReplicaToDelete)
+				deletedVolumeReplicas.Add(int64(deleted))
+				return err
 			})
 			ewg.Add(func() error {
-				return c.deleteOneVolume(commandEnv, writer, *applyChanges, *doCheck, misplacedVolumeIds, volumeReplicas, allLocations, pickOneMisplacedVolume)
+				deleted, err := c.deleteOneVolume(commandEnv, writer, *applyChanges, *doCheck, misplacedVolumeIds, volumeReplicas, pickOneMisplacedVolume)
+				deletedVolumeReplicas.Add(int64(deleted))
+				return err
 			})
 		}
 		if err := ewg.Wait(); err != nil {
-			return nil
+			return err
 		}
 
 		if !*applyChanges {
@@ -206,8 +224,58 @@ func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, 
 				}
 			}
 		}
+
+		// Without progress the next pass would reclassify the same volumes and
+		// loop forever, e.g. when no destination can accept a replica; stop
+		// instead. Deletions count as progress since they free up slots.
+		if underReplicatedVolumeIdsCount > 0 && len(fixedVolumeReplicas) == 0 && deletedVolumeReplicas.Load() == 0 {
+			fmt.Fprintf(writer, "no progress made on %d under replicated volumes, stopping; free up capacity or adjust replica placement, then re-run\n", underReplicatedVolumeIdsCount)
+			break
+		}
 	}
 	return nil
+}
+
+// replicaFix is the single next action volume.fix.replication takes on one
+// volume's replica set.
+type replicaFix int
+
+const (
+	replicaFixNothing replicaFix = iota
+	// replicaFixAddOne: the volume lacks a replica, in count or in
+	// failure-domain spread; copy one to a well-placed destination.
+	replicaFixAddOne
+	// replicaFixAddOneBeforeTrim: the replica count is complete but a replica
+	// is misplaced. Add a well-placed replica first; a later pass trims the
+	// misplaced one as surplus. Deleting first would drop the volume below its
+	// intended durability — for good, if no destination can take the
+	// replacement copy.
+	replicaFixAddOneBeforeTrim
+	// replicaFixTrimMisplaced: more replicas than the policy asks for, at
+	// least one misplaced; delete a misplaced one.
+	replicaFixTrimMisplaced
+	// replicaFixTrimOver: more replicas than the policy asks for; delete a
+	// surplus one.
+	replicaFixTrimOver
+)
+
+// classifyReplicaSet decides the next action for one volume. Add always wins
+// over trim: a volume that lacks a replica and also has a misplaced or surplus
+// one gets its missing replica first, and the trim happens on a later pass
+// once the new copy registered in the topology.
+func classifyReplicaSet(replicaPlacement *super_block.ReplicaPlacement, replicas []*VolumeReplica) replicaFix {
+	switch {
+	case replicaPlacement.GetCopyCount() > len(replicas) || !satisfyReplicaCurrentLocation(replicaPlacement, replicas):
+		return replicaFixAddOne
+	case isMisplaced(replicas, replicaPlacement):
+		if len(replicas) <= replicaPlacement.GetCopyCount() {
+			return replicaFixAddOneBeforeTrim
+		}
+		return replicaFixTrimMisplaced
+	case replicaPlacement.GetCopyCount() < len(replicas):
+		return replicaFixTrimOver
+	}
+	return replicaFixNothing
 }
 
 func collectVolumeReplicaLocations(topologyInfo *master_pb.TopologyInfo) (map[uint32][]*VolumeReplica, []location) {
@@ -266,22 +334,12 @@ func checkOneVolume(a *VolumeReplica, b *VolumeReplica, writer io.Writer, comman
 	return
 }
 
-// matchCollectionPattern reports whether collection matches -collectionPattern:
-// empty matches everything, CollectionDefault matches the unnamed collection.
-func (c *commandVolumeFixReplication) matchCollectionPattern(collection string) bool {
-	if *c.collectionPattern == "" {
-		return true
-	}
-	if *c.collectionPattern == CollectionDefault {
-		return collection == ""
-	}
-	return wildcard.MatchesWildcard(*c.collectionPattern, collection)
-}
-
-func (c *commandVolumeFixReplication) deleteOneVolume(commandEnv *CommandEnv, writer io.Writer, applyChanges bool, doCheck bool, volumeIds []uint32, volumeReplicas map[uint32][]*VolumeReplica, allLocations []location, selectOneVolumeFn SelectOneVolumeFunc) error {
+// deleteOneVolume trims one replica from each of the given volumes, and
+// reports how many replicas it actually deleted.
+func (c *commandVolumeFixReplication) deleteOneVolume(commandEnv *CommandEnv, writer io.Writer, applyChanges bool, doCheck bool, volumeIds []uint32, volumeReplicas map[uint32][]*VolumeReplica, selectOneVolumeFn SelectOneVolumeFunc) (deleted int, err error) {
 	if len(volumeIds) == 0 {
 		// nothing to do
-		return nil
+		return 0, nil
 	}
 
 	for _, vid := range volumeIds {
@@ -331,13 +389,15 @@ func (c *commandVolumeFixReplication) deleteOneVolume(commandEnv *CommandEnv, wr
 
 		// Surplus replica being trimmed; keep the remote object since other
 		// replicas of the same .vif still reference it.
-		if err := deleteVolume(commandEnv.option.GrpcDialOption, needle.VolumeId(replica.info.Id),
+		if err := deleteVolume(context.Background(), commandEnv.option.GrpcDialOption, needle.VolumeId(replica.info.Id),
 			pb.NewServerAddressFromDataNode(replica.location.dataNode), false, true); err != nil {
 			fmt.Fprintf(writer, "deleting volume %d from %s : %v", replica.info.Id, replica.location.dataNode.Id, err)
+		} else {
+			deleted++
 		}
 
 	}
-	return nil
+	return deleted, nil
 }
 
 func (c *commandVolumeFixReplication) fixUnderReplicatedVolumes(commandEnv *CommandEnv, writer io.Writer, applyChanges bool, volumeIds []uint32, volumeReplicas map[uint32][]*VolumeReplica, allLocations []location, retryCount int, volumesPerStep int, maxParallelization int, maxParallelizationPerServer int) (fixedVolumes map[string]int, err error) {
@@ -471,10 +531,10 @@ func (c *commandVolumeFixReplication) fixOneUnderReplicatedVolume(commandEnv *Co
 		return true, nil
 	}
 
-	err := replicateVolumeToServer(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(replica.info.Id),
+	err := replicateVolumeToServer(context.Background(), commandEnv.option.GrpcDialOption, writer, needle.VolumeId(replica.info.Id),
 		pb.NewServerAddressFromDataNode(replica.location.dataNode),
 		pb.NewServerAddressFromDataNode(dst.dataNode),
-		replica.info.DiskType)
+		replica.info.DiskType, 0)
 	scheduler.releaseTarget(dst, replica.info.DiskType, err == nil)
 	if err != nil {
 		return false, err

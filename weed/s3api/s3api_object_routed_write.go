@@ -17,8 +17,8 @@ import (
 
 // objectWriteRouteKeyPrefix namespaces an object's full path into the ring key
 // used to resolve and forward its writes. Shared by every routed builder so the
-// gateway and filer hash the same key.
-const objectWriteRouteKeyPrefix = "s3.object.write:"
+// gateway, the admin dashboard and the filer hash the same key.
+const objectWriteRouteKeyPrefix = s3_constants.ObjectWriteRouteKeyPrefix
 
 // objectRouteKey is the ring key the gateway hashes to resolve an object's owner
 // filer. It is also sent as route_key on each routed transaction, so a non-owner
@@ -170,7 +170,7 @@ func (s3a *S3ApiServer) objectTxnOnFiler(owner pb.ServerAddress, req *filer_pb.O
 	if s3a.ownerRecentlyUnreachable(owner) {
 		preferred = ""
 	}
-	err := s3a.withFilerClientFailover(preferred, false, txn)
+	err := s3a.withFilerClientFailover(context.Background(), preferred, false, txn)
 	return resp, err
 }
 

@@ -33,7 +33,11 @@ type LevelDbNeedleMap struct {
 	db            *leveldb.DB
 	ldbOpts       *opt.Options
 	ldbAccessLock sync.RWMutex
-	exitChan      chan bool
+	// Serialize the complete index/LevelDB mutation, not just the index append.
+	// Otherwise concurrent updates can publish a different order to each store
+	// and advance the replay watermark past a mutation not yet in LevelDB.
+	mutationLock sync.Mutex
+	exitChan     chan bool
 	// no need to use atomic
 	accessFlag  int64
 	ldbTimeout  int64
@@ -163,6 +167,8 @@ func (m *LevelDbNeedleMap) getFromDb(key NeedleId) (element *needle_map.NeedleVa
 }
 
 func (m *LevelDbNeedleMap) Put(key NeedleId, offset Offset, size Size) error {
+	m.mutationLock.Lock()
+	defer m.mutationLock.Unlock()
 	var oldSize Size
 	var watermark uint64
 	if m.ldbTimeout > 0 {
@@ -174,11 +180,11 @@ func (m *LevelDbNeedleMap) Put(key NeedleId, offset Offset, size Size) error {
 	if oldNeedle, ok := m.getFromDb(key); ok {
 		oldSize = oldNeedle.Size
 	}
-	m.logPut(key, oldSize, size)
 	// write to index file first
 	if err := m.appendToIndexFile(key, offset, size); err != nil {
 		return fmt.Errorf("cannot write to indexfile %s: %v", m.indexFile.Name(), err)
 	}
+	m.logPut(key, oldSize, size)
 	m.recordCount++
 	if m.recordCount%watermarkBatchSize != 0 {
 		watermark = 0
@@ -186,7 +192,7 @@ func (m *LevelDbNeedleMap) Put(key NeedleId, offset Offset, size Size) error {
 		watermark = (m.recordCount / watermarkBatchSize) * watermarkBatchSize
 		glog.V(1).Infof("put cnt:%d for %s,watermark: %d", m.recordCount, m.dbFileName, watermark)
 	}
-	return levelDbWrite(m.db, key, offset, size, watermark == 0, watermark)
+	return levelDbWrite(m.db, key, offset, size, watermark != 0, watermark)
 }
 
 func getWatermark(db *leveldb.DB) uint64 {
@@ -229,6 +235,8 @@ func levelDbDelete(db *leveldb.DB, key NeedleId) error {
 }
 
 func (m *LevelDbNeedleMap) Delete(key NeedleId, offset Offset) error {
+	m.mutationLock.Lock()
+	defer m.mutationLock.Unlock()
 	var watermark uint64
 	if m.ldbTimeout > 0 {
 		if err := m.ensureLdbLoaded(); err != nil {
@@ -240,19 +248,18 @@ func (m *LevelDbNeedleMap) Delete(key NeedleId, offset Offset) error {
 	if !found || oldNeedle.Size.IsDeleted() {
 		return nil
 	}
-	m.logDelete(oldNeedle.Size)
-
 	// write to index file first
 	if err := m.appendToIndexFile(key, offset, TombstoneFileSize); err != nil {
 		return err
 	}
+	m.logDelete(oldNeedle.Size)
 	m.recordCount++
 	if m.recordCount%watermarkBatchSize != 0 {
 		watermark = 0
 	} else {
 		watermark = (m.recordCount / watermarkBatchSize) * watermarkBatchSize
 	}
-	return levelDbWrite(m.db, key, oldNeedle.Offset, -oldNeedle.Size, watermark == 0, watermark)
+	return levelDbWrite(m.db, key, oldNeedle.Offset, -oldNeedle.Size, watermark != 0, watermark)
 }
 
 func (m *LevelDbNeedleMap) Close() {
@@ -359,7 +366,7 @@ func (m *LevelDbNeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startF
 
 	}()
 	if dbErr != nil {
-		if errors.IsCorrupted(err) {
+		if errors.IsCorrupted(dbErr) {
 			db, dbErr = leveldb.RecoverFile(dbFileName, nil)
 		}
 		if dbErr != nil {

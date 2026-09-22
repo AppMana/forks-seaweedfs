@@ -12,6 +12,7 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 	<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
 		<h1 class="h2">
 			<i class="fas fa-table me-2"></i>S3 Tables
+			<span class={ formatBadgeClass(data.BucketFormat), "ms-2 align-middle" } title={ formatBadgeTitle(data.BucketFormat) }>{ formatLabel(data.BucketFormat) }</span>
 		</h1>
 		<div class="btn-toolbar mb-2 mb-md-0">
 			<div class="btn-group me-2">
@@ -93,6 +94,8 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 								<thead>
 									<tr>
 										<th>Name</th>
+										<th>Format</th>
+										<th>Rows</th>
 										<th>Table ARN</th>
 										<th>Created</th>
 										<th>Modified</th>
@@ -106,6 +109,16 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 										<tr>
 											{{ tableName := table.Name }}
 											<td>{ tableName }</td>
+											<td>
+												<span class={ formatBadgeClass(table.Format) } title={ formatBadgeTitle(table.Format) }>{ formatLabel(table.Format) }</span>
+											</td>
+											<td>
+												if rows, ok := data.ObservedRows[tableName]; ok {
+													<span title="Reported by a plugin worker">{ rows }</span>
+												} else {
+													<span class="text-muted">&mdash;</span>
+												}
+											</td>
 											<td class="text-muted small">{ table.TableARN }</td>
 											<td>{ table.CreatedAt.Format("2006-01-02 15:04") }</td>
 											<td>{ table.ModifiedAt.Format("2006-01-02 15:04") }</td>
@@ -126,7 +139,7 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 											<td>
 												<div class="btn-group btn-group-sm" role="group">
 													if parseErr == nil {
-														<a class="btn btn-outline-primary btn-sm" href={ dash.PUrl(ctx, fmt.Sprintf("/object-store/s3tables/buckets/%s/namespaces/%s/tables/%s", url.PathEscape(bucketName), url.PathEscape(data.Namespace), url.PathEscape(tableName))) } title="View Iceberg Details">
+														<a class="btn btn-outline-primary btn-sm" href={ dash.PUrl(ctx, fmt.Sprintf("/object-store/s3tables/buckets/%s/namespaces/%s/tables/%s", url.PathEscape(bucketName), url.PathEscape(data.Namespace), url.PathEscape(tableName))) } title="View Table Details">
 															<i class="fas fa-eye"></i>
 														</a>
 													} else {
@@ -149,7 +162,7 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 									}
 									if len(data.Tables) == 0 {
 										<tr>
-											<td colspan="7" class="text-center text-muted py-4">
+											<td colspan="9" class="text-center text-muted py-4">
 												<i class="fas fa-table fa-3x mb-3 text-muted"></i>
 												<div>
 													<h5>No tables found</h5>
@@ -186,9 +199,16 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 						</div>
 						<div class="mb-3">
 							<label for="s3tablesTableFormat" class="form-label">Format</label>
-							<select class="form-select" id="s3tablesTableFormat" name="format">
-								<option value="ICEBERG" selected>ICEBERG</option>
-							</select>
+							if data.BucketFormat != "" {
+								<input type="text" class="form-control-plaintext ps-2 border rounded bg-light" id="s3tablesTableFormat" name="format" value={ formatLabel(data.BucketFormat) } readonly/>
+								<div class="form-text">Set by the bucket, which holds one format.</div>
+							} else {
+								<select class="form-select" id="s3tablesTableFormat" name="format">
+									<option value="ICEBERG" selected>ICEBERG</option>
+									<option value="LANCE">LANCE</option>
+								</select>
+								<div class="form-text">This bucket was created before formats were declared, so either is allowed.</div>
+							}
 						</div>
 						<div class="mb-3">
 							<label for="s3tablesTableMetadata" class="form-label">Metadata JSON (optional)</label>
@@ -234,8 +254,10 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 			</div>
 		</div>
 	</div>
+	@PolicyDatalists()
+
 	<div class="modal fade" id="s3tablesTablePolicyModal" tabindex="-1" aria-labelledby="s3tablesTablePolicyModalLabel" aria-hidden="true">
-		<div class="modal-dialog modal-lg">
+		<div class="modal-dialog modal-xl">
 			<div class="modal-content">
 				<div class="modal-header">
 					<h5 class="modal-title" id="s3tablesTablePolicyModalLabel">
@@ -248,17 +270,35 @@ templ S3TablesTables(data dash.S3TablesTablesData) {
 						<input type="hidden" id="s3tablesTablePolicyBucketArn" name="bucket_arn"/>
 						<input type="hidden" id="s3tablesTablePolicyNamespace" name="namespace"/>
 						<input type="hidden" id="s3tablesTablePolicyName" name="name"/>
-						<div class="mb-3">
-							<label for="s3tablesTablePolicyText" class="form-label">Policy JSON</label>
-							<textarea class="form-control" id="s3tablesTablePolicyText" name="policy" rows="12" placeholder="{ }"></textarea>
+						<ul class="nav nav-tabs" role="tablist">
+							<li class="nav-item" role="presentation">
+								<button class="nav-link active" id="s3tablesTablePolicyEditorTabBtn" type="button" data-bs-toggle="tab" data-bs-target="#s3tablesTablePolicyEditorTab" role="tab" aria-controls="s3tablesTablePolicyEditorTab" aria-selected="true">Editor</button>
+							</li>
+							<li class="nav-item" role="presentation">
+								<button class="nav-link" id="s3tablesTablePolicyJsonTabBtn" type="button" data-bs-toggle="tab" data-bs-target="#s3tablesTablePolicyJsonTab" role="tab" aria-controls="s3tablesTablePolicyJsonTab" aria-selected="false">JSON</button>
+							</li>
+						</ul>
+						<div class="tab-content border border-top-0 rounded-bottom p-3 mb-3">
+							<div class="tab-pane fade show active" id="s3tablesTablePolicyEditorTab" role="tabpanel" aria-labelledby="s3tablesTablePolicyEditorTabBtn">
+								<div id="s3tablesTablePolicyEditorBody"></div>
+								<button type="button" class="btn btn-sm btn-outline-secondary" id="s3tablesTablePolicyAddStatementBtn">
+									<i class="fas fa-plus me-1"></i>Add statement
+								</button>
+							</div>
+							<div class="tab-pane fade" id="s3tablesTablePolicyJsonTab" role="tabpanel" aria-labelledby="s3tablesTablePolicyJsonTabBtn">
+								<textarea class="form-control" id="s3tablesTablePolicyText" name="policy" rows="12" placeholder="{ }"></textarea>
+							</div>
 						</div>
 					</div>
 					<div class="modal-footer">
 						<button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-						<button type="button" class="btn btn-outline-danger" onclick="deleteS3TablesTablePolicy()">
+						<button type="button" class="btn btn-outline-danger" id="s3tablesTablePolicyDeleteBtn" onclick="deleteS3TablesTablePolicy()">
 							<i class="fas fa-trash me-1"></i>Delete Policy
 						</button>
-						<button type="submit" class="btn btn-primary">
+						<!-- type="button": a submit button would make Enter in any
+						     single-line editor input implicitly submit a half-built
+						     policy, which the backend stores verbatim. -->
+						<button type="button" class="btn btn-primary" id="s3tablesTablePolicySaveBtn">
 							<i class="fas fa-save me-1"></i>Save Policy
 						</button>
 					</div>

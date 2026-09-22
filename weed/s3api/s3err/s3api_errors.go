@@ -56,6 +56,8 @@ const (
 	ErrNoSuchBucketPolicy
 	ErrNoSuchCORSConfiguration
 	ErrNoSuchLifecycleConfiguration
+	ErrNoSuchWebsiteConfiguration
+	ErrReplicationConfigurationNotFound
 	ErrNoSuchKey
 	ErrNoSuchVersion
 	ErrNoSuchUpload
@@ -71,6 +73,7 @@ const (
 	ErrInvalidMaxDeleteObjects
 	ErrInvalidPartNumberMarker
 	ErrInvalidPart
+	ErrInvalidPartNumber
 	ErrInvalidPartOrder
 	ErrInvalidRange
 	ErrInternalError
@@ -93,6 +96,7 @@ const (
 	ErrMalformedCredentialDate
 	ErrMalformedPolicy
 	ErrInvalidPolicyDocument
+	ErrPolicyTooLarge
 	ErrMissingSignHeadersTag
 	ErrMissingSignTag
 	ErrUnsignedHeaders
@@ -160,6 +164,13 @@ const (
 
 	// Truncated request body (fewer bytes than Content-Length)
 	ErrIncompleteBody
+
+	// Peer went away before the request body was fully received
+	ErrClientDisconnected
+
+	ErrInvalidRenameSource
+	ErrRenameDestinationSameAsSource
+	ErrIdempotentParameterMismatch
 )
 
 // Error message constants for checksum validation
@@ -292,6 +303,16 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "The lifecycle configuration does not exist",
 		HTTPStatusCode: http.StatusNotFound,
 	},
+	ErrNoSuchWebsiteConfiguration: {
+		Code:           "NoSuchWebsiteConfiguration",
+		Description:    "The specified bucket does not have a website configuration",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrReplicationConfigurationNotFound: {
+		Code:           "ReplicationConfigurationNotFoundError",
+		Description:    "The replication configuration was not found",
+		HTTPStatusCode: http.StatusNotFound,
+	},
 	ErrNoSuchKey: {
 		Code:           "NoSuchKey",
 		Description:    "The specified key does not exist.",
@@ -317,11 +338,23 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "You did not provide the number of bytes specified by the Content-Length HTTP header.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	// 499 has no RFC; it is nginx's code for a client that went away, and is what
+	// log pipelines already recognise for this case.
+	ErrClientDisconnected: {
+		Code:           "ClientDisconnected",
+		Description:    "The client disconnected before the request body was fully received.",
+		HTTPStatusCode: 499,
+	},
 
 	ErrInvalidPart: {
 		Code:           "InvalidPart",
 		Description:    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidPartNumber: {
+		Code:           "InvalidPartNumber",
+		Description:    "The requested partnumber is not satisfiable.",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
 	},
 	ErrInvalidPartOrder: {
 		Code:           "InvalidPartOrder",
@@ -339,6 +372,23 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Copy Source must mention the source bucket and key: sourcebucket/sourcekey.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidRenameSource: {
+		Code:           "InvalidArgument",
+		Description:    "Rename Source must mention the source bucket and key: sourcebucket/sourcekey.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrRenameDestinationSameAsSource: {
+		Code:           "InvalidRequest",
+		Description:    "This rename request is illegal because it is trying to rename an object to itself.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrIdempotentParameterMismatch: {
+		Code:        "IdempotentParameterMismatch",
+		Description: "The request uses the same client token as a previous, but non-identical request.",
+		// 400 Bad Request, matching the AWS S3 RenameObject API documentation
+		// for IdempotencyParameterMismatch.
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInvalidTag: {
 		Code:           "InvalidTag",
 		Description:    "The Tag value you have provided is invalid",
@@ -352,6 +402,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrMalformedPolicy: {
 		Code:           "MalformedPolicy",
 		Description:    "Policy has invalid resource.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrPolicyTooLarge: {
+		Code:           "PolicyTooLarge",
+		Description:    "Policy exceeds the maximum allowed document size.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidPolicyDocument: {

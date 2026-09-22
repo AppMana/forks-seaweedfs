@@ -23,7 +23,7 @@ const (
 type AdminData struct {
 	Username          string              `json:"username"`
 	TotalVolumes      int                 `json:"total_volumes"`
-	TotalFiles        int64               `json:"total_files"`
+	TotalChunks       int64               `json:"total_chunks"`
 	TotalSize         int64               `json:"total_size"`
 	VolumeSizeLimitMB uint64              `json:"volume_size_limit_mb"`
 	MasterNodes       []MasterNode        `json:"master_nodes"`
@@ -44,6 +44,10 @@ type AdminData struct {
 	// Trends holds at-a-glance sparklines built from the admin's own recent
 	// cluster snapshots (no Prometheus required).
 	Trends DashboardTrends `json:"trends"`
+
+	// TierStats breaks volumes and EC shards down by storage tier: local
+	// disk types plus one entry per remote storage holding tiered volumes.
+	TierStats []TierStats `json:"tier_stats"`
 }
 
 // Object Store Users management structures
@@ -107,6 +111,34 @@ type UserDetails struct {
 	PolicyNames []string        `json:"policy_names"`
 	AccessKeys  []AccessKeyInfo `json:"access_keys"`
 	Groups      []string        `json:"groups"`
+}
+
+// RoleReadOnly is the session role assigned to read-only (view-only) admin
+// accounts. It matches the value stored by HandleLogin when the read-only
+// credentials are used.
+const RoleReadOnly = "readonly"
+
+// IsReadOnlyRole reports whether the given admin session role grants only
+// view-only access. Any other role (admin, or the empty role used when auth
+// is disabled) is treated as non-read-only.
+func IsReadOnlyRole(role string) bool {
+	return role == RoleReadOnly
+}
+
+// RedactSecretKey clears the plaintext S3 secret key from an object-store
+// user record. The access key (a public identifier) is retained so the
+// identity can still be listed; only the reusable secret is removed.
+func (u *ObjectStoreUser) RedactSecretKey() {
+	u.SecretKey = ""
+}
+
+// RedactSecretKeys clears the plaintext S3 secret keys from a user's access
+// key records. Access key identifiers are retained so the set of keys remains
+// visible; only the reusable secrets are removed.
+func (d *UserDetails) RedactSecretKeys() {
+	for i := range d.AccessKeys {
+		d.AccessKeys[i].SecretKey = ""
+	}
 }
 
 type FilerNode struct {
@@ -199,7 +231,7 @@ func (s *AdminServer) GetAdminData(username string) (AdminData, error) {
 	adminData := AdminData{
 		Username:          username,
 		TotalVolumes:      topology.TotalVolumes,
-		TotalFiles:        topology.TotalFiles,
+		TotalChunks:       topology.TotalChunks,
 		TotalSize:         topology.TotalSize,
 		VolumeSizeLimitMB: volumeSizeLimitMB,
 		MasterNodes:       masterNodes,
@@ -213,6 +245,7 @@ func (s *AdminServer) GetAdminData(username string) (AdminData, error) {
 		TotalEcShards:     totalEcShards,
 		TotalMountClients: totalMountClients,
 		Trends:            s.GetDashboardTrends(),
+		TierStats:         topology.TierStats,
 	}
 
 	return adminData, nil

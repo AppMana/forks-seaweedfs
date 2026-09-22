@@ -2,7 +2,6 @@ package mount
 
 import (
 	"context"
-	"math"
 	"strings"
 
 	cgofuse "github.com/winfsp/cgofuse/fuse"
@@ -10,7 +9,6 @@ import (
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -83,13 +81,8 @@ func (a *winfspFS) lookupChild(parent uint64, requested string) (uint64, string,
 	if status != fuse.OK {
 		return 0, "", status
 	}
-	if err := meta_cache.EnsureVisited(a.wfs.metaCache, a.wfs, parentPath); err != nil {
-		glog.Errorf("winfsp case-fold cache fill %s: %v", parentPath, err)
-		return 0, "", fuse.EIO
-	}
-
 	var actual string
-	if err := a.wfs.metaCache.ListDirectoryEntries(context.Background(), parentPath, "", false, math.MaxInt64, func(entry *filer.Entry) (bool, error) {
+	if err := a.wfs.listDirectoryForAdapter(context.Background(), parentPath, func(entry *filer.Entry) (bool, error) {
 		if winFspNameEqual(requested, entry.Name(), false) {
 			actual = entry.Name()
 			return false, nil
@@ -620,15 +613,11 @@ func (a *winfspFS) Readdir(path string,
 	fill(".", nil, 0)
 	fill("..", nil, 0)
 
-	if err := meta_cache.EnsureVisited(a.wfs.metaCache, a.wfs, dirPath); err != nil {
-		glog.Errorf("winfsp readdir %s: %v", dirPath, err)
-		return -cgofuse.EIO
-	}
 	a.wfs.inodeToPath.TouchDirectory(dirPath)
 
 	var attr fuse.Attr
 	var stat cgofuse.Stat_t
-	listErr := a.wfs.metaCache.ListDirectoryEntries(context.Background(), dirPath, "", false, math.MaxInt64, func(entry *filer.Entry) (bool, error) {
+	listErr := a.wfs.listDirectoryForAdapter(context.Background(), dirPath, func(entry *filer.Entry) (bool, error) {
 		childPath := dirPath.Child(entry.Name())
 		childIno := a.wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, false)
 		attr = fuse.Attr{}

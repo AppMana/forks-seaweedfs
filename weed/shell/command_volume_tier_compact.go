@@ -62,7 +62,7 @@ func (c *commandVolumeTierCompact) Do(args []string, commandEnv *CommandEnv, wri
 
 	tierCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	volumeId := tierCommand.Int("volumeId", 0, "the volume id")
-	collection := tierCommand.String("collection", "", "the collection name (supports regex)")
+	collection := tierCommand.String("collection", "", "comma-separated collection names, wildcards, or regex patterns; empty matches the collection with no name")
 	garbageThreshold := tierCommand.Float64("garbageThreshold", 0.3, "compact when garbage ratio exceeds this value")
 	if err = tierCommand.Parse(args); err != nil {
 		return nil
@@ -120,14 +120,13 @@ func (c *commandVolumeTierCompact) Do(args []string, commandEnv *CommandEnv, wri
 }
 
 func findRemoteVolumeInTopology(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId, collectionPattern string) (remoteVolumeInfo, bool, error) {
-	// when collectionPattern is provided, compile and use as regex filter
 	var matchesCollection func(string) bool
 	if collectionPattern != "" {
-		collectionRegex, err := compileCollectionPattern(collectionPattern)
+		collectionMatcher, err := compileCollectionPattern(collectionPattern)
 		if err != nil {
 			return remoteVolumeInfo{}, false, fmt.Errorf("invalid collection pattern '%s': %v", collectionPattern, err)
 		}
-		matchesCollection = collectionRegex.MatchString
+		matchesCollection = collectionMatcher.Matches
 	} else {
 		matchesCollection = func(string) bool { return true }
 	}
@@ -140,7 +139,7 @@ func findRemoteVolumeInTopology(topoInfo *master_pb.TopologyInfo, vid needle.Vol
 		}
 		for _, diskInfo := range dn.DiskInfos {
 			for _, v := range diskInfo.VolumeInfos {
-				if needle.VolumeId(v.Id) == vid && v.RemoteStorageName != "" && v.RemoteStorageKey != "" {
+				if needle.VolumeId(v.Id) == vid && v.RemoteStorageName != "" {
 					if !matchesCollection(v.Collection) {
 						continue
 					}
@@ -161,7 +160,7 @@ func findRemoteVolumeInTopology(topoInfo *master_pb.TopologyInfo, vid needle.Vol
 }
 
 func collectRemoteVolumesWithInfo(topoInfo *master_pb.TopologyInfo, collectionPattern string) ([]remoteVolumeInfo, error) {
-	collectionRegex, err := compileCollectionPattern(collectionPattern)
+	collectionMatcher, err := compileCollectionPattern(collectionPattern)
 	if err != nil {
 		return nil, fmt.Errorf("invalid collection pattern '%s': %v", collectionPattern, err)
 	}
@@ -171,10 +170,10 @@ func collectRemoteVolumesWithInfo(topoInfo *master_pb.TopologyInfo, collectionPa
 	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		for _, diskInfo := range dn.DiskInfos {
 			for _, v := range diskInfo.VolumeInfos {
-				if v.RemoteStorageName == "" || v.RemoteStorageKey == "" {
+				if v.RemoteStorageName == "" {
 					continue
 				}
-				if !collectionRegex.MatchString(v.Collection) {
+				if !collectionMatcher.Matches(v.Collection) {
 					continue
 				}
 				if seen[v.Id] {

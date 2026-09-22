@@ -14,9 +14,14 @@ type ClusterTopology struct {
 	DataCenters   []DataCenter   `json:"datacenters"`
 	VolumeServers []VolumeServer `json:"volume_servers"`
 	TotalVolumes  int            `json:"total_volumes"`
-	TotalFiles    int64          `json:"total_files"`
-	TotalSize     int64          `json:"total_size"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	// TotalChunks counts chunks stored in volumes, not filer entries: a file
+	// is split into one or more chunks.
+	TotalChunks int64     `json:"total_chunks"`
+	TotalSize   int64     `json:"total_size"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	// TierStats breaks volumes and EC shards down by storage tier: local
+	// disk types plus one entry per remote storage holding tiered volumes.
+	TierStats []TierStats `json:"tier_stats"`
 }
 
 type MasterNode struct {
@@ -50,6 +55,11 @@ type VolumeServer struct {
 	EcVolumes      int                  `json:"ec_volumes"`       // Number of EC volumes this server has shards for
 	EcShards       int                  `json:"ec_shards"`        // Total number of EC shards on this server
 	EcShardDetails []VolumeServerEcInfo `json:"ec_shard_details"` // Detailed EC shard information
+
+	// RemoteSize is the bytes this server's remote-tiered volumes hold in
+	// cloud storage. Those bytes are excluded from DiskUsage, which only
+	// counts what occupies local disks.
+	RemoteSize int64 `json:"remote_size"`
 }
 
 func (vs *VolumeServer) GetDisplayAddress() string {
@@ -88,6 +98,12 @@ type S3Bucket struct {
 
 	LifecycleRuleCount    int `json:"lifecycle_rule_count"`
 	LifecycleEnabledCount int `json:"lifecycle_enabled_count"`
+
+	// PolicyStatementCount is the number of statements in the bucket policy,
+	// or 0 if the bucket has none. A policy document can't have zero
+	// statements (see policy_engine.ValidatePolicy), so >0 is a faithful
+	// "has a policy" flag.
+	PolicyStatementCount int `json:"policy_statement_count"`
 }
 
 type S3Object struct {
@@ -274,7 +290,7 @@ type CollectionInfo struct {
 	DataCenter    string   `json:"datacenter"`
 	VolumeCount   int      `json:"volume_count"`
 	EcVolumeCount int      `json:"ec_volume_count"`
-	FileCount     int64    `json:"file_count"`
+	ChunkCount    int64    `json:"chunk_count"`
 	TotalSize     int64    `json:"total_size"`
 	DiskTypes     []string `json:"disk_types"`
 }
@@ -285,7 +301,7 @@ type ClusterCollectionsData struct {
 	TotalCollections int              `json:"total_collections"`
 	TotalVolumes     int              `json:"total_volumes"`
 	TotalEcVolumes   int              `json:"total_ec_volumes"`
-	TotalFiles       int64            `json:"total_files"`
+	TotalChunks      int64            `json:"total_chunks"`
 	TotalSize        int64            `json:"total_size"`
 	LastUpdated      time.Time        `json:"last_updated"`
 }
@@ -588,7 +604,7 @@ type CollectionDetailsData struct {
 	EcVolumes      []EcVolumeWithShards `json:"ec_volumes"`
 	TotalVolumes   int                  `json:"total_volumes"`
 	TotalEcVolumes int                  `json:"total_ec_volumes"`
-	TotalFiles     int64                `json:"total_files"`
+	TotalChunks    int64                `json:"total_chunks"`
 	TotalSize      int64                `json:"total_size"`
 	DataCenters    []string             `json:"data_centers"`
 	DiskTypes      []string             `json:"disk_types"`
@@ -768,4 +784,8 @@ type IcebergTableDetailsData struct {
 	TotalSizeBytes   int64                       `json:"total_size_bytes"`
 	HasTotalSize     bool                        `json:"has_total_size"`
 	MetadataError    string                      `json:"metadata_error,omitempty"`
+	// Set when the details came from a plugin worker rather than from metadata
+	// this server can read, so the page can say whose account it is and when.
+	ObservedBy string    `json:"observed_by,omitempty"`
+	ObservedAt time.Time `json:"observed_at,omitempty"`
 }

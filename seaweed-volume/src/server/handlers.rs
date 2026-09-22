@@ -356,6 +356,10 @@ fn parse_url_path(path: &str) -> Option<(VolumeId, NeedleId, Cookie)> {
 #[derive(Clone, Debug, Deserialize)]
 struct VolumeLocation {
     url: String,
+    #[serde(rename = "readOnly", default)]
+    read_only: bool,
+    #[serde(rename = "readOnlyCanDelete", default)]
+    read_only_can_delete: bool,
     // Master often omits publicUrl when it matches url (Go json omitempty).
     #[serde(rename = "publicUrl", default)]
     public_url: String,
@@ -546,27 +550,39 @@ async fn do_replicated_request(
     .await
     .map_err(|e| format!("lookup volume failed: {}", e))?;
 
-    // Mirror Go's GetWritableRemoteReplications: reject when the master reports fewer replicas than
-    // the copy count. lookup_volume is uncached, so recovery is immediate once the replica re-registers.
     let copy_count = {
         let store = state.store.read().unwrap();
-        store.find_volume(VolumeId(vid)).map_or(1, |(_, v)| {
-            v.super_block.replica_placement.get_copy_count()
-        })
+        store
+            .find_volume(VolumeId(vid))
+            .map_or(1, |(_, v)| v.super_block.replica_placement.get_copy_count())
     };
-    if locations.len() < copy_count as usize {
+    let allow_delete = method == axum::http::Method::DELETE;
+    let eligible_locations: Vec<_> = locations
+        .into_iter()
+        .filter(|loc| {
+            (!loc.read_only && allow_delete)
+                || (!loc.read_only && !allow_delete)
+                || (allow_delete && loc.read_only_can_delete)
+        })
+        .collect();
+    if eligible_locations.len() < copy_count as usize {
         return Err(format!(
             "replicating operations [{}] is less than volume {} replication copy count [{}]",
-            locations.len(),
+            eligible_locations.len(),
             vid,
             copy_count
         ));
     }
 
     let self_http = to_http_address(&state.self_url);
-    let remote_locations: Vec<_> = locations
+    let remote_locations: Vec<_> = eligible_locations
         .into_iter()
         .filter(|loc| {
+            if (!allow_delete && loc.read_only)
+                || (allow_delete && loc.read_only && !loc.read_only_can_delete)
+            {
+                return false;
+            }
             to_http_address(&loc.url) != self_http
                 && to_http_address(loc.public_or_url()) != self_http
         })
@@ -733,7 +749,7 @@ async fn proxy_or_redirect_to_target(
     // Shuffle for load balancing
     if candidates.len() >= 2 {
         use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         candidates.shuffle(&mut rng);
     }
 
@@ -1047,8 +1063,8 @@ async fn get_or_head_handler_inner(
     let has_range = headers.contains_key(header::RANGE);
     let ext = extract_extension_from_path(&path);
     // Go checks resize and crop extensions separately: resize supports .webp, crop does not.
-    let has_resize_ops =
-        is_image_resize_ext(&ext) && (query.width.unwrap_or(0) > 0 || query.height.unwrap_or(0) > 0);
+    let has_resize_ops = is_image_resize_ext(&ext)
+        && (query.width.unwrap_or(0) > 0 || query.height.unwrap_or(0) > 0);
     // Go's shouldCropImages (L410) requires x2 > x1 && y2 > y1 (x1/y1 default 0).
     // Only disable streaming when a real crop will actually happen.
     let has_crop_ops = is_image_crop_ext(&ext) && {
@@ -1077,10 +1093,8 @@ async fn get_or_head_handler_inner(
         // serves both the "all shards local" fast case and the
         // "some intervals need peer fetch + reconstruct" general
         // case without paying for the local interval reads twice.
-        match crate::server::store_ec::read_ec_shard_needle_distributed(
-            &state, vid, needle_id,
-        )
-        .await
+        match crate::server::store_ec::read_ec_shard_needle_distributed(&state, vid, needle_id)
+            .await
         {
             Ok(Some(ec_needle)) => {
                 n = ec_needle;
@@ -1101,10 +1115,7 @@ async fn get_or_head_handler_inner(
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return StatusCode::NOT_FOUND.into_response();
                 }
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("ec read: {}", e),
-                )
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("ec read: {}", e))
                     .into_response();
             }
         }
@@ -1589,11 +1600,14 @@ async fn get_or_head_handler_inner(
 }
 
 /// Handle HTTP Range requests. Returns 206 Partial Content or 416 Range Not Satisfiable.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct HttpRange {
     start: i64,
     length: i64,
 }
+
+// Returned when the first-byte-pos of every byte-range-spec is at or past the content size.
+const RANGE_NO_OVERLAP: &str = "invalid range: failed to overlap";
 
 fn parse_range_header(s: &str, size: i64) -> Result<Vec<HttpRange>, &'static str> {
     if s.is_empty() {
@@ -1604,6 +1618,7 @@ fn parse_range_header(s: &str, size: i64) -> Result<Vec<HttpRange>, &'static str
         return Err("invalid range");
     }
     let mut ranges = Vec::new();
+    let mut no_overlap = false;
     for part in s[PREFIX.len()..].split(',') {
         let part = part.trim();
         if part.is_empty() {
@@ -1627,8 +1642,12 @@ fn parse_range_header(s: &str, size: i64) -> Result<Vec<HttpRange>, &'static str
             r.length = size - r.start;
         } else {
             let i = start_str.parse::<i64>().map_err(|_| "invalid range")?;
-            if i > size || i < 0 {
+            if i < 0 {
                 return Err("invalid range");
+            }
+            if i >= size {
+                no_overlap = true;
+                continue;
             }
             r.start = i;
             if end_str.is_empty() {
@@ -1645,6 +1664,9 @@ fn parse_range_header(s: &str, size: i64) -> Result<Vec<HttpRange>, &'static str
             }
         }
         ranges.push(r);
+    }
+    if no_overlap && ranges.is_empty() {
+        return Err(RANGE_NO_OVERLAP);
     }
     Ok(ranges)
 }
@@ -1679,7 +1701,15 @@ fn handle_range_request(
     let total = data.len() as i64;
     let ranges = match parse_range_header(range_str, total) {
         Ok(r) => r,
-        Err(msg) => return range_error_response(headers, msg),
+        Err(msg) => {
+            if msg == RANGE_NO_OVERLAP {
+                headers.insert(
+                    "Content-Range",
+                    format!("bytes */{}", total).parse().unwrap(),
+                );
+            }
+            return range_error_response(headers, msg);
+        }
     };
 
     // Go's ProcessRangeRequest returns nil (empty body) for empty or oversized ranges
@@ -1762,7 +1792,15 @@ fn handle_range_request_from_source(
     let total = info.data_size as i64;
     let ranges = match parse_range_header(range_str, total) {
         Ok(r) => r,
-        Err(msg) => return range_error_response(headers, msg),
+        Err(msg) => {
+            if msg == RANGE_NO_OVERLAP {
+                headers.insert(
+                    "Content-Range",
+                    format!("bytes */{}", total).parse().unwrap(),
+                );
+            }
+            return range_error_response(headers, msg);
+        }
     };
 
     if ranges.is_empty() {
@@ -2216,7 +2254,10 @@ pub async fn post_handler(
             // With a limit configured, an error here means the body exceeded it
             // before we buffered the whole thing; report it like the size check.
             let msg = if state.file_size_limit_bytes > 0 {
-                format!("file over the limited {} bytes", state.file_size_limit_bytes)
+                format!(
+                    "file over the limited {} bytes",
+                    state.file_size_limit_bytes
+                )
             } else {
                 format!("read body: {}", e)
             };
@@ -2384,7 +2425,7 @@ pub async fn post_handler(
     } else {
         None
     };
-    if let (Some(ref expected_md5), Some(ref actual_md5)) = (&content_md5, &original_content_md5) {
+    if let (Some(expected_md5), Some(actual_md5)) = (&content_md5, &original_content_md5) {
         if expected_md5 != actual_md5 {
             return json_error_with_query(
                 StatusCode::BAD_REQUEST,
@@ -2580,11 +2621,17 @@ pub async fn post_handler(
         n.set_has_name();
     }
 
+    // A durable write flushes before it is acked. Read it the way Go's
+    // r.FormValue does, off the decoded fields, so a percent-encoded value is
+    // honored here too. ReplicatedWrite forwards the parameter, so a replica
+    // sees it the same way the primary did.
+    let fsync = form_value("fsync").as_deref() == Some("true");
+
     let write_result = if let Some(wq) = state.write_queue.get() {
-        wq.submit(vid, n.clone()).await
+        wq.submit(vid, n.clone(), fsync).await
     } else {
         let mut store = state.store.write().unwrap();
-        store.write_volume_needle(vid, &mut n)
+        store.write_volume_needle(vid, &mut n, fsync)
     };
 
     // Replicate to remote volume servers if this volume has replicas.
@@ -3080,6 +3127,11 @@ pub async fn healthz_handler(State(state): State<Arc<VolumeServerState>>) -> Res
     if !state.is_heartbeating.load(Ordering::Relaxed) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    // A server with quarantined local replicas has faulty storage media;
+    // report degraded so a load balancer can drain it.
+    if state.store.read().unwrap().has_io_quarantine() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     StatusCode::OK.into_response()
 }
 
@@ -3330,7 +3382,7 @@ async fn try_expand_chunk_manifest(
     response_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
 
     // Last-Modified — Go sets this on the response writer before tryHandleChunkedFile
-    if let Some(ref lm) = last_modified_str {
+    if let Some(lm) = last_modified_str {
         if let Ok(hval) = lm.parse() {
             response_headers.insert(header::LAST_MODIFIED, hval);
         }
@@ -3431,10 +3483,7 @@ async fn try_expand_chunk_manifest(
 /// (reconstruct-on-read from surviving shards), or a peer resolved via the
 /// master. Mirrors Go's ChunkedFileReader, which looks every chunk up through
 /// the master instead of assuming a local regular needle.
-async fn read_chunk_needle(
-    state: &Arc<VolumeServerState>,
-    fid: &str,
-) -> Result<Vec<u8>, String> {
+async fn read_chunk_needle(state: &Arc<VolumeServerState>, fid: &str) -> Result<Vec<u8>, String> {
     let (vid, nid, cookie) =
         parse_url_path(fid).ok_or_else(|| format!("invalid chunk fid: {}", fid))?;
 
@@ -3852,6 +3901,26 @@ fn parse_content_disposition_filename(value: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The upload handler reads fsync off the decoded query fields rather than
+    /// matching the raw string, because Go's r.FormValue decodes and a raw
+    /// match would silently drop a percent-encoded value.
+    #[test]
+    fn test_encoded_query_field_decodes() {
+        let raw = "fsync=%74rue";
+        assert!(
+            !raw.split('&').any(|p| p == "fsync=true"),
+            "a raw match is exactly what misses this"
+        );
+        let fields: Vec<(String, String)> = serde_urlencoded::from_str(raw).unwrap();
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(k, _)| k == "fsync")
+                .map(|(_, v)| v.as_str()),
+            Some("true")
+        );
+    }
+
     #[test]
     fn test_parse_url_path_comma() {
         let (vid, nid, cookie) = parse_url_path("/3,01637037d6").unwrap();
@@ -3884,6 +3953,25 @@ mod tests {
     fn test_parse_url_path_invalid() {
         assert!(parse_url_path("/invalid").is_none());
         assert!(parse_url_path("").is_none());
+    }
+
+    #[test]
+    fn test_parse_range_header_no_overlap() {
+        assert_eq!(
+            parse_range_header("bytes=10-", 10).unwrap_err(),
+            RANGE_NO_OVERLAP
+        );
+        assert_eq!(
+            parse_range_header("bytes=100-", 10).unwrap_err(),
+            RANGE_NO_OVERLAP
+        );
+        // 416 only when every range fails to overlap
+        let ranges = parse_range_header("bytes=10-,0-1", 10).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start, ranges[0].length), (0, 2));
+        // an end past the size is clamped, still satisfiable
+        let ranges = parse_range_header("bytes=5-100", 10).unwrap();
+        assert_eq!((ranges[0].start, ranges[0].length), (5, 5));
     }
 
     #[test]
@@ -4106,6 +4194,8 @@ mod tests {
             url: "volume.internal:8080".to_string(),
             public_url: "volume.public:8080".to_string(),
             grpc_port: 18080,
+            read_only: false,
+            read_only_can_delete: false,
         };
 
         let response = redirect_request(&info, &target, "https");
@@ -4132,6 +4222,8 @@ mod tests {
             url: "volume.internal:8080.18080".to_string(),
             public_url: "volume.public:8080.18080".to_string(),
             grpc_port: 18080,
+            read_only: false,
+            read_only_can_delete: false,
         };
 
         let response = redirect_request(&info, &target, "http");
@@ -4178,15 +4270,19 @@ mod tests {
 
         let app = Router::new().route(
             "/dir/lookup",
-            get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
-                assert_eq!(params.get("volumeId").map(String::as_str), Some("31"));
-                axum::Json(serde_json::json!({
-                    "volumeOrFileId": "31",
-                    "locations": [
-                        {"url": "10.0.0.2:5301", "publicUrl": "10.0.0.2:5301", "grpcPort": 5311}
-                    ]
-                }))
-            }),
+            get(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    assert_eq!(params.get("volumeId").map(String::as_str), Some("31"));
+                    axum::Json(serde_json::json!({
+                        "volumeOrFileId": "31",
+                        "locations": [
+                            {"url": "10.0.0.2:5301", "publicUrl": "10.0.0.2:5301", "grpcPort": 5311}
+                        ]
+                    }))
+                },
+            ),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

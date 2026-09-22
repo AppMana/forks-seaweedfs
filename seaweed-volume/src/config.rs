@@ -64,6 +64,8 @@ pub struct Cli {
     pub rack: String,
 
     /// Choose [memory|redb|redbMedium|redbLarge] mode for memory~performance balance.
+    /// The redb tiers give each volume's on-disk index a 4, 8, or 16 MiB page
+    /// cache respectively; total index memory is roughly (volumes x cache).
     /// `leveldb`/`leveldbMedium`/`leveldbLarge` are accepted as aliases for the
     /// corresponding redb backends (Rust volume server uses redb under the hood).
     #[arg(long = "index", default_value = "memory")]
@@ -256,6 +258,8 @@ pub struct VolumeServerConfig {
     pub https_client_ca_file: String,
     pub grpc_cert_file: String,
     pub grpc_key_file: String,
+    pub grpc_client_cert_file: String,
+    pub grpc_client_key_file: String,
     pub grpc_ca_file: String,
     pub grpc_allowed_wildcard_domain: String,
     pub grpc_volume_allowed_common_names: Vec<String>,
@@ -805,6 +809,8 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
         https_client_ca_file: sec.https_client_ca_file,
         grpc_cert_file: sec.grpc_cert_file,
         grpc_key_file: sec.grpc_key_file,
+        grpc_client_cert_file: sec.grpc_client_cert_file,
+        grpc_client_key_file: sec.grpc_client_key_file,
         grpc_ca_file: sec.grpc_ca_file,
         grpc_allowed_wildcard_domain: sec.grpc_allowed_wildcard_domain,
         grpc_volume_allowed_common_names: sec.grpc_volume_allowed_common_names,
@@ -837,6 +843,8 @@ pub struct SecurityConfig {
     pub https_client_ca_file: String,
     pub grpc_cert_file: String,
     pub grpc_key_file: String,
+    pub grpc_client_cert_file: String,
+    pub grpc_client_key_file: String,
     pub grpc_ca_file: String,
     pub grpc_allowed_wildcard_domain: String,
     pub grpc_volume_allowed_common_names: Vec<String>,
@@ -882,6 +890,8 @@ const SECURITY_CONFIG_FILE_NAME: &str = "security.toml";
 /// [grpc.volume]
 /// cert = "/path/to/cert.pem"
 /// key = "/path/to/key.pem"
+/// client_cert = "/path/to/client-cert.pem"
+/// client_key = "/path/to/client-key.pem"
 /// allowed_commonNames = "volume-a.internal,volume-b.internal"
 /// ```
 pub fn parse_security_config(path: &str) -> SecurityConfig {
@@ -1003,6 +1013,8 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                 Section::GrpcVolume => match key {
                     "cert" => cfg.grpc_cert_file = value.to_string(),
                     "key" => cfg.grpc_key_file = value.to_string(),
+                    "client_cert" => cfg.grpc_client_cert_file = value.to_string(),
+                    "client_key" => cfg.grpc_client_key_file = value.to_string(),
                     // Go only reads CA from [grpc], not [grpc.volume]
                     "allowed_commonNames" => {
                         cfg.grpc_volume_allowed_common_names =
@@ -1134,6 +1146,12 @@ fn apply_env_overrides(cfg: &mut SecurityConfig) {
     if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_KEY") {
         cfg.grpc_key_file = v;
     }
+    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CLIENT_CERT") {
+        cfg.grpc_client_cert_file = v;
+    }
+    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CLIENT_KEY") {
+        cfg.grpc_client_key_file = v;
+    }
     if let Ok(v) = std::env::var("WEED_GRPC_CA") {
         cfg.grpc_ca_file = v;
     } else if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CA") {
@@ -1191,21 +1209,30 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    // SAFETY (all env mutation in this module): `set_var`/`remove_var` are
+    // unsafe as of Rust 2024 because they race with concurrent readers in
+    // other threads. Every test that reaches these helpers holds
+    // `process_state_lock()` for the duration, so only one test at a time
+    // touches the environment and none observes another's edit.
     fn with_temp_env_var<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
         let previous = std::env::var_os(key);
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
         f();
         restore_env_var(key, previous);
     }
 
     fn restore_env_var(key: &str, value: Option<OsString>) {
-        if let Some(value) = value {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
         }
     }
 
@@ -1231,6 +1258,8 @@ mod tests {
             "WEED_HTTPS_CLIENT_CA",
             "WEED_GRPC_VOLUME_CERT",
             "WEED_GRPC_VOLUME_KEY",
+            "WEED_GRPC_VOLUME_CLIENT_CERT",
+            "WEED_GRPC_VOLUME_CLIENT_KEY",
             "WEED_GRPC_CA",
             "WEED_GRPC_VOLUME_CA",
             "WEED_GRPC_ALLOWED_WILDCARD_DOMAIN",
@@ -1248,7 +1277,10 @@ mod tests {
             .collect();
 
         for key in KEYS {
-            std::env::remove_var(key);
+            // SAFETY: as above — the caller holds `process_state_lock()`.
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
 
         f();
@@ -1384,12 +1416,18 @@ mod tests {
 
     #[test]
     fn test_resolve_config_defaults_dir_to_platform_temp_dir() {
+        // resolve_config reads HOME/USERPROFILE and the WEED_* set, so it has to
+        // hold the same lock the mutation helpers take — a concurrent set_var
+        // during this read is exactly what makes those calls unsafe.
+        let _guard = process_state_lock();
         let cfg = resolve_config(Cli::parse_from(["bin"]));
         assert_eq!(cfg.folders, vec![default_volume_dir()]);
     }
 
     #[test]
     fn test_resolve_config_index_accepts_redb_and_leveldb_aliases() {
+        // As above: resolve_config reads the environment.
+        let _guard = process_state_lock();
         let pairs = [
             ("memory", NeedleMapKind::InMemory),
             ("redb", NeedleMapKind::Redb),
@@ -1497,6 +1535,35 @@ key = "/etc/seaweedfs/volume-key.pem"
             assert_eq!(cfg.grpc_ca_file, "/etc/seaweedfs/grpc-ca.pem");
             assert_eq!(cfg.grpc_cert_file, "/etc/seaweedfs/volume-cert.pem");
             assert_eq!(cfg.grpc_key_file, "/etc/seaweedfs/volume-key.pem");
+        });
+    }
+
+    #[test]
+    fn test_parse_security_config_uses_grpc_volume_client_cert() {
+        let _guard = process_state_lock();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[grpc.volume]
+cert = "/etc/seaweedfs/volume-cert.pem"
+key = "/etc/seaweedfs/volume-key.pem"
+client_cert = "/etc/seaweedfs/volume-client-cert.pem"
+client_key = "/etc/seaweedfs/volume-client-key.pem"
+"#,
+        )
+        .unwrap();
+
+        with_cleared_security_env(|| {
+            let cfg = parse_security_config(tmp.path().to_str().unwrap());
+            assert_eq!(
+                cfg.grpc_client_cert_file,
+                "/etc/seaweedfs/volume-client-cert.pem"
+            );
+            assert_eq!(
+                cfg.grpc_client_key_file,
+                "/etc/seaweedfs/volume-client-key.pem"
+            );
         });
     }
 

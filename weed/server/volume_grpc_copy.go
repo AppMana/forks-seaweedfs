@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -27,6 +28,9 @@ const BufferSizeLimit = 1024 * 1024 * 2
 
 // VolumeCopy copy the .idx .dat .vif files, and mount the volume
 func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stream volume_server_pb.VolumeServer_VolumeCopyServer) error {
+	if err := vs.checkGrpcAdminAuth(stream.Context()); err != nil {
+		return err
+	}
 	if err := vs.CheckMaintenanceMode(); err != nil {
 		return err
 	}
@@ -46,28 +50,26 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 	//   send .dat file
 	//   confirm size and timestamp
 	var volFileInfoResp *volume_server_pb.ReadVolumeFileStatusResponse
+	var sourceVolumeStatus *volume_server_pb.VolumeStatusResponse
+	var sourceVolumeStatusAfterCopy *volume_server_pb.VolumeStatusResponse
 	var dataBaseFileName, indexBaseFileName, idxFileName, datFileName string
 	var hasRemoteDatFile bool
 	err := operation.WithVolumeServerClient(true, pb.ServerAddress(req.SourceDataNode), vs.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 		var err error
-		volFileInfoResp, err = client.ReadVolumeFileStatus(context.Background(),
+		sourceVolumeStatus, err = client.VolumeStatus(stream.Context(), &volume_server_pb.VolumeStatusRequest{
+			VolumeId: req.VolumeId,
+		})
+		if err != nil {
+			glog.Warningf("failed to read source volume %d status before copy; skip record count validation: %v", req.VolumeId, err)
+			sourceVolumeStatus = nil
+		}
+
+		volFileInfoResp, err = client.ReadVolumeFileStatus(stream.Context(),
 			&volume_server_pb.ReadVolumeFileStatusRequest{
 				VolumeId: req.VolumeId,
 			})
 		if nil != err {
 			return fmt.Errorf("read volume file status failed, %w", err)
-		}
-
-		// Source is reachable and holds the volume: only now is it safe to drop
-		// an existing local replica before overwriting its files.
-		if hasExistingVolume {
-			glog.V(0).Infof("volume %d already exists. deleting before copying from %s...", req.VolumeId, req.SourceDataNode)
-			// keep remote data: the inbound copy carries a .vif that may point at
-			// the same cloud-tier object the existing volume references.
-			if delErr := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), false, true); delErr != nil {
-				return fmt.Errorf("failed to delete existing volume %d: %v", req.VolumeId, delErr)
-			}
-			glog.V(0).Infof("deleted existing volume %d before copying.", req.VolumeId)
 		}
 
 		diskType := volFileInfoResp.DiskType
@@ -83,9 +85,21 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		location := vs.store.FindFreeLocation(func(location *storage.DiskLocation) bool {
 			return location.DiskType == types.ToDiskType(diskType) &&
 				location.AvailableSpace.Load() > neededSpace
-		})
+		}, needle.VolumeId(req.VolumeId))
 		if location == nil {
 			return fmt.Errorf("%s %s", util.ErrVolumeNoSpaceLeft, types.ToDiskType(diskType).ReadableString())
+		}
+
+		// Source is reachable and a destination is reserved: only now is it
+		// safe to drop an existing local replica before overwriting its files.
+		if hasExistingVolume {
+			glog.V(0).Infof("volume %d already exists. deleting before copying from %s...", req.VolumeId, req.SourceDataNode)
+			// keep remote data: the inbound copy carries a .vif that may point at
+			// the same cloud-tier object the existing volume references.
+			if delErr := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), false, true); delErr != nil {
+				return fmt.Errorf("failed to delete existing volume %d: %v", req.VolumeId, delErr)
+			}
+			glog.V(0).Infof("deleted existing volume %d before copying.", req.VolumeId)
 		}
 
 		dataBaseFileName = storage.VolumeFileName(location.Directory, volFileInfoResp.Collection, int(req.VolumeId))
@@ -185,6 +199,15 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			return fmt.Errorf("remove .note for volume %d: %w", req.VolumeId, noteErr)
 		}
 
+		var statusErr error
+		sourceVolumeStatusAfterCopy, statusErr = client.VolumeStatus(stream.Context(), &volume_server_pb.VolumeStatusRequest{
+			VolumeId: req.VolumeId,
+		})
+		if statusErr != nil {
+			err = fmt.Errorf("read source volume %d status after copy failed: %w", req.VolumeId, statusErr)
+			return err
+		}
+
 		return nil
 	})
 
@@ -219,10 +242,22 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		}
 	}
 
-	// mount the volume
-	err = vs.store.MountVolume(needle.VolumeId(req.VolumeId))
+	shouldValidateCopyCounts := copyCountsStable(sourceVolumeStatus, sourceVolumeStatusAfterCopy)
+	if !shouldValidateCopyCounts {
+		glog.V(1).Infof("source volume %d changed during copy; skip record count validation", req.VolumeId)
+	}
+
+	// Load and validate the volume before announcing it to the master. A failed
+	// validation is unloaded by the store without ever making the replica
+	// routable.
+	err = vs.store.MountVolume(needle.VolumeId(req.VolumeId), &req.Collection, func(targetVolume *storage.Volume) error {
+		if !shouldValidateCopyCounts {
+			return nil
+		}
+		return checkCopyCounts(sourceVolumeStatusAfterCopy, targetVolume.FileCount(), targetVolume.DeletedCount())
+	})
 	if err != nil {
-		return fmt.Errorf("failed to mount volume %d: %v", req.VolumeId, err)
+		return fmt.Errorf("failed to mount or validate volume %d: %w", req.VolumeId, err)
 	}
 
 	if err = stream.Send(&volume_server_pb.VolumeCopyResponse{
@@ -262,11 +297,8 @@ func (vs *VolumeServer) doCopyFileWithThrottler(client volume_server_pb.VolumeSe
 
 }
 
-/*
-*
-only check the differ of the file size
-todo: maybe should check the received count and deleted count of the volume
-*/
+// checkCopyFiles verifies the copied file sizes. Record counts are checked
+// after the target volume is mounted, when the target needle map is available.
 func checkCopyFiles(originFileInf *volume_server_pb.ReadVolumeFileStatusResponse, hasRemoteDatFile bool, idxFileName, datFileName string) error {
 	stat, err := os.Stat(idxFileName)
 	if err != nil {
@@ -294,6 +326,25 @@ func checkCopyFiles(originFileInf *volume_server_pb.ReadVolumeFileStatusResponse
 			stat.Size(), originFileInf.DatFileSize)
 	}
 	return nil
+}
+
+func checkCopyCounts(origin *volume_server_pb.VolumeStatusResponse, targetFileCount, targetDeletedCount uint64) error {
+	if origin.FileCount != targetFileCount {
+		return fmt.Errorf("target file count [%d] is not same as origin file count [%d]", targetFileCount, origin.FileCount)
+	}
+	if origin.FileDeletedCount != targetDeletedCount {
+		return fmt.Errorf("target deleted count [%d] is not same as origin deleted count [%d]", targetDeletedCount, origin.FileDeletedCount)
+	}
+	return nil
+}
+
+func copyCountsStable(before, after *volume_server_pb.VolumeStatusResponse) bool {
+	// A writable source may receive writes or deletions while its files are
+	// copied. In that case the before/after counts do not describe one stable
+	// snapshot, so strict target-count validation would report a false error.
+	return before != nil && after != nil &&
+		before.FileCount == after.FileCount &&
+		before.FileDeletedCount == after.FileDeletedCount
 }
 
 func findLastAppendAtNsFromCopiedFiles(idxFileName, datFileName string, version needle.Version) (uint64, error) {
@@ -477,10 +528,51 @@ func (vs *VolumeServer) ReadVolumeFileStatus(ctx context.Context, req *volume_se
 	return resp, nil
 }
 
+// checkVolumeFileExtension guards the client-supplied Ext that CopyFile and
+// ReceiveFile turn into an on-disk path. Both RPCs are intentionally ungated
+// for cluster-internal peers (see volume_grpc_admin_auth_coverage_test.go), so
+// this is the only check standing between a peer request and the os.Open /
+// os.Create target: without it an Ext like "/../../x" is joined onto the volume
+// directory and, once path-cleaned, resolves outside it. A genuine extension is
+// a leading dot followed by alphanumerics -- ".dat", ".idx", ".vif", ".ecx",
+// ".ecj", ".ecsum", ".ec00".. -- and never contains a separator or "..".
+func checkVolumeFileExtension(ext string) error {
+	if len(ext) < 2 || ext[0] != '.' {
+		return fmt.Errorf("invalid file extension %q", ext)
+	}
+	for _, r := range ext[1:] {
+		if r < '0' || (r > '9' && r < 'A') || (r > 'Z' && r < 'a') || r > 'z' {
+			return fmt.Errorf("invalid file extension %q", ext)
+		}
+	}
+	return nil
+}
+
+// checkVolumeCollection guards the client-supplied Collection, which CopyFile
+// and ReceiveFile fold into a path component ("<collection>_<vid>"). An empty
+// collection is the default; any other value must be a single path element so a
+// collection like "../../x" cannot climb out of the volume directory once
+// path-cleaned. Collection names are user-facing and may hold '.' or '-', so
+// this rejects only separators and bare parent references rather than the
+// stricter alphanumeric rule used for extensions.
+func checkVolumeCollection(collection string) error {
+	if collection == "." || collection == ".." || strings.ContainsAny(collection, `/\`) {
+		return fmt.Errorf("invalid collection %q", collection)
+	}
+	return nil
+}
+
 // CopyFile client pulls the volume related file from the source server.
 // if req.CompactionRevision != math.MaxUint32, it ensures the compact revision is as expected
 // The copying still stop at req.StopOffset, but you can set it to math.MaxUint64 in order to read all data.
 func (vs *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream volume_server_pb.VolumeServer_CopyFileServer) error {
+
+	if err := checkVolumeFileExtension(req.Ext); err != nil {
+		return err
+	}
+	if err := checkVolumeCollection(req.Collection); err != nil {
+		return err
+	}
 
 	var fileName string
 	if !req.IsEcVolume {
@@ -590,6 +682,19 @@ func (vs *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream v
 	return nil
 }
 
+// diskHoldsEcShardFile reports whether dir contains any <vid>.ecNN shard file,
+// so a decoded <vid>.dat is never staged beside a shard. Unlike FindEcVolume,
+// it also catches shards present on disk but not mounted.
+func diskHoldsEcShardFile(dir, collection string, vid needle.VolumeId) bool {
+	base := erasure_coding.EcShardFileName(collection, dir, int(vid))
+	for i := 0; i < erasure_coding.MaxShardCount; i++ {
+		if fi, err := os.Stat(base + erasure_coding.ToExt(i)); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ReceiveFile receives a file stream from client and writes it to storage
 func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_ReceiveFileServer) error {
 	if err := vs.CheckMaintenanceMode(); err != nil {
@@ -635,6 +740,19 @@ func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_Receive
 			fileInfo = data.Info
 			glog.V(1).Infof("ReceiveFile: volume %d, ext %s, collection %s, shard %d, size %d",
 				fileInfo.VolumeId, fileInfo.Ext, fileInfo.Collection, fileInfo.ShardId, fileInfo.FileSize)
+
+			if err := checkVolumeFileExtension(fileInfo.Ext); err != nil {
+				glog.Errorf("ReceiveFile: %v", err)
+				return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
+					Error: err.Error(),
+				})
+			}
+			if err := checkVolumeCollection(fileInfo.Collection); err != nil {
+				glog.Errorf("ReceiveFile: %v", err)
+				return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
+					Error: err.Error(),
+				})
+			}
 
 			if fileInfo.IsEcVolume {
 				// os.Create below truncates in place; a mounted EcVolume
@@ -684,12 +802,42 @@ func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_Receive
 				// Regular volume file
 				v := vs.store.GetVolume(needle.VolumeId(fileInfo.VolumeId))
 				if v == nil {
-					glog.Errorf("ReceiveFile: volume %d not found", fileInfo.VolumeId)
-					return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
-						Error: fmt.Sprintf("volume %d not found", fileInfo.VolumeId),
+					if fileInfo.DiskType == "" {
+						glog.Errorf("ReceiveFile: volume %d not found", fileInfo.VolumeId)
+						return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
+							Error: fmt.Sprintf("volume %d not found", fileInfo.VolumeId),
+						})
+					}
+					// Staged-new-volume mode (EC decode onto a clean peer): the
+					// volume does not exist here yet. Pick a free-slot disk location
+					// of the requested medium and stage the file as
+					// <base><ext>.copying, to be renamed into place and mounted by
+					// VolumeEcShardsToVolume(from_staged). .idx.copying/.vif.copying
+					// are not valid volume names, so the scanner never half-loads.
+					want := types.ToDiskType(fileInfo.DiskType)
+					stagedVid := needle.VolumeId(fileInfo.VolumeId)
+					loc := vs.store.FindFreeLocation(func(l *storage.DiskLocation) bool {
+						if l.DiskType != want {
+							return false
+						}
+						// Don't stage the decoded .dat onto a disk that holds a shard
+						// of this vid. Check the mounted map and the on-disk files, so
+						// an unmounted or orphan shard (on disk, absent from the map)
+						// is caught too.
+						if _, holds := l.FindEcVolume(stagedVid); holds {
+							return false
+						}
+						return !diskHoldsEcShardFile(l.Directory, fileInfo.Collection, stagedVid)
 					})
+					if loc == nil {
+						return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
+							Error: fmt.Sprintf("no %s disk location with a free slot for volume %d", fileInfo.DiskType, fileInfo.VolumeId),
+						})
+					}
+					filePath = storage.VolumeFileName(loc.Directory, fileInfo.Collection, int(fileInfo.VolumeId)) + fileInfo.Ext + ".copying"
+				} else {
+					filePath = v.FileName(fileInfo.Ext)
 				}
-				filePath = v.FileName(fileInfo.Ext)
 			}
 
 			// Create target file

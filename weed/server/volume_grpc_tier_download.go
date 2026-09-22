@@ -1,6 +1,7 @@
 package weed_server
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,10 +13,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/volume_info"
 )
 
 // VolumeTierMoveDatFromRemote copy dat file from a remote tier to local volume server
 func (vs *VolumeServer) VolumeTierMoveDatFromRemote(req *volume_server_pb.VolumeTierMoveDatFromRemoteRequest, stream volume_server_pb.VolumeServer_VolumeTierMoveDatFromRemoteServer) error {
+	if err := vs.checkGrpcAdminAuth(stream.Context()); err != nil {
+		return err
+	}
 
 	// find existing volume
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
@@ -91,7 +96,14 @@ func (vs *VolumeServer) VolumeTierMoveDatFromRemote(req *volume_server_pb.Volume
 	// with a .vif referencing the remote object while that object is deleted.
 	v.GetVolumeInfo().Files = v.GetVolumeInfo().Files[1:]
 	if err := v.SaveVolumeInfo(); err != nil {
-		return fmt.Errorf("volume %d failed to save remote file info: %v", v.Id, err)
+		var ndErr *volume_info.NotCrashDurableError
+		if !errors.As(err, &ndErr) {
+			return fmt.Errorf("volume %d failed to save remote file info: %v", v.Id, err)
+		}
+		// The .vif is committed but may not be crash-durable. Continue
+		// with the backend switch and remote deletion since the metadata
+		// already reflects the local-only state.
+		glog.Warningf("volume %d saved remote file info but not crash-durable: %v", v.Id, err)
 	}
 
 	// fsync the directory again so the rewritten .vif is durable.
@@ -122,7 +134,7 @@ func (vs *VolumeServer) VolumeTierMoveDatFromRemote(req *volume_server_pb.Volume
 // swapToLocalDatBackend closes the remote data backend and opens the downloaded
 // local .dat as a DiskFile so reads are served from local disk.
 func swapToLocalDatBackend(v *storage.Volume, datFileName string) error {
-	dataFile, err := os.OpenFile(datFileName, os.O_RDWR, 0644)
+	dataFile, err := backend.OpenVolumeFile(datFileName, os.O_RDWR)
 	if err != nil {
 		return err
 	}

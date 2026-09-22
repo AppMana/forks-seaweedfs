@@ -32,7 +32,7 @@ func TestMakeupDiffRelocatesLargeOffsets(t *testing.T) {
 			seed := newEmptyNeedle(1)
 			seed.Data = []byte("seed")
 			seed.Checksum = needle.NewCRC(seed.Data)
-			if _, _, _, err := v.writeNeedle2(seed, true, false); err != nil {
+			if _, _, _, err := v.writeNeedle2(seed, true, false, false); err != nil {
 				t.Fatal(err)
 			}
 			if err := v.CompactByIndex(nil); err != nil {
@@ -46,7 +46,7 @@ func TestMakeupDiffRelocatesLargeOffsets(t *testing.T) {
 			n := newEmptyNeedle(2)
 			n.Data = []byte("concurrent write survives relocation")
 			n.Checksum = needle.NewCRC(n.Data)
-			if _, _, _, err := v.writeNeedle2(n, true, false); err != nil {
+			if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
 				t.Fatal(err)
 			}
 			if err := v.nm.Sync(); err != nil {
@@ -129,7 +129,7 @@ func TestCommitCompactReportsReplayFailure(t *testing.T) {
 	n := newEmptyNeedle(1)
 	n.Data = []byte("must survive failed compaction")
 	n.Checksum = needle.NewCRC(n.Data)
-	if _, _, _, err := v.writeNeedle2(n, true, false); err != nil {
+	if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := v.CompactByIndex(nil); err != nil {
@@ -138,7 +138,7 @@ func TestCommitCompactReportsReplayFailure(t *testing.T) {
 	n2 := newEmptyNeedle(2)
 	n2.Data = []byte("tail")
 	n2.Checksum = needle.NewCRC(n2.Data)
-	if _, _, _, err := v.writeNeedle2(n2, true, false); err != nil {
+	if _, _, _, err := v.writeNeedle2(n2, true, false, false); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate an obsolete compaction generation. Commit must fail visibly,

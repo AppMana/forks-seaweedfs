@@ -20,22 +20,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// isSkippableNeedleReadError returns true when a needle read failed because
-// the on-disk bytes are unreadable in a permanent way (offset past EOF, header
-// corruption, CRC mismatch, malformed v2/v3/v4 fields). Vacuum can safely drop
-// such entries during compaction. Anything else (real disk EIO on Unix,
-// ERROR_CRC / ERROR_IO_DEVICE on Windows, network timeouts, EROFS, etc.) is
-// transient or environmental and must abort the compaction so an operator
-// notices, rather than silently dropping recoverable data.
-func isSkippableNeedleReadError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, needle.ErrorSizeMismatch) ||
-		errors.Is(err, needle.ErrorSizeInvalid) ||
-		errors.Is(err, needle.ErrorCorrupted)
+// exceedsExpectedCompactedSize reports whether the compacted .dat is short of
+// the live bytes the pre-compaction index snapshot expected.
+func exceedsExpectedCompactedSize(expectedLiveBytes uint64, dstDatSize int64) bool {
+	return expectedLiveBytes > uint64(dstDatSize)
 }
 
 type ProgressFunc func(processed int64) bool
@@ -91,6 +79,7 @@ func (v *Volume) CompactByVolumeData(opts *CompactOptions) error {
 	}
 	defer v.isCompactionInProgress.Store(false)
 
+	v.compactCopyFailed.Store(true)
 	v.lastCompactIndexOffset = v.IndexFileSize()
 	v.lastCompactRevision = v.SuperBlock.CompactionRevision
 	glog.V(3).Infof("creating copies for volume %d ,last offset %d...", v.Id, v.lastCompactIndexOffset)
@@ -112,7 +101,9 @@ func (v *Volume) CompactByVolumeData(opts *CompactOptions) error {
 	opts.destIdxPath = v.FileName(".cpx")
 	opts.superBlock = v.SuperBlock
 	opts.version = v.Version()
-	return v.copyDataAndGenerateIndexFile(opts)
+	err := v.copyDataAndGenerateIndexFile(opts)
+	v.compactCopyFailed.Store(err != nil)
+	return err
 }
 
 // compact a volume based on deletions in .idx files
@@ -133,6 +124,7 @@ func (v *Volume) CompactByIndex(opts *CompactOptions) error {
 	}
 	defer v.isCompactionInProgress.Store(false)
 
+	v.compactCopyFailed.Store(true)
 	v.lastCompactIndexOffset = v.IndexFileSize()
 	v.lastCompactRevision = v.SuperBlock.CompactionRevision
 	glog.V(3).Infof("creating copies for volume %d ...", v.Id)
@@ -156,7 +148,9 @@ func (v *Volume) CompactByIndex(opts *CompactOptions) error {
 	opts.destIdxPath = v.FileName(".cpx")
 	opts.superBlock = v.SuperBlock
 	opts.version = v.Version()
-	return v.copyDataBasedOnIndexFile(opts)
+	err := v.copyDataBasedOnIndexFile(opts)
+	v.compactCopyFailed.Store(err != nil)
+	return err
 }
 
 func (v *Volume) CommitCompact() error {
@@ -174,6 +168,15 @@ func (v *Volume) CommitCompact() error {
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
+	if v.compactCopyFailed.Load() {
+		return fmt.Errorf("volume %d compact commit aborted: preceding copy failed", v.Id)
+	}
+	// A failed copy is not a decided commit. Check before closing the live
+	// backend or publishing a marker that restart would roll forward.
+	if !util.FileExists(v.FileName(".cpd")) || !util.FileExists(v.FileName(".cpx")) {
+		return fmt.Errorf("volume %d compact commit aborted: missing .cpd/.cpx", v.Id)
+	}
+
 	glog.V(3).Infof("Got volume %d committing lock...", v.Id)
 	if v.nm != nil {
 		v.nm.Close()
@@ -187,9 +190,8 @@ func (v *Volume) CommitCompact() error {
 	v.DataBackend = nil
 	stats.VolumeServerVolumeGauge.WithLabelValues(v.Collection, "volume").Dec()
 
-	var e error
 	var replayErr error
-	if e = v.makeupDiff(v.FileName(".cpd"), v.FileName(".cpx"), v.FileName(".dat"), v.FileName(".idx")); e != nil {
+	if e := v.makeupDiff(v.FileName(".cpd"), v.FileName(".cpx"), v.FileName(".dat"), v.FileName(".idx")); e != nil {
 		replayErr = e
 		glog.V(0).Infof("makeupDiff in CommitCompact volume %d failed %v", v.Id, e)
 		// The temporary map describes the abandoned compacted generation, not
@@ -198,13 +200,13 @@ func (v *Volume) CommitCompact() error {
 			v.tmpNm.Close()
 			v.tmpNm = nil
 		}
-		e = os.Remove(v.FileName(".cpd"))
-		if e != nil {
-			return e
+		if e := os.Remove(v.FileName(".cpd")); e != nil && !os.IsNotExist(e) {
+			glog.V(0).Infof("remove %s: %v", v.FileName(".cpd"), e)
+			replayErr = errors.Join(replayErr, e)
 		}
-		e = os.Remove(v.FileName(".cpx"))
-		if e != nil {
-			return e
+		if e := os.Remove(v.FileName(".cpx")); e != nil && !os.IsNotExist(e) {
+			glog.V(0).Infof("remove %s: %v", v.FileName(".cpx"), e)
+			replayErr = errors.Join(replayErr, e)
 		}
 	} else {
 		// makeupDiff has fsynced the .cpd/.cpx contents. Persist a durable .cpc
@@ -212,10 +214,10 @@ func (v *Volume) CommitCompact() error {
 		// crash: a marker on disk means the swap is decided and reconcile rolls
 		// forward; no marker means roll back. Without it, a crash between the
 		// two renames leaves a stale .idx that a later vacuum compacts to empty.
-		if e = v.writeCompactCommitMarker(); e != nil {
+		if e := v.writeCompactCommitMarker(); e != nil {
 			return e
 		}
-		if e = v.applyCompactSwap(); e != nil {
+		if e := v.applyCompactSwap(); e != nil {
 			return e
 		}
 	}
@@ -224,7 +226,7 @@ func (v *Volume) CommitCompact() error {
 	//time.Sleep(20 * time.Second)
 
 	glog.V(3).Infof("Loading volume %d commit file...", v.Id)
-	if e = v.load(true, false, v.needleMapKind, 0, v.Version()); e != nil {
+	if e := v.load(true, false, v.needleMapKind, 0, v.Version()); e != nil {
 		return errors.Join(replayErr, e)
 	}
 	glog.V(3).Infof("Finish committing volume %d", v.Id)
@@ -292,19 +294,25 @@ func (v *Volume) finishCompactSwap() error {
 			return fmt.Errorf("rename %s: %v", v.FileName(".cpx"), e)
 		}
 	}
-	if cpdExists || cpxExists {
-		if e := fsyncDir(filepath.Dir(v.FileName(".dat"))); e != nil {
+	if e := fsyncDir(filepath.Dir(v.FileName(".dat"))); e != nil {
+		return e
+	}
+	if v.dir != v.dirIdx {
+		if e := fsyncDir(filepath.Dir(v.FileName(".idx"))); e != nil {
 			return e
 		}
-		if v.dir != v.dirIdx {
-			if e := fsyncDir(filepath.Dir(v.FileName(".idx"))); e != nil {
-				return e
-			}
-		}
-		// A stale .ldb/.rdb mirrors the old .idx; remove it so it can never
-		// poison the needle map built from the freshly renamed .idx.
-		os.RemoveAll(v.FileName(".ldb"))
-		os.Remove(v.FileName(".rdb"))
+	}
+	// Both renames may have completed before a crash without invalidating the
+	// old cache. The marker, not the presence of temp files, requires this step.
+	// Keep the marker on any error so recovery cannot accept a stale cache.
+	if e := os.RemoveAll(v.FileName(".ldb")); e != nil {
+		return fmt.Errorf("invalidate compacted volume cache: %w", e)
+	}
+	if e := os.Remove(v.FileName(".rdb")); e != nil && !os.IsNotExist(e) {
+		return fmt.Errorf("invalidate compacted volume cache: %w", e)
+	}
+	if e := fsyncDir(filepath.Dir(v.FileName(".idx"))); e != nil {
+		return e
 	}
 
 	// Clear the marker last and fsync the dir so a restart does not re-run a
@@ -385,12 +393,16 @@ func (v *Volume) cleanupCompact() error {
 }
 
 // fsyncDir fsyncs a directory so a rename/create/unlink inside it is durable.
-// A failure to open the directory for sync is non-fatal on platforms that do
-// not support it.
+// Windows has no directory fsync, so the .cpc protocol leans on NTFS metadata
+// ordering there. On systems with directory fsync, opening the directory is
+// part of the durability guarantee and must not be silently ignored.
 func fsyncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	d, err := os.Open(dir)
 	if err != nil {
-		return nil
+		return fmt.Errorf("open dir %s for sync: %v", dir, err)
 	}
 	defer d.Close()
 	if err = d.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
@@ -484,7 +496,12 @@ func (v *Volume) makeupDiff(newDatFileName, newIdxFileName, oldDatFileName, oldI
 	defer func() {
 		// makeupDiff appends new needles/tombstones to the .cpx; its fsync is the
 		// durability gate that must succeed before CommitCompact writes the .cpc
-		// marker and swaps the files.
+		// marker and swaps the files. Sync the dat file once after all appends
+		// rather than per-needle — a fsync per entry scales poorly on slow disks
+		// and can exceed test timeouts with large entry counts.
+		if syncErr := dstDatBackend.Sync(); syncErr != nil && err == nil {
+			err = fmt.Errorf("sync dat %s: %v", newDatFileName, syncErr)
+		}
 		if syncErr := idx.Sync(); syncErr != nil && err == nil {
 			err = fmt.Errorf("sync idx %s: %v", newIdxFileName, syncErr)
 		}
@@ -533,13 +550,23 @@ func (v *Volume) makeupDiff(newDatFileName, newIdxFileName, oldDatFileName, oldI
 				v.checkReadWriteError(err)
 				return fmt.Errorf("ReadNeedleBlob %s key %d offset %d size %d failed: %w", oldDatFile.Name(), key, increIdxEntry.offset.ToActualOffset(), increIdxEntry.size, err)
 			}
+			// Replay needs the same integrity checks as the initial copy. A
+			// readable blob can belong to a different key or have a corrupt body.
+			// Do not publish a new generation that makes the original unrecoverable.
+			if v.Version() != needle.Version1 && increIdxEntry.size < 4 {
+				return fmt.Errorf("replay needle %d: invalid body size %d", key, increIdxEntry.size)
+			}
+			n := new(needle.Needle)
+			if err := n.ReadBytes(needleBytes, increIdxEntry.offset.ToActualOffset(), increIdxEntry.size, v.Version()); err != nil {
+				return fmt.Errorf("validate replay needle %d: %w", key, err)
+			}
+			if n.Id != key {
+				return fmt.Errorf("replay index key %d points to needle %d at offset %d", key, n.Id, increIdxEntry.offset.ToActualOffset())
+			}
 			if n, writeErr := dstDatBackend.Write(needleBytes); writeErr != nil {
 				return fmt.Errorf("write compacted needle %d: %w", key, writeErr)
 			} else if n != len(needleBytes) {
 				return fmt.Errorf("write compacted needle %d: %w", key, io.ErrShortWrite)
-			}
-			if err := dstDatBackend.Sync(); err != nil {
-				return fmt.Errorf("cannot sync needle %s: %v", dstDatBackend.File.Name(), err)
 			}
 			idxEntryBytes = needle_map.ToBytes(key, ToOffset(offset), increIdxEntry.size)
 		} else { //deleted needle
@@ -620,7 +647,18 @@ func (v *Volume) copyDataAndGenerateIndexFile(opts *CompactOptions) (err error) 
 	if dst, err = backend.CreateVolumeFile(opts.destDatPath, opts.PreallocateBytes, 0); err != nil {
 		return err
 	}
-	defer dst.Close()
+	defer func() {
+		if closeErr := dst.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close compacted dat %s: %v", opts.destDatPath, closeErr)
+		}
+		if err != nil {
+			for _, path := range []string{opts.destDatPath, opts.destIdxPath} {
+				if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+					err = errors.Join(err, removeErr)
+				}
+			}
+		}
+	}()
 
 	nm := needle_map.NewMemDb()
 	defer nm.Close()
@@ -642,6 +680,9 @@ func (v *Volume) copyDataAndGenerateIndexFile(opts *CompactOptions) (err error) 
 }
 
 func (v *Volume) copyDataBasedOnIndexFile(opts *CompactOptions) (err error) {
+	if util.FileExists(v.FileName(".cpc")) {
+		return fmt.Errorf("volume %d: refusing compact copy while commit marker present", v.Id)
+	}
 	var (
 		srcDatBackend, dstDatBackend backend.BackendStorageFile
 		dataFile                     *os.File
@@ -656,6 +697,19 @@ func (v *Volume) copyDataBasedOnIndexFile(opts *CompactOptions) (err error) {
 		// of leaving a half-written .cpd that CommitCompact would rename live.
 		if closeErr := dstDatBackend.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("close compacted dat %s: %v", opts.destDatPath, closeErr)
+		}
+		if err != nil {
+			// Invalidate only this abandoned generation, never the original
+			// data/index. A later commit must not install a partial copy.
+			for _, path := range []string{opts.destDatPath, opts.destIdxPath} {
+				if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+					err = errors.Join(err, removeErr)
+				}
+			}
+			if v.tmpNm != nil {
+				v.tmpNm.Close()
+				v.tmpNm = nil
+			}
 		}
 	}()
 
@@ -681,10 +735,7 @@ func (v *Volume) copyDataBasedOnIndexFile(opts *CompactOptions) (err error) {
 	}
 
 	writeThrottler := util.NewWriteThrottler(opts.MaxBytesPerSecond)
-	var (
-		skippedNeedles   int
-		skippedDataBytes uint64
-	)
+	var expectedLiveBytes uint64
 	err = oldNm.AscendingVisit(func(value needle_map.NeedleValue) error {
 
 		offset, size := value.Offset, value.Size
@@ -702,26 +753,20 @@ func (v *Volume) copyDataBasedOnIndexFile(opts *CompactOptions) (err error) {
 		n := new(needle.Needle)
 		if err := n.ReadData(srcDatBackend, offset.ToActualOffset(), size, opts.version); err != nil {
 			v.checkReadWriteError(err)
-			// Only drop the entry when the failure is one of the well-known
-			// permanent-corruption shapes. A transient disk fault, a tiered
-			// read timeout, or a Windows hardware error (ERROR_CRC etc.) must
-			// abort so an operator notices, rather than silently compacting
-			// away data that might come back on retry. See issue #8928.
-			if !isSkippableNeedleReadError(err) {
-				return fmt.Errorf("cannot hydrate needle from file: %w", err)
-			}
-			skippedNeedles++
-			if size.IsValid() {
-				skippedDataBytes += uint64(size)
-			}
-			glog.Warningf("vacuum volume %d: dropping unreadable needle key=%d offset=%d size=%d: %v",
+			// A bad index offset does not prove the body is absent or garbage.
+			// Preserve the original generation for diagnosis/repair instead.
+			return fmt.Errorf("vacuum volume %d: refusing unreadable live needle key=%d offset=%d size=%d: %w",
 				v.Id, value.Key, offset.ToActualOffset(), size, err)
-			return nil
+		}
+		if n.Id != value.Key {
+			return fmt.Errorf("vacuum volume %d: index key %d points to needle %d at offset %d", v.Id, value.Key, n.Id, offset.ToActualOffset())
 		}
 
 		if n.HasTtl() && now >= n.LastModified+uint64(opts.superBlock.Ttl.Minutes()*60) {
 			return nil
 		}
+
+		expectedLiveBytes += uint64(size)
 
 		if err = newNm.Set(n.Id, ToOffset(newOffset), n.Size); err != nil {
 			return fmt.Errorf("cannot put needle: %s", err)
@@ -739,32 +784,17 @@ func (v *Volume) copyDataBasedOnIndexFile(opts *CompactOptions) (err error) {
 	if err != nil {
 		return err
 	}
-	if skippedNeedles > 0 {
-		glog.Warningf("vacuum volume %d: dropped %d unreadable index entries (%d data bytes) during compaction",
-			v.Id, skippedNeedles, skippedDataBytes)
-	}
-	if v.Ttl.String() == "" && v.nm != nil {
+	if v.Ttl.String() == "" {
 		dstDatSize, _, err := dstDatBackend.GetStat()
 		if err != nil {
 			return err
 		}
-		if v.nm.ContentSize() > v.nm.DeletedSize() {
-			expectedContentSize := v.nm.ContentSize() - v.nm.DeletedSize()
-			// Skipped needles still contribute to the source-side ContentSize but
-			// were not written to the destination, so subtract them before the
-			// safety check to avoid a false positive.
-			if skippedDataBytes >= expectedContentSize {
-				expectedContentSize = 0
-			} else {
-				expectedContentSize -= skippedDataBytes
-			}
-			if expectedContentSize > uint64(dstDatSize) {
-				return fmt.Errorf("volume %s unexpected new data size: %d does not match size of content minus deleted: %d",
-					v.Id.String(), dstDatSize, expectedContentSize)
-			}
-		} else if v.nm.DeletedSize() > v.nm.ContentSize() {
-			glog.Warningf("volume %s content size: %d less deleted size: %d, new size: %d",
-				v.Id.String(), v.nm.ContentSize(), v.nm.DeletedSize(), dstDatSize)
+		// expectedLiveBytes is tallied from oldNm (the frozen snapshot this
+		// loop copied from), not the live v.nm. Any unreadable live entry
+		// aborts the copy rather than weakening this integrity check.
+		if exceedsExpectedCompactedSize(expectedLiveBytes, dstDatSize) {
+			return fmt.Errorf("volume %s unexpected new data size: %d does not match expected live content size %d from the pre-compaction snapshot",
+				v.Id.String(), dstDatSize, expectedLiveBytes)
 		}
 	}
 	err = newNm.SaveToIdx(opts.destIdxPath)

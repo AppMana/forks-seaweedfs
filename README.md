@@ -52,6 +52,21 @@ to serve SeaweedFS persistent volumes to Windows Kubernetes nodes.
 
 ## Reliability CI: configuration and updating the baseline
 
+For safe local reproduction, see the [isolated storage lab](test/storage_lab/README.md).
+It reuses existing tests with bounded resources and no production network or
+writable host mounts. Linux, native Windows, and Synology SPK qualification are
+separate gates; passing the Linux lab does not qualify the other packages.
+
+Passing local tests does not authorize promotion; deployment requirements and
+current operational facts belong in the existing AppMana `docs/seaweedfs.md`
+runbook, not a second document in this source repository.
+
+The candidate also backports upstream #11411, including its unchanged
+five-byte-offset regression test; plain 4.47 does not contain that fix.
+Index-based vacuum refuses unreadable or wrong-identity live records rather
+than dropping them. This is a safety policy, not a tuning option: bad indexes
+require diagnosis/repair before reclamation, even if that leaves disk usage high.
+
 The [storage reliability workflow](.github/workflows/appmana-storage-reliability.yml)
 runs on `merge/**`, `master`, `main`, pull requests, and manual dispatch. It
 uses the existing storage tests and `test/volume_server` process harness. It
@@ -64,6 +79,8 @@ Secrets and variables → Actions → Variables:
 | --- | --- | --- |
 | `SEAWEEDFS_RELIABILITY_BASELINE_REF` | Full 40-character commit SHA for the source compatibility baseline | Change deliberately when the baseline is promoted; keep the previous deployed release in the upgrade/rollback matrix. Do not use `HEAD~1`, a branch, or `latest`. |
 | `SEAWEEDFS_RELIABILITY_GO_FUSE_REF` | Full commit SHA for `AppMana/forks-go-fuse`, required by the local `go.mod` replacement | Change only alongside a reviewed and tested dependency upgrade. Both test builds use this pinned sibling. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Set this only after the VM lifecycle, QGA, and large-artifact fixes are committed there. Never point this at a moving branch. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE` | Qualified Ubuntu VM image reference including `@sha256:<64 hex>` | Build from the pinned source, publish and preload it on the dedicated runner, and update only after its live KVM smoke test passes. Mutable tags are rejected. |
 
 The initial baseline is `9ec822e2d634abc36eb2a113d0ddb4a844970873` (the audited
 4.40 fork source), and the initial Go-FUSE pin is
@@ -75,6 +92,8 @@ deployed version before rollout.
 ```sh
 gh variable set SEAWEEDFS_RELIABILITY_BASELINE_REF --repo AppMana/forks-seaweedfs --body "$BASELINE_SHA"
 gh variable set SEAWEEDFS_RELIABILITY_GO_FUSE_REF --repo AppMana/forks-seaweedfs --body "$GO_FUSE_SHA"
+gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_SHA"
+gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_VM_IMAGE_AT_DIGEST"
 gh variable list --repo AppMana/forks-seaweedfs
 ```
 
@@ -84,6 +103,13 @@ Go comes from `go.mod`. Missing/invalid pins and identical baseline/candidate
 commits fail explicitly. The job summary records both resolved commits and
 the dependency pin, and the binaries embed their source commits. A manual
 override does not update the repository variable.
+
+The intensive `vm-fault-gates` job runs only on a dedicated self-hosted runner
+labelled `linux`, `x64`, `kvm`, and `seaweedfs-lab`. It requires `/dev/kvm`,
+Docker, Containerlab 0.79.0, and the digest-pinned VM image, but no production
+routes or credentials. Four fresh isolated labs test replicated concurrent
+vacuum, acknowledged-write power loss, graceful baseline/candidate/rollback
+migration, and power loss after observing the vacuum `.cpd` copy.
 
 Workflow-level variables `STORAGE_BUILD_TAGS`, `STORAGE_UNIT_TEST_TIMEOUT`, and
 `STORAGE_PROCESS_TEST_TIMEOUT` define the build format and test deadlines in
@@ -126,55 +152,10 @@ bounded `.dat` size for a fixed live dataset, on memory and LevelDB indexes.
 SIGKILL is **not power loss**: host page-cache survival does not prove durable
 acknowledgements.
 
-## Operational configuration: what must move together
+## Deployment-specific operations
 
-The cluster's GitOps manifests are in
-`appmana-cluster/clusters/appmana-cluster-03/seaweedfs/`; do not edit running
-pod executables or substitute direct Helm installs for Flux rollout.
-
-| Configuration/source | Requirement and update responsibility |
-| --- | --- |
-| Master/filer `helm-release.yaml`, per-disk `volume-statefulsets.yaml`, dedicated S3 gateway manifests | Pin qualified role images/digests and record their source commits. Current roles can differ; test those combinations and rollback before changing pins. |
-| `master.extraEnvironmentVars.WEED_MASTER_VOLUME_GROWTH_COPY_{1,2,3,OTHER}` | Explicitly set to `1` for the conservative growth policy. Chart defaults override TOML through environment precedence. Validate the rendered StatefulSet, not just `master.config`. Keep TOML and the config-revision annotation consistent. |
-| `volumeSizeLimitMB`, `volumePreallocate`, replication | Current design: 131072 MiB (128 GiB), no preallocation, default `020` (three copies on three physical hosts). Growth counts are logical volume IDs: `copy_3=1` creates three replicas, not three logical volumes. Changing defaults does not migrate old replicas. |
-| Volume `-max` and NAS `volume.yaml` | Slot count/placement weight, not reserved bytes or true physical capacity. NAS target `700` needs capacity/placement validation before application; do not delete volumes to meet it. Preserve native XFS/Btrfs protections. |
-| Upload/download admission, Go/container memory, timeouts | Admission includes replication and is not an RSS cap. Account for multipart buffers and page cache; ensure server admission timeout fits client deadlines. Test against each host's RAM/link/disk limits before changing values. |
-| CSI driver and mount image source pins, Linux/Windows DaemonSets | Coordinate server and client releases; verify every passed mount flag against that exact binary (`df.logical` is not supported by every 4.40 fork build). Local chunk-cache capacity is **per mounted volume/process**, not a shared node cap. |
-| `spk-seaweedfs/cross/seaweedfs/{Makefile,digests}`, package metadata and DSM override `weed.image`/`weed.digest` | Update source version/checksums and image **plus digest** together; the OCI cache is digest-keyed. Run package/supervisor tests. Leave degraded NAS SSD write-back bypassed pending hardware repair. |
-| `etcd-backup-cronjob.yaml` | Backup target must remain outside SeaweedFS. Staged policy: 256 GiB PVC, 14-day retention before snapshot, protect newest verified published snapshot, at least 16 GiB staging headroom for the 12 GiB backend quota. Recalculate capacity/headroom if quota or retention changes. Expansion requires storage-driver support. Snapshot status is not a restore drill. |
-| Filer ServiceMonitor post-render patch and `apps/monitoring/seaweedfs-dashboard.yaml` | Select one canonical Service (`monitoring=true` on `seaweedfs-filer-client`). Re-render and assert exactly one match after chart changes. Bucket counters are volume/needle-derived estimates, not an authoritative live namespace/object inventory; leader freshness still matters. |
-
-The cluster contract tests render the exact chart version and exercise backup
-preflight behavior. From the cluster repository:
-
-```sh
-uv run --no-project --with pytest --with pyyaml pytest -q tests/contracts/test_seaweedfs_capacity.py
-```
-
-### Deployment and reclamation gates
-
-Local fixes/tests are not release approval. Before publishing/deploying:
-
-1. Complete the 4.47 merge and fork-diff/source audit; retain the production
-   offset format and Linux/Windows mount behavior.
-2. Test each deployed baseline, mixed roles, rollback, S3/multipart/copy/abort,
-   CSI Linux/Windows, and native XFS plus isolated NAS Btrfs volumes.
-3. Verify a fresh external etcd backup by isolated restore. Run VM power-cut,
-   ENOSPC, short-write, sync-failure, and metadata/replica integrity tests;
-   acknowledged durable operations must survive, except explicit cache data.
-4. Complete the 24-hour representative soak. Roll one instance at a time via
-   GitOps; stop on integrity errors, unsafe replicas, or a required write outage.
-5. Separately inventory application references, manifests, versions and uploads;
-   reconcile concurrent writes and apply the agreed orphan grace/revalidation.
-   Prove one canary reclaim with payload hashes and before/after physical bytes
-   before expanding. Do not run overlapping vacuum jobs or remove commit markers.
-
-Measured excess is **not a deletion list**. The investigation found about
-56 TiB in SeaweedFS directories, 5.1 TiB in deleted-payload counters, a 2×
-duplicate scrape, and about 3.9 TiB of XFS `df`/`du` difference consistent with
-filesystem reservations. Harbor's approximately 20 TiB remaining gap is still
-unclassified, not promised reclaimable space. Empty volume headers consume
-kilobytes, not the nominal 128 GiB limit. Reclamation requires the full chain:
-application reference removal → chunk deletion → vacuum → filesystem release.
+Cluster hardware, GitOps settings, capacity accounting, release gates, and
+reclamation procedures are maintained in AppMana's existing
+`docs/seaweedfs.md` runbook, not duplicated in this source tree.
 
 Upstream README: https://github.com/seaweedfs/seaweedfs

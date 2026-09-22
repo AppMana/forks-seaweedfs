@@ -36,6 +36,21 @@ import (
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
+// A bucket creation lists collections, and a bucket deletion deletes one.
+// Neither RPC carried a deadline, so a transient failure anywhere down the chain
+// -- gateway to filer, filer to master, master to volume server -- held the S3
+// request open until the client gave up on it. Both budgets are taken outside
+// the filer failover walk, so they cover the whole walk rather than granting
+// each filer a fresh one.
+//
+// The delete is the shorter of the two: the filer has already spent its own
+// budget on this collection, under the bucket entry's delete inside s3a.rm, and
+// this call is the follow-up for when that did not happen.
+const (
+	collectionListTimeout   = 15 * time.Second
+	collectionDeleteTimeout = 10 * time.Second
+)
+
 func (s3a *S3ApiServer) ListBucketsHandler(w http.ResponseWriter, r *http.Request) {
 
 	glog.V(3).Infof("ListBucketsHandler")
@@ -260,12 +275,12 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 		s3err.WriteErrorResponse(w, r, s3err.ErrBucketAlreadyExists)
 		return
 	}
-	if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		if resp, err := client.CollectionList(context.Background(), &filer_pb.CollectionListRequest{
+	listCtx, cancelList := context.WithTimeout(r.Context(), collectionListTimeout)
+	if err := s3a.withFilerClient(listCtx, false, func(client filer_pb.SeaweedFilerClient) error {
+		if resp, err := client.CollectionList(listCtx, &filer_pb.CollectionListRequest{
 			IncludeEcVolumes:     true,
 			IncludeNormalVolumes: true,
 		}); err != nil {
-			glog.Errorf("list collection: %v", err)
 			return fmt.Errorf("list collections: %w", err)
 		} else {
 			for _, c := range resp.Collections {
@@ -277,9 +292,13 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 		}
 		return nil
 	}); err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		return
+		// Advisory: the answer decides nothing below except whether to log that a
+		// leftover collection is being reused. s3a.exists is what decides whether
+		// the bucket already exists, so a listing that failed is no reason to
+		// refuse the creation.
+		glog.Warningf("PutBucketHandler: list collections for %s: %v", bucket, err)
 	}
+	cancelList()
 
 	// Bucket already exists: report whether the caller already owns it or the
 	// name is taken / the request conflicts.
@@ -374,7 +393,7 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 	// This ensures we don't leave a bucket without the requested Object Lock configuration
 	if objectLockSetupError != nil {
 		glog.Errorf("PutBucketHandler: rolling back bucket %s creation due to Object Lock setup failure: %v", bucket, objectLockSetupError)
-		if deleteErr := s3a.rm(s3a.option.BucketsPath, bucket, true, true); deleteErr != nil {
+		if deleteErr := s3a.rm(context.Background(), s3a.option.BucketsPath, bucket, true, true); deleteErr != nil {
 			glog.Errorf("PutBucketHandler: failed to rollback bucket %s after Object Lock setup failure: %v", bucket, deleteErr)
 		}
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
@@ -418,6 +437,9 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 
 	bucket, _ := s3_constants.GetBucketAndObject(r)
 	glog.V(3).Infof("DeleteBucketHandler %s", bucket)
+	// The teardown below retries, and a failover walk repeats it once per
+	// filer, so the backoff comes out of one allowance held here.
+	r = r.WithContext(withFilerRetryBudget(r.Context(), filerRetryRequestBudget))
 
 	if s3a.isTableBucket(bucket) {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
@@ -467,7 +489,7 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 	// the "collection exists but bucket directory missing" inconsistency that blocks
 	// bucket recreation. An orphaned collection is harmless and will be cleaned up
 	// or reused when the bucket is recreated.
-	err := s3a.rm(s3a.option.BucketsPath, bucket, false, true)
+	err := s3a.rm(r.Context(), s3a.option.BucketsPath, bucket, false, true)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
@@ -479,23 +501,34 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	// Bounded on a background context: the bucket directory is already gone, so
+	// this follow-up must survive a client disconnect, but it must not outlive the
+	// client by an unbounded amount either.
+	deleteCtx, cancelDelete := context.WithTimeout(context.Background(), collectionDeleteTimeout)
+	err = s3a.withFilerClient(deleteCtx, false, func(client filer_pb.SeaweedFilerClient) error {
 		deleteCollectionRequest := &filer_pb.DeleteCollectionRequest{
 			Collection: s3a.getCollectionName(bucket),
 		}
 
 		glog.V(1).Infof("delete collection: %v", deleteCollectionRequest)
-		if _, err := client.DeleteCollection(context.Background(), deleteCollectionRequest); err != nil {
+		if _, err := client.DeleteCollection(deleteCtx, deleteCollectionRequest); err != nil {
 			return fmt.Errorf("delete collection %s: %v", bucket, err)
 		}
 
 		return nil
 	})
+	timedOut := deleteCtx.Err() != nil
+	cancelDelete()
 
 	if err != nil {
 		// Log but don't fail — the bucket directory is already removed, so the bucket
 		// is effectively deleted. The orphaned collection will be cleaned up or reused.
-		glog.Errorf("DeleteBucketHandler: failed to delete collection for bucket %s: %v", bucket, err)
+		if timedOut {
+			// Our own budget, not a refusal: the master carries on deleting once asked.
+			glog.Warningf("DeleteBucketHandler: stopped waiting for the collection delete for bucket %s: %v", bucket, err)
+		} else {
+			glog.Errorf("DeleteBucketHandler: failed to delete collection for bucket %s: %v", bucket, err)
+		}
 	}
 
 	// Clean up bucket-related caches, locks, and metrics after successful deletion
@@ -565,8 +598,13 @@ func (s3a *S3ApiServer) HeadBucketHandler(w http.ResponseWriter, r *http.Request
 	bucket, _ := s3_constants.GetBucketAndObject(r)
 	glog.V(3).Infof("HeadBucketHandler %s", bucket)
 
-	if entry, err := s3a.getBucketEntry(bucket); entry == nil || errors.Is(err, filer_pb.ErrNotFound) {
-		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+	if _, err := s3a.getBucketEntry(bucket); err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			return
+		}
+		glog.Errorf("HeadBucketHandler: failed to get bucket entry for %s: %v", bucket, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
 
@@ -592,6 +630,9 @@ func (s3a *S3ApiServer) checkBucket(r *http.Request, bucket string) s3err.ErrorC
 
 // ErrAutoCreatePermissionDenied is returned when a user lacks permission to auto-create buckets
 var ErrAutoCreatePermissionDenied = errors.New("permission denied - requires Admin permission")
+
+// ErrAutoCreateDisabled is returned when bucket auto-creation is disabled by configuration
+var ErrAutoCreateDisabled = errors.New("bucket auto-creation is disabled")
 
 // ErrInvalidBucketName is returned when a bucket name doesn't meet S3 naming requirements
 var ErrInvalidBucketName = errors.New("invalid bucket name")
@@ -694,6 +735,10 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 		return fmt.Errorf("auto-create bucket %s: %w", bucket, errors.Join(ErrInvalidBucketName, err))
 	}
 
+	if !s3a.option.AutoCreateBucket {
+		return fmt.Errorf("auto-create bucket %s: %w", bucket, ErrAutoCreateDisabled)
+	}
+
 	// Check if user has admin permissions
 	if !s3a.isUserAdmin(r) {
 		return fmt.Errorf("auto-create bucket %s: %w", bucket, ErrAutoCreatePermissionDenied)
@@ -763,7 +808,9 @@ func (s3a *S3ApiServer) handleAutoCreateBucket(w http.ResponseWriter, r *http.Re
 	if err := s3a.autoCreateBucket(r, bucket); err != nil {
 		glog.Warningf("%s: %v", handlerName, err)
 		// Check for specific errors to return appropriate S3 error codes
-		if errors.Is(err, ErrInvalidBucketName) {
+		if errors.Is(err, ErrAutoCreateDisabled) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+		} else if errors.Is(err, ErrInvalidBucketName) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidBucketName)
 		} else if errors.Is(err, ErrAutoCreatePermissionDenied) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
@@ -1128,41 +1175,35 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 	// (volume server expires under the old rule) or contradict the new
 	// XML after a rule change. The add path is gone — this loop only
 	// shrinks the conf, never grows it.
-	fc, err := filer.ReadFilerConfFromFilers(s3a.option.Filers, s3a.option.GrpcDialOption, nil)
-	if err != nil {
-		glog.Errorf("PutBucketLifecycleConfigurationHandler read filer config: %s", err)
+	if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return filer.ClearBucketLifecycleDayTTLs(context.Background(), client, s3a.option.BucketsPath, bucket, s3a.getCollectionName(bucket))
+	}); err != nil {
+		glog.Errorf("PutBucketLifecycleConfigurationHandler clear legacy day-TTLs: %s", err)
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
-	collectionTtls := fc.GetCollectionTtls(s3a.getCollectionName(bucket))
-	changed := false
-	bucketPrefix := fmt.Sprintf("%s/%s/", s3a.option.BucketsPath, bucket)
-	for prefix, ttl := range collectionTtls {
-		if !strings.HasPrefix(prefix, bucketPrefix) || !strings.HasSuffix(ttl, "d") {
-			continue
-		}
-		fc.DeleteLocationConf(prefix)
-		changed = true
-	}
 
-	if changed {
-		var buf bytes.Buffer
-		if err := fc.ToText(&buf); err != nil {
-			glog.Errorf("PutBucketLifecycleConfigurationHandler save config to text: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		}
-		if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
-		}); err != nil {
-			glog.Errorf("PutBucketLifecycleConfigurationHandler save config inside filer: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return
-		}
+	// The per-write TTL fast path stamps a volume TTL at write time that
+	// can't be taken back. If it's active on this bucket, warn when the new
+	// config removes or lengthens a rule: objects already written keep their
+	// baked-in TTL and won't be rescued by this change (unlike the default
+	// worker path, which re-evaluates the current rules each pass).
+	// Compute the reason before storing, but emit only after the store
+	// succeeds so a failed mutation never carries a warning for a change
+	// that was not applied.
+	var fastpathWarnReason string
+	if cfg, _ := s3a.getBucketConfig(bucket); cfg != nil && cfg.LifecycleTTL != nil {
+		fastpathWarnReason = fastpathConfigChangeLeavesStampedObjects(cfg.LifecycleXML, lifecycleXML)
 	}
 
 	if errCode := s3a.storeBucketLifecycleConfiguration(bucket, lifecycleXML, r.Header.Get(bucketLifecycleTransitionMinimumObjectSizeHeader)); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
+	}
+
+	if fastpathWarnReason != "" {
+		glog.Warningf("PutBucketLifecycleConfigurationHandler %s: %s", bucket, fastpathWarnReason)
+		w.Header().Set(fastpathWarningHeader, fastpathWarnReason)
 	}
 
 	writeSuccessResponseEmpty(w, r)
@@ -1180,41 +1221,34 @@ func (s3a *S3ApiServer) DeleteBucketLifecycleHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	fc, err := filer.ReadFilerConfFromFilers(s3a.option.Filers, s3a.option.GrpcDialOption, nil)
-	if err != nil {
-		glog.Errorf("DeleteBucketLifecycleHandler read filer config: %s", err)
+	// Same legacy day-TTL migration as the PUT handler.
+	if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return filer.ClearBucketLifecycleDayTTLs(context.Background(), client, s3a.option.BucketsPath, bucket, s3a.getCollectionName(bucket))
+	}); err != nil {
+		glog.Errorf("DeleteBucketLifecycleHandler clear legacy day-TTLs: %s", err)
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
-	collectionTtls := fc.GetCollectionTtls(s3a.getCollectionName(bucket))
-	changed := false
-	bucketPrefix := fmt.Sprintf("%s/%s/", s3a.option.BucketsPath, bucket)
-	for prefix, ttl := range collectionTtls {
-		if !strings.HasPrefix(prefix, bucketPrefix) || !strings.HasSuffix(ttl, "d") {
-			continue
-		}
-		fc.DeleteLocationConf(prefix)
-		changed = true
-	}
 
-	if changed {
-		var buf bytes.Buffer
-		if err := fc.ToText(&buf); err != nil {
-			glog.Errorf("DeleteBucketLifecycleHandler save config to text: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		}
-		if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
-		}); err != nil {
-			glog.Errorf("DeleteBucketLifecycleHandler save config inside filer: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return
-		}
+	// If the per-write TTL fast path is active, every previously-stamped
+	// object keeps its baked-in volume TTL after the config is removed —
+	// deleting the rules does not rescue them (unlike the default worker
+	// path). Compute the reason before clearing, but emit only after the
+	// clear succeeds so a failed mutation never carries a warning for a
+	// change that was not applied.
+	var fastpathWarnReason string
+	if cfg, _ := s3a.getBucketConfig(bucket); cfg != nil && cfg.LifecycleTTL != nil {
+		fastpathWarnReason = fastpathConfigChangeLeavesStampedObjects(cfg.LifecycleXML, nil)
 	}
 
 	if errCode := s3a.clearStoredBucketLifecycleConfiguration(bucket); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
+	}
+
+	if fastpathWarnReason != "" {
+		glog.Warningf("DeleteBucketLifecycleHandler %s: %s", bucket, fastpathWarnReason)
+		w.Header().Set(fastpathWarningHeader, fastpathWarnReason)
 	}
 
 	s3err.WriteEmptyResponse(w, r, http.StatusNoContent)
@@ -1281,19 +1315,10 @@ func (s3a *S3ApiServer) PutBucketOwnershipControls(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Check if ownership needs to be updated
-	currentOwnership, errCode := s3a.getBucketOwnership(bucket)
-	if errCode != s3err.ErrNone {
+	// Persist even when it matches the implicit default, so a later delete has something to remove.
+	if errCode := s3a.setBucketOwnership(bucket, ownership); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
-	}
-
-	if currentOwnership != ownership {
-		errCode = s3a.setBucketOwnership(bucket, ownership)
-		if errCode != s3err.ErrNone {
-			s3err.WriteErrorResponse(w, r, errCode)
-			return
-		}
 	}
 
 	if printOwnership {

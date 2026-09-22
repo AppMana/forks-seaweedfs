@@ -1,6 +1,8 @@
 package s3api
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -39,10 +41,14 @@ func (s3a *S3ApiServer) latestPointerRecompute(bucket, object string, useInverte
 		SizeToKey:  s3_constants.ExtLatestVersionSizeKey,
 		MtimeToKey: s3_constants.ExtLatestVersionMtimeKey,
 		CopyExtended: map[string]string{
-			s3_constants.ExtLatestVersionIdKey:          s3_constants.ExtVersionIdKey,
-			s3_constants.ExtLatestVersionETagKey:        s3_constants.ExtETagKey,
-			s3_constants.ExtLatestVersionOwnerKey:       s3_constants.ExtAmzOwnerKey,
-			s3_constants.ExtLatestVersionIsDeleteMarker: s3_constants.ExtDeleteMarkerKey,
+			s3_constants.ExtLatestVersionIdKey:           s3_constants.ExtVersionIdKey,
+			s3_constants.ExtLatestVersionETagKey:         s3_constants.ExtETagKey,
+			s3_constants.ExtLatestVersionOwnerKey:        s3_constants.ExtAmzOwnerKey,
+			s3_constants.ExtLatestVersionIsDeleteMarker:  s3_constants.ExtDeleteMarkerKey,
+			s3_constants.ExtLatestVersionStorageClassKey: s3_constants.AmzStorageClass,
+			// Version files never carry the null-current signal, so this mapping
+			// deletes a stale one from the pointer whenever it recomputes.
+			s3_constants.ExtNullVersionIsLatestKey: s3_constants.ExtNullVersionIsLatestKey,
 		},
 		ExcludeName: excludeName,
 	}
@@ -150,8 +156,10 @@ func (s3a *S3ApiServer) routedDeleteSpecificVersion(owner pb.ServerAddress, buck
 // routedDeleteNullVersion deletes the null version (the regular object entry, not
 // a .versions file) off the distributed lock. There is no pointer to recompute;
 // the WORM guards, when present, gate the delete on the object entry itself
-// (condition defaults to lock_key).
-func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, object string, worm, bypass bool) s3err.ErrorCode {
+// (condition defaults to lock_key). The second return reports whether the delete
+// was settled here: the raw delete cannot remove an entry other keys are nested
+// under, which the lock path handles by stripping the object off it instead.
+func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, object string, worm, bypass bool) (s3err.ErrorCode, bool) {
 	fullpath := util.NewFullPath(s3a.bucketDir(bucket), object)
 	dir, name := fullpath.DirAndName()
 	resp, err := s3a.objectTxnOnFiler(owner, &filer_pb.ObjectTransactionRequest{
@@ -164,15 +172,15 @@ func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, 
 	})
 	switch {
 	case err != nil:
-		glog.Errorf("routedDeleteNullVersion: %s/%s on %s: %v", bucket, object, owner, err)
-		return s3err.ErrInternalError
+		glog.Warningf("routedDeleteNullVersion: %s/%s on %s, falling back to lock: %v", bucket, object, owner, err)
+		return s3err.ErrNone, false
 	case resp.ErrorCode == filer_pb.FilerError_PRECONDITION_FAILED:
-		return s3err.ErrAccessDenied
+		return s3err.ErrAccessDenied, true
 	case resp.Error != "":
-		glog.Errorf("routedDeleteNullVersion: %s/%s: %s", bucket, object, resp.Error)
-		return s3err.ErrInternalError
+		glog.Warningf("routedDeleteNullVersion: %s/%s returned %q, falling back to lock", bucket, object, resp.Error)
+		return s3err.ErrNone, false
 	default:
-		return s3err.ErrNone
+		return s3err.ErrNone, true
 	}
 }
 
@@ -192,4 +200,38 @@ func (s3a *S3ApiServer) versionedFinalize(bucket, object, versionId, versionFile
 			return s3err.ErrNone
 		},
 	}
+}
+
+// finalizeSuspendedNullWrite retires the null delete marker a suspended DELETE left
+// in .versions, so reads resolve the null version the caller just wrote at the
+// regular path. Pointer first: clearing the marker while the pointer still names it
+// makes reads rescan .versions and promote an older version. Call only once the
+// write has committed — retiring the marker for a write that then fails republishes
+// the deleted key.
+//
+// identityKey/identityValue name the extended attribute that marks the entry as the
+// caller's write (an upload id, an etag). The cleanup rewrites shared .versions state
+// off the object write lock, so it is skipped unless the regular path still holds that
+// write: a DELETE that landed in between owns the null slot, and retiring its marker
+// would resurrect an older version under a key that was deleted. Narrows that race,
+// does not close it. owner, when set, is the filer the write went to, so the check
+// reads its own write back rather than a peer that may be behind.
+func (s3a *S3ApiServer) finalizeSuspendedNullWrite(owner pb.ServerAddress, bucket, object, identityKey, identityValue string) error {
+	dir, name := util.FullPath(s3a.toFilerPath(bucket, object)).DirAndName()
+	current, err := s3a.lookupEntryPreferringOwner(owner, dir, name)
+	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+		return fmt.Errorf("re-read %s/%s: %w", bucket, object, err)
+	}
+	if current == nil || string(current.Extended[identityKey]) != identityValue {
+		glog.V(2).Infof("finalizeSuspendedNullWrite: %s/%s superseded by a concurrent write", bucket, object)
+		return nil
+	}
+
+	if err := s3a.updateIsLatestFlagsForSuspendedVersioning(bucket, object); err != nil {
+		return err
+	}
+	// Best-effort: with the pointer gone the regular-path object already owns the
+	// null slot, so a surviving marker is neither read nor listed.
+	s3a.removeNullVersionFile(bucket, object)
+	return nil
 }

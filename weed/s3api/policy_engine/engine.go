@@ -26,7 +26,6 @@ type PolicyEvaluationContext struct {
 	bucketName string
 	policy     *CompiledPolicy
 	cache      *PolicyCache
-	mutex      sync.RWMutex
 }
 
 // PolicyEngine is the main policy evaluation engine
@@ -520,23 +519,11 @@ func injectSSEForMultipart(conditions map[string][]string, inheritedSSE string) 
 	return modified
 }
 
-// extractSourceIP returns the best-effort client IP address for condition evaluation.
-// Preference order: X-Forwarded-For (first valid IP), X-Real-Ip, then RemoteAddr.
-// IMPORTANT: X-Forwarded-For and X-Real-Ip are trusted without validation.
-// When the service is exposed directly, clients can spoof aws:SourceIp unless a
-// reverse proxy overwrites these headers.
-
-// isPrivateIP returns true if the given IP is considered a "trusted proxy"
-// address, such as loopback, link-local, or RFC1918 private ranges.
-// isPrivateIP returns true if the given IP is considered a "trusted proxy"
-// address, such as loopback, link-local, or private ranges.
-func isPrivateIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate()
-}
-
+// extractSourceIP returns the direct TCP peer address for aws:SourceIp
+// condition evaluation. Forwarding headers (X-Forwarded-For, X-Real-Ip) are
+// intentionally ignored: without a configurable trusted-proxy allowlist they
+// are client-controlled and spoofable, which would let a caller behind a
+// private-looking peer bypass any aws:SourceIp restriction.
 func extractSourceIP(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -547,7 +534,6 @@ func extractSourceIP(r *http.Request) string {
 		return ""
 	}
 
-	// Fall back to unix socket markers or other non-IP placeholders.
 	if remoteAddr == "@" {
 		return remoteAddr
 	}
@@ -559,59 +545,9 @@ func extractSourceIP(r *http.Request) string {
 
 	remoteIP := net.ParseIP(host)
 	if remoteIP == nil {
-		// Do not return DNS names or unparseable values.
 		return ""
 	}
 
-	// Only trust forwarding headers when the connection appears to come from
-	// a trusted proxy (e.g., private/loopback address).
-	if isPrivateIP(remoteIP) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Iterate right-to-left to find the first non-trusted (public) IP
-			entries := strings.Split(xff, ",")
-			for i := len(entries) - 1; i >= 0; i-- {
-				candidate := strings.TrimSpace(entries[i])
-				if candidate == "" {
-					continue
-				}
-
-				ip := net.ParseIP(candidate)
-				if ip == nil {
-					continue
-				}
-
-				// If the IP is trusted/private, we treat it as another proxy in the chain and continue
-				if isPrivateIP(ip) {
-					continue
-				}
-
-				// Found a public/non-trusted IP, return it as the client IP
-				return ip.String()
-			}
-
-			// If we exhausted the list (all were private/trusted) or found no valid IPs,
-			// fallback related logic could go here.
-			// For now, if all are private, we continue to check X-Real-Ip or return RemoteIP?
-			// The prompt implies we should prefer the extracted IP.
-			// If all in XFF are private, likely the original client IS private (internal network).
-			// The best guess for "original client" in a fully trusted chain is the left-most valid IP.
-			for _, candidate := range entries {
-				candidate = strings.TrimSpace(candidate)
-				if ip := net.ParseIP(candidate); ip != nil {
-					return ip.String()
-				}
-			}
-		}
-
-		if xRealIP := strings.TrimSpace(r.Header.Get("X-Real-Ip")); xRealIP != "" {
-			if ip := net.ParseIP(xRealIP); ip != nil {
-				return ip.String()
-			}
-		}
-	}
-
-	// Default to the actual peer IP when no trusted proxy is detected or the
-	// forwarding headers are absent/invalid.
 	return remoteIP.String()
 }
 
@@ -642,6 +578,46 @@ func (engine *PolicyEngine) GetPolicyStatements(bucketName string) []PolicyState
 	}
 
 	return context.policy.Document.Statement
+}
+
+// BucketsAllowedForAction returns the buckets a policy names in the Allow
+// statements that can match the action, and whether those names cover every
+// bucket the policy can allow it on. A statement reaching buckets it does not
+// name -- a wildcard resource, a policy variable, a NotResource -- leaves the
+// set incomplete, as does an unknown policy name.
+func (engine *PolicyEngine) BucketsAllowedForAction(policyName string, action string) (buckets []string, complete bool) {
+	engine.mutex.RLock()
+	context, exists := engine.contexts[policyName]
+	engine.mutex.RUnlock()
+
+	if !exists {
+		return nil, false
+	}
+
+	for _, statement := range context.policy.Document.Statement {
+		// A Deny only narrows what an Allow named.
+		if statement.Effect != PolicyEffectAllow || !statementMayAllowAction(statement.Action.Strings(), action) {
+			continue
+		}
+		if statement.Resource == nil || statement.NotResource != nil {
+			return nil, false
+		}
+		resources := statement.Resource.Strings()
+		if len(resources) == 0 {
+			return nil, false
+		}
+		for _, resource := range resources {
+			if PolicyVariableRegex.MatchString(resource) {
+				return nil, false
+			}
+			bucket := GetBucketFromResource(resource)
+			if bucket == "" || strings.ContainsAny(bucket, "*?") {
+				return nil, false
+			}
+			buckets = append(buckets, bucket)
+		}
+	}
+	return buckets, true
 }
 
 // ValidatePolicyForBucket validates if a policy is valid for a bucket

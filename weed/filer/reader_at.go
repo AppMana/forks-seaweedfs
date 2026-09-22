@@ -131,9 +131,15 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 
 		fcDataCenter := filerClient.GetDataCenter()
 		var sameDcTargetUrls, otherTargetUrls []string
+		localUrls := make(map[string]bool)
 		for _, loc := range locations.Locations {
 			volumeServerAddress := filerClient.AdjustedUrl(loc)
 			targetUrl := fmt.Sprintf("http://%s/%s", volumeServerAddress, fileId)
+			glog.V(4).Infof("lookup %s => %s, data in remote storage tier: %v", fileId, targetUrl, loc.DataInRemote)
+
+			if !loc.DataInRemote {
+				localUrls[targetUrl] = true
+			}
 			if fcDataCenter == "" || fcDataCenter != loc.DataCenter {
 				otherTargetUrls = append(otherTargetUrls, targetUrl)
 			} else {
@@ -146,7 +152,13 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 		rand.Shuffle(len(otherTargetUrls), func(i, j int) {
 			otherTargetUrls[i], otherTargetUrls[j] = otherTargetUrls[j], otherTargetUrls[i]
 		})
-		// Prefer same data center
+		// Local replicas go first inside each data center, but never ahead of
+		// the data-center preference itself. Matches the wdclient lookup paths
+		// so deprecated callers pick cheap reads first too.
+		if len(localUrls) > 0 {
+			sameDcTargetUrls = util.ReorderToFront(localUrls, sameDcTargetUrls)
+			otherTargetUrls = util.ReorderToFront(localUrls, otherTargetUrls)
+		}
 		targetUrls = append(sameDcTargetUrls, otherTargetUrls...)
 		return
 	}
@@ -320,6 +332,15 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		}
 
 		if err != nil {
+			// a failed chunk leaves its window untouched while the tasks after it
+			// may well have filled theirs, so only the prefix up to the hole is
+			// data the caller may use
+			for _, task := range tasks {
+				if int64(task.bytesRead) != task.bufferEnd-task.bufferStart {
+					n = int(task.bufferStart) + task.bytesRead
+					break
+				}
+			}
 			return n, ts, err
 		}
 	}
@@ -366,7 +387,8 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 			// multi-megabyte backend transfer. If this chunk is touched again,
 			// the normal ReaderCache path below downloads it once and
 			// single-flights all subsequent readers.
-			return fetchChunkRange(ctx, buffer, c.readerCache.lookupFileIdFn, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset))
+			return fetchChunkRange(ctx, buffer, c.readerCache.lookupFileIdFn, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset),
+				refreshUrls(ctx, c.readerCache.cacheInvalidator, c.readerCache.lookupFileIdFn, chunkView.FileId))
 		}
 	}
 

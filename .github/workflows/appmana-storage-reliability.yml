@@ -9,9 +9,9 @@ on:
         required: false
   push:
     branches: [master, main, 'merge/**']
-    paths: ['weed/**', 'test/volume_server/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
   pull_request:
-    paths: ['weed/**', 'test/volume_server/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
 
 permissions:
   contents: read
@@ -21,6 +21,8 @@ permissions:
 env:
   BASELINE_REF: ${{ inputs.baseline_ref || vars.SEAWEEDFS_RELIABILITY_BASELINE_REF }}
   GO_FUSE_REF: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+  LABCONTAINERS_REF: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF }}
+  LABCONTAINERS_VM_IMAGE: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE }}
   STORAGE_BUILD_TAGS: 5BytesOffset
   STORAGE_UNIT_TEST_TIMEOUT: 10m
   STORAGE_PROCESS_TEST_TIMEOUT: 5m
@@ -70,6 +72,17 @@ jobs:
         run: >-
           go test -short -tags "$STORAGE_BUILD_TAGS" -race -count=1 -timeout="$STORAGE_UNIT_TEST_TIMEOUT"
           ./weed/storage ./weed/topology ./weed/shell ./weed/server
+          ./weed/filer ./weed/filer/empty_folder_cleanup ./weed/mount ./weed/operation
+      - name: Lab isolation command contracts
+        run: python3 -m unittest discover -s test/storage_lab -v
+      - name: Negative controls prove regressions turn red
+        env:
+          MUTANT_LOG_DIR: ${{ runner.temp }}/storage-mutant-logs
+        run: test/storage_lab/verify_mutants.sh
+      - name: Streamed S3 copy durability regressions
+        run: >-
+          go test -tags "$STORAGE_BUILD_TAGS" -race -count=1 -timeout="$STORAGE_UNIT_TEST_TIMEOUT"
+          ./weed/s3api -run 'TestStreamCopyChunkRange|TestNewChunkUploadOption'
       - name: Build explicit baseline and candidate
         run: |
           # Both worktrees resolve ../forks-go-fuse to the pinned checkout.
@@ -78,6 +91,33 @@ jobs:
           go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
           "$RUNNER_TEMP/weed-baseline" version
           "$RUNNER_TEMP/weed-candidate" version
+      - name: Build isolated lab tests
+        run: |
+          go test -c -tags "$STORAGE_BUILD_TAGS" -race -o "$RUNNER_TEMP/storage.test" ./weed/storage
+          preallocate_overlay=$(python3 test/storage_lab/preallocate_mutant.py)
+          go test -c -tags "$STORAGE_BUILD_TAGS" -race -overlay "$preallocate_overlay" -o "$RUNNER_TEMP/storage-preallocate-mutant.test" ./weed/storage
+          go test -c -tags "$STORAGE_BUILD_TAGS" -o "$RUNNER_TEMP/volume-grpc.test" ./test/volume_server/grpc
+          go test -c -tags "$STORAGE_BUILD_TAGS" -o "$RUNNER_TEMP/volume-http.test" ./test/volume_server/http
+      - name: Isolated storage, migration, and admission lab
+        run: |
+          missing=0
+          for command in bwrap mkfs.xfs mkfs.btrfs xfs_repair btrfs losetup unshare; do
+            command -v "$command" >/dev/null || missing=1
+          done
+          if [ "$missing" = 1 ]; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y bubblewrap xfsprogs btrfs-progs util-linux
+          fi
+          MUTANT_LOG_DIR="$RUNNER_TEMP/storage-mutant-logs" test/storage_lab/verify_preallocate_mutant.sh "$RUNNER_TEMP/storage-preallocate-mutant.test"
+          python3 test/storage_lab/run.py storage --tests "$RUNNER_TEMP/storage.test"
+          python3 test/storage_lab/run_filesystem.py xfs --tests "$RUNNER_TEMP/storage.test"
+          python3 test/storage_lab/run_filesystem.py btrfs --tests "$RUNNER_TEMP/storage.test"
+          python3 test/storage_lab/run_filesystem.py xfs --enospc --tests "$RUNNER_TEMP/storage.test"
+          python3 test/storage_lab/run_filesystem.py btrfs --enospc --tests "$RUNNER_TEMP/storage.test"
+          python3 test/storage_lab/run.py migration --tests "$RUNNER_TEMP/volume-grpc.test" \
+            --candidate "$RUNNER_TEMP/weed-candidate" --baseline "$RUNNER_TEMP/weed-baseline"
+          python3 test/storage_lab/run.py admission --tests "$RUNNER_TEMP/volume-http.test" \
+            --candidate "$RUNNER_TEMP/weed-candidate"
       - name: Admission and baseline-to-candidate rollback
         env:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate
@@ -92,6 +132,100 @@ jobs:
         if: always()
         with:
           name: storage-reliability-process-logs
-          path: /tmp/seaweedfs_volume_server_it_*/logs/
+          path: |
+            /tmp/seaweedfs_volume_server_it_*/logs/
+            /tmp/seaweedfs-lab-results-*/
+            /tmp/seaweedfs-fs-results-*/
+            ${{ runner.temp }}/storage-mutant-logs/
           if-no-files-found: warn
+          retention-days: 14
+
+  vm-fault-gates:
+    # This runner must be disposable/dedicated and provide KVM, Docker,
+    # Containerlab 0.79.0, and the pinned Labcontainers VM image. It must not
+    # have routes or credentials for production networks.
+    runs-on: [self-hosted, linux, x64, kvm, seaweedfs-lab]
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: seaweedfs
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          path: seaweedfs
+      - name: Validate immutable VM-lab inputs
+        run: |
+          for name in BASELINE_REF GO_FUSE_REF LABCONTAINERS_REF; do
+            if [[ ! "${!name}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::$name must be a full commit SHA. Configure the repository variables documented in README.md."
+              exit 1
+            fi
+          done
+          if [[ ! "$LABCONTAINERS_VM_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::LABCONTAINERS_VM_IMAGE must be an immutable image reference with an @sha256 digest."
+            exit 1
+          fi
+          command -v docker
+          command -v containerlab
+          test "$(containerlab version --short 2>/dev/null | tr -d 'v')" = "0.79.0" || {
+            echo "::error::The dedicated runner must provide Containerlab 0.79.0."
+            exit 1
+          }
+          test -c /dev/kvm || { echo "::error::The dedicated runner has no /dev/kvm."; exit 1; }
+          docker image inspect "$LABCONTAINERS_VM_IMAGE" >/dev/null || {
+            echo "::error::The pinned Labcontainers VM image is not preloaded."
+            exit 1
+          }
+      - uses: actions/checkout@v7
+        with:
+          repository: AppMana/labcontainers
+          ref: ${{ env.LABCONTAINERS_REF }}
+          path: labcontainers
+      - uses: actions/checkout@v7
+        with:
+          repository: AppMana/forks-go-fuse
+          ref: ${{ env.GO_FUSE_REF }}
+          path: forks-go-fuse
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: seaweedfs/go.mod
+          cache-dependency-path: |
+            seaweedfs/go.sum
+            labcontainers/go.sum
+      - name: Resolve and build exact baseline and candidate
+        run: |
+          baseline_sha=$(git rev-parse --verify --end-of-options "${BASELINE_REF}^{commit}")
+          candidate_sha=$(git rev-parse HEAD)
+          if [ "$baseline_sha" = "$candidate_sha" ]; then
+            echo "::error::Baseline and candidate are identical; this would not test an upgrade."
+            exit 1
+          fi
+          git worktree add --detach "$GITHUB_WORKSPACE/seaweed-baseline-vm" "$baseline_sha"
+          (cd "$GITHUB_WORKSPACE/seaweed-baseline-vm" && go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$baseline_sha" -o "$RUNNER_TEMP/weed-baseline-vm" ./weed)
+          go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$RUNNER_TEMP/weed-candidate-vm" ./weed
+          printf 'VM baseline: `%s`\n\nVM candidate: `%s`\n\nLabcontainers: `%s`\n\nVM image: `%s`\n' "$baseline_sha" "$candidate_sha" "$LABCONTAINERS_REF" "$LABCONTAINERS_VM_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+      - name: Unit-test the Labcontainers VM harness
+        run: |
+          vm_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-vm-work.XXXXXXXX")
+          (cd "$vm_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
+          GOWORK="$vm_work/go.work" go test ./test/storage_lab/vm/...
+      - name: Run isolated four-VM durability gates
+        env:
+          LABCONTAINERS_SOURCE: ${{ github.workspace }}/labcontainers
+          LABCONTAINERS_REF: ${{ env.LABCONTAINERS_REF }}
+        run: |
+          runner=test/storage_lab/vm/run_vm.sh
+          candidate="$RUNNER_TEMP/weed-candidate-vm"
+          baseline="$RUNNER_TEMP/weed-baseline-vm"
+          "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario replicated-vacuum
+          "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario power-loss
+          "$runner" --candidate "$candidate" --baseline "$baseline" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario migration
+          "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario vacuum-power-loss
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: storage-reliability-vm-lab-results
+          path: /tmp/seaweedfs-vm-lab-results-*/
+          if-no-files-found: error
           retention-days: 14

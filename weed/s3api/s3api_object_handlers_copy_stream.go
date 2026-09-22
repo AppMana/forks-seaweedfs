@@ -88,7 +88,7 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 	}
 	// Child context so a terminal error here unblocks both legs
 	// immediately. Without this, a failed POST closes pipeReader
-	// (which only fails the producer's writes), but the source GET's
+	// (which only fails the producer's writes), but the source GET's  //codespell:ignore
 	// read loop would keep draining srcResp.Body in the background
 	// until EOF — wasting source-volume bandwidth and CPU on a copy
 	// that's already failed. Cancelling streamCtx tears down both the
@@ -96,6 +96,9 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	dstUrl := fmt.Sprintf("http://%s/%s", assignResult.Location.Url, assignResult.FileId)
+	if assignResult.Fsync {
+		dstUrl += "?fsync=true"
+	}
 	dstJwt := security.EncodedJwt(assignResult.Auth)
 	srcJwt := filer.JwtForVolumeServer(srcFileId)
 

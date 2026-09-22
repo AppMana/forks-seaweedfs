@@ -94,7 +94,7 @@ func (f *Filer) maybeReloadFilerConfiguration(event *filer_pb.SubscribeMetadataR
 		return
 	}
 
-	glog.V(0).Infof("procesing %v", event)
+	glog.V(0).Infof("processing %v", event)
 	if entry.Name == FilerConfName {
 		f.reloadFilerConfiguration(entry)
 	}
@@ -141,5 +141,11 @@ func (f *Filer) LoadRemoteStorageConfAndMapping() {
 	}
 }
 func (f *Filer) maybeReloadRemoteStorageConfigurationAndMapping(event *filer_pb.SubscribeMetadataResponse) {
-	// FIXME add reloading
+	if !filer_pb.MetadataEventTouchesDirectory(event, DirectoryEtcRemote) {
+		return
+	}
+
+	// a mount left behind after remote.unmount would still send deletes to a
+	// remote the filer no longer owns
+	f.LoadRemoteStorageConfAndMapping()
 }

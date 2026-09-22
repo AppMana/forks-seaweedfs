@@ -46,6 +46,10 @@ var (
 	filerSftpOptions   SftpOptions
 )
 
+// allowUntrustedRemoteEndpointsUsage documents the flag shared by the filer and
+// S3 gateway, whose remote-mount read paths dial the mounted endpoint directly.
+const allowUntrustedRemoteEndpointsUsage = "if true, a read of a remote-only entry accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints."
+
 type FilerOptions struct {
 	masters                   *pb.ServerDiscovery
 	mastersString             *string
@@ -80,7 +84,11 @@ type FilerOptions struct {
 	allowedOrigins            *string
 	exposeDirectoryData       *bool
 	tusBasePath               *string
+	tusMaxSizeMB              *int
+	tusSessionExpiry          *time.Duration
 	s3ConfigFile              *string // optional path to static S3 identity config
+
+	allowUntrustedRemoteEndpoints *bool
 	// shutdownCtx, when non-nil, tells startFiler to gracefully shut down its
 	// HTTP/gRPC servers once the ctx is cancelled. Used by integration tests
 	// and by weed mini; nil for standalone weed filer.
@@ -123,6 +131,9 @@ func init() {
 	f.allowedOrigins = cmdFiler.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
 	f.exposeDirectoryData = cmdFiler.Flag.Bool("exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
 	f.tusBasePath = cmdFiler.Flag.String("tusBasePath", "/.tus", "TUS resumable upload endpoint base path (e.g., /.tus)")
+	f.tusMaxSizeMB = cmdFiler.Flag.Int("tusMaxSizeMB", 5*1024, "maximum TUS upload size in MB")
+	f.tusSessionExpiry = cmdFiler.Flag.Duration("tusSessionExpiry", 24*time.Hour, "incomplete TUS upload sessions are cleaned up after this duration, e.g. \"48h\", \"7h30m\"")
+	f.allowUntrustedRemoteEndpoints = cmdFiler.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 
 	// start s3 on filer
 	filerStartS3 = cmdFiler.Flag.Bool("s3", false, "whether to start S3 gateway")
@@ -141,6 +152,7 @@ func init() {
 	filerS3Options.metricsHttpIp = cmdFiler.Flag.String("s3.metricsIp", "", "metrics listen ip. If empty, default to same as -s3.ip.bind option.")
 	cmdFiler.Flag.Bool("s3.allowEmptyFolder", true, "deprecated, ignored. Empty folder cleanup is now automatic.")
 	filerS3Options.allowDeleteBucketNotEmpty = cmdFiler.Flag.Bool("s3.allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	filerS3Options.autoCreateBucket = cmdFiler.Flag.Bool("s3.autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	filerS3Options.localSocket = cmdFiler.Flag.String("s3.localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
 	filerS3Options.tlsCACertificate = cmdFiler.Flag.String("s3.cacert.file", "", "path to the TLS CA certificate file")
 	filerS3Options.tlsVerifyClientCert = cmdFiler.Flag.Bool("s3.tlsVerifyClientCert", false, "whether to verify the client's certificate")
@@ -152,9 +164,11 @@ func init() {
 	filerS3Options.cipher = cmdFiler.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads")
 	filerS3Options.iamReadOnly = cmdFiler.Flag.Bool("s3.iam.readOnly", true, "disable IAM write operations on this server")
 	filerS3Options.portIceberg = cmdFiler.Flag.Int("s3.port.iceberg", 8181, "Iceberg REST Catalog server listen port (0 to disable)")
-	filerS3Options.externalUrl = cmdFiler.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Used for S3 signature verification behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
+	filerS3Options.portLance = cmdFiler.Flag.Int("s3.port.lance", 9101, "Lance Namespace server listen port (0 to disable)")
+	filerS3Options.externalUrl = cmdFiler.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	filerS3Options.defaultFileMode = cmdFiler.Flag.String("s3.defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
 	filerS3Options.cacheSizeMB = cmdFiler.Flag.Int64("s3.cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	filerS3Options.allowUntrustedRemoteEndpoints = cmdFiler.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 
 	// start webdav on filer
 	filerStartWebDav = cmdFiler.Flag.Bool("webdav", false, "whether to start webdav gateway")
@@ -257,6 +271,7 @@ func runFiler(cmd *Command, args []string) bool {
 	startDelay := time.Duration(2)
 	if *filerStartS3 {
 		filerS3Options.filer = &filerAddress
+		filerS3Options.ip = f.ip
 		if *filerS3Options.bindIp == "" {
 			filerS3Options.bindIp = f.bindIp
 		}
@@ -384,12 +399,22 @@ func (fo *FilerOptions) startFiler() {
 		DownloadMaxBytesPs:        int64(*fo.downloadMaxMBps) * 1024 * 1024,
 		DiskType:                  *fo.diskType,
 		AllowedOrigins:            strings.Split(*fo.allowedOrigins, ","),
+		ExposeDirectoryData:       *fo.exposeDirectoryData,
 		TusBasePath:               *fo.tusBasePath,
+		TusMaxSize:                int64(*fo.tusMaxSizeMB) * 1024 * 1024,
+		TusSessionExpiry:          *fo.tusSessionExpiry,
 		CredentialManager:         credentialManager,
+
+		AllowUntrustedRemoteEndpoints: *fo.allowUntrustedRemoteEndpoints,
 	})
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)
 	}
+
+	// Serve "//" and ".." paths at their cleaned form instead of letting the mux
+	// redirect: its Location is double-escaped, turning non-ASCII names into
+	// percent-encoded directory names when a client follows it (#11125).
+	defaultHandler := weed_server.CleanPathHandler(defaultMux)
 
 	// Ensure fs.Shutdown() runs exactly once, whether triggered by a signal hook
 	// or by the main goroutine after Serve() returns (e.g., MiniCluster tests).
@@ -407,14 +432,15 @@ func (fo *FilerOptions) startFiler() {
 		if e != nil {
 			glog.Fatalf("Filer server public listener error on port %d:%v", *fo.publicPort, e)
 		}
+		publicHandler := weed_server.CleanPathHandler(publicVolumeMux)
 		go func() {
-			if e := http.Serve(publicListener, publicVolumeMux); e != nil {
+			if e := http.Serve(publicListener, publicHandler); e != nil {
 				glog.Fatalf("Volume server fail to serve public: %v", e)
 			}
 		}()
 		if localPublicListener != nil {
 			go func() {
-				if e := http.Serve(localPublicListener, publicVolumeMux); e != nil {
+				if e := http.Serve(localPublicListener, publicHandler); e != nil {
 					glog.Errorf("Volume server fail to serve public: %v", e)
 				}
 			}()
@@ -497,7 +523,7 @@ func (fo *FilerOptions) startFiler() {
 		if err != nil {
 			glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
 		}
-		socketServer = newHttpServer(defaultMux, nil)
+		socketServer = newHttpServer(defaultHandler, nil)
 		go socketServer.Serve(filerSocketListener)
 	}
 
@@ -540,14 +566,14 @@ func (fo *FilerOptions) startFiler() {
 
 		var localTLSServer *http.Server
 		if filerLocalListener != nil {
-			localTLSServer = newHttpServer(defaultMux, tlsConfig)
+			localTLSServer = newHttpServer(defaultHandler, tlsConfig)
 			go func() {
 				if err := localTLSServer.ServeTLS(filerLocalListener, "", ""); err != nil {
 					glog.Errorf("Filer Fail to serve: %v", err)
 				}
 			}()
 		}
-		httpS := newHttpServer(defaultMux, tlsConfig)
+		httpS := newHttpServer(defaultHandler, tlsConfig)
 
 		// Register a single shutdown hook that runs the steps in the correct order:
 		// stop accepting new gRPC/HTTP requests, then close the filer database.
@@ -591,14 +617,14 @@ func (fo *FilerOptions) startFiler() {
 	} else {
 		var localHTTPServer *http.Server
 		if filerLocalListener != nil {
-			localHTTPServer = newHttpServer(defaultMux, nil)
+			localHTTPServer = newHttpServer(defaultHandler, nil)
 			go func() {
 				if err := localHTTPServer.Serve(filerLocalListener); err != nil {
 					glog.Errorf("Filer Fail to serve: %v", err)
 				}
 			}()
 		}
-		httpS := newHttpServer(defaultMux, nil)
+		httpS := newHttpServer(defaultHandler, nil)
 
 		// Register a single shutdown hook that runs the steps in the correct order:
 		// stop accepting new gRPC/HTTP requests, then close the filer database.

@@ -87,15 +87,17 @@ func (mm *mapMetric) MaxFileKey() NeedleId {
 	if mm == nil {
 		return 0
 	}
-	t := uint64(mm.MaximumFileKey)
+	t := atomic.LoadUint64(&mm.MaximumFileKey)
 	return Uint64ToNeedleId(t)
 }
 func (mm *mapMetric) MaybeSetMaxFileKey(key NeedleId) {
 	if mm == nil {
 		return
 	}
-	if key > mm.MaxFileKey() {
-		atomic.StoreUint64(&mm.MaximumFileKey, uint64(key))
+	for old := atomic.LoadUint64(&mm.MaximumFileKey); uint64(key) > old; old = atomic.LoadUint64(&mm.MaximumFileKey) {
+		if atomic.CompareAndSwapUint64(&mm.MaximumFileKey, old, uint64(key)) {
+			break
+		}
 	}
 }
 
@@ -107,8 +109,10 @@ func (mm *mapMetric) MaybeSetMaxNeedleEnd(offset Offset, size Size, version need
 		return
 	}
 	end := offset.ToActualOffset() + needle.GetActualSize(size, version)
-	if end > atomic.LoadInt64(&mm.MaximumNeedleEnd) {
-		atomic.StoreInt64(&mm.MaximumNeedleEnd, end)
+	for old := atomic.LoadInt64(&mm.MaximumNeedleEnd); end > old; old = atomic.LoadInt64(&mm.MaximumNeedleEnd) {
+		if atomic.CompareAndSwapInt64(&mm.MaximumNeedleEnd, old, end) {
+			break
+		}
 	}
 }
 

@@ -54,6 +54,9 @@ func TestCompactAbortsOnSourceSyncFailure(t *testing.T) {
 				if !errors.Is(err, want) {
 					t.Fatalf("sync failure not propagated: %v", err)
 				}
+				if err := v.CommitCompact(); err == nil {
+					t.Fatal("failed preflight must not be committable")
+				}
 				for _, ext := range []string{".cpd", ".cpx", ".cpc"} {
 					if _, err := os.Stat(v.FileName(ext)); !os.IsNotExist(err) {
 						t.Fatalf("failed preflight created %s: %v", ext, err)

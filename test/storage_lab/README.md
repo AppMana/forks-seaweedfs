@@ -206,7 +206,11 @@ For WinFsp/Git runtime coverage in a disposable Windows VM, supply the candidate
 and offline installers from the host (the guest has no external network):
 
 ```sh
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /absolute/winfsp.test.exe ./test/winfsp
 SEAWEEDFS_WINDOWS_MOUNT_LIVE=1 \
+SEAWEEDFS_WINDOWS_MOUNT_REPEATS=5 \
+SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY=1 \
+SEAWEEDFS_WINDOWS_WINFSP_TEST=/absolute/winfsp.test.exe \
 SEAWEEDFS_WINDOWS_WEED=/absolute/weed.exe \
 SEAWEEDFS_WINFSP_MSI=/absolute/winfsp.msi \
 SEAWEEDFS_GIT_INSTALLER=/absolute/git-installer.exe \
@@ -220,14 +224,34 @@ Use the same temporary Go workspace described above. This runs the existing
 prerequisites and all 32 modified assets, and rejects missing completion markers.
 The test logs input hashes and retains combined scenario stdout/stderr under the
 printed results directory (`RUNNER_TEMP` in CI, system temp otherwise). Guest
-weed/server log directories are not yet exported. Archive the complete Go test
-output as well. A skipped opt-in
+logs are exported to `guest-logs.txt` (last 2,000 lines per top-level log file;
+not a complete recursive archive). Archive the complete Go test output as well.
+`SEAWEEDFS_WINDOWS_MOUNT_REPEATS` defaults to 1 and accepts 1..20 fresh scenario
+pairs within the existing 40-minute harness budget; raising the repeat count
+does not extend that budget. Verbosity defaults to 0 and accepts 0..4.
+The optional native executable adds 512 create/chmod/write/close/mkdir/rename
+transactions per pair, including uppercase `.GIT` paths and exact final object
+content checks. The Actions gate builds and requires this executable, runs five
+pairs, and rejects skipped/missing native completion. A skipped opt-in
 test is not qualification. Pin installer hashes and VM image digests for release
 evidence; a local `latest` image run is exploratory only. The harness contract
 test (`pwsh -File hack/appmana/mount-smoke-contract-test.ps1`) injects prerequisite
 failures without starting a VM and runs in the existing Windows build workflow.
 An intermittent LFS object-move failure has been observed in this lab; a later
 successful run does not resolve it or qualify Windows deployment.
+
+The subsequent Windows stress run also reproduced stale `config.lock` after a
+successful server rename. `TestStreamRenameAckSurvivesClockBehindMetadataFence`
+reproduces this cache failure deterministically when the monotonic metadata
+clock is ahead of wall time. Streaming rename replies must use the actual
+committed metadata events, not separately sampled wall-clock timestamps.
+`TestStreamRenameRepliesMatchCommittedLog` checks reply/log equality, both
+transports, overwrites, recursive moves, and data preservation on disconnect.
+An acknowledgment can be lost **after commit**: an RPC error alone does not
+prove the rename failed. Inspect source and destination before retrying; do not
+delete a destination or assume an old lock file is disposable based on that
+error. These tests do not establish that the original LFS object-move failure
+has the same cause, nor qualify Synology packaging or cluster deployment.
 
 The dedicated `vm-fault-gates` Actions job also runs this test with preloaded,
 hash-checked installers (variables are listed in the root README). Its pinned

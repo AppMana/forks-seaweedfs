@@ -244,6 +244,9 @@ jobs:
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:
           SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'
+          SEAWEEDFS_WINDOWS_MOUNT_REPEATS: '5'
+          SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY: '1'
+          SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/windows-winfsp.test.exe
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
           SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
           WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 }}
@@ -260,6 +263,7 @@ jobs:
           printf '%s  %s\n' "$GIT_INSTALLER_SHA256" "$SEAWEEDFS_GIT_INSTALLER" | sha256sum -c -
           candidate_sha=$(git rev-parse HEAD)
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_WINDOWS_WINFSP_TEST" ./test/winfsp
           windows_work=$(mktemp -d "$RUNNER_TEMP/windows-mount-work.XXXXXXXX")
           (cd "$windows_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           export GOWORK="$windows_work/go.work"

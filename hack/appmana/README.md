@@ -32,6 +32,26 @@ Every invocation removes and recreates `WorkRoot` so schedule comparisons
 start with the same filer, mount, and metadata-cache state. Logs are retained
 under `WorkRoot\logs`; use `-Verbosity 4` for SeaweedFS callback/filer ordering
 and `-WinFspOptions` for explicit WinFsp cache-option A/B runs.
+Add `-EtwFileIO -Trace` in a disposable Windows VM to record WPR FileIO ETW
+alongside WinFsp request/reply diagnostics. The lab's automated opt-in capture,
+artifact integrity checks, and Actions switch are documented in
+[`test/storage_lab/README.md`](../../test/storage_lab/README.md).
+For a portable first pass through decoded events:
+
+```sh
+python3 hack/appmana/analyze-fileio.py /path/to/GitLfsTempMetadata-01-fileio.xml.zip --path git-lfs-temp-metadata
+python3 -m unittest discover -s hack/appmana -p 'test_analyze_fileio.py'
+```
+
+The analyzer pairs FileIo requests/completions by IRP, preserves the initiating
+PID, timestamps and NTSTATUS, and resolves paths from successful creates on a
+file object. Those paths describe the open, not necessarily a later renamed
+name. It reports unmatched events and trace-loss headers; circular overwrites
+can remove older history even when `EventsLost` is zero. Nonzero statuses
+include expected absent-file probes, reparses, and fast-I/O fallback: they are
+not automatically bugs. Compare the recorded `GIT FAILURE UTC` timestamp and
+full WinFsp request/reply log before drawing conclusions. Add `--all` to include
+successful completions. Preserve ETL for deeper analysis in WPA.
 
 ### Recorded failure signature
 

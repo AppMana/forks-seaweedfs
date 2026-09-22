@@ -231,6 +231,61 @@ pairs within the existing 40-minute harness budget; raising the repeat count
 does not extend that budget. Verbosity defaults to 0 and accepts 0..4.
 For a targeted diagnostic run, `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO` selects either
 `GitAtomicRenamePrimed` or `GitLfsTempMetadata`; omit it for the complete gate.
+For low-level diagnosis, set `SEAWEEDFS_WINDOWS_MOUNT_TRACE=1` (or the Actions
+dispatch input `windows_trace`). The disposable VM enables WinFsp debug output
+and starts the checked-in `hack/appmana/seaweed-fileio.wprp` profile (a fixed
+16 MiB event ring, process identities, file names and I/O completions) before
+the workload. WPR is stopped in cleanup; a missing profile, busy recorder, or
+failed flush is a diagnostic failure, not a silent fallback. No existing WPR
+session is cancelled. Each scenario's binary `<scenario>-fileio.etl` is retrieved
+before VM destruction, in bounded chunks with size and SHA-256 verification;
+files over 128 MiB or incomplete transfers fail the run. The VM also runs
+`tracerpt` to preserve decoded XML in a ZIP and downloads the full WinFsp debug log,
+not just the ordinary last-2,000-lines summary. Open the ETL in
+Windows Performance Analyzer's File I/O tables and correlate process, path,
+operation, timestamp, and status with the WinFsp/SeaweedFS logs. Memory mode
+retains a bounded recent window; inspect trace loss before claiming complete
+history. Debug logging changes scheduling, so preserve untraced failures too.
+The ordinary gate leaves tracing off. Artifact-transfer negative tests run with
+`go test ./test/storage_lab/vm -run '^TestWindowsArtifact'` using the same Go
+workspace as the VM tests. ETLs contain paths and process information; keep
+their existing CI artifact access restrictions and 14-day retention.
+The focused profile captured a real failure against diagnostic candidate
+`2ef9c71d1`: in `/tmp/seaweedfs-windows-mount-results-3402907160`, cycle 1 passed,
+but cycle 2 failed resolving `.git` during seed `git add`. Both ETLs, decoded
+XML ZIPs, and full WinFsp logs were retrieved and hash-verified. The suspected
+LFS client's directory opens and subsequent file-name information queries
+succeeded in that trace; do not misreport this as a proven missing filer entry.
+Process events identify the failing client as `git-lfs.exe filter-process`
+(PID 2356); successful kernel name queries do not prove that subsequent
+user-mode DOS-volume translation succeeded. The remaining canonicalization
+failure requires further client/API tracing.
+
+For failure-only client instrumentation, set
+`SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC` to a host Windows `git-lfs.exe`. The runner
+replaces the installed copies only inside its fresh disposable VM, records the
+input SHA-256 and client version, and leaves the default bundled client unchanged
+when the variable is absent. This override can also select an official release
+for a controlled A/B run; label those results separately from instrumented runs.
+Keep the SeaweedFS binary, WinFsp installer, VM image, and workload fixed.
+The historical reproduction uses Git for Windows 2.51.0 with Git LFS 3.7.0;
+that client is not a current-version qualification.
+
+`hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
+commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of
+that exact source, apply the patch with `git apply`, then build:
+
+```sh
+GOTOOLCHAIN=go1.24.4 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go build -ldflags '-X github.com/git-lfs/git-lfs/v3/config.GitCommit=92dddf56-lab-diagnostics' \
+  -o /absolute/lab/artifacts/git-lfs-diagnostic.exe .
+```
+
+The patch distinguishes `filepath.Abs`, `CreateFile`, and
+`GetFinalPathNameByHandle` failures. Only after the last API fails does it query
+DOS/GUID/NT names, with normalized and opened-name flags, on the same handle.
+It always returns the original error: these probes are observations, not retries
+that turn a failed workload green. Do not deploy this diagnostic client.
 The optional native executable adds 512 create/chmod/write/close/mkdir/rename
 transactions per pair, including uppercase `.GIT` paths and exact final object
 content checks. The Actions gate builds and requires this executable, runs five

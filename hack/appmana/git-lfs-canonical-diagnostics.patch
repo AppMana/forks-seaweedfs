@@ -1,0 +1,53 @@
+diff --git a/tools/filetools.go b/tools/filetools.go
+index cce0586..55a3edc 100644
+--- a/tools/filetools.go
++++ b/tools/filetools.go
+@@ -489,7 +489,7 @@ func CanonicalizePath(path string, missingOk bool) (string, error) {
+ 	if len(path) > 0 {
+ 		path, err := filepath.Abs(path)
+ 		if err != nil {
+-			return "", err
++			return "", fmt.Errorf("LFS-LAB filepath.Abs: %w", err)
+ 		}
+ 		result, err := CanonicalizeSystemPath(path)
+ 		if err != nil && os.IsNotExist(err) && missingOk {
+diff --git a/tools/filetools_windows.go b/tools/filetools_windows.go
+index 077bfcc..8ed7c1d 100644
+--- a/tools/filetools_windows.go
++++ b/tools/filetools_windows.go
+@@ -4,6 +4,9 @@
+ package tools
+ 
+ import (
++	"fmt"
++	"strings"
++
+ 	"golang.org/x/sys/windows"
+ )
+ 
+@@ -25,7 +28,7 @@ func openSymlink(path string) (windows.Handle, error) {
+ func CanonicalizeSystemPath(path string) (string, error) {
+ 	h, err := openSymlink(path)
+ 	if err != nil {
+-		return "", err
++		return "", fmt.Errorf("LFS-LAB CreateFile(%q): %w", path, err)
+ 	}
+ 	defer windows.CloseHandle(h)
+ 
+@@ -33,7 +36,15 @@ func CanonicalizeSystemPath(path string) (string, error) {
+ 	for {
+ 		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+ 		if err != nil {
+-			return "", err
++			// Observe only after failure, and always return that original error.
++			// Flags: DOS=0, GUID=1, NT=2; FILE_NAME_OPENED adds 8.
++			var probes []string
++			for _, flags := range []uint32{0, 1, 2, 8, 9, 10} {
++				probe := make([]uint16, 32768)
++				count, probeErr := windows.GetFinalPathNameByHandle(h, &probe[0], uint32(len(probe)), flags)
++				probes = append(probes, fmt.Sprintf("flags=%d n=%d name=%q err=%v", flags, count, windows.UTF16ToString(probe), probeErr))
++			}
++			return "", fmt.Errorf("LFS-LAB GetFinalPathNameByHandle(%q, size=%d, n=%d): %w; probes=[%s]", path, len(buf), n, err, strings.Join(probes, "; "))
+ 		}
+ 		if n < uint32(len(buf)) {
+ 			break

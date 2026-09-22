@@ -5,6 +5,7 @@ import unittest
 import tempfile
 import sys
 import subprocess
+from unittest import mock
 from offset_mutant import BROKEN, FIXED, revert
 from compaction_mutant import MUTATIONS, mutate
 from fsck_mutant import MUTATIONS as FSCK_MUTATIONS, mutate as mutate_fsck
@@ -17,6 +18,29 @@ spec.loader.exec_module(lab)
 
 
 class IsolationContract(unittest.TestCase):
+    def test_required_inventory_rejects_missing_skipped_or_failed_tests(self):
+        for suite, names in lab.REQUIRED_TESTS.items():
+            lines = ['--- PASS: ' + name + ' (0.01s)' for name in names]
+            output = 'boundary\n' + '\n'.join(lines) + '\nPASS\n'
+            self.assertEqual(lab.assess_results(suite, output, 0, 'boundary')['status'], 'passed')
+            for name in names:
+                incomplete = output.replace('--- PASS: ' + name + ' (0.01s)\n', '')
+                self.assertIn(name, lab.assess_results(suite, incomplete, 0, 'boundary')['missing_tests'])
+            for broken, code in [(output, 1), (output.replace('boundary', ''), 0),
+                                 (output.replace('\nPASS\n', '\n'), 0),
+                                 (output + '    --- SKIP: TestExtra/subtest (0s)\n', 0),
+                                 (output + '--- FAIL: TestExtra (0s)\n', 0)]:
+                self.assertEqual(lab.assess_results(suite, broken, code, 'boundary')['status'], 'failed')
+
+    def test_missing_storage_tests_cannot_pass_on_one_success(self):
+        def one_test_only(cmd, log, **kwargs):
+            log.write(b'PASS: sandbox boundary probe\n--- PASS: TestVacuumStableLiveDatasetHasBoundedGrowth (0.01s)\nPASS\n')
+            return 0
+        with mock.patch.object(sys, 'argv', ['run.py', 'storage', '--tests', sys.executable]), \
+                mock.patch.object(lab, 'run_bounded', side_effect=one_test_only), \
+                mock.patch.object(lab.subprocess, 'run'):
+            self.assertEqual(lab.main(), 1, 'a partial suite was reported as qualified')
+
     def test_filesystem_helper_rejects_physical_device_before_privileged_work(self):
         helper = Path(__file__).with_name('filesystem_helper.sh')
         result = subprocess.run([str(helper), '/dev/sda', 'xfs', '/tmp/tests',

@@ -76,10 +76,9 @@ def main():
                 code = lab.run_bounded(cmd, log, limit=32 * 1024**2)
             report['exit_code'] = code
             output = (results / 'test.log').read_text(errors='replace')
-            report['status'] = ('passed' if code == 0 and '--- PASS:' in output
-                                and '--- SKIP:' not in output
-                                and 'PASS: native filesystem boundary probe' in output
-                                else 'failed')
+            report.update(lab.assess_results('enospc' if args.enospc else 'storage',
+                                            output, code,
+                                            'PASS: native filesystem boundary probe'))
     finally:
         subprocess.run(['sudo', '-n', 'systemctl', 'stop', unit],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

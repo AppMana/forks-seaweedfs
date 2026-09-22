@@ -79,7 +79,7 @@ Secrets and variables → Actions → Variables:
 | --- | --- | --- |
 | `SEAWEEDFS_RELIABILITY_BASELINE_REF` | Full 40-character commit SHA for the source compatibility baseline | Change deliberately when the baseline is promoted; keep the previous deployed release in the upgrade/rollback matrix. Do not use `HEAD~1`, a branch, or `latest`. |
 | `SEAWEEDFS_RELIABILITY_GO_FUSE_REF` | Full commit SHA for `AppMana/forks-go-fuse`, required by the local `go.mod` replacement | Change only alongside a reviewed and tested dependency upgrade. Both test builds use this pinned sibling. |
-| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Set this only after the VM lifecycle, QGA, and large-artifact fixes are committed there. Never point this at a moving branch. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Use a published, qualified commit containing explicit crashes and peer bridge restoration (locally tested: `a0b41e1c5123fc129ea7a02c8a091b847c8312cb`). Publish the commit before selecting it in Actions. Never point this at a moving branch. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE` | Qualified Ubuntu VM image reference including `@sha256:<64 hex>` | Build from the pinned source, publish and preload it on the dedicated runner, and update only after its live KVM smoke test passes. Mutable tags are rejected. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Windows VM image including `@sha256:<64 hex>` | Preload the licensed image on the same dedicated runner. Run the native Windows core regressions and Labcontainers NTFS crash test before promotion. |
 

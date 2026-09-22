@@ -25,6 +25,8 @@ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFI
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
 github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260922222613-9fea7eee373a h1:TDpoGn7GfRZUdxuzyQ3VsduoEwtL/F0UFDcsCz2+qV0=
 github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260922222613-9fea7eee373a/go.mod h1:t8wYsITQR0SWsj4m8Lj6GZqnu3Ph0K+ihHWPZAhZhNo=
+github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260922225920-43833b0979f7 h1:RaBWp+Qmp21TdjaoB8y4CF6vnrmumXFHdMLTTYcgihA=
+github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260922225920-43833b0979f7/go.mod h1:t8wYsITQR0SWsj4m8Lj6GZqnu3Ph0K+ihHWPZAhZhNo=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 h1:0CwZNZbxp69SHPdPJAN/hZIm0C4OItdklCFmMRWYpio=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5/go.mod h1:wHh0iHkYZB8zMSxRWpUBQtwG5a7fFgvEO+odwuTv2gs=
 github.com/awalterschulze/gographviz v2.0.3+incompatible h1:9sVEXJBJLwGX7EQVhLm2elIKCm7P2YHFC8v6096G09E=

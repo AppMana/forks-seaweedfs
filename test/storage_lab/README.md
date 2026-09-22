@@ -337,6 +337,22 @@ execution. Results are in `/tmp/seaweedfs-windows-mount-results-327889120`;
 `09b3ca72e0fa4d3cebc1f9ee95df9dcaed9b136e38798f54ec994631842662bf`.
 Switching to driver-side registration is therefore not a fix. Investigate
 the shared mount lifecycle rather than recommending this registry setting.
+Another isolated comparison uses
+`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION=1`. Before the unchanged DOS
+queries, the native probe changes its own synthetic mount's junction target
+from the NT device name to the GUID path of that same volume. It verifies the
+original junction against the device identified through an open root handle
+and checks the virtual sentinel afterward. It does not re-register the mount,
+retry failed queries, or act on SeaweedFS data. The option is rejected outside
+the isolated scenario and cannot be combined with the driver-side comparison.
+This is a causal experiment, not an application fix or deployment guidance;
+its mode is retained in `provenance.txt` and each intervention is logged.
+Use the matched `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION=nt-control`
+mode before attributing a pass to GUID targeting: it performs the same GUID/NT
+identity queries, reparse read, rewrite, readback, and sentinel check, but writes
+the original NT target. Both modes verify the exact substitute name after the
+write. This controls for query priming and effects of rewriting the junction;
+neither mode changes the first-failure behavior of the DOS path assertions.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

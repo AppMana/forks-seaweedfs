@@ -58,6 +58,10 @@ func TestWindowsMountLab(t *testing.T) {
 	if registrationMode != "" && (registrationMode != "1" || !isolateMountManager) {
 		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD=1 is only supported by the isolated mount-manager experiment")
 	}
+	guidJunction := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION")
+	if guidJunction != "" && ((guidJunction != "1" && guidJunction != "nt-control") || !isolateMountManager || registrationMode != "") {
+		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION must be 1 or nt-control and requires the isolated default-registration experiment")
+	}
 	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
 	if !isolateMountManager {
 		inputs[`C:\lab\weed.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_WEED")
@@ -80,6 +84,7 @@ func TestWindowsMountLab(t *testing.T) {
 	artifacts := map[string][]byte{}
 	var provenance strings.Builder
 	fmt.Fprintf(&provenance, "mount_manager_from_fsd=%q\n", registrationMode)
+	fmt.Fprintf(&provenance, "mount_manager_guid_junction=%q\n", guidJunction)
 	for target, path := range inputs {
 		if path == "" {
 			t.Fatalf("missing input for %s", target)
@@ -182,7 +187,13 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		t.Fatalf("dependency installation exit %d", r.GetExitCode())
 	}
 	if isolateMountManager {
-		result, runErr := n.ExecWithTimeout(ctx, 6*time.Minute, ps, "-NoProfile", "-Command", `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^TestMountManagerDirectoryLifecycle$' '-test.v' '-test.count=1' '-test.timeout=5m'; exit $LASTEXITCODE`)
+		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^TestMountManagerDirectoryLifecycle$' '-test.v' '-test.count=1' '-test.timeout=5m'`
+		if guidJunction == "1" {
+			command += ` '-mount-manager-guid-junction'`
+		} else if guidJunction == "nt-control" {
+			command += ` '-mount-manager-nt-junction-control'`
+		}
+		result, runErr := n.ExecWithTimeout(ctx, 6*time.Minute, ps, "-NoProfile", "-Command", command+`; exit $LASTEXITCODE`)
 		output := string(result.GetStdout()) + string(result.GetStderr())
 		if err := os.WriteFile(filepath.Join(resultDir, "mount-manager.log"), []byte(fmt.Sprintf("execution error: %v\n%s", runErr, output)), 0600); err != nil {
 			t.Fatal(err)

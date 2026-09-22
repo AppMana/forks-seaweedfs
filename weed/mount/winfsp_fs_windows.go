@@ -58,6 +58,7 @@ func (a *winfspFS) resolveInode(path string) (uint64, fuse.Status) {
 	for _, comp := range strings.Split(strings.Trim(path, "/"), "/") {
 		child, _, st := a.lookupChild(ino, comp)
 		if st != fuse.OK {
+			glog.V(1).Infof("winfsp resolve failed: path=%q parent_inode=%d component=%q status=%v", path, ino, comp, st)
 			return 0, st
 		}
 		ino = child
@@ -93,11 +94,13 @@ func (a *winfspFS) lookupChild(parent uint64, requested string) (uint64, string,
 		return 0, "", fuse.EIO
 	}
 	if actual == "" {
+		glog.V(1).Infof("winfsp case-fold miss: parent=%q requested=%q", parentPath, requested)
 		return 0, "", fuse.ENOENT
 	}
 
 	out = fuse.EntryOut{}
 	if status = a.wfs.Lookup(nil, &fuse.InHeader{NodeId: parent}, actual, &out); status != fuse.OK {
+		glog.V(1).Infof("winfsp canonical lookup failed: parent=%q requested=%q canonical=%q status=%v", parentPath, requested, actual, status)
 		return 0, "", status
 	}
 	return out.NodeId, actual, fuse.OK
@@ -226,6 +229,7 @@ func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 	}
 	var out fuse.AttrOut
 	if status := a.wfs.GetAttr(nil, &in, &out); status != fuse.OK {
+		glog.V(1).Infof("winfsp getattr failed: path=%q inode=%d fh=%d status=%v", path, in.NodeId, fh, status)
 		return toWinErrno(status)
 	}
 	attrToStat(&out.Attr, st)

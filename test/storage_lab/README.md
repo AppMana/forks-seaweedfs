@@ -240,6 +240,15 @@ path at its existing version. Directory updates with omitted `NewParentPath`
 must also preserve children.
 Failure-only `winfsp rename failed at`
 diagnostics at verbosity 1 identify which rename stage rejects a request.
+Verbosity 1 also
+records failed component resolution, case-fold lookup, and attribute reads to
+localize this earlier failure without retries or successful-path tracing.
+Deployment must include both components: the committed-event acknowledgment
+fix runs in the **filer**, while the in-place update correction runs in the
+**mount**. A mount-only upgrade leaves old filer rename replies unchanged.
+Mixed-version operation needs its own qualification; these tests use the same
+candidate for the local filer and Windows mount and do not certify a rolling
+upgrade against older filers.
 
 The dedicated `vm-fault-gates` Actions job also runs this test with preloaded,
 hash-checked installers (variables are listed in the root README). Its pinned

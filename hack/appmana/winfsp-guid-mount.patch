@@ -1,0 +1,146 @@
+diff --git a/src/dll/mount.c b/src/dll/mount.c
+index c7b94e8..10f95db 100644
+--- a/src/dll/mount.c
++++ b/src/dll/mount.c
+@@ -93,6 +93,55 @@ static BOOL WINAPI FspMountInitialize(
+ static NTSTATUS FspMountSet_Directory(PWSTR VolumeName, PWSTR MountPoint,
+     PSECURITY_DESCRIPTOR SecurityDescriptor, PHANDLE PMountHandle);
+ static NTSTATUS FspMountRemove_Directory(HANDLE MountHandle);
++static NTSTATUS FspMountSet_DirectoryTarget(PWSTR VolumeName, HANDLE MountHandle);
++static NTSTATUS FspMountRemove_MountmgrDirectory(HANDLE VolumeHandle, PWSTR VolumeName,
++    PWSTR MountPoint, HANDLE MountHandle);
++
++static NTSTATUS FspMountSet_MountmgrDirectoryTarget(PWSTR VolumeName, HANDLE MountHandle)
++{
++    WCHAR GuidName[50], DeviceName[1024];
++    HANDLE FindHandle;
++    NTSTATUS Result = STATUS_OBJECT_NAME_NOT_FOUND;
++    DWORD Length, Error;
++
++    /* Do not open the file system here: its dispatcher has not started yet.
++     * Resolve the Mount Manager's persistent name through the DOS device namespace. */
++    FindHandle = FindFirstVolumeW(GuidName, sizeof GuidName / sizeof(WCHAR));
++    if (INVALID_HANDLE_VALUE == FindHandle)
++        return FspNtStatusFromWin32(GetLastError());
++
++    do
++    {
++        Length = lstrlenW(GuidName);
++        if (49 != Length || 0 != wcsncmp(GuidName, L"\\\\?\\Volume{", 11) ||
++            L'\\' != GuidName[Length - 1])
++        {
++            Result = STATUS_INVALID_PARAMETER;
++            break;
++        }
++
++        GuidName[Length - 1] = L'\0';
++        if (QueryDosDeviceW(GuidName + 4, DeviceName, sizeof DeviceName / sizeof(WCHAR)) &&
++            0 == lstrcmpiW(DeviceName, VolumeName))
++        {
++            GuidName[Length - 1] = L'\\';
++            GuidName[1] = L'?'; /* Win32 \\?\ -> NT \??\ */
++            Result = FspMountSet_DirectoryTarget(GuidName, MountHandle);
++            break;
++        }
++
++        if (!FindNextVolumeW(FindHandle, GuidName, sizeof GuidName / sizeof(WCHAR)))
++        {
++            Error = GetLastError();
++            if (ERROR_NO_MORE_FILES != Error)
++                Result = FspNtStatusFromWin32(Error);
++            break;
++        }
++    } while (TRUE);
++
++    FindVolumeClose(FindHandle);
++    return Result;
++}
+ 
+ static NTSTATUS FspMountSet_MountmgrDrive(HANDLE VolumeHandle, PWSTR VolumeName, PWSTR MountPoint)
+ {
+@@ -145,10 +194,7 @@ static NTSTATUS FspMountSet_MountmgrDirectory(HANDLE VolumeHandle, PWSTR VolumeN
+         if (!NT_SUCCESS(Result))
+             goto exit;
+ 
+-        *PMountHandle = MountHandle;
+-
+-        Result = STATUS_SUCCESS;
+-        goto exit;
++        goto registered;
+     }
+ 
+     /* transform our volume into one that can be used by the MountManager */
+@@ -166,6 +212,17 @@ static NTSTATUS FspMountSet_MountmgrDirectory(HANDLE VolumeHandle, PWSTR VolumeN
+     if (!NT_SUCCESS(Result))
+         goto exit;
+ 
++registered:
++    /* Mount Manager reconciliation expects a persistent volume GUID junction,
++     * not the transient NT device name used by unregistered directory mounts. */
++    Result = FspMountSet_MountmgrDirectoryTarget(VolumeName, MountHandle);
++    if (!NT_SUCCESS(Result))
++    {
++        FspMountRemove_MountmgrDirectory(VolumeHandle, VolumeName, MountPoint, MountHandle);
++        MountHandle = INVALID_HANDLE_VALUE;
++        goto exit;
++    }
++
+     *PMountHandle = MountHandle;
+ 
+     Result = STATUS_SUCCESS;
+@@ -477,10 +534,8 @@ static NTSTATUS FspMountSet_Directory(PWSTR VolumeName, PWSTR MountPoint,
+     NTSTATUS Result;
+     SECURITY_ATTRIBUTES SecurityAttributes;
+     HANDLE MountHandle = INVALID_HANDLE_VALUE;
+-    DWORD Backslashes, Bytes;
+-    USHORT VolumeNameLength, BackslashLength, ReparseDataLength;
+-    PREPARSE_DATA_BUFFER ReparseData = 0;
+-    PWSTR P, PathBuffer;
++    DWORD Backslashes;
++    PWSTR P;
+ 
+     *PMountHandle = 0;
+ 
+@@ -514,6 +569,27 @@ static NTSTATUS FspMountSet_Directory(PWSTR VolumeName, PWSTR MountPoint,
+         goto exit;
+     }
+ 
++    Result = FspMountSet_DirectoryTarget(VolumeName, MountHandle);
++    if (!NT_SUCCESS(Result))
++        goto exit;
++
++    *PMountHandle = MountHandle;
++
++exit:
++    if (!NT_SUCCESS(Result) && INVALID_HANDLE_VALUE != MountHandle)
++        CloseHandle(MountHandle);
++
++    return Result;
++}
++
++static NTSTATUS FspMountSet_DirectoryTarget(PWSTR VolumeName, HANDLE MountHandle)
++{
++    NTSTATUS Result;
++    DWORD Bytes;
++    USHORT VolumeNameLength, BackslashLength, ReparseDataLength;
++    PREPARSE_DATA_BUFFER ReparseData = 0;
++    PWSTR PathBuffer;
++
+     VolumeNameLength = (USHORT)lstrlenW(VolumeName);
+     BackslashLength = 0 == VolumeNameLength || L'\\' != VolumeName[VolumeNameLength - 1];
+     VolumeNameLength *= sizeof(WCHAR);
+@@ -563,14 +639,9 @@ static NTSTATUS FspMountSet_Directory(PWSTR VolumeName, PWSTR MountPoint,
+         goto exit;
+     }
+ 
+-    *PMountHandle = MountHandle;
+-
+     Result = STATUS_SUCCESS;
+ 
+ exit:
+-    if (!NT_SUCCESS(Result) && INVALID_HANDLE_VALUE != MountHandle)
+-        CloseHandle(MountHandle);
+-
+     MemFree(ReparseData);
+ 
+     return Result;

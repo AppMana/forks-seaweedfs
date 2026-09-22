@@ -69,6 +69,8 @@ func TestWindowsMountLab(t *testing.T) {
 	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
 	if labDLL != "" {
 		inputs[`C:\lab\winfsp-x64.dll`] = labDLL
+		inputs[`C:\lab\winfsp-x64.dll.manifest.txt`] = labDLL + ".manifest.txt"
+		inputs[`C:\lab\winfsp-x64.dll.source.patch`] = labDLL + ".source.patch"
 	}
 	if !isolateMountManager {
 		inputs[`C:\lab\weed.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_WEED")
@@ -103,6 +105,18 @@ func TestWindowsMountLab(t *testing.T) {
 		artifacts[target] = b
 		t.Logf("artifact=%s sha256=%s", target, sha(b))
 		fmt.Fprintf(&provenance, "artifact=%s sha256=%s\n", target, sha(b))
+	}
+	if labDLL != "" {
+		manifest := artifacts[`C:\lab\winfsp-x64.dll.manifest.txt`]
+		patch := artifacts[`C:\lab\winfsp-x64.dll.source.patch`]
+		if err := validateWinFspLabManifest(manifest, artifacts[`C:\lab\winfsp-x64.dll`], patch); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range map[string][]byte{"winfsp-build-manifest.txt": manifest, "winfsp-source.patch": patch} {
+			if err := os.WriteFile(filepath.Join(resultDir, name), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	img := os.Getenv("LABCONTAINERS_WINDOWS_IMAGE")
 	if img == "" {

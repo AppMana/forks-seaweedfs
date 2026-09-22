@@ -385,6 +385,12 @@ For source-level WinFsp experiments, run
 the x86_64 MinGW compiler, headers, libraries, and resource compiler installed.
 The script pins the upstream source revision, writes into a new temporary
 directory, retains compiler output and the source diff, and prints the DLL hash.
+Clean sources are required by default; untracked files are rejected. For an
+explicit source candidate, set `WINFSP_LAB_ALLOW_TRACKED_PATCH=1`; staged and
+unstaged tracked changes are captured together. The pinned commit supplies
+`SOURCE_DATE_EPOCH`, and the linker fixes timestamps and the preferred image
+base (ASLR remains enabled). Two clean builds with this recipe produced the
+same DLL SHA-256, `c0a63935ff993fc58cb90bed1c2982efb91cbb6fb602ff86fb2b478d945a3e10`.
 Its compatibility header adapts compiler/SDK declarations, not mount behavior;
 this unsigned user-mode DLL is lab-only, not a release artifact. The signed
 kernel driver still comes from the pinned WinFsp MSI. First reproduce RED with
@@ -396,6 +402,20 @@ loaded module path. Missing verification or fallback to the installed DLL
 fails the run. This mode cannot be combined with junction or registration
 interventions and is rejected outside the isolated scenario. Retain both
 the build directory and VM results as the provenance chain.
+The runner requires adjacent `.manifest.txt` and `.source.patch` files,
+validates the DLL/patch hashes and baseline/candidate distinction, and retains
+both with the VM results. The manifest records the source revision, recipe and
+shim hashes, epoch and tool versions; retain the build directory separately
+for full compiler output. Manifest consistency is not proof of provenance or
+cross-run equivalence: compare recipe, shim and tool versions between baseline
+and candidate, not just their source labels.
+The lab-only core candidate `hack/appmana/winfsp-guid-mount.patch` applies to
+the pinned WinFsp checkout with `git apply`. It resolves the registered volume
+GUID without opening the not-yet-dispatched filesystem, sets that target on
+the owned junction handle, and rolls back registration if the update fails.
+It changes both registration modes but not ordinary unregistered mounts or
+drive mounts. It is experimental, not deployment-qualified; the unchanged
+native reproducer and real LFS workload must qualify it before adoption.
 The unmodified source-build baseline reproduced RED on zero-based cycle 34,
 query 123 (100.93 seconds native), with the same DOS failure, successful
 same-handle GUID/NT queries, and missing reverse mount mapping. The probe
@@ -405,9 +425,10 @@ native executable SHA-256:
 `a01eaef12e96b6b78e9dc54e6cf236585158aeb8d43425405d2f3964c10dc7a5`.
 Results: `/tmp/seaweedfs-windows-mount-results-3424831313`; log SHA-256
 `38c5e34c5a65af9935ffdc769a6b998ecafc868dcd6eabc85eab22e0683ab2a1`.
-This establishes a usable locally built RED baseline before a WinFsp source
-patch, not a fix. The preserved build script also completed end-to-end; its
-lab resource label differs from the initial manually built baseline.
+This is exploratory source-build RED evidence, not a formal matched-build
+comparison or a fix. That manual DLL predates the manifested deterministic
+recipe and uses a different lab resource label. Use clean manifested builds
+with identical recipes for the baseline/candidate comparison.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

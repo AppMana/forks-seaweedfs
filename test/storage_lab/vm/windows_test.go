@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -40,8 +39,11 @@ func TestWindowsStorageLab(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	topology := []byte(fmt.Sprintf("name: ignored\ntopology:\n  nodes:\n    vm:\n      kind: generic_vm\n      image: %q\n      network-mode: none\n    peer:\n      kind: linux\n      image: alpine:3.20\n      network-mode: none\n  links:\n    - endpoints: [vm:eth1, peer:eth1]\n", img))
-	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: &labv1.TopologySource{Source: &labv1.TopologySource_Yaml{Yaml: topology}}, Nodes: map[string]*labv1.NodeExtension{"vm": {Control: "qga"}}}, 18*time.Minute)
+	topology, err := windowsTopology(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: topology, Nodes: map[string]*labv1.NodeExtension{"vm": {Control: "qga"}}}, 18*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

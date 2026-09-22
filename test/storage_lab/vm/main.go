@@ -17,6 +17,10 @@ import (
 
 	labv1 "github.com/appmana/labcontainers/api/v1"
 	"github.com/appmana/labcontainers/pkg/client"
+	clab "github.com/appmana/labcontainers/pkg/containerlab"
+	"github.com/srl-labs/containerlab/core"
+	"github.com/srl-labs/containerlab/links"
+	"github.com/srl-labs/containerlab/types"
 )
 
 const (
@@ -146,6 +150,9 @@ func run(cfg config) (runErr error) {
 		if runErr != nil && cfg.keep && h.lab != nil {
 			if err := h.lab.Keep(context.Background(), 2*time.Hour); err != nil {
 				runErr = errors.Join(runErr, fmt.Errorf("keep failed session: %w", err))
+			} else {
+				h.manifest["kept_socket"] = c.Socket()
+				h.manifest["kept_state_directory"] = c.StateDirectory()
 			}
 		}
 		if err := c.Close(); err != nil {
@@ -162,16 +169,20 @@ func run(cfg config) (runErr error) {
 		_ = os.WriteFile(filepath.Join(cfg.results, "manifest.json"), append(data, '\n'), 0o600)
 	}()
 
-	networkDir, err := os.MkdirTemp("", "seaweedfs-vm-net-")
+	networkDir, err := filepath.Abs(filepath.Join(cfg.results, "network"))
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(networkDir)
+	// Bind inputs must survive --keep and later native recovery. Retain them
+	// with this run's evidence rather than deleting them before Client.Close.
+	if err := os.MkdirAll(networkDir, 0o700); err != nil {
+		return err
+	}
 	if err := writeNetworkConfigs(networkDir); err != nil {
 		return err
 	}
-	topology := topologyYAML(networkDir, cfg.image)
-	if err := os.WriteFile(filepath.Join(cfg.results, "topology.clab.yml"), topology, 0o600); err != nil {
+	topology, err := clab.Source(topologyConfig(networkDir, cfg.image))
+	if err != nil {
 		return err
 	}
 	nodes := map[string]*labv1.NodeExtension{controller: {Control: "qga"}}
@@ -179,7 +190,7 @@ func run(cfg config) (runErr error) {
 		nodes[name] = &labv1.NodeExtension{Control: "qga", Disks: []*labv1.Disk{{Name: "volume", SizeBytes: 2 << 30}}}
 	}
 	h.lab, err = c.Start(ctx, &labv1.LabSpec{
-		Topology:          &labv1.TopologySource{Source: &labv1.TopologySource_Yaml{Yaml: topology}},
+		Topology:          topology,
 		Nodes:             nodes,
 		ArtifactDirectory: cfg.results,
 	}, 40*time.Minute)
@@ -275,17 +286,24 @@ func writeNetworkConfigs(dir string) error {
 	return nil
 }
 
-func topologyYAML(networkDir, image string) []byte {
-	var b strings.Builder
-	b.WriteString("name: ignored\ntopology:\n  nodes:\n")
+func topologyConfig(networkDir, image string) *core.Config {
+	c := &core.Config{Name: "seaweedfs-storage", Topology: &types.Topology{
+		Nodes: map[string]*types.NodeDefinition{
+			"switch": {Kind: "linux", Image: "alpine:3.20", NetworkMode: "none", ImagePullPolicy: "Never"},
+		},
+	}}
 	for _, name := range append([]string{controller}, volumes...) {
-		fmt.Fprintf(&b, "    %s:\n      kind: generic_vm\n      image: %s\n      network-mode: none\n      binds:\n        - %s\n", name, strconv.Quote(image), strconv.Quote(filepath.Join(networkDir, name+".yaml")+":/extra-network.yaml:ro"))
+		c.Topology.Nodes[name] = &types.NodeDefinition{
+			Kind: "generic_vm", Image: image, NetworkMode: "none", ImagePullPolicy: "Never",
+			Binds: []string{filepath.Join(networkDir, name+".yaml") + ":/extra-network.yaml:ro"},
+		}
 	}
-	b.WriteString("    switch:\n      kind: linux\n      image: alpine:3.20\n      network-mode: none\n  links:\n")
 	for i, name := range append([]string{controller}, volumes...) {
-		fmt.Fprintf(&b, "    - endpoints: [%s:eth1, switch:eth%d]\n", name, i+1)
+		c.Topology.Links = append(c.Topology.Links, &links.LinkDefinition{Link: &links.LinkBriefRaw{
+			Endpoints: []string{name + ":eth1", fmt.Sprintf("switch:eth%d", i+1)},
+		}})
 	}
-	return []byte(b.String())
+	return c
 }
 
 func (h *harness) execOK(node string, argv ...string) error {
@@ -497,7 +515,7 @@ func (h *harness) powerLoss(fid, victim string) error {
 	if err := h.lab.Node(victim).Crash(h.ctx); err != nil {
 		return err
 	}
-	if err := h.lab.Node(victim).Start(h.ctx); err != nil {
+	if err := h.recoverNode(victim); err != nil {
 		return err
 	}
 	if err := h.waitOK(victim, 3*time.Minute, "sh", "-ec", "cloud-init status --wait >/dev/null; ip -4 address show | grep -q '192.0.2.'"); err != nil {
@@ -521,7 +539,7 @@ func (h *harness) rollingMigration(fid string) error {
 			if err := h.lab.Node(name).PowerOff(h.ctx); err != nil {
 				return err
 			}
-			if err := h.lab.Node(name).Start(h.ctx); err != nil {
+			if err := h.recoverNode(name); err != nil {
 				return err
 			}
 			if err := h.waitOK(name, 3*time.Minute, "sh", "-ec", "cloud-init status --wait >/dev/null; ip -4 address show | grep -q '192.0.2.'"); err != nil {
@@ -585,7 +603,7 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	if err != nil || result.GetCompleted() != 2 {
 		return fmt.Errorf("vacuum copy marker was not observed and power cut: completed=%d: %w", result.GetCompleted(), err)
 	}
-	if err := h.lab.Node(victim).Start(h.ctx); err != nil {
+	if err := h.recoverNode(victim); err != nil {
 		return err
 	}
 	if err := h.waitOK(victim, 3*time.Minute, "sh", "-ec", "cloud-init status --wait >/dev/null; ip -4 address show | grep -q '192.0.2.'"); err != nil {

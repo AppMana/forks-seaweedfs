@@ -115,6 +115,22 @@ The latter is **not** whole-cluster rolling-upgrade qualification.
 
 ## Labcontainers four-VM fault runner
 
+The native-SDK migration constructs Containerlab `core.Config`, node, and link
+objects directly; callers no longer render topology YAML. Crash/stop recovery
+reviews native `core.ApplyResult` and rejects changes to unrelated nodes or
+links before explicit `Apply`. Windows tests share the same native topology
+boundary and use generated RPC requests for execution timeouts. Assertions
+about SeaweedFS durability and WinFsp remain in this repository.
+
+Set `LABCONTAINERS_CONTAINERLAB` to an absolute CLI path built with the SDK's
+`scripts/build-containerlab.sh`; recovery needs its pinned native patches.
+The runner does not replace the host's Containerlab installation. Native
+topology objects explicitly require preloaded node images (`Never` pull policy).
+
+Network bootstrap inputs now stay with run evidence so `--keep` does not delete
+files needed for later recovery. Failed kept runs record the daemon socket and
+state root in `manifest.json`.
+
 `vm/run_vm.sh` uses the shared Labcontainers SDK instead of maintaining another
 VM lifecycle implementation. Every invocation creates a controller VM, three
 rack-separated volume-server VMs, three new 2 GiB data disks, and an internal

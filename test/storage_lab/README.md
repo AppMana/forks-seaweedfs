@@ -320,6 +320,9 @@ mount process's loaded modules before exercising Git. Missing, duplicate,
 uninspectable or wrong-path modules fail the run and invoke existing cleanup.
 Every scenario must emit the module-verification marker. Retain both
 the build directory and VM results as the provenance chain.
+Setup and each real-workload cycle also require their own run-specific terminal
+marker; a zero exit with an old readiness message or another cycle's output is
+not success. Setup output is retained in `setup.log`.
 The runner requires adjacent `.manifest.txt` and `.source.patch` files,
 validates the DLL/patch hashes and baseline/candidate distinction, and retains
 both with the VM results. The manifest records the source revision, recipe and

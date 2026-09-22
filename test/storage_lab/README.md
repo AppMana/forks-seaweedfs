@@ -371,6 +371,15 @@ The controlled executable SHA-256 is
 `17e08df5e917d73ab5fb28a20dea3c6db5e639b05a3a1127393b4d397d0fd975`.
 Thus preparatory identity queries and rewriting a junction are not sufficient
 to prevent the defect. Compare GUID treatment with this same executable.
+The audited GUID treatment using that same controlled executable passed all
+64 cycles (16,384 DOS queries) in 182.25 seconds, with exact junction target
+readback and sentinel validation. Results:
+`/tmp/seaweedfs-windows-mount-results-1934794895`; log SHA-256
+`20f2623019c89d55622f5ff43b1c3ff34bce4025c935205f680b3882787acccc`.
+This RED-control/GREEN-treatment pair supports the junction-target hypothesis,
+but one intermittent comparison is not proof of a production fix. A source-level
+mount implementation change, repeated verification, and real Git LFS testing
+remain required. Do not deploy the test helper as a post-mount repair loop.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

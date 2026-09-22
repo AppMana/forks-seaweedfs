@@ -320,6 +320,20 @@ decoded XML ZIP SHA-256 is
 `d4cdda3b42c979e6b44048030011c3cfc6db34c6230d2e4d38f76d8db0b27d95`.
 The full WinFsp trace and scenario failure text were also retained. Keep this
 result separate from the original object-move failure until causality is proven.
+
+The official Git LFS 3.8.0 comparison completed five traced LFS-only cycles
+successfully in `/tmp/seaweedfs-windows-mount-results-735008305` (1116 seconds).
+The official Windows archive SHA-256 was
+`b62e7b8ceddee635f691233d77de8eaa4b213e9209e0173811d8cfa77f7882c1`;
+the extracted executable SHA-256 was
+`d1a2b2a90a3b8d57e68db6a6d0daefc7c96e12a1abd1c0849f41d13839252857`.
+Git remained 2.51.0.windows.1 and the SeaweedFS binary remained the same
+`2ef9c71d1` diagnostic candidate used for the failing 3.7.0 run. All five ETLs,
+XML ZIPs and WinFsp logs were retained. This was not the full atomic/native
+qualification gate, and is not evidence that the intermittent defect is fixed:
+the Windows canonicalization function is unchanged between these LFS releases,
+and older clients have also passed multiple cycles. Continue untraced stress
+and root-cause verification; do not substitute this result for deployment gates.
 The optional native executable adds 512 create/chmod/write/close/mkdir/rename
 transactions per pair, including uppercase `.GIT` paths and exact final object
 content checks. The Actions gate builds and requires this executable, runs five

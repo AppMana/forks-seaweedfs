@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -250,5 +251,30 @@ func TestStreamRenameDoesNotAcknowledgeFailedCommit(t *testing.T) {
 	}
 	if events := renameLoggedEvents(t, server); len(events) != 0 {
 		t.Fatalf("failed commit published %d log events", len(events))
+	}
+}
+
+// Internal log files deliberately do not recursively generate metadata events,
+// but their caller still needs a namespace acknowledgment after a successful move.
+func TestStreamRenameAcknowledgesUnloggedPath(t *testing.T) {
+	store := newRenameTestStore()
+	dir := filer.SystemLogDir
+	store.entries[dir] = newDirectoryEntry(dir, 100)
+	store.entries[dir+"/src"] = newFileEntry(dir+"/src", 101)
+	server := &FilerServer{filer: newRenameTestFiler(t, store), entryLockTable: util.NewLockTable[util.FullPath]()}
+	var replies []*filer_pb.StreamRenameEntryResponse
+	stream := &renameAckStream{onSend: func(r *filer_pb.StreamRenameEntryResponse) error { replies = append(replies, r); return nil }}
+	if err := server.StreamRenameEntry(&filer_pb.StreamRenameEntryRequest{OldDirectory: dir, OldName: "src", NewDirectory: dir, NewName: "dst"}, stream); err != nil {
+		t.Fatal(err)
+	}
+	if len(replies) != 1 {
+		t.Fatalf("successful unlogged rename delivered %d acknowledgments, want 1", len(replies))
+	}
+	r := replies[0]
+	if r.TsNs != 0 || r.Directory != dir || r.EventNotification.GetOldEntry().GetName() != "src" || r.EventNotification.GetNewEntry().GetName() != "dst" {
+		t.Fatalf("invalid unversioned acknowledgment: %v", r)
+	}
+	if len(renameLoggedEvents(t, server)) != 0 {
+		t.Fatal("internal log rename recursively generated metadata events")
 	}
 }

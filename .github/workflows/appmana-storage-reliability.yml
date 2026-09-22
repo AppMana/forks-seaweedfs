@@ -223,6 +223,9 @@ jobs:
           "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario power-loss
           "$runner" --candidate "$candidate" --baseline "$baseline" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario migration
           "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem ext4 --scenario vacuum-power-loss
+          for filesystem in xfs btrfs; do
+            "$runner" --candidate "$candidate" --image "$LABCONTAINERS_VM_IMAGE" --filesystem "$filesystem" --scenario vacuum-power-loss
+          done
       - name: Native Windows core storage regressions
         env:
           SEAWEEDFS_WINDOWS_LIVE: '1'

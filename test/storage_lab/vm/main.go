@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -125,6 +126,10 @@ func run(cfg config) (runErr error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Minute)
 	defer cancel()
+	imageID, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", cfg.image).Output()
+	if err != nil {
+		return fmt.Errorf("resolve VM image identity: %w", err)
+	}
 	c, err := client.Launch(ctx, client.Options{LabdPath: cfg.labd})
 	if err != nil {
 		return err
@@ -132,6 +137,7 @@ func run(cfg config) (runErr error) {
 	h := &harness{cfg: cfg, ctx: ctx, client: c, candidate: candidate, baseline: baseline}
 	h.manifest = map[string]any{
 		"scenario": cfg.scenario, "filesystem": cfg.filesystem,
+		"vm_image": cfg.image, "vm_image_id": strings.TrimSpace(string(imageID)),
 		"candidate_sha256": sha(candidate), "baseline_sha256": sha(baseline),
 		"topology":          "one controller VM and three rack-separated volume VMs",
 		"production_access": false, "started": time.Now().UTC(), "status": "running",
@@ -431,9 +437,12 @@ func (h *harness) seedAndOverwrite(count int) (string, error) {
 
 func (h *harness) verify(fid string, sequence int) error {
 	for _, name := range volumes {
-		if _, err := h.output(controller, "python3", "/opt/workload.py", "read", fid, addresses[name], strconv.Itoa(sequence)); err != nil {
+		digest, err := h.output(controller, "python3", "/opt/workload.py", "read", fid, addresses[name], strconv.Itoa(sequence))
+		if err != nil {
 			return fmt.Errorf("verify %s sequence %d: %w", name, sequence, err)
 		}
+		checks, _ := h.manifest["verified_reads"].([]map[string]any)
+		h.manifest["verified_reads"] = append(checks, map[string]any{"file_id": fid, "sequence": sequence, "replica": name, "sha256": digest})
 	}
 	return nil
 }
@@ -551,6 +560,8 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 		return fmt.Errorf("decode live vacuum set %q: %w", liveJSON, err)
 	}
 	fid = liveFIDs[0]
+	h.manifest["vacuum_live_fids"] = liveFIDs
+	h.manifest["vacuum_overwrite_sequence"] = 1159
 	for sequence := 1100; sequence < 1160; sequence++ {
 		if err := h.execOK(controller, "python3", "/opt/workload.py", "write", fid, addresses["volume1"], strconv.Itoa(sequence)); err != nil {
 			return err

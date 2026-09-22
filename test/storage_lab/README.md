@@ -134,8 +134,9 @@ test/storage_lab/vm/run_vm.sh --candidate /absolute/bin/weed-candidate \
 
 `LABCONTAINERS_REF` makes the runner reject a checkout whose `HEAD` differs.
 The image should likewise use a registry digest, not the local default tag.
-The manifest records binary SHA-256 values, filesystem, scenario, timestamps,
-topology, and that production access was disabled. Results remain in the
+The manifest records binary SHA-256 values, VM image identity, filesystem,
+scenario, timestamps, per-replica verified read digests, topology, and that
+production access was disabled. Results remain in the
 printed `/tmp/seaweedfs-vm-lab-results-*` directory.
 
 The crash gates now call Labcontainers `Crash`, which sends SIGKILL to the
@@ -149,9 +150,10 @@ replica at a time; abrupt failure is tested separately. This matters for the
 4.40 baseline: a hard cut can expose its pre-fix acknowledged-index durability
 defect and is not a valid rollback procedure.
 
-`--filesystem xfs` and `--filesystem btrfs` require those formatting tools in
-the pinned image. CI runs four fresh sessions so scenarios cannot contaminate
-one another.
+The XFS/Btrfs image must
+include their formatting tools. CI runs six fresh Linux sessions: the four
+ext4 scenarios above, plus XFS and Btrfs `vacuum-power-loss`, so scenarios cannot
+contaminate one another. This is not all-phase or all-filesystem migration coverage.
 
 For native Windows storage regressions, build the existing suite with
 `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -tags 5BytesOffset -o /absolute/storage.test.exe ./weed/storage`.
@@ -183,7 +185,7 @@ each fixed behavior is removed.
 
 | Target | Existing infrastructure to reuse | Still required before release |
 | --- | --- | --- |
-| Linux | Namespace/native-filesystem runners; volume-server harness; Labcontainers four-VM ext4 topology and abrupt-power model | XFS/Btrfs VM power tests, allocation accounting, CSI, injected EIO, 24-hour soak |
+| Linux | Namespace/native-filesystem runners; volume-server harness; Labcontainers four-VM ext4/XFS/Btrfs vacuum crash recovery | Exact-phase barriers, broader filesystem fault/migration matrix, allocation accounting, CSI, injected EIO, 24-hour soak |
 | Windows | `.github/workflows/appmana-weed-windows.yml`, `test/winfsp`, WinFsp conformance | Native packaged artifact/service and CSI tests, UNC/flush behavior, upgrade/rollback; cross-compilation does not qualify runtime |
 | Synology SPK | Sibling `spk-seaweedfs/tests`, bootstrap Go tests, `lab/dsm` | Audit/re-isolate existing DSM scripts before use; actual SPK install/upgrade/uninstall-preserves-data, correct DSM/architecture and Btrfs coverage |
 
@@ -200,9 +202,11 @@ and install cluster credentials. They are **not approved by this runner**.
 Do not run them against the live NAS or assume their existing network is isolated.
 
 Process kills leave the host page cache intact. Tmpfs tests prove neither disk
-flush durability nor XFS/Btrfs behavior. The Labcontainers ext4 gate tests
-abrupt VM loss and recreation. It does not model drive/controller caches that
-lie about flushes. Never power-cut production.
+flush durability nor XFS/Btrfs behavior. The Labcontainers ext4 gate now requests
+abrupt VM loss and recreation; the `.dat`-before-index durability gap has
+separate regression coverage. Do not attribute earlier stop/restart results
+to this stronger fault model. It does not model drive/controller caches that lie about flushes, and
+broader XFS/Btrfs fault and migration tests remain outstanding. Never power-cut production.
 Restore drills use copied backups, new cluster identities, and blocked production
 networking. An etcd snapshot alone does not contain volume payloads.
 

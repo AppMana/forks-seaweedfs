@@ -100,13 +100,13 @@ func FindGarbageChunks(visibles *IntervalList[*VisibleInterval], start int64, st
 	return
 }
 
-func MinusChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, as, bs []*filer_pb.FileChunk) (delta []*filer_pb.FileChunk, err error) {
+func MinusChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, as, bs []*filer_pb.FileChunk, invalidator CacheInvalidator) (delta []*filer_pb.FileChunk, err error) {
 
-	aData, aMeta, aErr := ResolveChunkManifest(ctx, lookupFileIdFn, as, 0, math.MaxInt64)
+	aData, aMeta, aErr := ResolveChunkManifest(ctx, lookupFileIdFn, as, 0, math.MaxInt64, invalidator)
 	if aErr != nil {
 		return nil, aErr
 	}
-	bData, bMeta, bErr := ResolveChunkManifest(ctx, lookupFileIdFn, bs, 0, math.MaxInt64)
+	bData, bMeta, bErr := ResolveChunkManifest(ctx, lookupFileIdFn, bs, 0, math.MaxInt64, invalidator)
 	if bErr != nil {
 		return nil, bErr
 	}
@@ -193,6 +193,19 @@ func ViewFromChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFun
 
 }
 
+// viewFromChunksOrErr is ViewFromChunks with the manifest resolve error
+// propagated. Ignoring it yields empty chunk views and the caller zero-fills
+// the whole requested range (https://github.com/seaweedfs/seaweedfs/issues/11286).
+func viewFromChunksOrErr(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk, offset int64, size int64) (*IntervalList[*ChunkView], error) {
+
+	visibles, err := NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, offset, offset+size)
+	if err != nil {
+		return nil, err
+	}
+
+	return ViewFromVisibleIntervals(visibles, offset, size), nil
+}
+
 func ViewFromVisibleIntervals(visibles *IntervalList[*VisibleInterval], offset int64, size int64) (chunkViews *IntervalList[*ChunkView]) {
 
 	stop := offset + size
@@ -271,7 +284,7 @@ func MergeIntoChunkViews(chunkViews *IntervalList[*ChunkView], start int64, stop
 // If the file chunk content is a chunk manifest
 func NonOverlappingVisibleIntervals(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk, startOffset int64, stopOffset int64) (visibles *IntervalList[*VisibleInterval], err error) {
 
-	chunks, _, err = ResolveChunkManifest(ctx, lookupFileIdFn, chunks, startOffset, stopOffset)
+	chunks, _, err = ResolveChunkManifest(ctx, lookupFileIdFn, chunks, startOffset, stopOffset, nil)
 	if err != nil {
 		return
 	}

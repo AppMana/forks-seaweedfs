@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/stats"
-	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -166,7 +165,7 @@ func TestCommitCompactDeletionTailKeepsWritable(t *testing.T) {
 	}
 
 	for i := uint64(1); i <= 5; i++ {
-		if _, _, _, err := v.writeNeedle2(newRandomNeedle(i), true, false); err != nil {
+		if _, _, _, err := v.writeNeedle2(newRandomNeedle(i), true, false, false); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -283,11 +282,9 @@ func TestCleanupCompactRemovesTempFiles(t *testing.T) {
 	}
 }
 
-// TestCompactByIndex_DropsDanglingNeedle verifies that vacuum compaction
-// tolerates an .idx entry whose offset points past the end of the .dat file
-// (the failure mode reported in issue #8928). The bad entry should be silently
-// dropped from the resulting .cpx, while every healthy needle is preserved.
-func TestCompactByIndex_DropsDanglingNeedle(t *testing.T) {
+// An offset past EOF (#8928) is not proof that a live body is garbage.
+// Keep the suspect entry and original data available for repair.
+func TestCompactByIndex_RejectsDanglingNeedle(t *testing.T) {
 	dir := t.TempDir()
 
 	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
@@ -299,7 +296,7 @@ func TestCompactByIndex_DropsDanglingNeedle(t *testing.T) {
 	infos := make([]*needleInfo, goodNeedleCount)
 	for i := 1; i <= goodNeedleCount; i++ {
 		n := newRandomNeedle(uint64(i))
-		_, size, _, err := v.writeNeedle2(n, true, false)
+		_, size, _, err := v.writeNeedle2(n, true, false, false)
 		if err != nil {
 			t.Fatalf("write needle %d: %v", i, err)
 		}
@@ -331,45 +328,93 @@ func TestCompactByIndex_DropsDanglingNeedle(t *testing.T) {
 		t.Fatalf("sync .idx after inject: %v", err)
 	}
 
-	if err := v.CompactByIndex(nil); err != nil {
-		t.Fatalf("CompactByIndex should tolerate dangling entries, got: %v", err)
+	if err := v.CompactByIndex(nil); err == nil {
+		t.Fatal("CompactByIndex must reject dangling live entries")
 	}
-
-	// Walk the new index and confirm the dangling entry was dropped while
-	// all of the original keys made it through.
-	cpx, err := os.Open(filepath.Join(dir, "1.cpx"))
-	if err != nil {
-		t.Fatalf("open .cpx: %v", err)
-	}
-	defer cpx.Close()
-	keptKeys := map[types.NeedleId]bool{}
-	if err := idx.WalkIndexFile(cpx, 0, func(key types.NeedleId, _ types.Offset, size types.Size) error {
-		if !size.IsDeleted() {
-			keptKeys[key] = true
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("walk .cpx: %v", err)
-	}
-	if keptKeys[badKey] {
-		t.Fatalf("dangling key %d should have been dropped from .cpx", badKey)
+	if _, present := v.nm.Get(badKey); !present {
+		t.Fatal("failed compaction removed the suspect index entry")
 	}
 	for i := 1; i <= goodNeedleCount; i++ {
-		if infos[i-1].size == 0 {
-			continue
+		n := newEmptyNeedle(uint64(i))
+		if _, err := v.readNeedle(n, nil, nil); err != nil {
+			t.Fatalf("healthy needle %d unreadable: %v", i, err)
 		}
-		k := types.Uint64ToNeedleId(uint64(i))
-		if !keptKeys[k] {
-			t.Fatalf("healthy key %d missing from compacted .cpx", k)
+		if n.Checksum != infos[i-1].crc {
+			t.Fatalf("healthy needle %d changed", i)
+		}
+	}
+	v.Close()
+}
+
+// TestCompactByIndex_ConcurrentWriteDoesNotFailIntegrityCheck reproduces the
+// vacuum-vs-live-traffic race: a needle written to the volume after
+// CompactByIndex has already loaded its point-in-time index snapshot must not
+// trip the post-copy integrity check. CommitCompact's makeupDiff is what
+// reconciles a write landing mid-copy (see TestCommitCompactDeletionTailKeepsWritable);
+// the copy-phase check must not treat that expected case as corruption.
+func TestCompactByIndex_ConcurrentWriteDoesNotFailIntegrityCheck(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	for i := 1; i <= 8; i++ {
+		if _, _, _, err := v.writeNeedle2(newRandomNeedle(uint64(i)), true, false, false); err != nil {
+			t.Fatalf("write needle %d: %v", i, err)
 		}
 	}
 
-	v.Close()
+	wroteConcurrently := false
+	opts := &CompactOptions{
+		ProgressCallback: func(processed int64) bool {
+			if !wroteConcurrently {
+				wroteConcurrently = true
+				// Simulate a client write landing on the live volume while
+				// CompactByIndex is still copying the pre-write snapshot.
+				if _, _, _, err := v.writeNeedle2(newRandomNeedle(uint64(100)), true, false, false); err != nil {
+					t.Fatalf("concurrent write: %v", err)
+				}
+			}
+			return true
+		},
+	}
+
+	if err := v.CompactByIndex(opts); err != nil {
+		t.Fatalf("CompactByIndex should tolerate a write that lands mid-copy, got: %v", err)
+	}
+}
+
+// TestExceedsExpectedCompactedSize guards the copy-phase integrity check
+// against regressing into double-subtracting skipped bytes: expectedLiveBytes
+// already excludes needles dropped as unreadable (they return before being
+// added to the tally), so the check must compare it directly against the
+// compacted .dat size, with no further adjustment for skipped bytes.
+func TestExceedsExpectedCompactedSize(t *testing.T) {
+	cases := []struct {
+		name              string
+		expectedLiveBytes uint64
+		dstDatSize        int64
+		wantExceeds       bool
+	}{
+		{"destination matches expected size exactly", 100, 100, false},
+		{"destination larger than expected is fine", 100, 150, false},
+		{"destination short of expected signals data loss", 100, 90, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := exceedsExpectedCompactedSize(c.expectedLiveBytes, c.dstDatSize); got != c.wantExceeds {
+				t.Fatalf("exceedsExpectedCompactedSize(%d, %d) = %v, want %v", c.expectedLiveBytes, c.dstDatSize, got, c.wantExceeds)
+			}
+		})
+	}
 }
 
 func doSomeWritesDeletes(i int, v *Volume, t *testing.T, infos []*needleInfo) {
 	n := newRandomNeedle(uint64(i))
-	_, size, _, err := v.writeNeedle2(n, true, false)
+	_, size, _, err := v.writeNeedle2(n, true, false, false)
 	if err != nil {
 		t.Fatalf("write file %d: %v", i, err)
 	}
@@ -397,7 +442,8 @@ type needleInfo struct {
 
 func newRandomNeedle(id uint64) *needle.Needle {
 	n := new(needle.Needle)
-	n.Data = make([]byte, rand.Intn(1024))
+	// never zero bytes: an empty needle writes a size-0 .dat record, indistinguishable from a delete marker
+	n.Data = make([]byte, 1+rand.Intn(1023))
 	rand.Read(n.Data)
 
 	n.Checksum = needle.NewCRC(n.Data)

@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,31 +28,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
-func runMount(cmd *Command, args []string) bool {
-
-	if *mountOptions.debug {
-		go http.ListenAndServe(fmt.Sprintf(":%d", *mountOptions.debugPort), nil)
-	}
-
-	*mountCpuProfile = util.ResolvePath(*mountCpuProfile)
-	*mountMemProfile = util.ResolvePath(*mountMemProfile)
-	grace.SetupProfiling(*mountCpuProfile, *mountMemProfile)
-	if *mountReadRetryTime < time.Second {
-		*mountReadRetryTime = time.Second
-	}
-	util.RetryWaitTime = *mountReadRetryTime
-
-	umask, umaskErr := strconv.ParseUint(*mountOptions.umaskString, 8, 64)
-	if umaskErr != nil {
-		fmt.Printf("can not parse umask %s", *mountOptions.umaskString)
-		return false
-	}
-
-	if len(args) > 0 {
-		return false
-	}
-
-	return RunMountWindows(&mountOptions, os.FileMode(umask))
+func RunMount(option *MountOptions, umask os.FileMode) bool {
+	return RunMountWindows(option, umask)
 }
 
 // checkWinFspInstalled verifies the WinFsp FSD is installed before
@@ -135,6 +110,10 @@ func isReparsePoint(fi os.FileInfo) bool {
 }
 
 func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
+	if err := configureMountMemory(option); err != nil {
+		fmt.Println(err)
+		return false
+	}
 
 	// basic checks
 	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
@@ -265,6 +244,10 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		ConcurrentWriters:           *option.concurrentWriters,
 		ConcurrentReaders:           *option.concurrentReaders,
 		ReaderCacheMode:             readerCacheMode,
+		ReaderCacheSizeMB:           *option.readerCacheSizeMB,
+		CacheDirMaxEntries:          *option.cacheDirMaxEntries,
+		LogicalDiskUsage:            *option.logicalDiskUsage,
+		EagerFilerCreate:            true,
 		CacheDirForRead:             cacheDirForRead,
 		CacheSizeMBForRead:          *option.cacheSizeMBForRead,
 		CacheDirForWrite:            cacheDirForWrite,
@@ -285,17 +268,10 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		DisableXAttr:                *option.disableXAttr,
 		IsMacOs:                     false,
 		MetadataFlushSeconds:        *option.metadataFlushSeconds,
-		// RDMA acceleration options
-		RdmaEnabled:           *option.rdmaEnabled,
-		RdmaSidecarAddr:       *option.rdmaSidecarAddr,
-		RdmaFallback:          *option.rdmaFallback,
-		RdmaReadOnly:          *option.rdmaReadOnly,
-		RdmaMaxConcurrent:     *option.rdmaMaxConcurrent,
-		RdmaTimeoutMs:         *option.rdmaTimeoutMs,
-		DirIdleEvictSec:       *option.dirIdleEvictSec,
-		EnableDistributedLock: option.distributedLock != nil && *option.distributedLock,
-		WritebackCache:        option.writebackCache != nil && *option.writebackCache,
-		PosixDirNlink:         option.posixDirNlink != nil && *option.posixDirNlink,
+		DirIdleEvictSec:             *option.dirIdleEvictSec,
+		EnableDistributedLock:       option.distributedLock != nil && *option.distributedLock,
+		WritebackCache:              option.writebackCache != nil && *option.writebackCache,
+		PosixDirNlink:               option.posixDirNlink != nil && *option.posixDirNlink,
 		// Peer chunk sharing
 		PeerEnabled:    option.peerEnabled != nil && *option.peerEnabled,
 		PeerListen:     peerStringOrEmpty(option.peerListen),
@@ -323,6 +299,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		if !host.Unmount() {
 			glog.Errorf("failed to unmount %s", dir)
 		}
+		seaweedFileSystem.WaitForAsyncFlush()
 	})
 
 	seaweedFileSystem.Init(nil)
@@ -437,6 +414,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		}
 	}
 	mountErr := host.Mount(mountPoint, *option.volumeLabel, extraOptions)
+	seaweedFileSystem.WaitForAsyncFlush()
 	if cleanupSymlink {
 		// host.Mount blocks until unmount; remove the staging symlink so
 		// a clean unmount leaves nothing behind (mirrors WinFsp removing

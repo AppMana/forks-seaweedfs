@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -78,7 +79,7 @@ func (s3a *S3ApiServer) resolveDeleteConditionalEntry(bucket, object, versionId,
 		}
 		return normalizeConditionalTargetEntry(entry), nil
 	default:
-		entry, err := s3a.resolveObjectEntry(bucket, normalizedObject)
+		entry, err := s3a.resolveObjectEntry(bucket, normalizedObject, "")
 		if err != nil {
 			return nil, err
 		}
@@ -121,6 +122,13 @@ func (s3a *S3ApiServer) checkDeleteIfMatch(bucket, object, versionId, versioning
 
 func (s3a *S3ApiServer) deleteVersionedObject(r *http.Request, bucket, object, versionId, versioningState string) (deleteMutationResult, s3err.ErrorCode) {
 	var result deleteMutationResult
+
+	// The key "dir/" is the filer directory itself, which a delete marker cannot stand
+	// in for without hiding the children underneath it. It is not a versioned object,
+	// so it is deleted the way an unversioned bucket deletes it.
+	if versionId == "" && strings.HasSuffix(object, "/") {
+		return result, s3a.deleteDirectoryMarker(r, bucket, object)
+	}
 
 	switch {
 	case versionId != "":
@@ -182,19 +190,26 @@ func (s3a *S3ApiServer) deleteVersionedObject(r *http.Request, bucket, object, v
 // relies on the volume's natural TTL to reclaim chunks; pass true only
 // when the entry's Attributes.TtlSec > 0 so the volume is guaranteed to
 // drop the chunks on its own.
-func (s3a *S3ApiServer) deleteUnversionedObjectWithClient(client filer_pb.SeaweedFilerClient, bucket, object string, metadataOnly bool) error {
+func (s3a *S3ApiServer) deleteUnversionedObjectWithClient(ctx context.Context, client filer_pb.SeaweedFilerClient, bucket, object string, metadataOnly bool) error {
 	if !s3_constants.IsValidBucketName(bucket) || !s3_constants.IsValidObjectKey(object) {
 		return errors.New("invalid bucket or object path")
 	}
 	target := util.NewFullPath(s3a.bucketDir(bucket), object)
 	dir, name := target.DirAndName()
-	return deleteObjectEntry(client, dir, name, !metadataOnly, false)
+	// The caller holds one client for a whole batch, so a dropped reply is
+	// replayed on that client rather than by re-entering WithFilerClient.
+	return retryFilerOp(ctx, "delete "+string(target), func() error {
+		return deleteObjectEntry(ctx, client, dir, name, !metadataOnly, false)
+	})
 }
 
 func (s3a *S3ApiServer) DeleteObjectHandler(w http.ResponseWriter, r *http.Request) {
 
 	bucket, object := s3_constants.GetBucketAndObject(r)
 	glog.Infof("DeleteObjectHandler %s %s", bucket, object)
+	// The filer ops below each retry, and a failover walk runs the whole set
+	// once per filer, so the backoff comes out of one allowance held here.
+	r = r.WithContext(withFilerRetryBudget(r.Context(), filerRetryRequestBudget))
 	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
 		return
@@ -230,10 +245,21 @@ func (s3a *S3ApiServer) DeleteObjectHandler(w http.ResponseWriter, r *http.Reque
 	var deleteResult deleteMutationResult
 	var deleteCode s3err.ErrorCode
 
+	// A trailing-slash key is a directory marker in every bucket, versioned or not, and
+	// is deleted the same way: the raw delete below cannot handle a directory that still
+	// has children, and versioning has nothing to add to a key that is not an object.
+	deleteHandled := false
+	if versionId == "" && strings.HasSuffix(object, "/") {
+		deleteCode, deleteHandled = s3a.withObjectWriteLock(bucket, object, func() s3err.ErrorCode {
+			return s3a.checkDeleteIfMatch(bucket, object, versionId, versioningState, r.Header.Get(s3_constants.IfMatch), s3err.ErrPreconditionFailed)
+		}, func() s3err.ErrorCode {
+			return s3a.deleteDirectoryMarker(r, bucket, object)
+		}), true
+	}
+
 	// Fast path: route the delete to the owner filer under its per-path lock;
 	// routedObjectOwner excludes versioned/object-lock buckets.
-	deleteHandled := false
-	if !versioningConfigured {
+	if !deleteHandled && !versioningConfigured {
 		if cond, condOk := buildDeleteCondition(r); condOk {
 			if owner, ownerOk := s3a.routedObjectOwner(bucket, object); ownerOk {
 				resp, err := s3a.routedDelete(owner, bucket, object, cond)
@@ -281,11 +307,10 @@ func (s3a *S3ApiServer) DeleteObjectHandler(w http.ResponseWriter, r *http.Reque
 					}
 				}
 				if versionId == "null" {
-					deleteCode = s3a.routedDeleteNullVersion(owner, bucket, object, worm, bypass)
+					deleteCode, deleteHandled = s3a.routedDeleteNullVersion(owner, bucket, object, worm, bypass)
 				} else {
-					deleteCode = s3a.routedDeleteSpecificVersion(owner, bucket, object, versionId, worm, bypass)
+					deleteCode, deleteHandled = s3a.routedDeleteSpecificVersion(owner, bucket, object, versionId, worm, bypass), true
 				}
-				deleteHandled = true
 			}
 		}
 	}
@@ -309,7 +334,7 @@ func (s3a *S3ApiServer) DeleteObjectHandler(w http.ResponseWriter, r *http.Reque
 			}
 
 			if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-				return s3a.deleteUnversionedObjectWithClient(client, bucket, object, false)
+				return s3a.deleteUnversionedObjectWithClient(r.Context(), client, bucket, object, false)
 			}); err != nil {
 				glog.Errorf("DeleteObjectHandler: failed to delete %s/%s: %v", bucket, object, err)
 				return s3err.ErrInternalError
@@ -424,11 +449,15 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 	deletedCount := 0
 
 	// Per-key authorization: keys arrive in the body, so the route Auth middleware
-	// only authenticated. Authorize each key via AuthorizeBatchDeleteKey below.
+	// only authenticated. Authorize each key via AuthorizeObjectDelete below.
 	var identity *Identity
 	if id := s3_constants.GetIdentityFromContext(r); id != nil {
 		identity, _ = id.(*Identity)
 	}
+
+	// The keys below each drive their own bounded filer retries, and the client
+	// picks how many keys there are, so the whole batch shares one allowance.
+	r = r.WithContext(withFilerRetryBudget(r.Context(), filerRetryRequestBudget))
 
 	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		// delete file entries
@@ -444,7 +473,7 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 				deleteErrors = append(deleteErrors, deleteErrorFromCode(s3err.ErrAccessDenied, object.Key, object.VersionId))
 				continue
 			}
-			if authErr := s3a.iam.AuthorizeBatchDeleteKey(r, identity, bucket, object.Key, object.VersionId); authErr != s3err.ErrNone {
+			if authErr := s3a.iam.AuthorizeObjectDelete(r, identity, bucket, object.Key, object.VersionId); authErr != s3err.ErrNone {
 				deleteErrors = append(deleteErrors, deleteErrorFromCode(authErr, object.Key, object.VersionId))
 				continue
 			}
@@ -468,7 +497,11 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 					return s3err.ErrAccessDenied
 				}
 
-				if err := s3a.deleteUnversionedObjectWithClient(client, bucket, object.Key, false); err != nil {
+				if strings.HasSuffix(object.Key, "/") {
+					return s3a.deleteDirectoryMarker(r, bucket, object.Key)
+				}
+
+				if err := s3a.deleteUnversionedObjectWithClient(r.Context(), client, bucket, object.Key, false); err != nil {
 					glog.Errorf("DeleteMultipleObjectsHandler: failed to delete %s/%s: %v", bucket, object.Key, err)
 					return s3err.ErrInternalError
 				}

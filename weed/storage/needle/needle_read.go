@@ -108,6 +108,10 @@ func (n *Needle) ParseNeedleHeader(bytes []byte) {
 func (n *Needle) readNeedleDataVersion2(bytes []byte) (err error) {
 	index, lenBytes := 0, len(bytes)
 	if index < lenBytes {
+		if lenBytes-index < 4 {
+			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorIndexOutOfRange).Inc()
+			return fmt.Errorf("data size header truncated: %w", ErrorCorrupted)
+		}
 		n.DataSize = util.BytesToUint32(bytes[index : index+4])
 		index = index + 4
 		if int(n.DataSize)+index > lenBytes {

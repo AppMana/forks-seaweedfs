@@ -39,9 +39,9 @@ jobs:
         working-directory: test/postgres
     steps:
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
       id: go
 
     - name: Check out code

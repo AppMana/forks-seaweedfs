@@ -195,9 +195,9 @@ pub fn remove_bitrot_sidecars(base: &str) -> io::Result<()> {
 /// Returns a fresh random per-encode identity used to detect a stale sidecar
 /// left behind by an in-place re-encode.
 pub fn new_encode_uuid() -> Vec<u8> {
-    use rand::RngCore;
+    use rand::Rng;
     let mut b = vec![0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     b
 }
 
@@ -465,6 +465,28 @@ pub fn resolve_status(
     }
 }
 
+/// Whether a generation-matching sidecar agrees with the geometry the volume is
+/// mounted with. Both files record the layout the generation was encoded with,
+/// so a disagreement means one of them is wrong and reads through the other
+/// would land at the wrong shard offsets — the caller fails the mount rather
+/// than merely dropping protection. A sidecar that records no EC config has
+/// nothing to contradict.
+pub fn geometry_matches(
+    prot: &EcBitrotProtection,
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: i64,
+) -> bool {
+    match &prot.ec_shard_config {
+        None => true,
+        Some(cfg) => {
+            cfg.data_shards as usize == data_shards
+                && cfg.parity_shards as usize == parity_shards
+                && cfg.block_size == block_size
+        }
+    }
+}
+
 /// Returns the [`EcShardChecksums`] entry for a shard id, or `None`.
 pub fn shard_checksums(prot: &EcBitrotProtection, shard_id: u32) -> Option<&EcShardChecksums> {
     prot.shards.iter().find(|s| s.shard_id == shard_id)
@@ -483,7 +505,21 @@ pub fn verify_shard_file_blocks(
     entry: &EcShardChecksums,
     block_size: i64,
 ) -> io::Result<Vec<usize>> {
-    let f = File::open(path)?;
+    verify_shard_blocks(&File::open(path)?, entry, block_size)
+}
+
+/// Same verification against an ALREADY-OPEN shard handle.
+///
+/// Go's `ChecksumScrub` reads through `shard.ReadAt`, i.e. the handle the
+/// EcVolumeShard already holds, so a concurrent teardown that unlinks the shard
+/// cannot turn an intentional removal into a scrub read error. A scrub that
+/// runs with the store lock released has to read the same way — see
+/// `EcChecksumScrubPlan`.
+pub fn verify_shard_blocks(
+    f: &File,
+    entry: &EcShardChecksums,
+    block_size: i64,
+) -> io::Result<Vec<usize>> {
     let file_size = f.metadata()?.len() as i64;
     let want = unpack_u32_le(&entry.block_crc32c);
 
@@ -501,7 +537,7 @@ pub fn verify_shard_file_blocks(
             break;
         }
         let to_read = to_read as usize;
-        read_full_at(&f, &mut buf[..to_read], offset as u64)?;
+        read_full_at(f, &mut buf[..to_read], offset as u64)?;
         if CRC::new(&buf[..to_read]).0 != *want_crc {
             mismatched.push(i);
         }
@@ -539,11 +575,12 @@ fn read_full_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 
 /// Builds the `EcShardConfig` proto for the given layout. The bitrot sidecar
 /// carries its own top-level encode_uuid, so the nested config leaves it empty.
-pub fn ec_shard_config(data_shards: u32, parity_shards: u32) -> EcShardConfig {
+pub fn ec_shard_config(data_shards: u32, parity_shards: u32, block_size: i64) -> EcShardConfig {
     EcShardConfig {
         data_shards,
         parity_shards,
         encode_ts_ns: 0,
+        block_size,
     }
 }
 
@@ -567,6 +604,7 @@ mod tests {
                 data_shards: 10,
                 parity_shards: 4,
                 encode_ts_ns: 0,
+                block_size: 0,
             }),
             shards: vec![
                 EcShardChecksums {
@@ -712,7 +750,7 @@ mod tests {
             algorithm: ChecksumAlgorithm::ChecksumCrc32c as i32,
             block_size: DEFAULT_BITROT_BLOCK_SIZE as u32,
             generation: 0,
-            ec_shard_config: Some(ec_shard_config(10, 4)),
+            ec_shard_config: Some(ec_shard_config(10, 4, 0)),
             shards: vec![EcShardChecksums {
                 shard_id: 0,
                 covered_size: covered,
@@ -750,7 +788,7 @@ mod tests {
             algorithm: ChecksumAlgorithm::ChecksumCrc32c as i32,
             block_size: DEFAULT_BITROT_BLOCK_SIZE as u32,
             generation: 0,
-            ec_shard_config: Some(ec_shard_config(10, 4)),
+            ec_shard_config: Some(ec_shard_config(10, 4, 0)),
             shards: vec![EcShardChecksums {
                 shard_id: 0,
                 covered_size: 5,
@@ -794,7 +832,7 @@ mod tests {
             algorithm: ChecksumAlgorithm::ChecksumCrc32c as i32,
             block_size: DEFAULT_BITROT_BLOCK_SIZE as u32,
             generation: 0,
-            ec_shard_config: Some(ec_shard_config(10, 4)),
+            ec_shard_config: Some(ec_shard_config(10, 4, 0)),
             shards,
             encode_uuid: vec![0u8; 16],
         }

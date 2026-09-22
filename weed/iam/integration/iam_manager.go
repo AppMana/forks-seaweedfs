@@ -466,7 +466,13 @@ func (m *IAMManager) SyncRuntimePolicies(ctx context.Context, policies []*iam_pb
 
 		var document policy.PolicyDocument
 		if err := json.Unmarshal([]byte(runtimePolicy.Content), &document); err != nil {
-			return fmt.Errorf("failed to parse runtime policy %q: %w", runtimePolicy.Name, err)
+			// Drop just this one: aborting here would leave every other policy
+			// unsynced. Leaving it out of desiredPolicies also deletes it from
+			// the engine below, which is the point — a policy whose stored
+			// definition no longer parses must stop granting access rather than
+			// keep enforcing a document the operator can no longer see.
+			glog.Warningf("skipping unparsable runtime policy %q: %v", runtimePolicy.Name, err)
+			continue
 		}
 
 		desiredPolicies[runtimePolicy.Name] = &document
@@ -857,6 +863,44 @@ func (m *IAMManager) UpdateBucketPolicy(ctx context.Context, bucketName string, 
 	// Store the policy with a special prefix to distinguish from IAM policies
 	policyName := "bucket-policy:" + bucketName
 	return m.policyEngine.AddPolicy(m.getFilerAddress(), policyName, &policyDoc)
+}
+
+// EnsureBucketPolicy stores the policy for a bucket only when no mirror is
+// stored yet, backfilling policies that predate the IAM integration (the
+// metadata subscription only sees changes). A present mirror is left alone,
+// so repeat calls cost one cached read. Returns whether a write happened,
+// so the caller can reconcile a write that raced a concurrent change.
+func (m *IAMManager) EnsureBucketPolicy(ctx context.Context, bucketName string, policyJSON []byte) (bool, error) {
+	if !m.initialized {
+		return false, fmt.Errorf("IAM manager not initialized")
+	}
+
+	if bucketName == "" {
+		return false, fmt.Errorf("bucket name cannot be empty")
+	}
+
+	if existing, err := m.policyEngine.GetPolicy(ctx, m.getFilerAddress(), "bucket-policy:"+bucketName); err == nil && existing != nil {
+		return false, nil
+	}
+
+	if err := m.UpdateBucketPolicy(ctx, bucketName, policyJSON); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RemoveBucketPolicy deletes the stored policy for a bucket. Removing a
+// policy that was never stored is a success.
+func (m *IAMManager) RemoveBucketPolicy(ctx context.Context, bucketName string) error {
+	if !m.initialized {
+		return fmt.Errorf("IAM manager not initialized")
+	}
+
+	if bucketName == "" {
+		return fmt.Errorf("bucket name cannot be empty")
+	}
+
+	return m.policyEngine.DeletePolicy(ctx, m.getFilerAddress(), "bucket-policy:"+bucketName)
 }
 
 // AssumeRoleWithWebIdentity assumes a role using web identity (OIDC)

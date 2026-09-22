@@ -79,10 +79,13 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 	}
 
 	// Verify policy signature.
-	errCode := s3a.iam.doesPolicySignatureMatch(formValues)
+	identity, errCode := s3a.iam.doesPolicySignatureMatch(formValues)
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
+	}
+	if identity != nil {
+		r = r.WithContext(s3_constants.SetIdentityNameInContext(r.Context(), identity.Name))
 	}
 
 	policyBytes, err := base64.StdEncoding.DecodeString(formValues.Get("Policy"))
@@ -136,11 +139,17 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 	// Forward validated POST form fields to the underlying PUT as headers.
 	applyPostPolicyFormHeaders(r, formValues)
 
+	// Authorize the object like the PUT path; the coarse Write check above does not consult the bucket policy.
+	if errCode := s3a.iam.AuthorizeObjectWrite(r, identity, bucket, object); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
 	// Use fileSize, not r.ContentLength: the multipart body wrapping form
 	// fields and boundaries inflates ContentLength relative to the
 	// object body, which would mis-evaluate any size-filtered rule.
 	ttlSec := s3a.lifecycleTTLForObjectWrite(bucket, object, fileSize)
-	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, fileBody, bucket, object, 1, ttlSec, nil, false)
+	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, fileBody, bucket, object, 1, ttlSec, nil, false, "")
 
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
@@ -319,8 +328,8 @@ func getRedirectPostRawQuery(bucket, key, etag string) string {
 	return redirectValues.Encode()
 }
 
-// Check to see if Policy is signed correctly.
-func (iam *IdentityAccessManagement) doesPolicySignatureMatch(formValues http.Header) s3err.ErrorCode {
+// Check to see if Policy is signed correctly, returning the signing identity.
+func (iam *IdentityAccessManagement) doesPolicySignatureMatch(formValues http.Header) (*Identity, s3err.ErrorCode) {
 	// For SignV2 - Signature field will be valid
 	if _, ok := formValues["Signature"]; ok {
 		return iam.doesPolicySignatureV2Match(formValues)

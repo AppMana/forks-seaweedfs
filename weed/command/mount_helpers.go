@@ -19,7 +19,7 @@ import (
 // attributes on every mount start. A bucket created here is a volume, so it
 // keeps its empty directories.
 func ensureMountRoot(ctx context.Context, filerClient filer_pb.FilerClient, mountRoot, bucketRootPath string) error {
-	entry, err := filer_pb.GetEntry(ctx, filerClient, util.FullPath(mountRoot))
+	entry, _, _, err := filer_pb.GetEntry(ctx, filerClient, util.FullPath(mountRoot))
 	if err != nil && err != filer_pb.ErrNotFound {
 		return err
 	}
@@ -41,7 +41,7 @@ func ensureBucketAllowEmptyFolders(ctx context.Context, filerClient filer_pb.Fil
 		return nil
 	}
 
-	entry, err := filer_pb.GetEntry(ctx, filerClient, util.FullPath(bucketPath))
+	entry, _, _, err := filer_pb.GetEntry(ctx, filerClient, util.FullPath(bucketPath))
 	if err != nil {
 		return err
 	}

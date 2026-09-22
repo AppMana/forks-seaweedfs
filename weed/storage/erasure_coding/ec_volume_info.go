@@ -18,6 +18,15 @@ type EcVolumeInfo struct {
 	EncodeTsNs  int64  // encode-run identity (unix nanos); one value per (volume, disk)
 }
 
+// DataShardsOrDefault returns how many of this volume's shards hold data; shard
+// ids below it are data, the rest are parity. Open-source SeaweedFS always uses
+// the fixed 10+4 layout, so this returns DataShardsCount. It is a per-volume
+// accessor, like EcShardsVolumeDataShards, so callers stay correct on builds
+// that derive the ratio per volume.
+func (ecInfo *EcVolumeInfo) DataShardsOrDefault() int {
+	return DataShardsCount
+}
+
 func (ecInfo *EcVolumeInfo) Minus(other *EcVolumeInfo) *EcVolumeInfo {
 	return &EcVolumeInfo{
 		VolumeId:    ecInfo.VolumeId,
@@ -45,4 +54,16 @@ func (evi *EcVolumeInfo) ToVolumeEcShardInformationMessage() (ret *master_pb.Vol
 		DeleteCount: evi.DeleteCount,
 		EncodeTsNs:  evi.EncodeTsNs,
 	}
+}
+
+func (evi *EcVolumeInfo) GetCollection() string {
+	return evi.Collection
+}
+
+func (evi *EcVolumeInfo) GetVolumeId() needle.VolumeId {
+	return evi.VolumeId
+}
+
+func (evi *EcVolumeInfo) GetRemoteStorageName() string {
+	return ""
 }

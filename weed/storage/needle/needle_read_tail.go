@@ -10,6 +10,13 @@ import (
 
 func (n *Needle) readNeedleTail(needleBody []byte, version Version) error {
 	// for all versions, we need to read the checksum
+	required := NeedleChecksumSize
+	if version == Version3 {
+		required += TimestampSize
+	}
+	if len(needleBody) < required {
+		return fmt.Errorf("needle tail truncated: got %d bytes, need %d: %w", len(needleBody), required, ErrorCorrupted)
+	}
 	if len(n.Data) > 0 {
 		expectedChecksum := CRC(util.BytesToUint32(needleBody[0:NeedleChecksumSize]))
 		dataChecksum := NewCRC(n.Data)

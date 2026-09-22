@@ -3,8 +3,8 @@
 //! Mirrors the Go SeaweedFS volume server metrics.
 
 use prometheus::{
-    self, Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
-    Opts, Registry, TextEncoder,
+    self, Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::sync::Once;
 
@@ -171,6 +171,23 @@ lazy_static::lazy_static! {
         &["mode"],
     ).expect("metric can be created");
 
+    /// Counter of storage read/write EIO errors on volumes and EC shards.
+    /// Mirrors Go's VolumeServerStorageIoErrorCounter.
+    pub static ref STORAGE_IO_ERROR_COUNTER: IntCounter = IntCounter::new(
+        "SeaweedFS_volumeServer_storage_io_error_total",
+        "Counter of storage read/write EIO errors on volumes and EC shards.",
+    ).expect("metric can be created");
+
+    /// Number of volumes quarantined due to storage IO errors.
+    /// Mirrors Go's VolumeServerIoQuarantineGauge.
+    pub static ref IO_QUARANTINE_GAUGE: IntGaugeVec = IntGaugeVec::new(
+        Opts::new(
+            "SeaweedFS_volumeServer_io_quarantine",
+            "Number of volumes or EC shards quarantined due to storage IO errors.",
+        ),
+        &["kind"],
+    ).expect("metric can be created");
+
     // ---- Legacy aliases for backward compat with existing code ----
 
     /// Total number of volumes on this server (flat gauge).
@@ -283,6 +300,8 @@ pub fn register_metrics() {
             Box::new(SCRUB_LAST_TIME_SECONDS.clone()),
             Box::new(SCRUB_VOLUME_FAILURES.clone()),
             Box::new(SCRUB_SHARD_FAILURES.clone()),
+            Box::new(STORAGE_IO_ERROR_COUNTER.clone()),
+            Box::new(IO_QUARANTINE_GAUGE.clone()),
             // Legacy metrics
             Box::new(VOLUMES_TOTAL.clone()),
             Box::new(DISK_SIZE_BYTES.clone()),
@@ -328,6 +347,16 @@ pub fn delete_collection_metrics(collection: &str) {
     delete_partial_match_collection(&VOLUME_GAUGE, collection);
     delete_partial_match_collection(&READ_ONLY_VOLUME_GAUGE, collection);
     delete_partial_match_collection(&DISK_SIZE_GAUGE, collection);
+}
+
+/// Drop a collection's volume server series once its last volume leaves this
+/// server. These gauges are only ever set for collections still present, so the
+/// values from the heartbeat that saw the last volume would otherwise stand
+/// until the process restarts.
+pub fn delete_volume_server_collection_metrics(collection: &str) {
+    let _ = DISK_SIZE_GAUGE.remove_label_values(&[collection, DISK_SIZE_LABEL_NORMAL]);
+    let _ = DISK_SIZE_GAUGE.remove_label_values(&[collection, DISK_SIZE_LABEL_DELETED_BYTES]);
+    delete_partial_match_collection(&READ_ONLY_VOLUME_GAUGE, collection);
 }
 
 /// Remove all metric entries from a GaugeVec where the "collection" label matches.

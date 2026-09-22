@@ -186,7 +186,7 @@ func tierUpVolumeLive(t *testing.T, dir string, vid needle.VolumeId, b *localDir
 	require.NoError(t, err)
 
 	for i := 1; i <= 5; i++ {
-		_, _, _, err := v.writeNeedle2(newRandomNeedle(uint64(i)), true, false)
+		_, _, _, err := v.writeNeedle2(newRandomNeedle(uint64(i)), true, false, false)
 		require.NoError(t, err)
 	}
 
@@ -289,7 +289,7 @@ func TestRemoteTier_LiveTierUpload_StillReportsToMaster(t *testing.T) {
 	require.True(t, v.HasRemoteFile(), "a tier-uploaded volume is in remote mode even before any reload")
 	require.False(t, util.FileExists(v.FileName(".dat")), "tier-up should have removed the local .dat")
 
-	_, msg := v.ToVolumeInformationMessage()
+	_, msg := v.ToVolumeInformationMessage(nil)
 	require.NotNil(t, msg, "tier-uploaded volume must still report to master")
 	require.NotEmpty(t, msg.RemoteStorageName, "reported volume must carry its remote backend name")
 }

@@ -30,7 +30,7 @@ func TestHandleRenameResponseLeavesUncachedTargetOutOfCache(t *testing.T) {
 		func(path util.FullPath) bool {
 			return inodeToPath.IsChildrenCached(path)
 		},
-		func(util.FullPath, *filer_pb.Entry) {},
+		func(meta_cache.EntryInvalidation) {},
 		nil,
 	)
 	defer mc.Shutdown()
@@ -76,7 +76,7 @@ func TestHandleRenameResponseLeavesUncachedTargetOutOfCache(t *testing.T) {
 		t.Fatalf("source path %s still has an inode mapping after rename", sourcePath)
 	}
 
-	entry, findErr := mc.FindEntry(context.Background(), targetPath)
+	entry, _, findErr := mc.FindEntry(context.Background(), targetPath)
 	if findErr != filer_pb.ErrNotFound {
 		t.Fatalf("find target entry error = %v, want %v", findErr, filer_pb.ErrNotFound)
 	}

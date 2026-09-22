@@ -48,14 +48,13 @@ type MiniOptions struct {
 }
 
 const (
-	bytesPerMB                    = 1024 * 1024 // Bytes per MB
-	miniVolumeMaxDataVolumeCounts = "0"         // auto-configured based on free disk space
-	miniVolumeMinFreeSpace        = "1"         // 1% minimum free space
-	minVolumeSizeMB               = 64          // Minimum volume size in MB
-	defaultMiniVolumeSizeMB       = 128         // Default volume size for mini mode
-	maxVolumeSizeMB               = 1024        // Maximum volume size in MB (1GB)
-	GrpcPortOffset                = 10000       // Offset used to calculate gRPC port from HTTP port
-	defaultMiniPluginJobTypes     = "all"
+	bytesPerMB                = 1024 * 1024 // Bytes per MB
+	miniVolumeMinFreeSpace    = "1"         // 1% minimum free space
+	minVolumeSizeMB           = 64          // Minimum volume size in MB
+	defaultMiniVolumeSizeMB   = 128         // Default volume size for mini mode
+	maxVolumeSizeMB           = 1024        // Maximum volume size in MB (1GB)
+	GrpcPortOffset            = 10000       // Offset used to calculate gRPC port from HTTP port
+	defaultMiniPluginJobTypes = "all"
 )
 
 var (
@@ -66,11 +65,12 @@ var (
 	miniWebDavOptions WebDavOption
 	miniAdminOptions  AdminOptions
 	// Track which port flags were explicitly passed on CLI before config file is applied
-	explicitPortFlags map[string]bool
-	miniEnableWebDAV  *bool
-	miniEnableS3      *bool
-	miniEnableAdminUI *bool
-	miniS3IamReadOnly *bool
+	explicitPortFlags             map[string]bool
+	miniEnableWebDAV              *bool
+	miniEnableS3                  *bool
+	miniEnableAdminUI             *bool
+	miniS3IamReadOnly             *bool
+	miniVolumeMaxDataVolumeCounts *string
 	// MiniClusterCtx is the context for the mini cluster. If set, the mini cluster will stop when the context is cancelled.
 	MiniClusterCtx context.Context
 
@@ -212,6 +212,9 @@ func miniStartupServices() []string {
 		if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 			services = append(services, "Iceberg")
 		}
+		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+			services = append(services, "Lance")
+		}
 	}
 	services = append(services, "Admin")
 	return services
@@ -340,7 +343,7 @@ S3 gateway, WebDAV gateway, and Admin UI).
 
 All settings are optimized for small/dev use cases:
 - Volume size limit: auto configured based on disk space (64MB-1024MB)
-- Volume max: 0 (auto-configured based on free disk space)
+- Volume max: 0 (auto-configured based on free disk space), see -volume.max
 - Pre-stop seconds: 1 (faster shutdown)
 - Master peers: none (single master mode)
 
@@ -389,8 +392,9 @@ var (
 	miniS3Config                    = cmdMini.Flag.String("s3.config", "", "path to the S3 config file")
 	miniIamConfig                   = cmdMini.Flag.String("s3.iam.config", "", "path to the advanced IAM config file for S3")
 	miniS3AllowDeleteBucketNotEmpty = cmdMini.Flag.Bool("s3.allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	miniS3AutoCreateBucket          = cmdMini.Flag.Bool("s3.autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	miniBucket                      = cmdMini.Flag.String("bucket", "", "comma-separated S3 bucket names to create on startup if they do not already exist; leave empty to skip. Falls back to S3_BUCKET env var.")
-	miniTableBucket                 = cmdMini.Flag.String("tableBucket", "", "comma-separated S3 Tables bucket names to create on startup if they do not already exist; leave empty to skip. Falls back to S3_TABLE_BUCKET env var.")
+	miniTableBucket                 = cmdMini.Flag.String("tableBucket", "", "comma-separated S3 Tables buckets to create on startup if they do not already exist, each name[:FORMAT] with FORMAT one of ICEBERG (default) or LANCE, e.g. warehouse,vectors:LANCE; leave empty to skip. Falls back to S3_TABLE_BUCKET env var.")
 )
 
 // getBindIp determines the bind IP address based on miniIp and miniBindIp flags
@@ -433,7 +437,7 @@ func initMiniMasterFlags() {
 	miniMasterOptions.raftHashicorp = cmdMini.Flag.Bool("master.raftHashicorp", false, "use hashicorp raft")
 	miniMasterOptions.raftBootstrap = cmdMini.Flag.Bool("master.raftBootstrap", false, "whether to bootstrap the Raft cluster")
 	miniMasterOptions.telemetryUrl = cmdMini.Flag.String("master.telemetry.url", "https://telemetry.seaweedfs.com/api/collect", "telemetry server URL")
-	miniMasterOptions.telemetryEnabled = cmdMini.Flag.Bool("master.telemetry", false, "enable telemetry reporting")
+	miniMasterOptions.telemetryEnabled = cmdMini.Flag.Bool("master.telemetry", true, "report anonymous cluster statistics to master.telemetry.url, use -master.telemetry=false to opt out")
 }
 
 // initMiniFilerFlags initializes Filer server flag options
@@ -458,10 +462,14 @@ func initMiniFilerFlags() {
 	miniFilerOptions.allowedOrigins = cmdMini.Flag.String("filer.allowedOrigins", "*", "comma separated list of allowed origins")
 	miniFilerOptions.exposeDirectoryData = cmdMini.Flag.Bool("filer.exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
 	miniFilerOptions.tusBasePath = cmdMini.Flag.String("filer.tusBasePath", "/.tus", "TUS resumable upload endpoint base path")
+	miniFilerOptions.tusMaxSizeMB = cmdMini.Flag.Int("filer.tusMaxSizeMB", 5*1024, "maximum TUS upload size in MB")
+	miniFilerOptions.tusSessionExpiry = cmdMini.Flag.Duration("filer.tusSessionExpiry", 24*time.Hour, "incomplete TUS upload sessions are cleaned up after this duration")
+	miniFilerOptions.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("filer.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 }
 
 // initMiniVolumeFlags initializes Volume server flag options
 func initMiniVolumeFlags() {
+	miniVolumeMaxDataVolumeCounts = cmdMini.Flag.String("volume.max", "0", "maximum numbers of volumes, count[,count]... If set to zero, the limit will be auto configured as free disk space divided by volume size.")
 	miniOptions.v.port = cmdMini.Flag.Int("volume.port", 9340, "volume server http listen port")
 	miniOptions.v.portGrpc = cmdMini.Flag.Int("volume.port.grpc", 0, "volume server grpc listen port")
 	miniOptions.v.publicPort = cmdMini.Flag.Int("volume.port.public", 0, "volume server public port")
@@ -495,6 +503,9 @@ func initMiniS3Flags() {
 	miniS3Options.portHttps = cmdMini.Flag.Int("s3.port.https", 0, "s3 server https listen port")
 	miniS3Options.portGrpc = cmdMini.Flag.Int("s3.port.grpc", 0, "s3 server grpc listen port")
 	miniS3Options.portIceberg = cmdMini.Flag.Int("s3.port.iceberg", 8181, "Iceberg REST Catalog server listen port (0 to disable)")
+	miniS3Options.portLance = cmdMini.Flag.Int("s3.port.lance", 9101, "Lance Namespace server listen port (0 to disable)")
+	miniS3Options.icebergCredentialRole = cmdMini.Flag.String("s3.iceberg.credentialRole", "", "IAM role ARN the Iceberg catalog assumes to vend table-scoped credentials (empty disables vending)")
+	miniS3Options.icebergCredentialDuration = cmdMini.Flag.Int("s3.iceberg.credentialDurationSeconds", 3600, "lifetime of credentials vended by the Iceberg catalog")
 	miniS3Options.domainName = cmdMini.Flag.String("s3.domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
 	miniS3Options.allowedOrigins = cmdMini.Flag.String("s3.allowedOrigins", "*", "comma separated list of allowed origins")
 	miniS3Options.tlsPrivateKey = cmdMini.Flag.String("s3.key.file", "", "path to the TLS private key file")
@@ -516,9 +527,11 @@ func initMiniS3Flags() {
 	miniS3Options.iamConfig = miniIamConfig
 	miniS3Options.auditLogConfig = cmdMini.Flag.String("s3.auditLogConfig", "", "path to the audit log config file")
 	miniS3Options.allowDeleteBucketNotEmpty = miniS3AllowDeleteBucketNotEmpty
-	miniS3Options.externalUrl = cmdMini.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Used for S3 signature verification behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
+	miniS3Options.autoCreateBucket = miniS3AutoCreateBucket
+	miniS3Options.externalUrl = cmdMini.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	miniS3Options.defaultFileMode = cmdMini.Flag.String("s3.defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
 	miniS3Options.cacheSizeMB = cmdMini.Flag.Int64("s3.cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	miniS3Options.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	// In mini mode, S3 uses the shared debug server started at line 681, not its own separate debug server
 	miniS3Options.debug = new(bool) // explicitly false
 	miniS3Options.debugPort = cmdMini.Flag.Int("s3.debug.port", 6060, "http port for debugging (unused in mini mode)")
@@ -878,6 +891,14 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 				grpcPtr  *int
 			}{miniS3Options.portIceberg, "Iceberg", "s3.port.iceberg", nil})
 		}
+		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+			portConfigs = append(portConfigs, struct {
+				port     *int
+				name     string
+				flagName string
+				grpcPtr  *int
+			}{miniS3Options.portLance, "Lance", "s3.port.lance", nil})
+		}
 	}
 	portConfigs = append(portConfigs, struct {
 		port     *int
@@ -924,14 +945,32 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 	// All gRPC port handling (calculation, validation, and assignment) is performed exclusively in initializeGrpcPortsOnIP
 	initializeGrpcPortsOnIP(bindIp)
 
+	// Every other service binds within a moment of this check, but the admin
+	// waits for all of them first. The admin gRPC port sits inside the Linux
+	// ephemeral range, so during that gap one of the cluster's own outgoing
+	// connections can take it and the admin then dies on bind. Hold a listener
+	// from here and hand it to the admin instead of re-binding later. Clear
+	// first: an in-process rerun would otherwise inherit the closed listener
+	// of the previous run and only find out inside Serve.
+	miniAdminOptions.workerGrpcListener = nil
+	if listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *miniAdminOptions.grpcPort)); err != nil {
+		glog.Warningf("Could not reserve Admin gRPC port %d: %v", *miniAdminOptions.grpcPort, err)
+	} else {
+		miniAdminOptions.workerGrpcListener = listener
+	}
+
 	// Log the final port configuration
 	icebergPortStr := "disabled"
 	if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 		icebergPortStr = fmt.Sprintf("%d", *miniS3Options.portIceberg)
 	}
-	glog.V(1).Infof("Final port configuration - Master: %d, Filer: %d, Volume: %d, S3: %d, Iceberg: %s, WebDAV: %d, Admin: %d",
+	lancePortStr := "disabled"
+	if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+		lancePortStr = fmt.Sprintf("%d", *miniS3Options.portLance)
+	}
+	glog.V(1).Infof("Final port configuration - Master: %d, Filer: %d, Volume: %d, S3: %d, Iceberg: %s, Lance: %s, WebDAV: %d, Admin: %d",
 		*miniMasterOptions.port, *miniFilerOptions.port, *miniOptions.v.port,
-		*miniS3Options.port, icebergPortStr, *miniWebDavOptions.port, *miniAdminOptions.port)
+		*miniS3Options.port, icebergPortStr, lancePortStr, *miniWebDavOptions.port, *miniAdminOptions.port)
 
 	// Log gRPC ports too (now finalized)
 	glog.V(1).Infof("gRPC port configuration - Master: %d, Filer: %d, Volume: %d, S3: %d, Admin: %d",
@@ -960,6 +999,9 @@ func initializeGrpcPortsOnIP(bindIp string) {
 		allocatedPorts[*miniS3Options.port] = true
 		if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 			allocatedPorts[*miniS3Options.portIceberg] = true
+		}
+		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+			allocatedPorts[*miniS3Options.portLance] = true
 		}
 	}
 
@@ -1223,16 +1265,24 @@ func runMini(cmd *Command, args []string) bool {
 	miniFilerOptions.masters = pb.ServerAddresses(actualPeersForComponents).ToServiceDiscovery()
 	miniFilerOptions.ip = miniIp
 	miniFilerOptions.bindIp = miniBindIp
+	miniS3Options.ip = miniIp
 	miniS3Options.bindIp = miniBindIp
 	miniWebDavOptions.ipBind = miniBindIp
 	miniOptions.v.ip = miniIp
 	miniOptions.v.bindIp = miniBindIp
 	miniOptions.v.masters = pb.ServerAddresses(actualPeersForComponents).ToAddresses()
 	miniOptions.v.idleConnectionTimeout = miniTimeout
+	// Admin server binds to the same address as the other mini services.
+	// The public-bind-without-auth guard in `weed admin` does not apply here
+	// because mini calls startAdminServer directly, not runAdmin.
+	miniAdminOptions.ip = miniBindIp
 	miniOptions.v.dataCenter = miniDataCenter
 	miniOptions.v.rack = miniRack
 
 	miniMasterOptions.whiteList = miniWhiteListOption
+	// The master's /submit buffers the upload before handing it to the volume
+	// server started here, so it must not reject what that volume server accepts.
+	miniMasterOptions.fileSizeLimitMB = miniOptions.v.fileSizeLimitMB
 
 	miniFilerOptions.dataCenter = miniDataCenter
 	miniFilerOptions.rack = miniRack
@@ -1260,8 +1310,8 @@ func runMini(cmd *Command, args []string) bool {
 
 	go stats_collect.StartMetricsServer(*miniMetricsHttpIp, *miniMetricsHttpPort)
 
-	if *miniMasterOptions.volumeSizeLimitMB > util.VolumeSizeLimitGB*1000 {
-		glog.Fatalf("masterVolumeSizeLimitMB should be less than 30000")
+	if *miniMasterOptions.volumeSizeLimitMB > util.MaxVolumeSizeLimitMB {
+		glog.Fatalf("master.volumeSizeLimitMB should not exceed %d", util.MaxVolumeSizeLimitMB)
 	}
 
 	if *miniMasterOptions.metaFolder == "" {
@@ -1342,8 +1392,18 @@ func runMini(cmd *Command, args []string) bool {
 	if tableBucketSpec == "" {
 		tableBucketSpec = os.Getenv("S3_TABLE_BUCKET")
 	}
-	if err := ensureMiniTableBuckets(tableBucketSpec); err != nil {
+	ready, err := ensureMiniTableBuckets(parseTableBucketList(tableBucketSpec))
+	if err != nil {
 		glog.Warningf("failed to ensure table buckets %q: %v", tableBucketSpec, err)
+	}
+	// The Iceberg catalog routes unprefixed requests to the first
+	// S3_TABLE_BUCKET entry and looks the name up as given, so rewrite the
+	// variable whichever way the spec arrived: a Lance entry or a :FORMAT
+	// suffix left in place names a bucket the catalog cannot find.
+	if names := icebergRoutingNames(ready); len(names) > 0 {
+		os.Setenv("S3_TABLE_BUCKET", strings.Join(names, ","))
+	} else {
+		os.Unsetenv("S3_TABLE_BUCKET")
 	}
 
 	// Print welcome message after all services are running
@@ -1383,7 +1443,7 @@ func startMiniServices(miniWhiteList []string, allServicesReady chan struct{}) {
 		defer reportMiniStopped("Volume")
 		startMiniService("Volume", func() {
 			minFreeSpaces := util.MustParseMinFreeSpace(miniVolumeMinFreeSpace, "")
-			miniOptions.v.startVolumeServer(*miniDataFolders, miniVolumeMaxDataVolumeCounts, *miniWhiteListOption, minFreeSpaces)
+			miniOptions.v.startVolumeServer(*miniDataFolders, *miniVolumeMaxDataVolumeCounts, *miniWhiteListOption, minFreeSpaces)
 		}, *miniOptions.v.port)
 	}()
 
@@ -1410,9 +1470,13 @@ func startMiniServices(miniWhiteList []string, allServicesReady chan struct{}) {
 		go func() {
 			defer done()
 			defer reportMiniStopped("S3")
-			// Iceberg lives inside the S3 server; report it stopped alongside.
+			// Iceberg and Lance live inside the S3 server; report them stopped
+			// alongside it.
 			if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 				defer reportMiniStopped("Iceberg")
+			}
+			if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+				defer reportMiniStopped("Lance")
 			}
 			startMiniService("S3", startS3Service, *miniS3Options.port)
 		}()
@@ -1441,6 +1505,12 @@ func startMiniServices(miniWhiteList []string, allServicesReady chan struct{}) {
 			}
 			waitForServiceReady("Iceberg", *miniS3Options.portIceberg, bindIp)
 		}
+		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+			if miniProgressBoard != nil {
+				miniProgressBoard.starting("Lance")
+			}
+			waitForServiceReady("Lance", *miniS3Options.portLance, bindIp)
+		}
 	}
 	if *miniEnableWebDAV {
 		waitForServiceReady("WebDAV", *miniWebDavOptions.port, bindIp)
@@ -1462,7 +1532,7 @@ func startMiniService(name string, fn func(), port int) {
 // waitForServiceReady pings the service HTTP endpoint to check if it's ready
 // to accept connections, and reports the transition to the progress board.
 func waitForServiceReady(name string, port int, bindIp string) {
-	address := fmt.Sprintf("http://%s:%d", bindIp, port)
+	address := "http://" + util.JoinHostPort(bindIp, port)
 	healthAddr := getHealthCheckAddr(address)
 	maxAttempts := 30 // 30 * 200ms = 6 seconds max wait
 	attempt := 0
@@ -1525,6 +1595,14 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 	// Set admin options
 	*miniAdminOptions.master = masterAddr
 
+	// Mini knows its own S3 address, so the file browser can offer object
+	// URLs without any configuration. Assigned unconditionally so a value
+	// from a prior in-process run cannot outlive its S3 server.
+	miniAdminOptions.defaultS3PublicEndpoint = ""
+	if *miniEnableS3 {
+		miniAdminOptions.defaultS3PublicEndpoint = "http://" + util.JoinHostPort(*miniIp, *miniS3Options.port)
+	}
+
 	// Resolve admin credentials from security.toml [admin] / WEED_ADMIN_* env
 	// vars, matching the standalone `weed admin` command.
 	applyMiniAdminCredentialFallback(&miniAdminOptions)
@@ -1570,21 +1648,36 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 	if miniProgressBoard != nil {
 		miniProgressBoard.starting("Admin")
 	}
+	// Snapshot the options, and with them the reserved listener, so a later
+	// in-process run cannot swap either out from under this goroutine.
+	adminOptions := miniAdminOptions
 	done := trackMiniClient()
 	go func() {
 		defer done()
 		defer reportMiniStopped("Admin")
-		var icebergPort int
-		if miniS3Options.portIceberg != nil {
-			icebergPort = *miniS3Options.portIceberg
+		// Only advertise a catalog port when S3 is actually running: with -s3=false
+		// the admin UI would otherwise print an endpoint nothing is listening on.
+		var icebergPort, lancePort int
+		if miniEnableS3 != nil && *miniEnableS3 {
+			if miniS3Options.portIceberg != nil {
+				icebergPort = *miniS3Options.portIceberg
+			}
+			if miniS3Options.portLance != nil {
+				lancePort = *miniS3Options.portLance
+			}
 		}
-		if err := startAdminServer(ctx, miniAdminOptions, *miniEnableAdminUI, icebergPort, urlPrefix); err != nil {
+		if err := startAdminServer(ctx, adminOptions, *miniEnableAdminUI, icebergPort, lancePort, urlPrefix); err != nil {
 			glog.Errorf("Admin server error: %v", err)
+		}
+		// A no-op once the admin took it over and shut it down; it matters when
+		// startAdminServer bailed out before that.
+		if adminOptions.workerGrpcListener != nil {
+			adminOptions.workerGrpcListener.Close()
 		}
 	}()
 
 	// Wait for admin server's HTTP port to be ready before launching worker
-	adminAddr := fmt.Sprintf("http://%s:%d", bindIp, *miniAdminOptions.port)
+	adminAddr := "http://" + util.JoinHostPort(bindIp, *miniAdminOptions.port)
 	if err := waitForAdminServerReady(ctx, adminAddr); err != nil {
 		// If the parent context was cancelled (e.g. a previous in-process
 		// mini run is being torn down), bail out gracefully instead of
@@ -1845,6 +1938,9 @@ func printWelcomeMessage() {
 		if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 			fmt.Fprintf(&sb, "    Iceberg Catalog: http://%s:%d\n", *miniIp, *miniS3Options.portIceberg)
 		}
+		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
+			fmt.Fprintf(&sb, "    Lance Namespace: http://%s:%d\n", *miniIp, *miniS3Options.portLance)
+		}
 	}
 	if *miniEnableAdminUI {
 		fmt.Fprintf(&sb, "    Admin UI:        http://%s:%d\n", *miniIp, *miniAdminOptions.port)
@@ -1889,7 +1985,7 @@ func printWelcomeMessage() {
 // Best-effort: any error returns ok=false so the welcome banner simply omits
 // the lines.
 func miniVolumeCounts() (max, free int64, ok bool) {
-	url := getHealthCheckAddr(fmt.Sprintf("http://%s:%d/dir/status", *miniIp, *miniMasterOptions.port))
+	url := getHealthCheckAddr("http://" + util.JoinHostPort(*miniIp, *miniMasterOptions.port) + "/dir/status")
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -1962,42 +2058,157 @@ func ensureMiniBuckets(bucketSpec string) error {
 	})
 }
 
+// tableBucketEntry is one -tableBucket entry: a bucket name and the table
+// format that bucket will hold.
+type tableBucketEntry struct {
+	name   string
+	format string
+}
+
 // ensureMiniTableBuckets creates each named S3 Tables bucket on the embedded
-// filer if it does not already exist. bucketSpec is comma-separated; whitespace
-// is trimmed and duplicates are dropped. Per-bucket failures are logged so one
-// bad name does not block the rest. Buckets are owned by s3tables.DefaultAccountID
+// filer if it does not already exist, and returns the ones that now hold the
+// format that was asked for. Per-bucket failures are logged so one bad name
+// does not block the rest. Buckets are owned by s3tables.DefaultAccountID
 // since mini does not yet model multi-account ownership.
-func ensureMiniTableBuckets(bucketSpec string) error {
-	names := parseBucketList(bucketSpec)
-	if len(names) == 0 {
-		return nil
+func ensureMiniTableBuckets(buckets []tableBucketEntry) ([]tableBucketEntry, error) {
+	// A bucket holds one format, and the format decides which catalog serves
+	// it, so one created in a format this mini does not serve is a bucket no
+	// client can reach.
+	var servable []tableBucketEntry
+	for _, bucket := range buckets {
+		if !miniServesTableFormat(bucket.format) {
+			// An unsuffixed name means Iceberg, so on a Lance-only mini say how to ask.
+			hint := ""
+			if bucket.format == s3tables.FormatIceberg && miniServesTableFormat(s3tables.FormatLance) {
+				hint = fmt.Sprintf("; name it %s:%s for the Lance namespace", bucket.name, s3tables.FormatLance)
+			}
+			glog.Warningf("not creating table bucket %s: no %s endpoint is enabled, so nothing could reach it%s", bucket.name, bucket.format, hint)
+			continue
+		}
+		servable = append(servable, bucket)
+	}
+	if len(servable) == 0 {
+		return nil, nil
 	}
 
 	filerAddress := pb.NewServerAddress(*miniIp, *miniFilerOptions.port, *miniFilerOptions.portGrpc)
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 
-	return pb.WithGrpcFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	var ready []tableBucketEntry
+	err := pb.WithGrpcFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		manager := s3tables.NewManager()
 		mgrClient := s3tables.NewManagerClient(client)
-		for _, name := range names {
+		for _, bucket := range servable {
 			ctx, cancel := context.WithTimeout(miniClientsCtx(), 5*time.Second)
-			req := &s3tables.CreateTableBucketRequest{Name: name}
+			req := &s3tables.CreateTableBucketRequest{Name: bucket.name, Format: bucket.format}
 			var resp s3tables.CreateTableBucketResponse
 			err := manager.Execute(ctx, mgrClient, "CreateTableBucket", req, &resp, s3tables.DefaultAccountID)
 			cancel()
 			if err == nil {
-				glog.V(0).Infof("created table bucket %s", name)
+				glog.V(0).Infof("created %s table bucket %s", bucket.format, bucket.name)
+				ready = append(ready, bucket)
 				continue
 			}
 			var s3Err *s3tables.S3TablesError
 			if errors.As(err, &s3Err) && s3Err.Type == s3tables.ErrCodeBucketAlreadyExists {
-				glog.V(0).Infof("table bucket %s already exists", name)
+				// The name being taken says nothing about what holds it: it
+				// may be the other format, or an ordinary S3 bucket, which
+				// answers the same conflict. Only reuse what reads back as
+				// the format asked for, since the rest fails later at the
+				// client instead of here.
+				existing, readErr := existingTableBucketFormat(manager, mgrClient, bucket.name)
+				switch {
+				case readErr != nil:
+					glog.Warningf("%s already exists but does not read back as a table bucket: %v; leaving it alone", bucket.name, readErr)
+				case existing != "" && existing != bucket.format:
+					glog.Warningf("table bucket %s already exists holding %s tables, not %s; leaving it alone", bucket.name, existing, bucket.format)
+				default:
+					glog.V(0).Infof("table bucket %s already exists", bucket.name)
+					ready = append(ready, bucket)
+				}
 				continue
 			}
-			glog.Warningf("create table bucket %s: %v", name, err)
+			glog.Warningf("create table bucket %s: %v", bucket.name, err)
 		}
 		return nil
 	})
+	return ready, err
+}
+
+// icebergRoutingNames is the bare names of the buckets holding Iceberg tables,
+// which are the only ones the Iceberg catalog can take as its default warehouse.
+func icebergRoutingNames(buckets []tableBucketEntry) []string {
+	var names []string
+	for _, bucket := range buckets {
+		if bucket.format == s3tables.FormatIceberg {
+			names = append(names, bucket.name)
+		}
+	}
+	return names
+}
+
+// existingTableBucketFormat is the format the named table bucket holds. An empty
+// format with no error is a bucket predating declared formats, which accepts
+// either; an error means nothing was confirmed, an ordinary S3 bucket wearing
+// the name included.
+func existingTableBucketFormat(manager *s3tables.Manager, client *s3tables.ManagerClient, name string) (string, error) {
+	arn, err := s3tables.BuildBucketARN(s3tables.DefaultRegion, s3tables.DefaultAccountID, name)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(miniClientsCtx(), 5*time.Second)
+	defer cancel()
+	var resp s3tables.GetTableBucketResponse
+	if err := manager.Execute(ctx, client, "GetTableBucket", &s3tables.GetTableBucketRequest{TableBucketARN: arn}, &resp, s3tables.DefaultAccountID); err != nil {
+		return "", err
+	}
+	return resp.Format, nil
+}
+
+// miniServesTableFormat reports whether the endpoint that serves format is
+// running here: the Iceberg catalog for ICEBERG, the Lance namespace for LANCE.
+func miniServesTableFormat(format string) bool {
+	if miniEnableS3 == nil || !*miniEnableS3 {
+		return false
+	}
+	switch format {
+	case s3tables.FormatIceberg:
+		return miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0
+	case s3tables.FormatLance:
+		return miniS3Options.portLance != nil && *miniS3Options.portLance > 0
+	}
+	return false
+}
+
+// parseTableBucketList splits a comma-separated table bucket spec into
+// deduplicated name[:FORMAT] entries, in the order given. The format is stated
+// rather than read off whichever catalog happens to be listening, so one spec
+// means one thing on every mini.
+func parseTableBucketList(spec string) []tableBucketEntry {
+	if spec == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var buckets []tableBucketEntry
+	for _, raw := range strings.Split(spec, ",") {
+		name, rawFormat, _ := strings.Cut(raw, ":")
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		format := s3tables.FormatIceberg
+		if rawFormat = strings.TrimSpace(rawFormat); rawFormat != "" {
+			normalized, ok := s3tables.NormalizeFormat(rawFormat)
+			if !ok {
+				glog.Warningf("not creating table bucket %s: unsupported format %q", name, rawFormat)
+				continue
+			}
+			format = normalized
+		}
+		seen[name] = true
+		buckets = append(buckets, tableBucketEntry{name: name, format: format})
+	}
+	return buckets
 }
 
 // parseBucketList splits a comma-separated bucket spec into a deduplicated list

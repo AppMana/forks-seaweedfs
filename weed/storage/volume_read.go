@@ -287,8 +287,7 @@ func ScanVolumeFileFrom(version needle.Version, datBackend backend.BackendStorag
 			// println("needle", n.Id.String(), "offset", offset, "size", n.Size, "rest", rest)
 			if needleBody, err = n.ReadNeedleBody(datBackend, version, offset+NeedleHeaderSize, rest); err != nil {
 				glog.V(0).Infof("cannot read needle head [%d, %d) body [%d, %d) body length %d: %v", offset, offset+NeedleHeaderSize, offset+NeedleHeaderSize, offset+NeedleHeaderSize+rest, rest, err)
-				// err = fmt.Errorf("cannot read needle body: %v", err)
-				// return
+				return fmt.Errorf("cannot read needle body at offset %d: %w", offset, err)
 			}
 		}
 		err := volumeFileScanner.VisitNeedle(n, offset, nh, needleBody)

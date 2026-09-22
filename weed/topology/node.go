@@ -11,6 +11,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
@@ -305,11 +306,45 @@ func (n *NodeImpl) getOrCreateDisk(diskType types.DiskType) *DiskUsageCounts {
 	return n.diskUsages.getOrCreateDisk(diskType)
 }
 
+// inMaintenanceMode is true for a data node whose volume server is in
+// maintenance mode. Racks and data centers never are: their rolled-up counters
+// still include such a node, so their free-slot totals may exceed what their
+// children will actually hand out; see reserveOneVolumeInternal.
+func (n *NodeImpl) inMaintenanceMode() bool {
+	dn, ok := n.value.(*DataNode)
+	return ok && dn.InMaintenanceMode()
+}
+
+// AvailableSpaceFor is the free volume slots on this node for the option's disk
+// type. A data node in maintenance mode reports none: it is being drained, so
+// it is neither a volume-growth candidate nor reservable.
 func (n *NodeImpl) AvailableSpaceFor(option *VolumeGrowOption) int64 {
+	if n.inMaintenanceMode() {
+		return 0
+	}
 	t := n.getOrCreateDisk(option.DiskType)
 	freeVolumeSlotCount := atomic.LoadInt64(&t.maxVolumeCount) + atomic.LoadInt64(&t.remoteVolumeCount) - atomic.LoadInt64(&t.volumeCount)
-	freeVolumeSlotCount -= ecShardSlots(atomic.LoadInt64(&t.ecShardCount))
+	freeVolumeSlotCount -= erasure_coding.VolumeSlots(atomic.LoadInt64(&t.ecShardCount))
 	return freeVolumeSlotCount
+}
+
+// CapacityFor is the total registered volume slots for the option's disk type;
+// zero means no volume server has reported capacity for it yet.
+func (n *NodeImpl) CapacityFor(option *VolumeGrowOption) int64 {
+	t := n.getOrCreateDisk(option.DiskType)
+	return atomic.LoadInt64(&t.maxVolumeCount) + atomic.LoadInt64(&t.remoteVolumeCount)
+}
+
+// CapacityForAnyDisk is the total registered volume slots across every disk
+// type. CapacityFor answers zero both while a cluster is still starting and
+// when it never serves the option's medium; this tells the two apart.
+func (n *NodeImpl) CapacityForAnyDisk() (total int64) {
+	n.diskUsages.RLock()
+	defer n.diskUsages.RUnlock()
+	for _, t := range n.diskUsages.usages {
+		total += atomic.LoadInt64(&t.maxVolumeCount) + atomic.LoadInt64(&t.remoteVolumeCount)
+	}
+	return
 }
 
 // AvailableSpaceForReservation returns available space considering existing reservations
@@ -380,13 +415,29 @@ func (n *NodeImpl) ReserveOneVolumeForReservation(r int64, option *VolumeGrowOpt
 func (n *NodeImpl) reserveOneVolumeInternal(r int64, option *VolumeGrowOption, useReservations bool) (assignedNode *DataNode, err error) {
 	n.RLock()
 	defer n.RUnlock()
-	for _, node := range n.children {
-		var freeSpace int64
+	freeSpaceOf := func(node Node) int64 {
 		if useReservations {
-			freeSpace = node.AvailableSpaceForReservation(option)
-		} else {
-			freeSpace = node.AvailableSpaceFor(option)
+			return node.AvailableSpaceForReservation(option)
 		}
+		return node.AvailableSpaceFor(option)
+	}
+	// The caller draws r from this node's rolled-up free slots, which still
+	// count children the walk below skips: a data node in maintenance mode
+	// reports no space, and an over-committed one reports less than zero. Fold
+	// r into the space that is actually on offer so it cannot walk off the end
+	// and fail with slots still free.
+	var eligible int64
+	for _, node := range n.children {
+		if freeSpace := freeSpaceOf(node); freeSpace > 0 {
+			eligible += freeSpace
+		}
+	}
+	if eligible <= 0 {
+		return nil, errors.New("No free volume slot found!")
+	}
+	r %= eligible
+	for _, node := range n.children {
+		freeSpace := freeSpaceOf(node)
 		// fmt.Println("r =", r, ", node =", node, ", freeSpace =", freeSpace)
 		if freeSpace <= 0 {
 			continue
@@ -514,7 +565,11 @@ func (n *NodeImpl) CollectDeadNodeAndFullVolumes(freshThreshHoldUnixTime int64, 
 						//fmt.Println("volume",v.Id,"size",v.Size,">",volumeSizeLimit)
 						topo.chanFullVolumes <- v
 					}
-				} else if float64(v.Size) > float64(volumeSizeLimit)*growThreshold {
+				} else if !v.ReadOnly && float64(v.Size) > float64(volumeSizeLimit)*growThreshold {
+					// Crowding asks for more room to write into, which a
+					// read-only volume can never provide. Growth already
+					// discounts them by intersecting with the writable list, so
+					// marking one only costs the entry.
 					topo.chanCrowdedVolumes <- v
 				}
 				copyCount := v.ReplicaPlacement.GetCopyCount()

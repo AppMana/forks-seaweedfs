@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"context"
 	"flag"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
 )
 
 func init() {
@@ -42,7 +44,7 @@ func (c *commandVolumeDeleteEmpty) Do(args []string, commandEnv *CommandEnv, wri
 
 	volDeleteCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	quietPeriod := volDeleteCommand.Duration("quietFor", 24*time.Hour, "select empty volumes with no recent writes, avoid newly created ones")
-	collectionPattern := volDeleteCommand.String("collectionPattern", "", "match with wildcard characters '*' and '?'")
+	collectionPattern := volDeleteCommand.String("collectionPattern", "", "comma-separated collection names, with '*' and '?' wildcards; empty matches all")
 	applyBalancing := volDeleteCommand.Bool("apply", false, "apply to delete empty volumes")
 	// TODO: remove this alias
 	applyBalancingAlias := volDeleteCommand.Bool("force", false, "apply to delete empty volumes (alias for -apply)")
@@ -63,16 +65,21 @@ func (c *commandVolumeDeleteEmpty) Do(args []string, commandEnv *CommandEnv, wri
 		return err
 	}
 
+	collectionMatcher, err := wildcard.CompileCollectionMatcher(*collectionPattern)
+	if err != nil {
+		return err
+	}
+
 	quietSeconds := int64(*quietPeriod / time.Second)
 	nowUnixSeconds := time.Now().Unix()
 
 	eachDataNode(topologyInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		for _, diskInfo := range dn.DiskInfos {
 			for _, v := range diskInfo.VolumeInfos {
-				if isEmptyVolumeDeleteCandidate(v, quietSeconds, nowUnixSeconds, *collectionPattern) {
+				if isEmptyVolumeDeleteCandidate(v, quietSeconds, nowUnixSeconds, collectionMatcher) {
 					if *applyBalancing {
 						log.Printf("deleting empty volume %d from %s", v.Id, dn.Id)
-						if deleteErr := deleteVolume(commandEnv.option.GrpcDialOption, needle.VolumeId(v.Id),
+						if deleteErr := deleteVolume(context.Background(), commandEnv.option.GrpcDialOption, needle.VolumeId(v.Id),
 							pb.NewServerAddressFromDataNode(dn), true, false); deleteErr != nil {
 							err = deleteErr
 						}
@@ -88,8 +95,8 @@ func (c *commandVolumeDeleteEmpty) Do(args []string, commandEnv *CommandEnv, wri
 	return
 }
 
-func isEmptyVolumeDeleteCandidate(v *master_pb.VolumeInformationMessage, quietSeconds, nowUnixSeconds int64, collectionPattern string) bool {
-	return matchesVolumeCollectionPattern(collectionPattern, v.Collection) &&
+func isEmptyVolumeDeleteCandidate(v *master_pb.VolumeInformationMessage, quietSeconds, nowUnixSeconds int64, collectionMatcher *wildcard.CollectionMatcher) bool {
+	return collectionMatcher.Matches(v.Collection) &&
 		v.Size <= super_block.SuperBlockSize &&
 		v.ModifiedAtSecond > 0 &&
 		v.ModifiedAtSecond+quietSeconds < nowUnixSeconds

@@ -43,7 +43,7 @@ jobs:
       matrix:
         container-id: [unit-tests-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 1.0 --memory 1g --hostname kafka-unit-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 1
@@ -51,9 +51,9 @@ jobs:
       CONTAINER_ID: ${{ matrix.container-id }}
     steps:
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
       id: go
 
     - name: Check out code
@@ -87,7 +87,7 @@ jobs:
       matrix:
         container-id: [integration-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 2.0 --memory 2g --ulimit nofile=1024:1024 --hostname kafka-integration-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 2
@@ -96,9 +96,9 @@ jobs:
       CONTAINER_ID: ${{ matrix.container-id }}
     steps:
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
       id: go
 
     - name: Check out code
@@ -134,7 +134,7 @@ jobs:
       matrix:
         container-id: [e2e-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 2.0 --memory 2g --hostname kafka-e2e-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 2
@@ -146,9 +146,9 @@ jobs:
       uses: actions/checkout@v7
 
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
         cache: true
         cache-dependency-path: |
           **/go.sum
@@ -313,7 +313,7 @@ jobs:
       matrix:
         container-id: [consumer-group-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 1.0 --memory 2g --ulimit nofile=512:512 --hostname kafka-consumer-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 1
@@ -325,9 +325,9 @@ jobs:
       uses: actions/checkout@v7
 
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
         cache: true
         cache-dependency-path: |
           **/go.sum
@@ -475,7 +475,7 @@ jobs:
       matrix:
         container-id: [client-compat-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 1.0 --memory 1.5g --shm-size 256m --hostname kafka-client-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 1
@@ -487,9 +487,9 @@ jobs:
       uses: actions/checkout@v7
 
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
         cache: true
         cache-dependency-path: |
           **/go.sum
@@ -633,7 +633,7 @@ jobs:
       matrix:
         container-id: [smq-integration-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 1.0 --memory 2g --hostname kafka-smq-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 1
@@ -645,9 +645,9 @@ jobs:
       uses: actions/checkout@v7
 
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
         cache: true
         cache-dependency-path: |
           **/go.sum
@@ -794,7 +794,7 @@ jobs:
       matrix:
         container-id: [protocol-1]
     container:
-      image: golang:1.24-alpine
+      image: golang:1.26-alpine
       options: --cpus 1.0 --memory 1g --tmpfs /tmp:exec --hostname kafka-protocol-${{ matrix.container-id }}
     env:
       GOMAXPROCS: 1
@@ -803,9 +803,9 @@ jobs:
       CONTAINER_ID: ${{ matrix.container-id }}
     steps:
     - name: Set up Go 1.x
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: ^1.25
+        go-version: ^1.26
       id: go
 
     - name: Check out code

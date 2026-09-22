@@ -23,6 +23,17 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
+// goBuildTags names the build tags a server the harness compiles must carry to
+// hold the same offsets as the test binary asking for it. A 4-byte server and a
+// 5-byte one disagree about every .idx row and reject each other's .vif, and
+// the mixed Go/Rust suites run both at once.
+func goBuildTags() []string {
+	if types.OffsetSize == 5 {
+		return []string{"-tags", "5BytesOffset"}
+	}
+	return nil
+}
+
 const (
 	defaultWaitTimeout    = 30 * time.Second
 	defaultWaitTick       = 200 * time.Millisecond
@@ -422,11 +433,8 @@ func FindOrBuildWeedBinary() (string, error) {
 		}
 		binPath := filepath.Join(binDir, "weed")
 
-		args := []string{"build", "-o", binPath}
-		if types.OffsetSize == 5 {
-			args = append(args, "-tags", "5BytesOffset")
-		}
-		args = append(args, ".")
+		args := append([]string{"build"}, goBuildTags()...)
+		args = append(args, "-o", binPath, ".")
 		cmd := exec.Command("go", args...)
 		cmd.Dir = filepath.Join(repoRoot, "weed")
 		var out bytes.Buffer

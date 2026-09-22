@@ -8,7 +8,6 @@ import (
 	"syscall"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
-	sys "golang.org/x/sys/unix"
 )
 
 const (
@@ -123,11 +122,11 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 	}
 	_, exists := entry.Extended[XATTR_PREFIX+attr]
 	switch input.Flags {
-	case sys.XATTR_CREATE:
+	case xattr_CREATE:
 		if exists {
 			return fuse.Status(syscall.EEXIST)
 		}
-	case sys.XATTR_REPLACE:
+	case xattr_REPLACE:
 		if !exists {
 			return fuse.ENODATA
 		}
@@ -140,6 +139,11 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 
 	if fh != nil {
 		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(input.NodeId, entry)
 		return fuse.OK
 	}
 
@@ -218,6 +222,11 @@ func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr 
 
 	if fh != nil {
 		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(header.NodeId, entry)
 		return fuse.OK
 	}
 

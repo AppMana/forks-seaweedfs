@@ -29,7 +29,7 @@ func TestVacuumStableLiveDatasetHasBoundedGrowth(t *testing.T) {
 					n := newEmptyNeedle(id)
 					n.Data = bytes.Repeat([]byte{value}, 4096)
 					n.Checksum = needle.NewCRC(n.Data)
-					if _, _, _, err := v.writeNeedle2(n, true, false); err != nil {
+					if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
 						t.Fatal(err)
 					}
 					if id <= 16 {

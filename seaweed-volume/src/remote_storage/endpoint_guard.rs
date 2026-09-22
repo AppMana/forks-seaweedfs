@@ -17,7 +17,7 @@
 //! narrow TOCTOU window (a hostname that resolves to a public IP here and then
 //! flips to a blocked one when the SDK dials) remains as a follow-up.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// AWS/Azure/GCP IPv4 instance-metadata-service (IMDS) address. It is
 /// link-local and thus already covered by [`is_link_local`], but is named
@@ -74,9 +74,52 @@ fn is_cgnat(ip: IpAddr) -> bool {
     }
 }
 
+/// Returns the IPv4 address carried by an IPv6 transition address -- NAT64
+/// 64:ff9b::/96 (RFC 6052), 6to4 2002::/16 (RFC 3056), Teredo 2001:0000::/32
+/// (RFC 4380), and the deprecated IPv4-compatible ::/96 (RFC 4291) -- or None
+/// when it is not one of those. IPv4-mapped ::ffff:0:0/96 is excluded; it is
+/// already normalized via `to_ipv4_mapped`.
+fn embedded_transition_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = v6.octets();
+    if o[0] == 0x00
+        && o[1] == 0x64
+        && o[2] == 0xff
+        && o[3] == 0x9b
+        && o[4..12].iter().all(|&b| b == 0)
+    {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    if o[0] == 0x20 && o[1] == 0x02 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && o[3] == 0x00 {
+        // Teredo obfuscates the client IPv4 as its ones' complement.
+        return Some(Ipv4Addr::new(
+            o[12] ^ 0xff,
+            o[13] ^ 0xff,
+            o[14] ^ 0xff,
+            o[15] ^ 0xff,
+        ));
+    }
+    if o[..12].iter().all(|&b| b == 0) {
+        // IPv4-compatible ::a.b.c.d; :: and ::1 are already handled by the
+        // unspecified / loopback checks before extraction runs.
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    None
+}
+
 /// Returns an error if `ip` is not safe to dial from a server that can reach
 /// cluster-internal hosts. Mirrors Go's `checkBlockedIP`.
 pub fn check_blocked_ip(endpoint: &str, ip: IpAddr) -> Result<(), String> {
+    check_blocked_ip_policy(endpoint, ip, false)
+}
+
+/// Like [`check_blocked_ip`], but `allow_private` keeps RFC 1918 / CGNAT
+/// reachable for callers whose target legitimately sits on an internal network
+/// (peer volume servers), while still blocking loopback, link-local (IMDS) and
+/// unspecified. Mirrors Go's `checkBlockedIPPolicy`.
+pub fn check_blocked_ip_policy(endpoint: &str, ip: IpAddr, allow_private: bool) -> Result<(), String> {
     // Normalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to its IPv4 form so the
     // IPv4 deny rules apply. The OS routes these to the embedded IPv4 address,
     // so without this `::ffff:127.0.0.1` / `::ffff:169.254.169.254` would slip
@@ -112,17 +155,28 @@ pub fn check_blocked_ip(endpoint: &str, ip: IpAddr) -> Result<(), String> {
             endpoint, ip
         ));
     }
-    if is_private(ip) {
-        return Err(format!(
-            "remote endpoint {:?} resolves to private address {}",
-            endpoint, ip
-        ));
+    if !allow_private {
+        if is_private(ip) {
+            return Err(format!(
+                "remote endpoint {:?} resolves to private address {}",
+                endpoint, ip
+            ));
+        }
+        if is_cgnat(ip) {
+            return Err(format!(
+                "remote endpoint {:?} resolves to CGNAT address {}",
+                endpoint, ip
+            ));
+        }
     }
-    if is_cgnat(ip) {
-        return Err(format!(
-            "remote endpoint {:?} resolves to CGNAT address {}",
-            endpoint, ip
-        ));
+    // IPv6 transition addresses embed an IPv4 destination that routes to the
+    // same host wherever the matching relay exists (common in IPv6-only cloud).
+    // to_ipv4_mapped above only covers ::ffff: mapped addresses, so pull the
+    // embedded IPv4 out of the other forms and re-check it against the rules.
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = embedded_transition_ipv4(v6) {
+            return check_blocked_ip_policy(endpoint, IpAddr::V4(v4), allow_private);
+        }
     }
     Ok(())
 }
@@ -243,6 +297,59 @@ pub async fn validate_remote_endpoint(endpoint: &str) -> Result<(), String> {
     }
 }
 
+/// Returns an error if `target` could redirect a replica upload away from a peer
+/// volume server. The target must be a bare `host:port` -- a scheme, userinfo,
+/// path, query or fragment can smuggle a different destination into the
+/// formatted upload URL -- whose host is not loopback, link-local (IMDS) or
+/// unspecified. Cluster peers legitimately sit on private networks, so RFC 1918
+/// / CGNAT are allowed. Mirrors Go's `validateReplicaTarget`.
+pub async fn validate_replica_target(target: &str) -> Result<(), String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("replica target is empty".to_string());
+    }
+    if trimmed.contains("://") || trimmed.contains(['/', '?', '#', '@', '\\']) {
+        return Err(format!("replica target {:?} must be a bare host:port", target));
+    }
+
+    // Require an explicit host:port, handling `[IPv6]:port`. A bracketless IPv6
+    // literal (which carries its own colons) is rejected; peers are addressed as
+    // `[ipv6]:port`, matching Go's net.SplitHostPort.
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, port)) if port.starts_with(':') && port.len() > 1 => h,
+            _ => return Err(format!("replica target {:?} must be a bare host:port", target)),
+        }
+    } else {
+        match trimmed.rsplit_once(':') {
+            Some((h, port)) if !port.is_empty() && !h.contains(':') => h,
+            _ => return Err(format!("replica target {:?} must be a bare host:port", target)),
+        }
+    };
+
+    if host.is_empty() {
+        return Err(format!("replica target {:?} has no host", target));
+    }
+    if is_blocked_imds_host(&host.to_ascii_lowercase()) {
+        return Err(format!(
+            "replica target {:?} targets instance metadata service",
+            target
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return check_blocked_ip_policy(target, ip, true);
+    }
+
+    let addrs = resolve_host(host).await?;
+    if addrs.is_empty() {
+        return Err(format!("resolve replica target host {:?}: no addresses", host));
+    }
+    for ip in addrs {
+        check_blocked_ip_policy(target, ip, true)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +441,49 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ipv6_transition_addresses() {
+        // Every transition form encoding an internal IPv4 must be blocked.
+        assert!(
+            check_blocked_ip("e", ip("64:ff9b::a9fe:a9fe")) // NAT64 -> IMDS
+                .unwrap_err()
+                .contains("metadata")
+        );
+        assert!(
+            check_blocked_ip("e", ip("64:ff9b::7f00:1")) // NAT64 -> loopback
+                .unwrap_err()
+                .contains("loopback")
+        );
+        assert!(
+            check_blocked_ip("e", ip("2002:a00:1::")) // 6to4 -> 10.0.0.1
+                .unwrap_err()
+                .contains("private")
+        );
+        assert!(
+            check_blocked_ip("e", ip("2001:0:4136:e378:8000:63bf:80ff:fffe")) // Teredo -> loopback
+                .unwrap_err()
+                .contains("loopback")
+        );
+        assert!(
+            check_blocked_ip("e", ip("::7f00:1")) // IPv4-compatible -> loopback
+                .unwrap_err()
+                .contains("loopback")
+        );
+        // A NAT64 address outside the 64:ff9b::/96 well-known prefix is not
+        // decoded (its embedded IPv4 lives elsewhere), so it is left as-is.
+        assert!(check_blocked_ip("e", ip("64:ff9b:1::a9fe:a9fe")).is_ok());
+        // Every transition form embedding a public IPv4 (8.8.8.8) still passes:
+        // NAT64, 6to4, Teredo, IPv4-compatible.
+        assert!(check_blocked_ip("e", ip("64:ff9b::808:808")).is_ok());
+        assert!(check_blocked_ip("e", ip("2002:808:808::")).is_ok());
+        assert!(check_blocked_ip("e", ip("2001::f7f7:f7f7")).is_ok());
+        assert!(check_blocked_ip("e", ip("::808:808")).is_ok());
+        // Bracketed transition literal via the full endpoint path.
+        assert!(precheck_endpoint("http://[64:ff9b::a9fe:a9fe]/")
+            .unwrap_err()
+            .contains("metadata"));
+    }
+
+    #[test]
     fn rejects_ipv4_mapped_ipv6() {
         // IPv4-mapped IPv6 must be unmapped so the IPv4 rules catch it.
         assert!(check_blocked_ip("e", ip("::ffff:127.0.0.1"))
@@ -355,5 +505,72 @@ mod tests {
         assert!(precheck_endpoint("http://[::ffff:127.0.0.1]/")
             .unwrap_err()
             .contains("loopback"));
+    }
+
+    #[test]
+    fn check_blocked_ip_policy_allows_private_peers() {
+        // The replica leg targets peer volume servers, which may be private.
+        assert!(check_blocked_ip_policy("e", ip("10.0.0.7"), true).is_ok());
+        assert!(check_blocked_ip_policy("e", ip("192.168.1.5"), true).is_ok());
+        assert!(check_blocked_ip_policy("e", ip("100.64.0.42"), true).is_ok());
+        // Loopback / IMDS / unspecified stay blocked even when private is allowed.
+        assert!(check_blocked_ip_policy("e", ip("127.0.0.1"), true)
+            .unwrap_err()
+            .contains("loopback"));
+        assert!(check_blocked_ip_policy("e", ip("169.254.169.254"), true)
+            .unwrap_err()
+            .contains("metadata"));
+        assert!(check_blocked_ip_policy("e", ip("0.0.0.0"), true)
+            .unwrap_err()
+            .contains("unspecified"));
+    }
+
+    #[tokio::test]
+    async fn validate_replica_target_rejects_and_allows() {
+        // A path plus a trailing ?a= would otherwise swallow ?type=replicate.
+        assert!(validate_replica_target("127.0.0.1:7000/status/x/?a=")
+            .await
+            .unwrap_err()
+            .contains("bare host:port"));
+        assert!(validate_replica_target("http://10.0.0.7:8080")
+            .await
+            .unwrap_err()
+            .contains("bare host:port"));
+        assert!(validate_replica_target("user@10.0.0.7:8080")
+            .await
+            .unwrap_err()
+            .contains("bare host:port"));
+        assert!(validate_replica_target("10.0.0.7")
+            .await
+            .unwrap_err()
+            .contains("bare host:port"));
+        assert!(validate_replica_target("peer.example.com")
+            .await
+            .unwrap_err()
+            .contains("bare host:port"));
+        assert!(validate_replica_target("127.0.0.1:8080")
+            .await
+            .unwrap_err()
+            .contains("loopback"));
+        assert!(validate_replica_target("[::1]:8080")
+            .await
+            .unwrap_err()
+            .contains("loopback"));
+        assert!(validate_replica_target("169.254.169.254:80")
+            .await
+            .unwrap_err()
+            .contains("metadata"));
+        assert!(validate_replica_target("metadata:80")
+            .await
+            .unwrap_err()
+            .contains("metadata"));
+        assert!(validate_replica_target("")
+            .await
+            .unwrap_err()
+            .contains("empty"));
+        // Legitimate peer volume servers on private networks pass.
+        assert!(validate_replica_target("10.0.0.7:8080").await.is_ok());
+        assert!(validate_replica_target("192.168.1.5:8080").await.is_ok());
+        assert!(validate_replica_target("[fd00::1]:8080").await.is_ok());
     }
 }

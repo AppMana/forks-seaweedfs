@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 
 use crate::storage::types::*;
+use crate::storage::volume_open::open_volume_file;
 
 pub const DATA_SHARDS_COUNT: usize = 10;
 pub const PARITY_SHARDS_COUNT: usize = 4;
@@ -50,7 +51,7 @@ impl EcVolumeShard {
     /// Open the shard file for reading.
     pub fn open(&mut self) -> io::Result<()> {
         let path = self.file_name();
-        let file = File::open(&path)?;
+        let file = open_volume_file(OpenOptions::new().read(true), &path)?;
         self.ecd_file_size = file.metadata()?.len() as i64;
         self.ecd_file = Some(file);
         Ok(())
@@ -59,12 +60,14 @@ impl EcVolumeShard {
     /// Create the shard file for writing.
     pub fn create(&mut self) -> io::Result<()> {
         let path = self.file_name();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let file = open_volume_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true),
+            &path,
+        )?;
         self.ecd_file = Some(file);
         self.ecd_file_size = 0;
         Ok(())
@@ -107,6 +110,21 @@ impl EcVolumeShard {
 
     pub fn file_size(&self) -> i64 {
         self.ecd_file_size
+    }
+
+    /// A duplicate of the mounted shard handle, for a reader that has to
+    /// outlive the store guard.
+    ///
+    /// This is the same descriptor `read_at` serves from, so it carries the
+    /// `O_NOATIME` from `open_volume_file` and keeps pointing at the shard
+    /// that was mounted, whatever later happens to the path. `dup` shares the
+    /// kernel file offset, which is why every read through it must be
+    /// positional (`read_at`), never seek-based.
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.ecd_file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "shard file not open"))?
+            .try_clone()
     }
 
     /// Protobuf descriptor for this shard. Mirrors Go's ToEcShardInfo.

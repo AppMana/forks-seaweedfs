@@ -40,6 +40,8 @@ type RemoteConf struct {
 	GcsProjectId                    string                 `protobuf:"bytes,12,opt,name=gcs_project_id,json=gcsProjectId,proto3" json:"gcs_project_id,omitempty"`
 	AzureAccountName                string                 `protobuf:"bytes,15,opt,name=azure_account_name,json=azureAccountName,proto3" json:"azure_account_name,omitempty"`
 	AzureAccountKey                 string                 `protobuf:"bytes,16,opt,name=azure_account_key,json=azureAccountKey,proto3" json:"azure_account_key,omitempty"`
+	AzureClientId                   string                 `protobuf:"bytes,17,opt,name=azure_client_id,json=azureClientId,proto3" json:"azure_client_id,omitempty"`
+	AzureEndpoint                   string                 `protobuf:"bytes,18,opt,name=azure_endpoint,json=azureEndpoint,proto3" json:"azure_endpoint,omitempty"`
 	BackblazeKeyId                  string                 `protobuf:"bytes,20,opt,name=backblaze_key_id,json=backblazeKeyId,proto3" json:"backblaze_key_id,omitempty"`
 	BackblazeApplicationKey         string                 `protobuf:"bytes,21,opt,name=backblaze_application_key,json=backblazeApplicationKey,proto3" json:"backblaze_application_key,omitempty"`
 	BackblazeEndpoint               string                 `protobuf:"bytes,22,opt,name=backblaze_endpoint,json=backblazeEndpoint,proto3" json:"backblaze_endpoint,omitempty"`
@@ -197,6 +199,20 @@ func (x *RemoteConf) GetAzureAccountName() string {
 func (x *RemoteConf) GetAzureAccountKey() string {
 	if x != nil {
 		return x.AzureAccountKey
+	}
+	return ""
+}
+
+func (x *RemoteConf) GetAzureClientId() string {
+	if x != nil {
+		return x.AzureClientId
+	}
+	return ""
+}
+
+func (x *RemoteConf) GetAzureEndpoint() string {
+	if x != nil {
+		return x.AzureEndpoint
 	}
 	return ""
 }
@@ -462,6 +478,7 @@ type RemoteStorageLocation struct {
 	Bucket                 string                 `protobuf:"bytes,2,opt,name=bucket,proto3" json:"bucket,omitempty"`
 	Path                   string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
 	ListingCacheTtlSeconds int32                  `protobuf:"varint,4,opt,name=listing_cache_ttl_seconds,json=listingCacheTtlSeconds,proto3" json:"listing_cache_ttl_seconds,omitempty"` // 0 = disabled; >0 enables on-demand directory listing with this TTL in seconds
+	CacheWaitMs            *int32                 `protobuf:"varint,5,opt,name=cache_wait_ms,json=cacheWaitMs,proto3,oneof" json:"cache_wait_ms,omitempty"`                              // unset = size based default; 0 = read straight from the remote without caching
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -524,11 +541,18 @@ func (x *RemoteStorageLocation) GetListingCacheTtlSeconds() int32 {
 	return 0
 }
 
+func (x *RemoteStorageLocation) GetCacheWaitMs() int32 {
+	if x != nil && x.CacheWaitMs != nil {
+		return *x.CacheWaitMs
+	}
+	return 0
+}
+
 var File_remote_proto protoreflect.FileDescriptor
 
 const file_remote_proto_rawDesc = "" +
 	"\n" +
-	"\fremote.proto\x12\tremote_pb\"\x9b\x0e\n" +
+	"\fremote.proto\x12\tremote_pb\"\xea\x0e\n" +
 	"\n" +
 	"RemoteConf\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x12\n" +
@@ -546,7 +570,9 @@ const file_remote_proto_rawDesc = "" +
 	" \x01(\tR\x1fgcsGoogleApplicationCredentials\x12$\n" +
 	"\x0egcs_project_id\x18\f \x01(\tR\fgcsProjectId\x12,\n" +
 	"\x12azure_account_name\x18\x0f \x01(\tR\x10azureAccountName\x12*\n" +
-	"\x11azure_account_key\x18\x10 \x01(\tR\x0fazureAccountKey\x12(\n" +
+	"\x11azure_account_key\x18\x10 \x01(\tR\x0fazureAccountKey\x12&\n" +
+	"\x0fazure_client_id\x18\x11 \x01(\tR\razureClientId\x12%\n" +
+	"\x0eazure_endpoint\x18\x12 \x01(\tR\razureEndpoint\x12(\n" +
 	"\x10backblaze_key_id\x18\x14 \x01(\tR\x0ebackblazeKeyId\x12:\n" +
 	"\x19backblaze_application_key\x18\x15 \x01(\tR\x17backblazeApplicationKey\x12-\n" +
 	"\x12backblaze_endpoint\x18\x16 \x01(\tR\x11backblazeEndpoint\x12)\n" +
@@ -581,12 +607,14 @@ const file_remote_proto_rawDesc = "" +
 	"\x1bprimary_bucket_storage_name\x18\x02 \x01(\tR\x18primaryBucketStorageName\x1a]\n" +
 	"\rMappingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x126\n" +
-	"\x05value\x18\x02 \x01(\v2 .remote_pb.RemoteStorageLocationR\x05value:\x028\x01\"\x92\x01\n" +
+	"\x05value\x18\x02 \x01(\v2 .remote_pb.RemoteStorageLocationR\x05value:\x028\x01\"\xcd\x01\n" +
 	"\x15RemoteStorageLocation\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06bucket\x18\x02 \x01(\tR\x06bucket\x12\x12\n" +
 	"\x04path\x18\x03 \x01(\tR\x04path\x129\n" +
-	"\x19listing_cache_ttl_seconds\x18\x04 \x01(\x05R\x16listingCacheTtlSecondsBP\n" +
+	"\x19listing_cache_ttl_seconds\x18\x04 \x01(\x05R\x16listingCacheTtlSeconds\x12'\n" +
+	"\rcache_wait_ms\x18\x05 \x01(\x05H\x00R\vcacheWaitMs\x88\x01\x01B\x10\n" +
+	"\x0e_cache_wait_msBP\n" +
 	"\x10seaweedfs.clientB\n" +
 	"FilerProtoZ0github.com/seaweedfs/seaweedfs/weed/pb/remote_pbb\x06proto3"
 
@@ -624,6 +652,7 @@ func file_remote_proto_init() {
 	if File_remote_proto != nil {
 		return
 	}
+	file_remote_proto_msgTypes[2].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

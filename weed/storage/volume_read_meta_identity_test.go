@@ -19,7 +19,7 @@ func TestReadNeedleMetaRejectsDifferentNeedleAtCopiedOffset(t *testing.T) {
 		n := newEmptyNeedle(id)
 		n.Data = []byte("identical size, different identity")
 		n.Checksum = needle.NewCRC(n.Data)
-		if _, _, _, err := v.writeNeedle2(n, true, false); err != nil {
+		if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
 			t.Fatal(err)
 		}
 	}

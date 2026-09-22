@@ -225,7 +225,7 @@ func newCreateTestWFSWithRoot(t *testing.T, mountRoot string) (*WFS, *createEntr
 		func(path util.FullPath) bool {
 			return wfs.inodeToPath.IsChildrenCached(path)
 		},
-		func(util.FullPath, *filer_pb.Entry) {},
+		func(meta_cache.EntryInvalidation) {},
 		nil,
 	)
 	wfs.inodeToPath.MarkChildrenCached(root)
@@ -433,7 +433,7 @@ func TestLookupDeferredCreateSurvivesMetadataCacheEviction(t *testing.T) {
 		t.Fatalf("evict parent metadata cache: %v", err)
 	}
 
-	entry, status := wfs.lookupEntry(fullPath)
+	entry, _, status := wfs.lookupEntry(fullPath)
 	if status != fuse.OK {
 		t.Fatalf("lookup after metadata cache eviction = %v, want OK", status)
 	}
@@ -566,7 +566,7 @@ func TestTruncateEntryClearsDirtyPagesForOpenHandle(t *testing.T) {
 		},
 	}
 
-	fh := wfs.fhMap.AcquireFileHandle(wfs, inode, entry)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, entry, 0, 0)
 	fh.RememberPath(fullPath)
 
 	if err := fh.dirtyPages.AddPage(0, []byte("hello"), true, time.Now().UnixNano()); err != nil {
@@ -614,7 +614,7 @@ func TestAccessChecksPermissions(t *testing.T) {
 
 	fullPath := util.FullPath("/visible.txt")
 	inode := wfs.inodeToPath.Lookup(fullPath, 1, false, false, 0, true)
-	handle := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{
+	handle, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{
 		Name: "visible.txt",
 		Attributes: &filer_pb.FuseAttributes{
 			FileMode: 0o640,
@@ -622,7 +622,7 @@ func TestAccessChecksPermissions(t *testing.T) {
 			Gid:      456,
 			Inode:    inode,
 		},
-	})
+	}, 0, 0)
 	handle.RememberPath(fullPath)
 
 	if status := wfs.Access(make(chan struct{}), &fuse.AccessIn{
@@ -763,7 +763,7 @@ func TestCreateExistingFileIgnoresQuotaPreflight(t *testing.T) {
 			Gid:      456,
 		},
 	}
-	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry)); err != nil {
+	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry), 0); err != nil {
 		t.Fatalf("InsertEntry: %v", err)
 	}
 	wfs.inodeToPath.Lookup(util.FullPath("/existing.txt"), entry.Attributes.Crtime, false, false, entry.Attributes.Inode, true)
@@ -822,7 +822,7 @@ func TestAcquireHandleHonorsDefaultPermissions(t *testing.T) {
 					Gid:      456,
 				},
 			}
-			if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry)); err != nil {
+			if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry), 0); err != nil {
 				t.Fatalf("InsertEntry: %v", err)
 			}
 			inode := wfs.inodeToPath.Lookup(util.FullPath("/secret.txt"), entry.Attributes.Crtime, false, false, entry.Attributes.Inode, true)

@@ -8,11 +8,49 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
+
+func TestStreamCopyChunkRangeHonorsAssignedDurability(t *testing.T) {
+	for _, durable := range []bool{false, true} {
+		t.Run(strconv.FormatBool(durable), func(t *testing.T) {
+			payload := []byte("durable streamed copy")
+			src := newStreamSrc(t, payload, false, true)
+			defer src.Close()
+			requested := make(chan string, 1)
+			dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requested <- r.URL.Query().Get("fsync")
+				_, _ = io.Copy(io.Discard, r.Body)
+				if durable {
+					http.Error(w, "injected disk sync failure", http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusCreated)
+			}))
+			defer dst.Close()
+			assignment := assignTo(t, dst)
+			assignment.Fsync = durable
+			err := (&S3ApiServer{}).streamCopyChunkRange(context.Background(), src.URL, "7,src", 0, int64(len(payload)), true, assignment)
+			want := ""
+			if durable {
+				want = "true"
+			}
+			if got := <-requested; got != want {
+				t.Errorf("destination fsync=%q, want %q", got, want)
+			}
+			if durable && (err == nil || !strings.Contains(err.Error(), "500")) {
+				t.Fatalf("sync failure must fail the copy: %v", err)
+			}
+			if !durable && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 // The destination POST of a streamed chunk copy must carry an exact
 // Content-Length. A volume server that receives a chunked upload has no

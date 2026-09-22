@@ -282,6 +282,13 @@ and build provenance); these temporary artifacts are not published CI evidence.
 The Windows gate remains **failed**, not partially qualified. Verbosity 1 also
 records failed component resolution, case-fold lookup, and attribute reads to
 localize this earlier failure without retries or successful-path tracing.
+`TestGitLfsDirectoryCanonicalization` additionally exercises Git LFS 3.7.0's
+actual Windows directory `CreateFile` / `GetFinalPathNameByHandle` sequence,
+after config-file replacements and through both original and uppercase paths.
+The native smoke gate requires this test as well as the object-rename test;
+cross-compilation alone does not qualify either. The adapter currently lacks
+the optional cgofuse `Getpath` callback, a hypothesis to investigate with this
+probe, not a proven explanation for the intermittent failure.
 Deployment must include both components: the committed-event acknowledgment
 fix runs in the **filer**, while the in-place update correction runs in the
 **mount**. A mount-only upgrade leaves old filer rename replies unchanged.

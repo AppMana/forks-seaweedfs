@@ -345,11 +345,12 @@ try {
     if ($TestCase -eq 'GitLfsTempMetadata') {
         Invoke-GitLfsTempMetadataTest $mnt
         if ($failures -eq 0 -and $WinFspTestExe) {
-            $nativeOutput = & $WinFspTestExe "-mountpoint=$mnt" '-test.run=^TestGitLfsObjectRename$' '-test.v' '-test.count=1' '-test.timeout=4m' 2>&1
+            $nativeOutput = & $WinFspTestExe "-mountpoint=$mnt" '-test.run=^TestGitLfs(ObjectRename|DirectoryCanonicalization)$' '-test.v' '-test.count=1' '-test.timeout=4m' 2>&1
             $nativeExit = $LASTEXITCODE
             $nativeOutput | ForEach-Object { Write-Host $_ }
             $nativeText = $nativeOutput | Out-String
             Assert ($nativeExit -eq 0 -and $nativeText -match '--- PASS: TestGitLfsObjectRename ' -and $nativeText -notmatch '--- SKIP:') 'native Git LFS object rename reproducer completes without skips'
+            Assert ($nativeExit -eq 0 -and $nativeText -match '--- PASS: TestGitLfsDirectoryCanonicalization ' -and $nativeText -notmatch '--- SKIP:') 'native Git LFS directory canonicalization completes without skips'
         }
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }

@@ -270,6 +270,15 @@ Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
 It is a component-isolation experiment, not the full Windows qualification gate.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
+For a lab-only comparison of WinFsp's user-mode and driver-side registration,
+set `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD=1` with this isolated scenario.
+The runner sets and verifies `MountUseMountmgrFromFSD` in the fresh VM before
+starting the unchanged probe. Other values and non-isolated scenarios are
+rejected. This is a diagnostic intervention, not a recommended deployment
+setting or a replacement qualification gate. With the variable unset the
+runner leaves the WinFsp default unchanged. `provenance.txt` retains the input
+artifact hashes, image reference, and selected experimental mode alongside
+the test results; the dependency transcript records the applied registry value.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

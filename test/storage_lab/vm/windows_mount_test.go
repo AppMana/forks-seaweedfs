@@ -54,6 +54,10 @@ func TestWindowsMountLab(t *testing.T) {
 		verbosity = value
 	}
 	isolateMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle"
+	registrationMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD")
+	if registrationMode != "" && (registrationMode != "1" || !isolateMountManager) {
+		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD=1 is only supported by the isolated mount-manager experiment")
+	}
 	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
 	if !isolateMountManager {
 		inputs[`C:\lab\weed.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_WEED")
@@ -74,6 +78,8 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal("mount-manager isolation test requires SEAWEEDFS_WINDOWS_WINFSP_TEST")
 	}
 	artifacts := map[string][]byte{}
+	var provenance strings.Builder
+	fmt.Fprintf(&provenance, "mount_manager_from_fsd=%q\n", registrationMode)
 	for target, path := range inputs {
 		if path == "" {
 			t.Fatalf("missing input for %s", target)
@@ -84,10 +90,15 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 		artifacts[target] = b
 		t.Logf("artifact=%s sha256=%s", target, sha(b))
+		fmt.Fprintf(&provenance, "artifact=%s sha256=%s\n", target, sha(b))
 	}
 	img := os.Getenv("LABCONTAINERS_WINDOWS_IMAGE")
 	if img == "" {
 		t.Fatal("LABCONTAINERS_WINDOWS_IMAGE required")
+	}
+	fmt.Fprintf(&provenance, "image=%s\n", img)
+	if err := os.WriteFile(filepath.Join(resultDir, "provenance.txt"), []byte(provenance.String()), 0600); err != nil {
+		t.Fatal(err)
 	}
 	// Readiness (10m), installation (5m), and two scenarios (8m each),
 	// plus staging overhead. Leave the outer Go timeout room for cleanup.
@@ -135,6 +146,22 @@ $p=Start-Process msiexec.exe -ArgumentList '/i','C:\lab\winfsp.msi','/qn','/nore
 Write-Output "SETUP $(Get-Date -Format o): WinFsp install exit $($p.ExitCode)";
 if($p.ExitCode -notin @(0,3010)){throw "WinFsp installer exit $($p.ExitCode)"};
 if(-not(Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)){throw 'WinFsp service absent'}`
+	if registrationMode == "1" {
+		// Diagnostic intervention in this disposable VM only. Never select
+		// this registration path silently for normal qualification runs.
+		setup += `; $key='HKLM:\SOFTWARE\WOW6432Node\WinFsp';
+if(-not(Test-Path -LiteralPath $key)){throw 'WinFsp registry key absent'};
+New-ItemProperty -LiteralPath $key -Name MountUseMountmgrFromFSD -PropertyType DWord -Value 1 -Force | Out-Null;
+$mode=Get-ItemPropertyValue -LiteralPath $key -Name MountUseMountmgrFromFSD;
+if($mode -ne 1){throw 'WinFsp registration mode was not applied'};
+Write-Output "EXPERIMENT: MountUseMountmgrFromFSD=$mode"`
+	}
+	if isolateMountManager && registrationMode == "" {
+		setup += `; $settings=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\WinFsp';
+$property=$settings.PSObject.Properties['MountUseMountmgrFromFSD'];
+if($null -eq $property){Write-Output 'CONTROL: MountUseMountmgrFromFSD absent (default 0)'}
+else {if($property.Value -ne 0){throw 'Control image has non-default MountUseMountmgrFromFSD'}; Write-Output "CONTROL: MountUseMountmgrFromFSD=$($property.Value)"}`
+	}
 	if !isolateMountManager {
 		setup += `; Write-Output "SETUP $(Get-Date -Format o): Git install starting";
 $p=Start-Process 'C:\lab\git-installer.exe' -ArgumentList '/VERYSILENT','/NORESTART','/SP-','/SUPPRESSMSGBOXES' -Wait -PassThru;

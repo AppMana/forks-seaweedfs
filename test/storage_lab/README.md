@@ -448,6 +448,16 @@ The first attempt to run that candidate
 (`/tmp/seaweedfs-windows-mount-results-1188166966`) failed during installer
 staging, before the native test ran; it is infrastructure evidence, not a
 candidate RED or GREEN result.
+The subsequent serial candidate run passed all 64 cycles and 16,384 DOS path
+queries (187.76 seconds native), with the same native executable and both
+junction experiment flags disabled. Loaded-module verification confirmed the
+candidate DLL. Results: `/tmp/seaweedfs-windows-mount-results-1769930251`;
+log SHA-256:
+`1c40c5592ca8dc6356ddcc0a44d6665936544a84e84f7dd52bb3bd2dfa665eaa`.
+This is a matched source-build RED/GREEN result, not full qualification:
+repeat stress, real Git LFS workloads, configuration/cleanup coverage and
+release packaging verification remain required before deployment. The native
+test does not run SeaweedFS or Git and cannot establish their data safety.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

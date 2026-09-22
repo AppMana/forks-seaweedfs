@@ -29,6 +29,20 @@ function git {
     }
 }
 
+function mountvol.exe {
+    if ($args.Count -ne 0) { throw 'mountvol must only list mappings' }
+    if (-not $script:commands.Contains($script:failCommand)) { throw 'diagnostics ran before Git failure' }
+    $script:mountDiagnostics++
+    $global:LASTEXITCODE = 0
+}
+function fsutil.exe {
+    if ($args.Count -ne 3 -or $args[0] -ne 'reparsepoint' -or $args[1] -ne 'query' -or $args[2] -ne $caseRoot) {
+        throw 'fsutil must only query the test mount'
+    }
+    $script:mountDiagnostics++
+    $global:LASTEXITCODE = 0
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('weed-smoke-contract-' + [guid]::NewGuid())
 [void][IO.Directory]::CreateDirectory($root)
 try {
@@ -38,6 +52,8 @@ try {
         'add .', 'commit -m seed lfs assets', 'status --short --untracked-files=no',
         'wrong-filter', 'missing-asset', 'success')
     foreach ($case in $cases) {
+        $script:Trace = $true
+        $script:mountDiagnostics = 0
         $script:failures = 0
         $script:GitIterations = 2
         $script:commands = [System.Collections.Generic.List[string]]::new()
@@ -47,6 +63,8 @@ try {
         $caseRoot = Join-Path $root ([guid]::NewGuid().ToString())
         [void][IO.Directory]::CreateDirectory($caseRoot)
         Invoke-GitLfsTempMetadataTest $caseRoot
+        $expectedDiagnostics = if ($case -in @('success', 'wrong-filter', 'missing-asset', 'check-attr filter asset-1.lfs', 'status --short --untracked-files=no')) { 0 } else { 2 }
+        if ($script:mountDiagnostics -ne $expectedDiagnostics) { throw "Incorrect mount diagnostics for $case" }
         if ($case -eq 'success') {
             if ($script:failures -ne 0) { throw 'Healthy scenario rejected' }
             $statusCalls = @($script:commands | Where-Object { $_ -eq 'status --short --untracked-files=no' })

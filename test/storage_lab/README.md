@@ -275,7 +275,15 @@ stage timestamps and exit codes; the failure collector retains its tail when
 the guest agent is responsive. A setup timeout is an infrastructure failure,
 not a reproduced LFS failure or a passing qualification. The first instrumented
 3.7.0 and official 3.8.0 comparisons both timed out during setup before any
-workload ran; neither establishes client-version behavior.
+workload ran; neither establishes client-version behavior. The setup cause was
+subsequently reproduced: Git for Windows hard-links `cmd/git-lfs.exe` to
+`cmd/git.exe`, so overwriting the former corrupted the latter. The lab override
+now unlinks only each installed LFS directory entry before copying, verifies
+all Git executable hashes remain unchanged, and verifies each replacement hash.
+`pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1` reproduces this
+with real hard links (RED before the unlink fix, GREEN afterward) and runs in CI.
+This lab-only setup defect is separate from the original unmodified-client
+filesystem failure; the latter remains unresolved.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

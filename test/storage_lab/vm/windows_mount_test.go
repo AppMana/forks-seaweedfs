@@ -64,6 +64,7 @@ func TestWindowsMountLab(t *testing.T) {
 	}
 	if diagnosticLFS := os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC"); diagnosticLFS != "" {
 		inputs[`C:\lab\git-lfs-diagnostic.exe`] = diagnosticLFS
+		inputs[`C:\lab\install-lab-git-lfs.ps1`] = filepath.Join("..", "..", "..", "hack", "appmana", "install-lab-git-lfs.ps1")
 	}
 	if nativeTest := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST"); nativeTest != "" {
 		inputs[`C:\lab\winfsp.test.exe`] = nativeTest
@@ -136,7 +137,7 @@ Write-Output "SETUP $(Get-Date -Format o): Git install exit $($p.ExitCode)";
 if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 & 'C:\Program Files\Git\cmd\git.exe' --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
 	if os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC") != "" {
-		setup += `; $targets=@(Get-ChildItem 'C:\Program Files\Git' -Filter git-lfs.exe -Recurse -File); if($targets.Count -eq 0){throw 'installed Git LFS not found'}; foreach($target in $targets){Copy-Item -LiteralPath C:\lab\git-lfs-diagnostic.exe -Destination $target.FullName -Force}; $env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & git lfs version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
+		setup += `; & C:\lab\install-lab-git-lfs.ps1 -GitRoot 'C:\Program Files\Git' -Candidate C:\lab\git-lfs-diagnostic.exe; $env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & git --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; & git lfs version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
 	}
 	setup += `; Write-Output "SETUP $(Get-Date -Format o): complete"; Stop-Transcript`
 	r, err := n.ExecWithTimeout(ctx, 5*time.Minute, ps, "-NoProfile", "-NonInteractive", "-Command", setup)

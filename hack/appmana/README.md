@@ -16,8 +16,11 @@ contract failures before changing mount implementation code.
   sequence from the full smoke test, then runs `git init`. This is the exact
   reduced workload for the observed stale `config.lock` failure.
 - `GitLfsTempMetadata` repeatedly runs `git status` over modified LFS assets.
-  This exercises Git LFS's create-then-chmod temp-file sequence and catches a
-  deferred create becoming path-invisible after directory metadata eviction.
+  Its seed `git add` exercises Git LFS's temp-file sequence. Status can use
+  cached metadata, so successful status iterations alone do not prove repeated
+  object renames. Supply `-WinFspTestExe` (compiled from `./test/winfsp`) to also
+  run `TestGitLfsObjectRename`: explicit create/chmod/write/close/fan-out mkdir/
+  rename operations with no retries, and byte-for-byte final object checks.
 
 ```powershell
 ./hack/appmana/mount-smoke.ps1 `

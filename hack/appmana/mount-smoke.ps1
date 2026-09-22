@@ -10,6 +10,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [string]$ServerWeedExe,
+    [string]$WinFspTestExe,
     [string]$WorkRoot,
     [int]$LargeFileMB = 100,
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
@@ -116,7 +117,7 @@ function Invoke-GitLfsTempMetadataTest([string]$mnt) {
         if ($statusExitCode -ne 0) {
             Write-Host ($statusOutputLines | Out-String) -ForegroundColor Red
         }
-        Assert ($statusExitCode -eq 0) "Git LFS status iteration $iteration can chmod newly-created filter temp files"
+        Assert ($statusExitCode -eq 0) "Git LFS status iteration $iteration completes successfully"
         if ($statusExitCode -ne 0) { break }
         $modifiedPaths = @($statusOutputLines | Where-Object { "$_" -match '^ M asset-\d+\.lfs$' })
         Assert ($modifiedPaths.Count -eq 32) "Git LFS status iteration $iteration reports all 32 modified assets"
@@ -343,6 +344,13 @@ try {
 
     if ($TestCase -eq 'GitLfsTempMetadata') {
         Invoke-GitLfsTempMetadataTest $mnt
+        if ($failures -eq 0 -and $WinFspTestExe) {
+            $nativeOutput = & $WinFspTestExe "-mountpoint=$mnt" '-test.run=^TestGitLfsObjectRename$' '-test.v' '-test.count=1' '-test.timeout=4m' 2>&1
+            $nativeExit = $LASTEXITCODE
+            $nativeOutput | ForEach-Object { Write-Host $_ }
+            $nativeText = $nativeOutput | Out-String
+            Assert ($nativeExit -eq 0 -and $nativeText -match '--- PASS: TestGitLfsObjectRename ' -and $nativeText -notmatch '--- SKIP:') 'native Git LFS object rename reproducer completes without skips'
+        }
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }
         exit 0

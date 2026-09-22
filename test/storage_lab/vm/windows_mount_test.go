@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,11 +25,29 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("retained results: %s", resultDir)
+	repeats := 1
+	if value := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_REPEATS"); value != "" {
+		repeats, err = strconv.Atoi(value)
+		if err != nil || repeats < 1 || repeats > 20 {
+			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_REPEATS must be 1..20")
+		}
+	}
+	verbosity := "0"
+	if value := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY"); value != "" {
+		v, parseErr := strconv.Atoi(value)
+		if parseErr != nil || v < 0 || v > 4 {
+			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY must be 0..4")
+		}
+		verbosity = value
+	}
 	inputs := map[string]string{
 		`C:\lab\weed.exe`:          os.Getenv("SEAWEEDFS_WINDOWS_WEED"),
 		`C:\lab\winfsp.msi`:        os.Getenv("SEAWEEDFS_WINFSP_MSI"),
 		`C:\lab\git-installer.exe`: os.Getenv("SEAWEEDFS_GIT_INSTALLER"),
 		`C:\lab\mount-smoke.ps1`:   filepath.Join("..", "..", "..", "hack", "appmana", "mount-smoke.ps1"),
+	}
+	if nativeTest := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST"); nativeTest != "" {
+		inputs[`C:\lab\winfsp.test.exe`] = nativeTest
 	}
 	artifacts := map[string][]byte{}
 	for target, path := range inputs {
@@ -70,7 +89,17 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := lab.Node("vm")
+	t.Log("Windows ready; staging offline inputs")
+	defer func() {
+		diagnosticCtx, stop := context.WithTimeout(context.Background(), time.Minute)
+		defer stop()
+		logs, logErr := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\smoke-*\logs\* -File -ErrorAction SilentlyContinue | ForEach-Object { Write-Output ("FILE: " + $_.FullName); Get-Content -LiteralPath $_.FullName -Tail 2000 }`)
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "guest-logs.txt"), []byte(fmt.Sprintf("collection error: %v\nexit: %d\n%s\n%s", logErr, logs.GetExitCode(), logs.GetStdout(), logs.GetStderr())), 0600); writeErr != nil {
+			t.Error(writeErr)
+		}
+	}()
 	for target, b := range artifacts {
+		t.Logf("staging %s (%d bytes)", target, len(b))
 		if err := n.Put(ctx, target, 0600, b); err != nil {
 			t.Fatal(err)
 		}
@@ -90,41 +119,50 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	if r.GetExitCode() != 0 {
 		t.Fatalf("dependency installation exit %d", r.GetExitCode())
 	}
-	for _, scenario := range []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"} {
-		guestLog := `C:\lab\` + scenario + `.log`
-		command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + scenario + ` -TestCase ` + scenario + ` -GitIterations 20 *>&1 | Tee-Object -FilePath ` + guestLog + `; exit $LASTEXITCODE`
-		r, err := n.ExecWithTimeout(ctx, 8*time.Minute, ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command)
-		if err != nil {
-			// Use a separate bounded context to salvage diagnostics even when the
-			// scenario context expired. The RPC error remains a test failure.
-			diagnosticCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
-			partial, readErr := n.ExecWithTimeout(diagnosticCtx, 25*time.Second, ps, "-NoProfile", "-Command", "Get-Content -LiteralPath '"+guestLog+"' -ErrorAction Stop")
-			stop()
-			log := fmt.Sprintf("execution error: %v\ndiagnostic error: %v\ndiagnostic exit: %d\n%s\n%s", err, readErr, partial.GetExitCode(), partial.GetStdout(), partial.GetStderr())
-			if writeErr := os.WriteFile(filepath.Join(resultDir, scenario+".log"), []byte(log), 0600); writeErr != nil {
-				t.Error(writeErr)
+	for repetition := 1; repetition <= repeats; repetition++ {
+		for _, scenario := range []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"} {
+			caseName := fmt.Sprintf("%s-%02d", scenario, repetition)
+			guestLog := `C:\lab\` + caseName + `.log`
+			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; exit $LASTEXITCODE`
+			if os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") != "" {
+				command = strings.Replace(command, " -TestCase ", ` -WinFspTestExe C:\lab\winfsp.test.exe -TestCase `, 1)
 			}
-			t.Fatal(log)
-		}
-		output := string(r.GetStdout()) + string(r.GetStderr())
-		if err := os.WriteFile(filepath.Join(resultDir, scenario+".log"), []byte(output), 0600); err != nil {
-			t.Fatal(err)
-		}
-		t.Log(output)
-		if r.GetExitCode() != 0 || strings.Contains(output, "FAIL:") {
-			t.Fatalf("%s failed: exit %d", scenario, r.GetExitCode())
-		}
-		marker := "PASS: git init iteration 20 leaves no stale config.lock"
-		if scenario == "GitLfsTempMetadata" {
-			marker = "PASS: Git LFS status iteration 20 reports all 32 modified assets"
-			for _, required := range []string{"PASS: Git LFS filter is active", "PASS: Git LFS seed commit succeeds"} {
-				if !strings.Contains(output, required) {
-					t.Fatalf("%s missing prerequisite evidence: %s", scenario, required)
+			r, err := n.ExecWithTimeout(ctx, 8*time.Minute, ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command)
+			if err != nil {
+				// Use a separate bounded context to salvage diagnostics even when the
+				// scenario context expired. The RPC error remains a test failure.
+				diagnosticCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+				partial, readErr := n.ExecWithTimeout(diagnosticCtx, 25*time.Second, ps, "-NoProfile", "-Command", "Get-Content -LiteralPath '"+guestLog+"' -ErrorAction Stop")
+				stop()
+				log := fmt.Sprintf("execution error: %v\ndiagnostic error: %v\ndiagnostic exit: %d\n%s\n%s", err, readErr, partial.GetExitCode(), partial.GetStdout(), partial.GetStderr())
+				if writeErr := os.WriteFile(filepath.Join(resultDir, caseName+".log"), []byte(log), 0600); writeErr != nil {
+					t.Error(writeErr)
+				}
+				t.Fatal(log)
+			}
+			output := string(r.GetStdout()) + string(r.GetStderr())
+			if err := os.WriteFile(filepath.Join(resultDir, caseName+".log"), []byte(output), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Log(output)
+			if r.GetExitCode() != 0 || strings.Contains(output, "FAIL:") {
+				t.Fatalf("%s failed: exit %d", scenario, r.GetExitCode())
+			}
+			marker := "PASS: git init iteration 20 leaves no stale config.lock"
+			if scenario == "GitLfsTempMetadata" {
+				marker = "PASS: Git LFS status iteration 20 reports all 32 modified assets"
+				for _, required := range []string{"PASS: Git LFS filter is active", "PASS: Git LFS seed commit succeeds"} {
+					if !strings.Contains(output, required) {
+						t.Fatalf("%s missing prerequisite evidence: %s", scenario, required)
+					}
 				}
 			}
-		}
-		if !strings.Contains(output, marker) {
-			t.Fatalf("%s did not complete all required iterations", scenario)
+			if !strings.Contains(output, marker) {
+				t.Fatalf("%s did not complete all required iterations", scenario)
+			}
+			if scenario == "GitLfsTempMetadata" && os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") != "" && !strings.Contains(output, "PASS: native Git LFS object rename reproducer completes without skips") {
+				t.Fatal("native object-rename regression did not complete")
+			}
 		}
 	}
 }

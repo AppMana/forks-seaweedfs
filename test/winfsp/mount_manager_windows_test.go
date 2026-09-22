@@ -113,7 +113,10 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 				if _, err := os.Stat(filepath.Join(windows.UTF16ToString(buf), sentinel)); err != nil {
 					t.Fatalf("returned DOS path inaccessible: %v", err)
 				}
-				time.Sleep(2 * time.Millisecond)
+				// Observe delayed mount-manager state changes as well as initial
+				// registration. Every lookup is still single-shot: the interval
+				// must never turn a failed lookup into a retry-and-pass.
+				time.Sleep(10 * time.Millisecond)
 			}
 			t.Logf("cycle=%d: 256 DOS-path queries succeeded", cycle)
 		}()

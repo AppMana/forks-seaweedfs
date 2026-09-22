@@ -297,10 +297,11 @@ Windows `test/winfsp` executable and select
 runner needs only the WinFsp MSI and native executable, installs WinFsp and
 executes `TestMountManagerDirectoryLifecycle`: 64 minimal cgofuse directory
 mounts, each checked 256 times for a DOS canonical path that reaches that
-cycle's unique virtual sentinel. Readiness also requires the sentinel, so an
-underlying NTFS directory cannot satisfy the test. The first failed query fails
-the test; alternative path
-flags and mount listings are diagnostic only. This mode never starts weed or
+cycle's unique virtual sentinel. Queries are separated by 10 ms to observe
+delayed registration changes over at least 2.56 seconds per mount. Readiness
+also requires the sentinel, so an underlying NTFS directory cannot satisfy the
+test. The first failed query fails the test; alternative path flags and mount
+listings are diagnostic only. This mode never starts weed or
 Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
 It is a component-isolation experiment, not the full Windows qualification gate.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
@@ -364,6 +365,19 @@ qualification gate, and is not evidence that the intermittent defect is fixed:
 the Windows canonicalization function is unchanged between these LFS releases,
 and older clients have also passed multiple cycles. Continue untraced stress
 and root-cause verification; do not substitute this result for deployment gates.
+The subsequent untraced 20-cycle attempt with that same official 3.8.0 executable
+failed on cycle 6 during `lfs install --local` after five successful cycles
+(`/tmp/seaweedfs-windows-mount-results-2039409665`, 408 seconds total).
+The error was again `error converting ".git" to absolute: The system cannot
+find the path specified.` The failure-only listing showed a WinFsp GUID volume
+with no mount points and an intact lab junction targeting an NT device volume.
+This unmodified client does not emit the same-handle GUID/NT probes, so those
+details remain evidence from the earlier diagnostic-client runs, not this run.
+The cycle-6 log SHA-256 is
+`ef9e50bbd175439a6dc17896f797c48bc0344a740288d86c8e66961ce13b4ab3`;
+the retained guest-log SHA-256 is
+`4f05bd871d38de7841c86d61010ec21587146c2b3d692b7cb9c43deacd26ae02`.
+Upgrading Git LFS to 3.8.0 alone therefore does not resolve this blocker.
 The optional native executable adds 512 create/chmod/write/close/mkdir/rename
 transactions per pair, including uppercase `.GIT` paths and exact final object
 content checks. The Actions gate builds and requires this executable, runs five

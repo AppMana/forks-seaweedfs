@@ -246,7 +246,7 @@ Windows Performance Analyzer's File I/O tables and correlate process, path,
 operation, timestamp, and status with the WinFsp/SeaweedFS logs. Memory mode
 retains a bounded recent window; inspect trace loss before claiming complete
 history. Debug logging changes scheduling, so preserve untraced failures too.
-On a failed Git prerequisite, traced runs also retain read-only `mountvol`
+On a failed Git prerequisite, all Windows runs also retain read-only `mountvol`
 and `fsutil reparsepoint query` output before unmounting. These inspect the
 registered DOS paths and junction target; they never create/delete mappings
 or retry the failed Git command. Contract tests verify their ordering and

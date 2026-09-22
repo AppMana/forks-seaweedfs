@@ -254,6 +254,22 @@ all Git executable hashes remain unchanged, and verifies each replacement hash.
 `pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1` reproduces this
 with real hard links and runs in CI.
 
+To isolate the mount layer from both SeaweedFS metadata and Git, build the
+Windows `test/winfsp` executable and select
+`SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle` with
+`SEAWEEDFS_WINDOWS_WINFSP_TEST` pointing to that executable. The existing VM
+runner needs only the WinFsp MSI and native executable, installs WinFsp and
+executes `TestMountManagerDirectoryLifecycle`: 64 minimal cgofuse directory
+mounts, each checked 256 times for a DOS canonical path that reaches that
+cycle's unique virtual sentinel. Readiness also requires the sentinel, so an
+underlying NTFS directory cannot satisfy the test. The first failed query fails
+the test; alternative path
+flags and mount listings are diagnostic only. This mode never starts weed or
+Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
+It is a component-isolation experiment, not the full Windows qualification gate.
+The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
+instead of) the regular Windows qualification gate. It defaults off.
+
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of
 that exact source, apply the patch with `git apply`, then build:

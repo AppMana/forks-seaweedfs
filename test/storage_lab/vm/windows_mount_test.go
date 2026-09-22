@@ -62,7 +62,14 @@ func TestWindowsMountLab(t *testing.T) {
 	if guidJunction != "" && ((guidJunction != "1" && guidJunction != "nt-control") || !isolateMountManager || registrationMode != "") {
 		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION must be 1 or nt-control and requires the isolated default-registration experiment")
 	}
+	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
+	if labDLL != "" && (!isolateMountManager || guidJunction != "" || registrationMode != "") {
+		t.Fatal("SEAWEEDFS_WINDOWS_WINFSP_DLL requires the isolated probe without test interventions")
+	}
 	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
+	if labDLL != "" {
+		inputs[`C:\lab\winfsp-x64.dll`] = labDLL
+	}
 	if !isolateMountManager {
 		inputs[`C:\lab\weed.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_WEED")
 		inputs[`C:\lab\git-installer.exe`] = os.Getenv("SEAWEEDFS_GIT_INSTALLER")
@@ -188,6 +195,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	}
 	if isolateMountManager {
 		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^TestMountManagerDirectoryLifecycle$' '-test.v' '-test.count=1' '-test.timeout=5m'`
+		if labDLL != "" {
+			command = `$env:SEAWEEDFS_WINDOWS_EXPECT_WINFSP_DLL='C:\lab\winfsp-x64.dll'; ` + command
+		}
 		if guidJunction == "1" {
 			command += ` '-mount-manager-guid-junction'`
 		} else if guidJunction == "nt-control" {
@@ -199,6 +209,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			t.Fatal(err)
 		}
 		t.Log(output)
+		if labDLL != "" && !strings.Contains(output, "verified loaded lab WinFsp DLL:") {
+			t.Fatal("native probe did not verify the requested lab DLL was loaded")
+		}
 		if runErr != nil || result.GetExitCode() != 0 || strings.Contains(output, "SKIP") || !strings.Contains(output, "--- PASS: TestMountManagerDirectoryLifecycle") || !strings.Contains(output, "cycle=63: 256 DOS-path queries succeeded") {
 			t.Fatalf("mount-manager isolation test failed: %v exit=%d", runErr, result.GetExitCode())
 		}

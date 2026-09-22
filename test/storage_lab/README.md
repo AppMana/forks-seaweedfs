@@ -380,6 +380,34 @@ This RED-control/GREEN-treatment pair supports the junction-target hypothesis,
 but one intermittent comparison is not proof of a production fix. A source-level
 mount implementation change, repeated verification, and real Git LFS testing
 remain required. Do not deploy the test helper as a post-mount repair loop.
+For source-level WinFsp experiments, run
+`bash hack/appmana/build-winfsp-lab-dll.sh /path/to/winfsp-v2.1` with Clang and
+the x86_64 MinGW compiler, headers, libraries, and resource compiler installed.
+The script pins the upstream source revision, writes into a new temporary
+directory, retains compiler output and the source diff, and prints the DLL hash.
+Its compatibility header adapts compiler/SDK declarations, not mount behavior;
+this unsigned user-mode DLL is lab-only, not a release artifact. The signed
+kernel driver still comes from the pinned WinFsp MSI. First reproduce RED with
+the unmodified source before comparing any source patch built the same way.
+Set `SEAWEEDFS_WINDOWS_WINFSP_DLL` to the built DLL with the isolated scenario
+and a freshly built native test. The runner stages it next to the test rather
+than replacing the installed DLL, and the native probe verifies its actual
+loaded module path. Missing verification or fallback to the installed DLL
+fails the run. This mode cannot be combined with junction or registration
+interventions and is rejected outside the isolated scenario. Retain both
+the build directory and VM results as the provenance chain.
+The unmodified source-build baseline reproduced RED on zero-based cycle 34,
+query 123 (100.93 seconds native), with the same DOS failure, successful
+same-handle GUID/NT queries, and missing reverse mount mapping. The probe
+verified it loaded `C:\lab\winfsp-x64.dll`, not the installed DLL. Baseline DLL
+SHA-256: `306b53736942ee2608afa40533deb572f842dc7c849d9390886a1dc5a9b7e23b`;
+native executable SHA-256:
+`a01eaef12e96b6b78e9dc54e6cf236585158aeb8d43425405d2f3964c10dc7a5`.
+Results: `/tmp/seaweedfs-windows-mount-results-3424831313`; log SHA-256
+`38c5e34c5a65af9935ffdc769a6b998ecafc868dcd6eabc85eab22e0683ab2a1`.
+This establishes a usable locally built RED baseline before a WinFsp source
+patch, not a fix. The preserved build script also completed end-to-end; its
+lab resource label differs from the initial manually built baseline.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

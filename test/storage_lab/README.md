@@ -406,6 +406,17 @@ mount process's loaded modules before exercising Git. Missing, duplicate,
 uninspectable or wrong-path modules fail the run and invoke existing cleanup.
 Every scenario must emit the module-verification marker. Retain both
 the build directory and VM results as the provenance chain.
+Setup and each real-workload cycle also require their own run-specific terminal
+marker; a zero exit with an old readiness message or another cycle's output is
+not success. Setup output is retained in `setup.log`. During candidate LFS
+qualification (`/tmp/seaweedfs-windows-mount-results-77732198`) the old transport
+returned `windows-ready` for setup even though subsequent workloads ran.
+A labcontainers regression reproduced stale results after timeout and Windows
+PID reuse; its cleanup fix reaps QGA records. That run predates the completion
+guards and transport fix and must not serve as final qualification, regardless
+of its workload pass count. Repeat with a VM container image containing the
+rebuilt guest helper (rebuilding `labd` alone is insufficient), and retain
+installation/version evidence; do not replace a live helper.
 The runner requires adjacent `.manifest.txt` and `.source.patch` files,
 validates the DLL/patch hashes and baseline/candidate distinction, and retains
 both with the VM results. The manifest records the source revision, recipe and

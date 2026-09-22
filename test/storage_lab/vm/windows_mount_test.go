@@ -198,14 +198,18 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	if os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC") != "" && !isolateMountManager {
 		setup += `; & C:\lab\install-lab-git-lfs.ps1 -GitRoot 'C:\Program Files\Git' -Candidate C:\lab\git-lfs-diagnostic.exe; $env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & git --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; & git lfs version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
 	}
-	setup += `; Write-Output "SETUP $(Get-Date -Format o): complete"; Stop-Transcript`
+	setupMarker := "SETUP_COMPLETE:" + filepath.Base(resultDir)
+	setup += `; Write-Output "SETUP $(Get-Date -Format o): complete"; Write-Output '` + setupMarker + `'; Stop-Transcript`
 	r, err := n.ExecWithTimeout(ctx, 5*time.Minute, ps, "-NoProfile", "-NonInteractive", "-Command", setup)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Log(string(r.GetStdout()), string(r.GetStderr()))
-	if r.GetExitCode() != 0 {
-		t.Fatalf("dependency installation exit %d", r.GetExitCode())
+	if err := os.WriteFile(filepath.Join(resultDir, "setup.log"), []byte(string(r.GetStdout())+string(r.GetStderr())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsCommandOutput(r.GetExitCode(), string(r.GetStdout()), setupMarker); err != nil {
+		t.Fatal(err)
 	}
 	if isolateMountManager {
 		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^TestMountManagerDirectoryLifecycle$' '-test.v' '-test.count=1' '-test.timeout=5m'`
@@ -234,8 +238,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	for repetition := 1; repetition <= repeats; repetition++ {
 		for _, scenario := range scenarios {
 			caseName := fmt.Sprintf("%s-%02d", scenario, repetition)
+			caseMarker := "SCENARIO_COMPLETE:" + filepath.Base(resultDir) + ":" + caseName
 			guestLog := `C:\lab\` + caseName + `.log`
-			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; exit $LASTEXITCODE`
+			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; $scenarioExit=$LASTEXITCODE; if($scenarioExit -eq 0){Write-Output '` + caseMarker + `'}; exit $scenarioExit`
 			if labDLL != "" {
 				command = strings.Replace(command, " -TestCase ", ` -ExpectedWinFspDll C:\lab\winfsp-x64.dll -TestCase `, 1)
 			}
@@ -292,6 +297,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 				t.Fatal(err)
 			}
 			t.Log(output)
+			if err := validateWindowsCommandOutput(r.GetExitCode(), output, caseMarker); err != nil {
+				t.Fatal(err)
+			}
 			if labDLL != "" && !strings.Contains(output, "verified mount process lab WinFsp DLL:") {
 				t.Fatal("SeaweedFS mount process did not verify the requested lab DLL was loaded")
 			}

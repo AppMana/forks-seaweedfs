@@ -52,7 +52,7 @@ try {
         'add .', 'commit -m seed lfs assets', 'status --short --untracked-files=no',
         'wrong-filter', 'missing-asset', 'success')
     foreach ($case in $cases) {
-        $script:Trace = $true
+        $script:Trace = $false
         $script:mountDiagnostics = 0
         $script:failures = 0
         $script:GitIterations = 2

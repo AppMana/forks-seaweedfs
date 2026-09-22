@@ -78,14 +78,12 @@ function Invoke-GitLfsTempMetadataTest([string]$mnt) {
             if ($code -ne 0) {
                 Write-Host ("GIT FAILURE UTC={0} exit={1} command={2}" -f [DateTime]::UtcNow.ToString('O'), $code, ($GitArgs -join ' '))
                 Write-Host ($lines | Out-String)
-                if ($Trace) {
-                    # Read-only, after failure and before unmount: retain the
-                    # DOS mount mapping and actual junction target together.
-                    Write-Host 'MOUNT DIAGNOSTICS: mountvol (read-only listing)'
-                    & mountvol.exe 2>&1 | ForEach-Object { Write-Host $_ }
-                    Write-Host "MOUNT DIAGNOSTICS: reparse point $mnt"
-                    & fsutil.exe reparsepoint query $mnt 2>&1 | ForEach-Object { Write-Host $_ }
-                }
+                # Read-only, after failure and before unmount. Also capture in
+                # untraced stress runs; no commands run on the successful path.
+                Write-Host 'MOUNT DIAGNOSTICS: mountvol (read-only listing)'
+                & mountvol.exe 2>&1 | ForEach-Object { Write-Host $_ }
+                Write-Host "MOUNT DIAGNOSTICS: reparse point $mnt"
+                & fsutil.exe reparsepoint query $mnt 2>&1 | ForEach-Object { Write-Host $_ }
                 & git -C $gitRepo lfs logs last 2>&1 | ForEach-Object { Write-Host $_ }
             }
         } finally { $ErrorActionPreference = $savedPreference }

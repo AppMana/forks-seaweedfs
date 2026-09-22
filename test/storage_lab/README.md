@@ -261,10 +261,11 @@ Windows `test/winfsp` executable and select
 runner needs only the WinFsp MSI and native executable, installs WinFsp and
 executes `TestMountManagerDirectoryLifecycle`: 64 minimal cgofuse directory
 mounts, each checked 256 times for a DOS canonical path that reaches that
-cycle's unique virtual sentinel. Readiness also requires the sentinel, so an
-underlying NTFS directory cannot satisfy the test. The first failed query fails
-the test; alternative path
-flags and mount listings are diagnostic only. This mode never starts weed or
+cycle's unique virtual sentinel. Queries are separated by 10 ms to observe
+delayed registration changes over at least 2.56 seconds per mount. Readiness
+also requires the sentinel, so an underlying NTFS directory cannot satisfy the
+test. The first failed query fails the test; alternative path flags and mount
+listings are diagnostic only. This mode never starts weed or
 Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
 It is a component-isolation experiment, not the full Windows qualification gate.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not

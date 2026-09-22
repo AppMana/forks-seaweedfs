@@ -5,13 +5,37 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $PSScriptRoot 'mount-smoke.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Assert', 'Invoke-GitLfsTempMetadataTest')) {
+foreach ($name in @('Assert', 'Invoke-GitLfsTempMetadataTest', 'Assert-WinFspModule')) {
     $definition = $ast.Find({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
     if (-not $definition) { throw "Missing function $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
 }
+
+# Verify the process-module gate without launching a process or mounting data.
+function Get-Process {
+    param([int]$Id)
+    if ($Id -ne 42) { throw 'Wrong process inspected' }
+    if ($script:moduleQueryFails) { throw 'Injected module inspection failure' }
+    return [pscustomobject]@{ Modules = $script:loadedModules }
+}
+$expectedDLL = Join-Path ([IO.Path]::GetTempPath()) 'lab-winfsp-x64.dll'
+foreach ($case in @('correct', 'missing', 'fallback', 'duplicate', 'query-failure')) {
+    $script:moduleQueryFails = $case -eq 'query-failure'
+    $module = [pscustomobject]@{ ModuleName = 'winfsp-x64.dll'; FileName = $expectedDLL }
+    $script:loadedModules = switch ($case) {
+        'correct' { @($module) }
+        'duplicate' { @($module, $module) }
+        'fallback' { @([pscustomobject]@{ ModuleName = 'winfsp-x64.dll'; FileName = $expectedDLL + '.other' }) }
+        default { @() }
+    }
+    $threw = $false
+    try { Assert-WinFspModule 42 $expectedDLL } catch { $threw = $true }
+    if ($threw -ne ($case -ne 'correct')) { throw "Incorrect DLL verification for $case" }
+}
+Remove-Item Function:Get-Process
+Write-Host 'PASS: process DLL gate rejects missing, fallback, duplicate and uninspectable modules'
 
 function git {
     $command = ($args | Select-Object -Skip 2) -join ' '

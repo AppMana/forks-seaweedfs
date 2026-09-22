@@ -314,7 +314,11 @@ and a freshly built native test. The runner stages it next to the test rather
 than replacing the installed DLL, and the native probe verifies its actual
 loaded module path. Missing verification or fallback to the installed DLL
 fails the run. This mode cannot be combined with junction or registration
-interventions and is rejected outside the isolated scenario. Retain both
+interventions. For real Git scenarios, the runner supplies
+`-ExpectedWinFspDll` to the smoke script, which inspects the actual SeaweedFS
+mount process's loaded modules before exercising Git. Missing, duplicate,
+uninspectable or wrong-path modules fail the run and invoke existing cleanup.
+Every scenario must emit the module-verification marker. Retain both
 the build directory and VM results as the provenance chain.
 The runner requires adjacent `.manifest.txt` and `.source.patch` files,
 validates the DLL/patch hashes and baseline/candidate distinction, and retains

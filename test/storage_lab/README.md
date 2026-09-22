@@ -289,6 +289,17 @@ The native smoke gate requires this test as well as the object-rename test;
 cross-compilation alone does not qualify either. The adapter currently lacks
 the optional cgofuse `Getpath` callback, a hypothesis to investigate with this
 probe, not a proven explanation for the intermittent failure.
+Follow-up testing of diagnostic-only SeaweedFS source `2ef9c71d1` passed five
+fresh LFS scenarios (results `/tmp/seaweedfs-windows-mount-results-3535845596`).
+A separate fresh VM using harness/test source `671054225` passed the real LFS
+scenario, 256 native directory canonicalization checks, and 512 native object
+renames without skips (results `/tmp/seaweedfs-windows-mount-results-535877824`).
+That candidate still has no `Getpath` callback: the new probe is exercised
+coverage, **not a RED reproduction** establishing a new fix. These positive
+runs do not close the earlier intermittent failure or supersede the failed
+five-pair qualification. Do not implement a speculative callback fix based on
+its absence alone; capture which Win32 operation/callback fails and establish
+a failing regression first.
 Deployment must include both components: the committed-event acknowledgment
 fix runs in the **filer**, while the in-place update correction runs in the
 **mount**. A mount-only upgrade leaves old filer rename replies unchanged.

@@ -209,6 +209,8 @@ not a complete recursive archive). Archive the complete Go test output as well.
 `SEAWEEDFS_WINDOWS_MOUNT_REPEATS` defaults to 1 and accepts 1..20 fresh scenario
 pairs within the existing 40-minute harness budget; raising the repeat count
 does not extend that budget. Verbosity defaults to 0 and accepts 0..4.
+For a targeted diagnostic run, `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO` selects either
+`GitAtomicRenamePrimed` or `GitLfsTempMetadata`; omit it for the complete gate.
 The optional native executable adds 512 create/chmod/write/close/mkdir/rename
 transactions per pair, including uppercase `.GIT` paths and exact final object
 content checks. The Actions gate builds and requires this executable, runs five
@@ -229,6 +231,15 @@ An acknowledgment can be lost **after commit**: an RPC error alone does not
 prove the rename failed. Inspect source and destination before retrying; do not
 delete a destination or assume an old lock file is disposable based on that
 error.
+Deterministic regressions cover a separate cache failure:
+`TestSaveEntryNoChangeAckPreservesCaseFoldListing` exercises the real no-event
+`UpdateEntry` acknowledgment fallback, which previously deleted a live `.git`
+cache entry at an equal timestamp and made `.GIT` lookup fail. In-place updates
+must fence both halves as writes; only actual renames/deletes may remove the old
+path at its existing version. Directory updates with omitted `NewParentPath`
+must also preserve children.
+Failure-only `winfsp rename failed at`
+diagnostics at verbosity 1 identify which rename stage rejects a request.
 
 The dedicated `vm-fault-gates` Actions job also runs this test with preloaded,
 hash-checked installers (variables are listed in the root README). Its pinned

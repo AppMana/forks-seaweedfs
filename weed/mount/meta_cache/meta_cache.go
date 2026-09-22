@@ -961,7 +961,12 @@ func (mc *MetaCache) applyMetadataResponseLocked(ctx context.Context, resp *file
 	// already reflected in it, and applying it would roll the entry back while
 	// the version keeps the newer claim. Each half is gated independently.
 	if resp.TsNs != 0 {
-		if oldPath != "" && mc.entryVersionBlocksLocked(ctx, oldPath, resp.TsNs, true) {
+		// An in-place update is a write, not a removal. At an equal version
+		// both halves must be fenced together; allowing its old half while
+		// fencing its new half would turn a no-change acknowledgment into
+		// a deletion of the still-live entry.
+		vacatesOldPath := oldPath != newPath
+		if oldPath != "" && mc.entryVersionBlocksLocked(ctx, oldPath, resp.TsNs, vacatesOldPath) {
 			oldPath = ""
 		}
 		if newEntry != nil && mc.entryVersionBlocksLocked(ctx, newEntry.FullPath, resp.TsNs, false) {
@@ -989,7 +994,9 @@ func (mc *MetaCache) applyMetadataResponseLocked(ctx context.Context, resp *file
 	// so stale children cannot be served from the local cache.
 	if err == nil && oldPath != "" && message.OldEntry != nil && message.OldEntry.IsDirectory {
 		isDelete := message.NewEntry == nil
-		isMove := message.NewEntry != nil && (message.NewParentPath != resp.Directory || message.NewEntry.Name != message.OldEntry.Name)
+		// An omitted NewParentPath means the original directory, as resolved
+		// above. Compare resolved paths, not the optional wire field.
+		isMove := message.NewEntry != nil && newPath != oldPath
 		if isDelete || isMove {
 			delete(mc.dirVersionFloors, oldPath)
 			delete(mc.dirSections, oldPath)

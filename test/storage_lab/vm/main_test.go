@@ -1,12 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"github.com/srl-labs/containerlab/core"
 	"github.com/srl-labs/containerlab/links"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -22,7 +22,7 @@ func TestTopologyHasFourIsolatedVMsAndNoProductionNetwork(t *testing.T) {
 	}
 	for _, name := range append([]string{controller}, volumes...) {
 		node := topology.Nodes[name]
-		if node.Kind != "generic_vm" || len(node.Binds) != 1 || node.Binds[0] != "/tmp/network/"+name+".yaml:/extra-network.yaml:ro" {
+		if node.Kind != "generic_vm" || len(node.Binds) != 1 || node.Binds[0] != "/tmp/network/"+name+".json:/extra-network.yaml:ro" {
 			t.Fatalf("%s network config is not read-only bound", name)
 		}
 	}
@@ -60,12 +60,22 @@ func TestNetworkConfigsUseOnlyDocumentationSubnet(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, address := range addresses {
-		data, err := os.ReadFile(filepath.Join(dir, name+".yaml"))
+		data, err := os.ReadFile(filepath.Join(dir, name+".json"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(data), address+"/24") || !strings.Contains(string(data), "optional: true") {
+		var config map[string]any
+		if err := json.Unmarshal(data, &config); err != nil {
+			t.Fatal(err)
+		}
+		nic := config["ethernets"].(map[string]any)["topology"].(map[string]any)
+		if config["version"] != float64(2) || nic["addresses"].([]any)[0] != address+"/24" || nic["optional"] != true {
 			t.Fatalf("unexpected %s network config: %s", name, data)
+		}
+		for _, forbidden := range []string{"dhcp4", "dhcp6", "gateway4", "gateway6", "routes", "nameservers"} {
+			if _, ok := nic[forbidden]; ok {
+				t.Fatalf("implicit network option %s: %s", forbidden, data)
+			}
 		}
 	}
 }

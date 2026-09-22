@@ -129,7 +129,10 @@ topology objects explicitly require preloaded node images (`Never` pull policy).
 
 Network bootstrap inputs now stay with run evidence so `--keep` does not delete
 files needed for later recovery. Failed kept runs record the daemon socket and
-state root in `manifest.json`.
+state root in `manifest.json`. Guest network bootstrap now constructs
+cloud-init-schema-generated `networkconfig.NetworkConfigVersion2` objects too;
+the SDK writes the launcher's input file as JSON, without caller-authored YAML.
+There are no implicit DHCP, DNS, gateway, or route fields in these inputs.
 
 `vm/run_vm.sh` uses the shared Labcontainers SDK instead of maintaining another
 VM lifecycle implementation. Every invocation creates a controller VM, three

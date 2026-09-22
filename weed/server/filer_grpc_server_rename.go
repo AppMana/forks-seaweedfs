@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -125,7 +124,7 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 
 	var metadataEvents []metadataEvent
 	var pendingChunkDeletes []*filer_pb.FileChunk
-	moveErr := fs.moveEntry(ctx, stream, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes)
+	moveErr := fs.moveEntry(ctx, nil, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes)
 	if moveErr != nil {
 		fs.filer.RollbackTransaction(ctx)
 		return fmt.Errorf("%s/%s move error: %v", req.OldDirectory, req.OldName, moveErr)
@@ -138,10 +137,27 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 	if len(pendingChunkDeletes) > 0 {
 		fs.filer.DeleteChunksNotRecursive(pendingChunkDeletes)
 	}
+	// Publish all committed events before sending any replies. A disconnected
+	// client must not prevent subscribers from learning the rest of a recursive
+	// rename. Replies use these exact log positions, never raw wall time: the
+	// monotonic metadata clock can run ahead of a coarse or adjusted OS clock.
+	var responses []*filer_pb.StreamRenameEntryResponse
 	for _, event := range metadataEvents {
-		event.notify(fs.filer, ctx, req.Signatures)
+		eventCtx, sink := filer.WithMetadataEventSink(ctx)
+		event.notify(fs.filer, eventCtx, req.Signatures)
+		if logged := sink.Last(); logged != nil {
+			responses = append(responses, &filer_pb.StreamRenameEntryResponse{
+				Directory: logged.Directory, EventNotification: logged.EventNotification, TsNs: logged.TsNs,
+			})
+		}
 	}
-
+	for _, response := range responses {
+		if err := stream.Send(response); err != nil {
+			// The transaction is already committed; do not roll it back or
+			// discard events when acknowledgment delivery fails.
+			return err
+		}
+	}
 	return nil
 }
 
@@ -280,27 +296,9 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		} else if len(toDelete) > 0 {
 			// Defer chunk deletion until after CommitTransaction so that a
 			// failure in any subsequent step (child moves, oldPath delete,
-			// stream send, or the commit itself) leaves the chunks intact for
+			// or the commit itself) leaves the chunks intact for
 			// the rolled-back rename.
 			*pendingChunkDeletes = append(*pendingChunkDeletes, toDelete...)
-		}
-	}
-	if stream != nil {
-		if err := stream.Send(&filer_pb.StreamRenameEntryResponse{
-			Directory: string(oldParent),
-			EventNotification: &filer_pb.EventNotification{
-				OldEntry: &filer_pb.Entry{
-					Name: entry.Name(),
-				},
-				NewEntry:           newEntry.ToProtoEntry(),
-				DeleteChunks:       false,
-				NewParentPath:      string(newParent),
-				IsFromOtherCluster: false,
-				Signatures:         nil,
-			},
-			TsNs: time.Now().UnixNano(),
-		}); err != nil {
-			return err
 		}
 	}
 
@@ -326,24 +324,6 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 	deleteErr := fs.filer.DeleteEntryMetaAndData(filer.WithSuppressedMetadataEvents(ctx), oldPath, false, false, false, false, signatures, 0)
 	if deleteErr != nil {
 		return deleteErr
-	}
-	if stream != nil {
-		if err := stream.Send(&filer_pb.StreamRenameEntryResponse{
-			Directory: string(oldParent),
-			EventNotification: &filer_pb.EventNotification{
-				OldEntry: &filer_pb.Entry{
-					Name: entry.Name(),
-				},
-				NewEntry:           nil,
-				DeleteChunks:       false,
-				NewParentPath:      "",
-				IsFromOtherCluster: false,
-				Signatures:         nil,
-			},
-			TsNs: time.Now().UnixNano(),
-		}); err != nil {
-			return err
-		}
 	}
 
 	return nil

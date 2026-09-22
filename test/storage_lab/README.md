@@ -306,6 +306,19 @@ Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
 It is a component-isolation experiment, not the full Windows qualification gate.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
+This minimal probe reproduced the DOS-path defect without Git, a weed binary,
+or a filer on WinFsp 2.1.25156: cycle 51 (zero-based), query 179 failed after
+earlier queries on that mount had succeeded. Same-handle GUID/NT queries
+succeeded; both DOS forms failed with `ERROR_PATH_NOT_FOUND`, and `mountvol`
+listed the matching GUID with no mount points. The native test failed after
+146.65 seconds, and the VM runner failed after 306.59 seconds. Evidence is in
+`/tmp/seaweedfs-windows-mount-results-1442029407/mount-manager.log`, SHA-256
+`bffb43b01ae9305a420ab1c50d7f5b35b6c57b6a189a4e0a4bfa943a3a67e8db`.
+The tested executable SHA-256 is
+`9b304d6aa5821780c880a2ce4ccee25977bbd150624e31bfa15ec72adfde3e55`.
+This isolates this canonical-path failure to the cgofuse/WinFsp/Windows mount
+layer; it does not yet identify the faulty component or explain the separate
+original LFS object-move failure. Preserve this RED probe when testing fixes.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

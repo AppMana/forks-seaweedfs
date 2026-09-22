@@ -270,6 +270,12 @@ for a controlled A/B run; label those results separately from instrumented runs.
 Keep the SeaweedFS binary, WinFsp installer, VM image, and workload fixed.
 The historical reproduction uses Git for Windows 2.51.0 with Git LFS 3.7.0;
 that client is not a current-version qualification.
+Dependency setup records `C:\lab\dependency-install.log`, including installer
+stage timestamps and exit codes; the failure collector retains its tail when
+the guest agent is responsive. A setup timeout is an infrastructure failure,
+not a reproduced LFS failure or a passing qualification. The first instrumented
+3.7.0 and official 3.8.0 comparisons both timed out during setup before any
+workload ran; neither establishes client-version behavior.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

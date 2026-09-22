@@ -112,7 +112,7 @@ func TestWindowsMountLab(t *testing.T) {
 	defer func() {
 		diagnosticCtx, stop := context.WithTimeout(context.Background(), time.Minute)
 		defer stop()
-		logs, logErr := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\smoke-*\logs\* -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.log','.txt' } | ForEach-Object { Write-Output ("FILE: " + $_.FullName); Get-Content -LiteralPath $_.FullName -Tail 2000 }`)
+		logs, logErr := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\smoke-*\logs\*,C:\lab\dependency-install.log -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.log','.txt' } | ForEach-Object { Write-Output ("FILE: " + $_.FullName); Get-Content -LiteralPath $_.FullName -Tail 2000 }`)
 		if writeErr := os.WriteFile(filepath.Join(resultDir, "guest-logs.txt"), []byte(fmt.Sprintf("collection error: %v\nexit: %d\n%s\n%s", logErr, logs.GetExitCode(), logs.GetStdout(), logs.GetStderr())), 0600); writeErr != nil {
 			t.Error(writeErr)
 		}
@@ -124,15 +124,21 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 	}
 	setup := `$ErrorActionPreference='Stop';
+Start-Transcript -LiteralPath C:\lab\dependency-install.log -Force;
+Write-Output "SETUP $(Get-Date -Format o): WinFsp install starting";
 $p=Start-Process msiexec.exe -ArgumentList '/i','C:\lab\winfsp.msi','/qn','/norestart','INSTALLLEVEL=1000' -Wait -PassThru;
+Write-Output "SETUP $(Get-Date -Format o): WinFsp install exit $($p.ExitCode)";
 if($p.ExitCode -notin @(0,3010)){throw "WinFsp installer exit $($p.ExitCode)"};
 if(-not(Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)){throw 'WinFsp service absent'};
+Write-Output "SETUP $(Get-Date -Format o): Git install starting";
 $p=Start-Process 'C:\lab\git-installer.exe' -ArgumentList '/VERYSILENT','/NORESTART','/SP-','/SUPPRESSMSGBOXES' -Wait -PassThru;
+Write-Output "SETUP $(Get-Date -Format o): Git install exit $($p.ExitCode)";
 if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 & 'C:\Program Files\Git\cmd\git.exe' --version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
 	if os.Getenv("SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC") != "" {
 		setup += `; $targets=@(Get-ChildItem 'C:\Program Files\Git' -Filter git-lfs.exe -Recurse -File); if($targets.Count -eq 0){throw 'installed Git LFS not found'}; foreach($target in $targets){Copy-Item -LiteralPath C:\lab\git-lfs-diagnostic.exe -Destination $target.FullName -Force}; $env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & git lfs version; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}`
 	}
+	setup += `; Write-Output "SETUP $(Get-Date -Format o): complete"; Stop-Transcript`
 	r, err := n.ExecWithTimeout(ctx, 5*time.Minute, ps, "-NoProfile", "-NonInteractive", "-Command", setup)
 	if err != nil {
 		t.Fatal(err)

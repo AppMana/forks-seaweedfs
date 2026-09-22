@@ -122,7 +122,7 @@ links before explicit `Apply`. Windows tests share the same native topology
 boundary and use generated RPC requests for execution timeouts. Assertions
 about SeaweedFS durability and WinFsp remain in this repository.
 
-The VM module pins published Labcontainers commit `9fea7eee373a`; no local SDK
+The VM module pins published Labcontainers commit `43833b0979f7`; no local SDK
 workspace is required. Run `GOWORK=off go test ./...` from `test/storage_lab/vm`
 to verify the published dependency. Set
 `LABCONTAINERS_CONTAINERLAB` to an absolute CLI path built with that SDK's

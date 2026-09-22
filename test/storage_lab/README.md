@@ -300,6 +300,11 @@ For source-level WinFsp experiments, run
 the x86_64 MinGW compiler, headers, libraries, and resource compiler installed.
 The script pins the upstream source revision, writes into a new temporary
 directory, retains compiler output and the source diff, and prints the DLL hash.
+Clean sources are required by default; untracked files are rejected. For an
+explicit source candidate, set `WINFSP_LAB_ALLOW_TRACKED_PATCH=1`; staged and
+unstaged tracked changes are captured together. The pinned commit supplies
+`SOURCE_DATE_EPOCH`, and the linker fixes timestamps and the preferred image
+base (ASLR remains enabled).
 Its compatibility header adapts compiler/SDK declarations, not mount behavior;
 this unsigned user-mode DLL is lab-only, not a release artifact. The signed
 kernel driver still comes from the pinned WinFsp MSI. First reproduce RED with
@@ -311,6 +316,20 @@ loaded module path. Missing verification or fallback to the installed DLL
 fails the run. This mode cannot be combined with junction or registration
 interventions and is rejected outside the isolated scenario. Retain both
 the build directory and VM results as the provenance chain.
+The runner requires adjacent `.manifest.txt` and `.source.patch` files,
+validates the DLL/patch hashes and baseline/candidate distinction, and retains
+both with the VM results. The manifest records the source revision, recipe and
+shim hashes, epoch and tool versions; retain the build directory separately
+for full compiler output. Manifest consistency is not proof of provenance or
+cross-run equivalence: compare recipe, shim and tool versions between baseline
+and candidate, not just their source labels.
+The lab-only core candidate `hack/appmana/winfsp-guid-mount.patch` applies to
+the pinned WinFsp checkout with `git apply`. It resolves the registered volume
+GUID without opening the not-yet-dispatched filesystem, sets that target on
+the owned junction handle, and rolls back registration if the update fails.
+It changes both registration modes but not ordinary unregistered mounts or
+drive mounts. It is experimental, not deployment-qualified; the unchanged
+native reproducer and real LFS workload must qualify it before adoption.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

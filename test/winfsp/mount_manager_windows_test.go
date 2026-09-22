@@ -99,6 +99,28 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 					t.Fatalf("junction intervention lost virtual sentinel: %v", err)
 				}
 			}
+			if cycle == 0 {
+				if expected := os.Getenv("SEAWEEDFS_WINDOWS_EXPECT_WINFSP_DLL"); expected != "" {
+					var module windows.Handle
+					name, err := windows.UTF16PtrFromString("winfsp-x64.dll")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := windows.GetModuleHandleEx(windows.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, name, &module); err != nil {
+						t.Fatal(err)
+					}
+					buf := make([]uint16, 32768)
+					n, err := windows.GetModuleFileName(module, &buf[0], uint32(len(buf)))
+					if err != nil || n == 0 || n >= uint32(len(buf)) {
+						t.Fatalf("loaded DLL path: n=%d err=%v", n, err)
+					}
+					actual := windows.UTF16ToString(buf)
+					if !strings.EqualFold(filepath.Clean(actual), filepath.Clean(expected)) {
+						t.Fatalf("DLL fallback: loaded %q, expected %q", actual, expected)
+					}
+					t.Logf("verified loaded lab WinFsp DLL: %s", actual)
+				}
+			}
 			for probe := 0; probe < 256; probe++ {
 				path, err := windows.UTF16PtrFromString(point)
 				if err != nil {

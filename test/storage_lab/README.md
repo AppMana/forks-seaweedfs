@@ -295,6 +295,22 @@ identity queries, reparse read, rewrite, readback, and sentinel check, but write
 the original NT target. Both modes verify the exact substitute name after the
 write. This controls for query priming and effects of rewriting the junction;
 neither mode changes the first-failure behavior of the DOS path assertions.
+For source-level WinFsp experiments, run
+`bash hack/appmana/build-winfsp-lab-dll.sh /path/to/winfsp-v2.1` with Clang and
+the x86_64 MinGW compiler, headers, libraries, and resource compiler installed.
+The script pins the upstream source revision, writes into a new temporary
+directory, retains compiler output and the source diff, and prints the DLL hash.
+Its compatibility header adapts compiler/SDK declarations, not mount behavior;
+this unsigned user-mode DLL is lab-only, not a release artifact. The signed
+kernel driver still comes from the pinned WinFsp MSI. First reproduce RED with
+the unmodified source before comparing any source patch built the same way.
+Set `SEAWEEDFS_WINDOWS_WINFSP_DLL` to the built DLL with the isolated scenario
+and a freshly built native test. The runner stages it next to the test rather
+than replacing the installed DLL, and the native probe verifies its actual
+loaded module path. Missing verification or fallback to the installed DLL
+fails the run. This mode cannot be combined with junction or registration
+interventions and is rejected outside the isolated scenario. Retain both
+the build directory and VM results as the provenance chain.
 
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of

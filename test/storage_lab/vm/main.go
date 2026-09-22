@@ -17,6 +17,7 @@ import (
 
 	labv1 "github.com/appmana/labcontainers/api/v1"
 	"github.com/appmana/labcontainers/pkg/client"
+	"github.com/appmana/labcontainers/pkg/cloudinit/networkconfig"
 	clab "github.com/appmana/labcontainers/pkg/containerlab"
 	"github.com/srl-labs/containerlab/core"
 	"github.com/srl-labs/containerlab/links"
@@ -278,8 +279,11 @@ func writeNetworkConfigs(dir string) error {
 		return err
 	}
 	for name, address := range addresses {
-		text := fmt.Sprintf("version: 2\nethernets:\n  topology:\n    match:\n      name: 'en*'\n    addresses: [%s/24]\n    optional: true\n", address)
-		if err := os.WriteFile(filepath.Join(dir, name+".yaml"), []byte(text), 0o644); err != nil {
+		match, optional := "en*", true
+		config := &networkconfig.NetworkConfigVersion2{Version: 2, Ethernets: networkconfig.NetworkConfigVersion2Ethernets{
+			"topology": {Match: &networkconfig.MappingPhysicalMatch{Name: &match}, Addresses: []string{address + "/24"}, Optional: &optional},
+		}}
+		if err := networkconfig.WriteFile(filepath.Join(dir, name+".json"), config); err != nil {
 			return err
 		}
 	}
@@ -295,7 +299,7 @@ func topologyConfig(networkDir, image string) *core.Config {
 	for _, name := range append([]string{controller}, volumes...) {
 		c.Topology.Nodes[name] = &types.NodeDefinition{
 			Kind: "generic_vm", Image: image, NetworkMode: "none", ImagePullPolicy: "Never",
-			Binds: []string{filepath.Join(networkDir, name+".yaml") + ":/extra-network.yaml:ro"},
+			Binds: []string{filepath.Join(networkDir, name+".json") + ":/extra-network.yaml:ro"},
 		}
 	}
 	for i, name := range append([]string{controller}, volumes...) {

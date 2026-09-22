@@ -132,9 +132,10 @@ topology objects explicitly require preloaded node images (`Never` pull policy).
 
 Network bootstrap inputs now stay with run evidence so `--keep` does not delete
 files needed for later recovery. Failed kept runs record the daemon socket and
-state root in `manifest.json`. The remaining handwritten guest network-config
-encoder is not yet migrated to schema-generated objects; topology migration
-alone is not completion of the code-only interface work.
+state root in `manifest.json`. Guest network bootstrap now constructs
+cloud-init-schema-generated `networkconfig.NetworkConfigVersion2` objects too;
+the SDK writes the launcher's input file as JSON, without caller-authored YAML.
+There are no implicit DHCP, DNS, gateway, or route fields in these inputs.
 
 Local migration verification on 2026-09-22 passed the four-VM ext4 `power-loss`
 scenario using SDK `141d1ff` and candidate SHA-256
@@ -144,6 +145,11 @@ Evidence: `/tmp/seaweedfs-vm-lab-results-2461738833/manifest.json` and its
 all three replicas retained the acknowledged sequence-1001 digest after
 recovery. Cleanup removed this run's runtime resources. This is not Windows,
 whole-matrix, or Kubernetes networking qualification.
+
+The same four-VM power-loss scenario passed again after switching guest boot
+inputs to schema-generated JSON objects. That run's evidence is
+`/tmp/seaweedfs-vm-lab-results-3545748081/manifest.json`; initial cloud-init boot,
+fresh-wrapper recovery, replicated digest checks, and cleanup all completed.
 
 `vm/run_vm.sh` uses the shared Labcontainers SDK instead of maintaining another
 VM lifecycle implementation. Every invocation creates a controller VM, three

@@ -81,6 +81,7 @@ Secrets and variables → Actions → Variables:
 | `SEAWEEDFS_RELIABILITY_GO_FUSE_REF` | Full commit SHA for `AppMana/forks-go-fuse`, required by the local `go.mod` replacement | Change only alongside a reviewed and tested dependency upgrade. Both test builds use this pinned sibling. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Set this only after the VM lifecycle, QGA, and large-artifact fixes are committed there. Never point this at a moving branch. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE` | Qualified Ubuntu VM image reference including `@sha256:<64 hex>` | Build from the pinned source, publish and preload it on the dedicated runner, and update only after its live KVM smoke test passes. Mutable tags are rejected. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Windows VM image including `@sha256:<64 hex>` | Preload the licensed image on the same dedicated runner. Run the native Windows core regressions and Labcontainers NTFS crash test before promotion. |
 
 The initial baseline is `9ec822e2d634abc36eb2a113d0ddb4a844970873` (the audited
 4.40 fork source), and the initial Go-FUSE pin is
@@ -94,6 +95,7 @@ gh variable set SEAWEEDFS_RELIABILITY_BASELINE_REF --repo AppMana/forks-seaweedf
 gh variable set SEAWEEDFS_RELIABILITY_GO_FUSE_REF --repo AppMana/forks-seaweedfs --body "$GO_FUSE_SHA"
 gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_SHA"
 gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_VM_IMAGE_AT_DIGEST"
+gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE --repo AppMana/forks-seaweedfs --body "$WINDOWS_IMAGE_AT_DIGEST"
 gh variable list --repo AppMana/forks-seaweedfs
 ```
 

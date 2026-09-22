@@ -138,10 +138,13 @@ The manifest records binary SHA-256 values, filesystem, scenario, timestamps,
 topology, and that production access was disabled. Results remain in the
 printed `/tmp/seaweedfs-vm-lab-results-*` directory.
 
-The power-loss gates call Labcontainers `PowerOff`, which destroys and
-recreates the VM wrapper rather than merely killing `weed` while retaining the
-guest page cache. The vacuum gate refuses to cut power unless it observes the
-victim `.cpd` file, proving the copy phase was active. The migration gate is
+The crash gates now call Labcontainers `Crash`, which sends SIGKILL to the
+session's VM wrapper and QEMU. Earlier `PowerOff` results exercised Containerlab
+stop/restart and must not be treated as verified hard-power-loss evidence.
+The vacuum gate uses a `wait_exec` timeline predicate to observe the victim's
+`.cpd` before requesting a crash. This proves observation order, but cannot
+guarantee the copy is still active when SIGKILL arrives; an application barrier
+is needed for an exact instruction boundary. The migration gate is
 deliberately graceful and tests baseline → candidate → baseline → candidate one
 replica at a time; abrupt failure is tested separately. This matters for the
 4.40 baseline: a hard cut can expose its pre-fix acknowledged-index durability
@@ -152,6 +155,24 @@ Ext4 is the currently verified VM filesystem. `--filesystem xfs` and
 those runs pass, the native runner below is XFS/Btrfs evidence, not VM
 power-loss qualification. CI runs four fresh sessions so scenarios cannot
 contaminate one another.
+
+For native Windows storage regressions, build the existing suite with
+`GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -tags 5BytesOffset -o /absolute/storage.test.exe ./weed/storage`.
+Use the same temporary Go workspace as the VM runner (include this module and
+the pinned Labcontainers checkout), then run:
+
+```sh
+SEAWEEDFS_WINDOWS_LIVE=1 \
+SEAWEEDFS_WINDOWS_STORAGE_TEST=/absolute/storage.test.exe \
+LABCONTAINERS_LABD=/absolute/labcontainers/bin/labd \
+LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
+go test ./test/storage_lab/vm -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
+```
+
+The harness boots a new isolated Windows VM, uploads the compiled tests, and
+requires every selected test to be listed and pass without skips. This verifies
+core NTFS behavior; WinFsp mounts, CSI, and packaged service upgrades are separate
+runtime gates. Labcontainers also provides `TestLiveWindows` for NTFS crash persistence.
 
 The core regressions are normal Go tests under `weed/storage`, `weed/shell`, and
 `weed/storage/needle`; they run in the existing large-disk race suite even when

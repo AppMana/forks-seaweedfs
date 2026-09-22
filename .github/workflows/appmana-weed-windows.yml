@@ -82,7 +82,6 @@ jobs:
       - name: Build weed.exe
         working-directory: forks-seaweedfs
         run: |
-          $env:CGO_ENABLED = '0'
           $commit = (git rev-parse --short HEAD)
           go build -tags 5BytesOffset -ldflags "-s -w -X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$commit" -o weed.exe ./weed
           .\weed.exe version

@@ -540,6 +540,12 @@ passed all 64 cycles with FSD registration in
 mapping removal and sibling preservation. Log SHA-256:
 `882a322d728b13c7bd4142baede8019ddb8462eee2ea69eeb6d508b4ed6f3b03`.
 Neither result establishes process-death cleanup or registration rollback.
+That same stronger executable also passed all 64 cycles under default
+registration in `/tmp/seaweedfs-windows-mount-results-364112300`
+(190.62 seconds native, 398.918 seconds full harness, exit 0). Junction removal,
+exact-GUID mapping removal, sibling bytes and same-path remount were verified.
+Log SHA-256:
+`7f00fc7e82997bc41db4a24e2b31dd4644f9c2a8ea22c068f5ab762f84e8b675`.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

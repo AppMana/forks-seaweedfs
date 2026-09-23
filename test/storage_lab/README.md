@@ -294,6 +294,13 @@ unused checkpoint/mount paths within that root; it never rewrites the sibling.
 Readiness is published by temporary-file rename. Child-exit waits are bounded.
 Post-termination absence checks are immediate and strict, with no repair or
 retry of a failed mapping assertion.
+The existing storage-reliability Actions workflow exposes these intensive checks
+through the optional `windows_mount_cleanup` dispatch input. It runs graceful
+same-path cleanup and process-crash cleanup in fresh VMs for default and FSD
+registration, before the unchanged real Git/LFS gate, and retains each log.
+It uses the workflow's pinned MSI, not an implicitly substituted lab DLL.
+Ownership negative controls run in the Linux job on every matching workflow run;
+changes under `test/winfsp/` now trigger that workflow too.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 For a lab-only comparison of WinFsp's user-mode and driver-side registration,

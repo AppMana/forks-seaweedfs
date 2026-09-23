@@ -15,11 +15,15 @@ on:
         description: 'Run the isolated native mount-manager stress test before Windows qualification'
         type: boolean
         default: false
+      windows_mount_cleanup:
+        description: 'Run same-path graceful and process-crash mount cleanup in both registration modes'
+        type: boolean
+        default: false
   push:
     branches: [master, main, 'merge/**']
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
   pull_request:
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
 
 permissions:
   contents: read
@@ -87,6 +91,8 @@ jobs:
           go test -short -tags "$STORAGE_BUILD_TAGS" -race -count=1 -timeout="$STORAGE_UNIT_TEST_TIMEOUT"
           ./weed/storage ./weed/topology ./weed/shell ./weed/server
           ./weed/filer ./weed/filer/empty_folder_cleanup ./weed/mount ./weed/operation
+      - name: Crash harness ownership negative controls
+        run: go test -race -count=1 ./test/winfsp -run '^TestCrashChildOwnership$'
       - name: Lab isolation command contracts
         run: python3 -m unittest discover -s test/storage_lab -v
       - name: Negative controls prove regressions turn red
@@ -261,6 +267,7 @@ jobs:
           SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY: '1'
           SEAWEEDFS_WINDOWS_MOUNT_TRACE: ${{ inputs.windows_trace && '1' || '0' }}
           WINDOWS_MOUNT_MANAGER_PROBE: ${{ inputs.windows_mount_manager_probe && '1' || '0' }}
+          WINDOWS_MOUNT_CLEANUP: ${{ inputs.windows_mount_cleanup && '1' || '0' }}
           SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/windows-winfsp.test.exe
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
           SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
@@ -287,6 +294,13 @@ jobs:
           if [[ "$WINDOWS_MOUNT_MANAGER_PROBE" == '1' ]]; then
             SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-manager-test.log"
           fi
+          if [[ "$WINDOWS_MOUNT_CLEANUP" == '1' ]]; then
+            for registration in '' 1; do
+              mode="${registration:-default}"
+              SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD="$registration" SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1 SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-cleanup-$mode.log"
+              SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD="$registration" SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerProcessCrash go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-crash-$mode.log"
+            done
+          fi
           go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-test.log"
       - uses: actions/upload-artifact@v7
         if: always()
@@ -297,5 +311,8 @@ jobs:
             /tmp/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/windows-mount-test.log
+            ${{ runner.temp }}/windows-mount-manager-test.log
+            ${{ runner.temp }}/windows-mount-cleanup-*.log
+            ${{ runner.temp }}/windows-mount-crash-*.log
           if-no-files-found: error
           retention-days: 14

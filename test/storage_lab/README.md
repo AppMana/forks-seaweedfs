@@ -506,6 +506,18 @@ run-specific setup/native completion tokens and the loaded candidate DLL.
 It extends native registration coverage, not real-workload or crash safety
 qualification; the real LFS qualification continues using default registration.
 
+An exploratory real-LFS candidate run in
+`/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after
+2193.456 seconds with all 20 workload logs containing the native rename/content
+and canonicalization success markers. Do not count this as final qualification:
+it used the old guest-agent helper, setup returned the stale `windows-ready`
+response, and terminal guest-log collection returned exit 125 with truncated
+output rather than an installation transcript. The staged client hash alone
+does not prove the installed client version. Retained `guest-logs.txt` SHA-256:
+`edd108c1aad85e203bb849c60fc8bdedb8cdd823ee3314c59eb26ca99f42257f`.
+Use the corrected-helper run with verified setup/client version and unique
+per-cycle completion tokens for the qualification decision.
+
 Related upstream [WinFsp issue 441](https://github.com/winfsp/winfsp/issues/441)
 was fixed by
 [`ea189c5b`](https://github.com/winfsp/winfsp/commit/ea189c5b683b25eeca0cdb60fd12e27536db1c01),

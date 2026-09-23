@@ -615,6 +615,14 @@ truncation; it is not a complete auxiliary archive. Unlike the exploratory run,
 setup and every workload response are independently retained and token-verified.
 This establishes the real-LFS stress result, not registration-failure rollback,
 power-loss durability, or a deployment-qualified release build.
+Subsequent harness runs materialize auxiliary log tails in the guest and use the
+existing chunked, SHA-256-verified artifact transfer instead of one oversized
+exec response. `guest-logs.txt` contains the diagnostic text;
+`guest-logs-collection.txt` records collection status, byte count and SHA-256.
+The existing 2,000-line-per-file tail policy remains: this is not a full log
+archive. Collection has a separate two-minute deadline and now fails the harness
+on error rather than silently allowing missing auxiliary evidence. Unit coverage
+reproduces the old truncation failure with more than 3 MiB of diagnostic text.
 
 Related upstream [WinFsp issue 441](https://github.com/winfsp/winfsp/issues/441)
 was fixed by

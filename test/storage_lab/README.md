@@ -668,6 +668,13 @@ builds a driver or produces an installer. Its host-independent argument/error
 contracts run in the existing reliability workflow; a passing contract does not
 prove compilation or runtime behavior. Windows-native build/runtime qualification
 remains outstanding until actual artifact results are recorded here.
+A read-only inventory in a fresh
+`labcontainers/windows-server-2022:lfs-qga-reap-da40c93` guest completed with exit
+0 and `TOOLCHAIN_INVENTORY_COMPLETE`: `vswhere.exe`, both standard Visual Studio
+installation roots, and `Windows Kits\10\Include` were absent. This image cannot
+be assumed to contain the required compiler/SDK. Provision a separate build image
+or supply a verified existing toolchain image before running the MSVC recipe;
+this inventory does not rule out nonstandard toolchain locations in other images.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

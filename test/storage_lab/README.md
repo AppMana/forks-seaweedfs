@@ -66,6 +66,13 @@ All six reviewed compaction/fsck/offset mutants and the separate preallocation
 mutant made their expected regressions fail. These process/filesystem
 checks are not additional power-loss or package-lifecycle qualification.
 
+Hosted verification of repair `db45439d3` also passed: `test-linux` in
+Actions run `35923638540` and `large-disk-regressions` in `35923638553`.
+The latter includes all native-filesystem/ENOSPC controls, isolated migration
+and admission, and the additional process-level migration/admission checks.
+Its `vm-fault-gates` job remains queued without a matching self-hosted runner;
+this is not a completed whole-workflow or additional VM power-loss pass.
+
 Do not increase limits without checking host capacity. Building is a separate
 step and may download dependencies: apply resource limits to builds too. Never
 pass a production volume directory. There is intentionally no endpoint argument

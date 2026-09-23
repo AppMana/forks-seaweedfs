@@ -242,6 +242,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		if cleanupMode == "1" && !strings.Contains(output, "cycle=63: owned junction removed and sibling preserved") {
 			t.Fatal("native probe did not complete same-path cleanup qualification")
 		}
+		if cleanupMode == "1" && !strings.Contains(output, "cycle=63: owned mount mapping removed") {
+			t.Fatal("native probe did not verify mount-manager mapping cleanup")
+		}
 		return
 	}
 	for repetition := 1; repetition <= repeats; repetition++ {

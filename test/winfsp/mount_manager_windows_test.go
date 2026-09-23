@@ -73,6 +73,7 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 			if *mountManagerCheckCleanup {
 				point = filepath.Join(root, "reused-mount")
 			}
+			var mountedGUID string
 			sentinel := fmt.Sprintf("sentinel-%02d-%d", cycle, time.Now().UnixNano())
 			host := fuse.NewFileSystemHost(&mountManagerRootFS{sentinel: sentinel})
 			host.SetCapCaseInsensitive(true)
@@ -93,6 +94,17 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 					t.Fatal("WinFsp unmount did not complete")
 				}
 				if *mountManagerCheckCleanup {
+					if mountedGUID != "" {
+						paths, err := mountManagerVolumePaths(mountedGUID)
+						if err != nil && err != windows.ERROR_FILE_NOT_FOUND && err != windows.ERROR_PATH_NOT_FOUND {
+							t.Errorf("query removed volume %q: %v", mountedGUID, err)
+						}
+						for _, path := range paths {
+							if strings.EqualFold(filepath.Clean(path), filepath.Clean(point)) {
+								t.Errorf("cycle=%d: stale mount mapping %q -> %q", cycle, mountedGUID, path)
+							}
+						}
+					}
 					// Lstat observes the junction itself: an inaccessible target
 					// must not masquerade as removal of a leftover junction.
 					if _, err := os.Lstat(point); !os.IsNotExist(err) {
@@ -104,6 +116,7 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 					}
 					if !t.Failed() {
 						t.Logf("cycle=%d: owned junction removed and sibling preserved", cycle)
+						t.Logf("cycle=%d: owned mount mapping removed", cycle)
 					}
 				}
 			}()
@@ -182,8 +195,74 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 			}
 			t.Logf("cycle=%d: 256 DOS-path queries succeeded", cycle)
+			if *mountManagerCheckCleanup {
+				// Query identity only after the canonicalization checks, so it
+				// cannot prime registration and conceal the original regression.
+				p, err := windows.UTF16PtrFromString(point)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h, err := windows.CreateFile(p, 0, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				buf := make([]uint16, 32768)
+				n, queryErr := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 1)
+				closeErr := windows.CloseHandle(h)
+				if queryErr != nil || closeErr != nil || n == 0 || n >= uint32(len(buf)) {
+					t.Fatalf("volume identity: query=%v close=%v n=%d", queryErr, closeErr, n)
+				}
+				mountedGUID = windows.UTF16ToString(buf)
+				paths, err := mountManagerVolumePaths(mountedGUID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				found := false
+				for _, path := range paths {
+					found = found || strings.EqualFold(filepath.Clean(path), filepath.Clean(point))
+				}
+				if !found {
+					t.Fatalf("mounted path %q absent from GUID %q paths %q", point, mountedGUID, paths)
+				}
+			}
 		}()
 	}
+}
+
+// GetVolumePathNamesForVolumeName returns a MULTI_SZ and the required WCHAR
+// count on ERROR_MORE_DATA. Only buffer growth is retried, never a missing path.
+func mountManagerVolumePaths(guid string) ([]string, error) {
+	p, err := windows.UTF16PtrFromString(guid)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]uint16, 256)
+	for attempt := 0; attempt < 3; attempt++ {
+		var n uint32
+		err := windows.GetVolumePathNamesForVolumeName(p, &buf[0], uint32(len(buf)), &n)
+		if err == windows.ERROR_MORE_DATA && n > uint32(len(buf)) && n <= 1<<20 {
+			buf = make([]uint16, n)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 || n > uint32(len(buf)) || buf[n-1] != 0 {
+			return nil, fmt.Errorf("invalid volume path buffer length %d", n)
+		}
+		var paths []string
+		for start, i := 0, 0; i < int(n); i++ {
+			if buf[i] == 0 {
+				if i == start {
+					return paths, nil
+				}
+				paths = append(paths, windows.UTF16ToString(buf[start:i]))
+				start = i + 1
+			}
+		}
+		return nil, fmt.Errorf("unterminated volume path list")
+	}
+	return nil, fmt.Errorf("volume path list kept growing")
 }
 
 // Diagnostic intervention before any assertions, never a repair after failure.

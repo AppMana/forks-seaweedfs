@@ -753,6 +753,28 @@ truncation; it is not a complete auxiliary archive. Unlike the exploratory run,
 setup and every workload response are independently retained and token-verified.
 This establishes the real-LFS stress result, not registration-failure rollback,
 power-loss durability, or a deployment-qualified release build.
+A subsequent current-application run built SeaweedFS commit
+`79936b2ead2ba87a3399a1f2249a0fa08aa4480e` with Windows/amd64, CGO disabled,
+`5BytesOffset`, and the full commit embedded in its version. The clean local
+Go-FUSE dependency was `1bdeec4d57d1e9ee85d4938f36f2ed876dd7bd5e`.
+Weed executable SHA-256:
+`58577fe7eb71ffac12aa8d0f540cd3953ffda891d974222c71bc7d7cc30a5c1c`;
+native test executable SHA-256:
+`71e02b7d5c3255c3f5010bd81a5b4b4db80ebc73996cd4495ba6d334055d33c4`.
+With the same candidate DLL `1ea9a10d...` and official LFS 3.8.0, all five
+`GitLfsTempMetadata` cycles passed in
+`/tmp/seaweedfs-windows-mount-results-1686275365` (742.328 seconds, harness exit 0).
+Each retained log independently verifies the loaded DLL, all 20 LFS status
+iterations, 32 modified assets, native canonicalization and rename/content
+checks without skips, graceful unmount and its unique completion marker.
+Setup log SHA-256:
+`cb3d961efebe98a74a0cea546559131e61a46d4a6ee7ff91751f3613014f3b05`;
+cycle-5 log SHA-256:
+`615854a6809c33cac259f60e8a4585ec1108ba6c450a3f070f8b982a83854e6c`.
+Auxiliary collection succeeded: 5,863,822 bytes, matching guest/host SHA-256
+`255b59cba8a6b72ff9d6ed2c120c80bc068d49d1c44653cae8ed7318a050f952`.
+This closes the older-diagnostic-weed limitation for this workload; it still
+uses the lab MinGW DLL and is not MSVC/package or power-loss qualification.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

@@ -304,6 +304,14 @@ test. The first failed query fails the test; alternative path flags and mount
 listings are diagnostic only. This mode never starts weed or
 Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
 It is a component-isolation experiment, not the full Windows qualification gate.
+For additional teardown coverage, set
+`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1` with a freshly built native
+executable. This reuses one exact mount path across all 64 cycles, checks with
+`Lstat` that the owned junction disappears after every graceful unmount, and
+verifies an unrelated sibling file byte-for-byte. The runner requires the final
+cleanup marker, rejecting older executables that lack this check. Run with both
+registration modes. This does not yet verify absence of stale Mount Manager
+metadata, process-death cleanup, or registration-failure rollback.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 This minimal probe reproduced the DOS-path defect without Git, a weed binary,

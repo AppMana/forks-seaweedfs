@@ -486,6 +486,27 @@ repeat stress, real Git LFS workloads, configuration/cleanup coverage and
 release packaging verification remain required before deployment. The native
 test does not run SeaweedFS or Git and cannot establish their data safety.
 
+The same candidate DLL and unchanged `a01eaef1...` native executable also
+passed the alternate registration branch with `MountUseMountmgrFromFSD=1`
+verified in the disposable guest: 64 cycles, 16,384 queries, 191.80 seconds
+native and 397.849 seconds for the complete harness (exit 0). Both test-side
+junction interventions remained disabled. Results:
+`/tmp/seaweedfs-windows-mount-results-1440216702`; `mount-manager.log` SHA-256:
+`4bb0554153a17379c2e9d9d97355206d9ea31c65cdcdc8fcb65a533b72a27b3f`.
+This run used the corrected `lfs-qga-reap-da40c93` helper image and verified
+run-specific setup/native completion tokens and the loaded candidate DLL.
+It extends native registration coverage, not real-workload or crash safety
+qualification; the real LFS qualification continues using default registration.
+
+Related upstream [WinFsp issue 441](https://github.com/winfsp/winfsp/issues/441)
+was fixed by
+[`ea189c5b`](https://github.com/winfsp/winfsp/commit/ea189c5b683b25eeca0cdb60fd12e27536db1c01),
+which preserves explicit mount-manager directory prefixes during Cygwin path
+conversion. Its directory-prefix branch and enlarged buffer are already present
+in our pinned v2.1 baseline's `src/dll/fuse/fuse.c`. That existing fix therefore
+does not resolve the delayed mapping loss reproduced by this native test; it
+is not an alternative patch to merge for this regression.
+
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of
 that exact source, apply the patch with `git apply`, then build:

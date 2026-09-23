@@ -399,8 +399,14 @@ Set `SEAWEEDFS_WINDOWS_WINFSP_DLL` to the built DLL with the isolated scenario
 and a freshly built native test. The runner stages it next to the test rather
 than replacing the installed DLL, and the native probe verifies its actual
 loaded module path. Missing verification or fallback to the installed DLL
-fails the run. This mode cannot be combined with junction or registration
-interventions. For real Git scenarios, the runner supplies
+fails the run. Candidate DLL runs cannot be combined with test-side junction
+rewrites. The isolated native scenario also accepts explicit
+`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD=1` with a candidate DLL to cover the
+driver-side registration branch; mode selection and registry readback remain
+recorded, and this combination remains forbidden in real Git scenarios.
+It is configuration coverage, not a recommendation to enable that registry
+setting. Native success also requires a run-specific completion token.
+For real Git scenarios, the runner supplies
 `-ExpectedWinFspDll` to the smoke script, which inspects the actual SeaweedFS
 mount process's loaded modules before exercising Git. Missing, duplicate,
 uninspectable or wrong-path modules fail the run and invoke existing cleanup.

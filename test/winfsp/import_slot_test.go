@@ -146,6 +146,9 @@ func TestMappedImportSlot(t *testing.T) {
 // or inaccessible pages of the loaded module. The live IAT target must still be
 // verified separately before any memory change. OFT-less images are unsupported.
 func labMappedPE(raw []byte) ([]byte, error) {
+	if len(raw) > 64<<20 {
+		return nil, fmt.Errorf("lab DLL exceeds size limit")
+	}
 	f, err := pe.NewFile(bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
@@ -157,16 +160,84 @@ func labMappedPE(raw []byte) ([]byte, error) {
 	}
 	image := make([]byte, h.SizeOfImage)
 	copy(image, raw[:h.SizeOfHeaders])
+	type interval struct{ start, end uint64 }
+	ranges := []interval{{0, uint64(h.SizeOfHeaders)}}
 	for _, section := range f.Sections {
-		if section.Size == 0 {
-			continue
-		}
-		if uint64(section.VirtualAddress)+uint64(section.Size) > uint64(len(image)) || uint64(section.Offset)+uint64(section.Size) > uint64(len(raw)) {
+		start, end := uint64(section.VirtualAddress), uint64(section.VirtualAddress)+uint64(section.VirtualSize)
+		if section.VirtualSize == 0 || end > uint64(len(image)) || uint64(section.Offset)+uint64(section.Size) > uint64(len(raw)) {
 			return nil, fmt.Errorf("PE section outside file or mapped image")
 		}
-		copy(image[section.VirtualAddress:], raw[section.Offset:uint64(section.Offset)+uint64(section.Size)])
+		for _, r := range ranges {
+			if start < r.end && r.start < end {
+				return nil, fmt.Errorf("overlapping PE virtual ranges")
+			}
+		}
+		ranges = append(ranges, interval{start, end})
+		count := min(section.Size, section.VirtualSize)
+		copy(image[section.VirtualAddress:], raw[section.Offset:uint64(section.Offset)+uint64(count)])
 	}
 	return image, nil
+}
+
+func TestLabMappedPE(t *testing.T) {
+	fixture := func() []byte {
+		b := make([]byte, 2048)
+		copy(b, "MZ")
+		binary.LittleEndian.PutUint32(b[60:], 128)
+		copy(b[128:], "PE\x00\x00")
+		binary.LittleEndian.PutUint16(b[132:], 0x8664)
+		binary.LittleEndian.PutUint16(b[134:], 2)
+		binary.LittleEndian.PutUint16(b[148:], 240)
+		binary.LittleEndian.PutUint16(b[152:], 0x20b)
+		binary.LittleEndian.PutUint32(b[208:], 4096)
+		binary.LittleEndian.PutUint32(b[212:], 512)
+		binary.LittleEndian.PutUint32(b[260:], 16)
+		for i, v := range []uint32{512, 768} {
+			s := 392 + i*40
+			copy(b[s:], ".test")
+			binary.LittleEndian.PutUint32(b[s+8:], 16)
+			binary.LittleEndian.PutUint32(b[s+12:], v)
+			binary.LittleEndian.PutUint32(b[s+16:], 32)
+			binary.LittleEndian.PutUint32(b[s+20:], uint32(1024+i*32))
+		}
+		copy(b[1024:], bytes.Repeat([]byte{'A'}, 32))
+		copy(b[1056:], bytes.Repeat([]byte{'B'}, 32))
+		return b
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func([]byte)
+		valid  bool
+	}{
+		{"raw padding", func([]byte) {}, true},
+		{"zero fill", func(b []byte) { binary.LittleEndian.PutUint32(b[400:], 48) }, true},
+		{"header overlap", func(b []byte) { binary.LittleEndian.PutUint32(b[404:], 500) }, false},
+		{"section overlap", func(b []byte) { binary.LittleEndian.PutUint32(b[444:], 520) }, false},
+		{"raw bounds", func(b []byte) { binary.LittleEndian.PutUint32(b[412:], 2040) }, false},
+		{"virtual bounds", func(b []byte) { binary.LittleEndian.PutUint32(b[404:], 4090) }, false},
+		{"unsupported zero virtual size", func(b []byte) { binary.LittleEndian.PutUint32(b[400:], 0) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := fixture()
+			tc.mutate(b)
+			mapped, err := labMappedPE(b)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+			if tc.valid {
+				if !bytes.Equal(mapped[512:528], bytes.Repeat([]byte{'A'}, 16)) {
+					t.Fatal("raw mapping incorrect")
+				}
+				start := 528
+				if tc.name == "zero fill" {
+					start = 544
+				}
+				if !bytes.Equal(mapped[start:start+16], make([]byte, 16)) {
+					t.Fatal("padding was copied or tail not zero-filled")
+				}
+			}
+		})
+	}
 }
 
 func TestMappedImportSlotCandidate(t *testing.T) {

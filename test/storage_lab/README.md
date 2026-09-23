@@ -377,6 +377,16 @@ It changes both registration modes but not ordinary unregistered mounts or
 drive mounts. It is experimental, not deployment-qualified; the unchanged
 native reproducer and real LFS workload must qualify it before adoption.
 
+Select `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerRegistrationRollback`
+with an explicit manifested `SEAWEEDFS_WINDOWS_WINFSP_DLL` and an amd64 native
+test executable for deterministic rollback injection. The test modifies only
+the loaded lab DLL's IAT in its own process, never the DLL file or global APIs.
+It fails `FindFirstVolumeW` or the second `FSCTL_SET_REPARSE_POINT`, requires exact
+hook counters and failed mounting, restores and verifies the original import,
+enumerates all volume paths to reject stale registration, and mounts the exact
+path normally. Sibling bytes must remain unchanged. Both registration modes are
+supported; junction interventions and the separate cleanup flag are rejected.
+PE-layout fixtures and live original-pointer checks guard the test-only hook.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

@@ -2,6 +2,7 @@ package winfsp
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,16 @@ func TestMountManagerProcessCrash(t *testing.T) {
 		t.Skip("requires a disposable elevated Windows VM with WinFsp")
 	}
 	root := t.TempDir()
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatal(err)
+	}
+	token := fmt.Sprintf("%x", nonce)
+	for name, content := range map[string]string{".crash-owner": token, "unrelated-data.txt": crashSiblingContent} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +48,7 @@ func TestMountManagerProcessCrash(t *testing.T) {
 			}
 			defer log.Close()
 			cmd := exec.CommandContext(ctx, exe, "-test.run=^TestMountManagerDirectoryLifecycle$", "-test.v", "-test.timeout=25s", "-mount-manager-check-cleanup", "-mount-manager-crash-child")
-			cmd.Env = append(os.Environ(), "SEAWEEDFS_MOUNT_CRASH_ROOT="+root, "SEAWEEDFS_MOUNT_CRASH_READY="+ready)
+			cmd.Env = append(os.Environ(), "SEAWEEDFS_MOUNT_CRASH_ROOT="+root, "SEAWEEDFS_MOUNT_CRASH_READY="+ready, "SEAWEEDFS_MOUNT_CRASH_TOKEN="+token)
 			cmd.Stdout, cmd.Stderr = log, log
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
@@ -48,7 +59,11 @@ func TestMountManagerProcessCrash(t *testing.T) {
 			defer func() {
 				if !waited {
 					_ = cmd.Process.Kill()
-					<-done
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						t.Error("terminated child did not exit within cleanup deadline")
+					}
 				}
 				data, err := os.ReadFile(logPath)
 				t.Logf("child cycle=%d log error=%v\n%s", cycle, err, data)
@@ -58,6 +73,9 @@ func TestMountManagerProcessCrash(t *testing.T) {
 				data, err := os.ReadFile(ready)
 				if err == nil && len(data) > 0 {
 					guid = string(data)
+					if len(guid) != 49 || !strings.HasPrefix(guid, `\\?\Volume{`) || !strings.HasSuffix(guid, `}\`) {
+						t.Fatalf("invalid child volume identity: %q", guid)
+					}
 					break
 				}
 				if err != nil && !os.IsNotExist(err) {
@@ -86,10 +104,15 @@ func TestMountManagerProcessCrash(t *testing.T) {
 			if err := cmd.Process.Kill(); err != nil {
 				t.Fatalf("terminate owned child: %v", err)
 			}
-			if err := <-done; err == nil {
-				t.Error("child unexpectedly exited successfully rather than being terminated")
+			select {
+			case err := <-done:
+				waited = true
+				if err == nil {
+					t.Error("child unexpectedly exited successfully rather than being terminated")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("terminated child did not exit within deadline")
 			}
-			waited = true
 			if _, err := os.Lstat(point); !os.IsNotExist(err) {
 				t.Errorf("junction remains after child death: %v", err)
 			}

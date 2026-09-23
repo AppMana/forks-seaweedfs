@@ -66,10 +66,13 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 		if root == "" || !*mountManagerCheckCleanup || os.Getenv("SEAWEEDFS_MOUNT_CRASH_READY") == "" {
 			t.Fatal("crash child requires parent-owned root, readiness path and cleanup checks")
 		}
+		if err := validateCrashOwnership(root, os.Getenv("SEAWEEDFS_MOUNT_CRASH_READY"), os.Getenv("SEAWEEDFS_MOUNT_CRASH_TOKEN")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	sibling := filepath.Join(root, "unrelated-data.txt")
 	const siblingContent = "unrelated data must survive mount cleanup"
-	if *mountManagerCheckCleanup {
+	if *mountManagerCheckCleanup && !*mountManagerCrashChild {
 		if err := os.WriteFile(sibling, []byte(siblingContent), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -232,7 +235,11 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 					t.Fatalf("mounted path %q absent from GUID %q paths %q", point, mountedGUID, paths)
 				}
 				if *mountManagerCrashChild {
-					if err := os.WriteFile(os.Getenv("SEAWEEDFS_MOUNT_CRASH_READY"), []byte(mountedGUID), 0600); err != nil {
+					ready := os.Getenv("SEAWEEDFS_MOUNT_CRASH_READY")
+					if err := os.WriteFile(ready+".tmp", []byte(mountedGUID), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(ready+".tmp", ready); err != nil {
 						t.Fatal(err)
 					}
 					// The parent terminates this process. No Unmount or deferred

@@ -596,6 +596,26 @@ does not prove the installed client version. Retained `guest-logs.txt` SHA-256:
 Use the corrected-helper run with verified setup/client version and unique
 per-cycle completion tokens for the qualification decision.
 
+That guarded real-LFS run completed all 20 cycles successfully in
+`/tmp/seaweedfs-windows-mount-results-1980685225` (2333.536 seconds, harness
+exit 0), using candidate DLL `1ea9a10d...`, unchanged weed `f45761ac...`, and
+official LFS 3.8.0. `setup.log` records the actual guest version and unique setup
+token; SHA-256:
+`1f7d435a971813c2eca57469e3ce4265f972a61ae59e6c3da5768d8c1baceebf`.
+Each retained cycle log has its unique completion token, loaded-DLL verification,
+20 successful LFS status iterations reporting all 32 modified assets, native
+canonicalization and rename/content checks without skips, and graceful unmount.
+Cycle-20 log SHA-256:
+`64e9bbbbd936c37ba7c93b993568592af7159997bc040b5d9b067ba732e4ac29`.
+The SHA-256 of `sha256sum` output over the sorted absolute
+`GitLfsTempMetadata-*.log` paths in that directory is
+`6dc42d6c4444afb30d167eb135573ab2510aa54e228c925a5338fd8581f3f783`.
+The separate terminal guest-log collection still reported exit 125 / output
+truncation; it is not a complete auxiliary archive. Unlike the exploratory run,
+setup and every workload response are independently retained and token-verified.
+This establishes the real-LFS stress result, not registration-failure rollback,
+power-loss durability, or a deployment-qualified release build.
+
 Related upstream [WinFsp issue 441](https://github.com/winfsp/winfsp/issues/441)
 was fixed by
 [`ea189c5b`](https://github.com/winfsp/winfsp/commit/ea189c5b683b25eeca0cdb60fd12e27536db1c01),

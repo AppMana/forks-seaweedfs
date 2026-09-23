@@ -11,6 +11,7 @@ import (
 func validateWinFspLabManifest(manifest, dll, patch []byte) error {
 	fields := map[string]string{}
 	for _, line := range strings.Split(string(manifest), "\n") {
+		line = strings.TrimSuffix(line, "\r") // Set-Content emits CRLF on Windows.
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
@@ -81,6 +82,8 @@ func TestWinFspLabManifest(t *testing.T) {
 		{"explicit mingw", baseline + "build_toolchain=mingw\n", dll, nil, true},
 		{"unknown toolchain", baseline + "build_toolchain=unknown\n", dll, nil, false},
 		{"msvc baseline", msvc, dll, nil, true},
+		{"msvc Windows CRLF", strings.ReplaceAll(msvc, "\n", "\r\n"), dll, nil, true},
+		{"msvc Windows CRLF duplicate", strings.ReplaceAll(msvc+"source_mode=baseline\n", "\n", "\r\n"), dll, nil, false},
 		{"msvc candidate", strings.Replace(strings.Replace(msvc, "source_mode=baseline", "source_mode=candidate", 1), fmt.Sprintf("source_patch_sha256=%x", sha256.Sum256(nil)), fmt.Sprintf("source_patch_sha256=%x", sha256.Sum256(patch)), 1), dll, patch, true},
 		{"msvc missing toolset", strings.Replace(msvc, "platform_toolset=v142", "platform_toolset=", 1), dll, nil, false},
 		{"msvc missing MSBuild", strings.Replace(msvc, "msbuild_version=16.11.2", "msbuild_version=", 1), dll, nil, false},

@@ -619,6 +619,12 @@ passed both rollback fail points under FSD registration in
 absence, exact-path reuse and sibling checks all passed; auxiliary log transfer
 also succeeded. Native log SHA-256:
 `b4af7fba93e1192a821c6e06c257f3a4719d574986b1b84f17ecc49368864d52`.
+The same hardened executable passed both default-registration fail points in
+`/tmp/seaweedfs-windows-mount-results-91939513` (0.14 seconds native,
+181.919 seconds full harness, exit 0), including both restoration markers,
+mapping absence and exact-path reuse. Auxiliary collection succeeded (2,254
+bytes). Native log SHA-256:
+`770c3a7b40c4fd5e9a458306474cf194fe43faa4801e257a35eaaeb855ed6aab`.
 
 Release-build follow-up must use upstream's `build/VStudio/winfsp_dll.vcxproj`
 in `Release|x64`, with the compiler and SDK versions recorded. The pinned v2.1
@@ -631,6 +637,14 @@ Use its existing project-specific `provisioning_scripts` extension for a separat
 compiler-enabled image. Neither a MinGW lab pass nor a successful MSVC compile
 alone establishes deployment qualification: test the resulting exact artifact
 and its packaging/load path before release.
+The DLL manifest verifier accepts `build_toolchain=msvc` only with recorded
+`platform_toolset`, `vc_tools_version`, `windows_sdk_version`, `msbuild_version`,
+`version_build_number` and `version_copyright_year`, in addition to the existing
+source revision, source mode, source epoch, patch/DLL hashes and recipe hash.
+An MSVC manifest must not claim `build_shim_sha256`. Existing MinGW manifests
+(absent toolchain field or `build_toolchain=mingw`) still require that shim hash;
+unknown toolchains fail validation. These checks establish evidence consistency,
+not compiler trust, reproducibility, or a successful Windows-native build.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

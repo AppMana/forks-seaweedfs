@@ -563,6 +563,14 @@ log SHA-256:
 This predates child ownership-token enforcement; the parent supplied its own
 fresh temporary directory, but direct child invocation was insufficiently guarded.
 Use the ownership-hardened executable for subsequent qualification.
+The hardened executable
+`e0f5d0be043e3d8ac4e94c7d61554fa21be82e0061a017a1297d11619046a450`
+passed all eight process-crash cycles with FSD registration in
+`/tmp/seaweedfs-windows-mount-results-661557478` (31.51 seconds native,
+224.994 seconds full harness, exit 0). Every child verified the candidate DLL;
+post-crash junction/mapping checks were immediate, with no polling or repair.
+Log SHA-256:
+`8755465461b05345fec557ca7992da6e9d63de0463f5f0734bad4af388e2d854`.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

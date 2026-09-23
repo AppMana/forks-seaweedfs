@@ -29,6 +29,7 @@ def main():
     checker = 'xfs_repair' if args.filesystem == 'xfs' else 'btrfs'
     if shutil.which(checker) is None:
         parser.error('missing required checker: ' + checker)
+    lab.require_bwrap_features()
     usage = shutil.disk_usage('/tmp')
     if usage.free < 4 * 1024**3:
         parser.error('less than 4 GiB host headroom')

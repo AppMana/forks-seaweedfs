@@ -36,6 +36,9 @@ jobs:
       - name: Windows smoke harness rejects failed prerequisites
         shell: pwsh
         run: ./forks-seaweedfs/hack/appmana/mount-smoke-contract-test.ps1
+      - name: Verify PowerShell contract exit status under the Actions wrapper
+        working-directory: forks-seaweedfs
+        run: python3 -m unittest discover -s hack/appmana -p 'test_smoke_contract_exit.py' -v
       - name: Cross-compile gate (windows/amd64, large disk)
         working-directory: forks-seaweedfs
         run: |

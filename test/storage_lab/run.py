@@ -126,6 +126,19 @@ def digest(path):
     return checksum.hexdigest()
 
 
+def require_bwrap_features():
+    """Fail before staging/privilege if bounded tmpfs cannot be established."""
+    result = subprocess.run(['/usr/bin/bwrap', '--help'], check=True,
+                            capture_output=True, text=True, timeout=10)
+    options = set(re.findall(r'--[a-z][a-z-]*', result.stdout))
+    missing = {'--size', '--perms', '--remount-ro'} - options
+    if missing:
+        raise RuntimeError('Bubblewrap missing required isolation options: ' +
+                           ', '.join(sorted(missing)) +
+                           '; use the qualified Ubuntu 24.04/Bubblewrap 0.9 runner; '
+                           'do not remove sandbox bounds')
+
+
 def command(suite, artifacts, unit):
     # Privilege is used ONLY to establish namespaces and cgroup ceilings. The
     # payload drops to the invoking UID/GID with no capabilities or host mounts.
@@ -194,6 +207,7 @@ def main():
     args = parser.parse_args()
     if os.getuid() == 0:
         parser.error('invoke as a normal user; the runner uses narrowly scoped sudo')
+    require_bwrap_features()
     artifacts = {'tests': args.tests}
     if args.suite in ('migration', 'admission'):
         if args.candidate is None:

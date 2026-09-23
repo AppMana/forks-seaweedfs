@@ -11,6 +11,10 @@ not a sandbox for hostile code or a substitute for a separate physical host.
 
 Linux with systemd, cgroup memory/CPU/PID controllers, `/usr/bin/bwrap`, Python 3,
 and noninteractive sudo for systemd-run/systemctl. Run as your ordinary user.
+The qualified hosted image is Ubuntu 24.04 with Bubblewrap 0.9. Both Linux
+runners check for `--size`, `--perms`, and `--remount-ro` before staging or
+privileged setup. Do not remove bounded tmpfs or read-only artifact options
+to accommodate an older installation; update the runner instead.
 Privilege establishes isolation; the test payload runs as that user's UID/GID
 with zero capabilities. A preflight inside the same sandbox verifies loopback
 only, no host home/devices/Docker socket, a read-only artifact mount, and bounded

@@ -37,7 +37,7 @@ permissions:
 env:
   BASELINE_REF: ${{ inputs.baseline_ref || vars.SEAWEEDFS_RELIABILITY_BASELINE_REF }}
   GO_FUSE_REF: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
-  LABCONTAINERS_REF: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF }}
+  LABCONTAINERS_REF: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF || '56e537c59dcb051ae6dba677a557db2483b6fefc' }}
   LABCONTAINERS_VM_IMAGE: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE }}
   LABCONTAINERS_WINDOWS_IMAGE: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE }}
   STORAGE_BUILD_TAGS: 5BytesOffset
@@ -81,6 +81,9 @@ jobs:
           test "$(containerlab version --short 2>/dev/null | tr -d 'v')" = '0.79.0'
           docker image inspect "$LABCONTAINERS_WINDOWS_IMAGE" >/dev/null
           docker image inspect "$LABCONTAINERS_VM_IMAGE" >/dev/null
+          for image in "$LABCONTAINERS_WINDOWS_IMAGE" "$LABCONTAINERS_VM_IMAGE"; do
+            test "$(docker image inspect --format '{{ index .Config.Labels "appmana.labcontainers.revision" }}' "$image")" = "$LABCONTAINERS_REF"
+          done
           # Require an explicit LFS client for this release-build qualification.
           for pair in 'SEAWEEDFS_WINDOWS_MSVC_ISO SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256' 'SEAWEEDFS_WINFSP_MSI WINFSP_MSI_SHA256' 'SEAWEEDFS_GIT_INSTALLER GIT_INSTALLER_SHA256' 'SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC GIT_LFS_SHA256'; do
             read -r path_name hash_name <<< "$pair"
@@ -106,6 +109,8 @@ jobs:
       - name: Build and verify matched native DLL artifacts
         run: |
           set -euo pipefail
+          sdk_pin=$(sed -n 's/.*github.com\/appmana\/labcontainers .*-[^-]*-\([0-9a-f]*\)$/\1/p' test/storage_lab/vm/go.mod)
+          test "${LABCONTAINERS_REF:0:12}" = "$sdk_pin"
           (cd "$GITHUB_WORKSPACE/labcontainers" && make build)
           compiler_work=$(mktemp -d "$RUNNER_TEMP/winfsp-msvc-work.XXXXXXXX")
           (cd "$compiler_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
@@ -353,6 +358,12 @@ jobs:
           printf 'VM baseline: `%s`\n\nVM candidate: `%s`\n\nLabcontainers: `%s`\n\nVM image: `%s`\n' "$baseline_sha" "$candidate_sha" "$LABCONTAINERS_REF" "$LABCONTAINERS_VM_IMAGE" >> "$GITHUB_STEP_SUMMARY"
       - name: Unit-test the Labcontainers VM harness
         run: |
+          sdk_pin=$(sed -n 's/.*github.com\/appmana\/labcontainers .*-[^-]*-\([0-9a-f]*\)$/\1/p' test/storage_lab/vm/go.mod)
+          test "${LABCONTAINERS_REF:0:12}" = "$sdk_pin"
+          test "$(docker image inspect --format '{{ index .Config.Labels "appmana.labcontainers.revision" }}' "$LABCONTAINERS_VM_IMAGE")" = "$LABCONTAINERS_REF"
+          native_cli="$GITHUB_WORKSPACE/labcontainers/bin/containerlab-recovery"
+          bash "$GITHUB_WORKSPACE/labcontainers/scripts/build-containerlab.sh" "$native_cli"
+          echo "LABCONTAINERS_CONTAINERLAB=$native_cli" >> "$GITHUB_ENV"
           vm_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-vm-work.XXXXXXXX")
           (cd "$vm_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           GOWORK="$vm_work/go.work" go test ./test/storage_lab/vm/...

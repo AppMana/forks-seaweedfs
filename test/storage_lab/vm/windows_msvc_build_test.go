@@ -14,6 +14,7 @@ import (
 
 	labv1 "github.com/appmana/labcontainers/api/v1"
 	"github.com/appmana/labcontainers/pkg/client"
+	clab "github.com/appmana/labcontainers/pkg/containerlab"
 )
 
 // This is an opt-in native compiler test, not a deployment or driver installer.
@@ -70,8 +71,14 @@ func TestWindowsWinFspMSVCBuildLab(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	topology := []byte(fmt.Sprintf("name: ignored\ntopology:\n  nodes:\n    vm:\n      kind: generic_vm\n      image: %q\n      network-mode: none\n      binds: [%q]\n      env:\n        QEMU_ADDITIONAL_ARGS: '-drive file=/compiler.iso,media=cdrom,readonly=on'\n    peer:\n      kind: linux\n      image: alpine:3.20\n      network-mode: none\n  links:\n    - endpoints: [vm:eth1, peer:eth1]\n", img, iso+":/compiler.iso:ro"))
-	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: &labv1.TopologySource{Source: &labv1.TopologySource_Yaml{Yaml: topology}}, Nodes: map[string]*labv1.NodeExtension{"vm": {Control: "qga"}}}, 60*time.Minute)
+	config := windowsTopologyConfig(img)
+	config.Topology.Nodes["vm"].Binds = []string{iso + ":/compiler.iso:ro"}
+	config.Topology.Nodes["vm"].Env = map[string]string{"QEMU_ADDITIONAL_ARGS": "-drive file=/compiler.iso,media=cdrom,readonly=on"}
+	topology, err := clab.Source(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: topology, Nodes: map[string]*labv1.NodeExtension{"vm": {Control: "qga"}}}, 60*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

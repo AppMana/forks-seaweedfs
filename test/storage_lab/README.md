@@ -387,6 +387,11 @@ enumerates all volume paths to reject stale registration, and mounts the exact
 path normally. Sibling bytes must remain unchanged. Both registration modes are
 supported; junction interventions and the separate cleanup flag are rejected.
 PE-layout fixtures and live original-pointer checks guard the test-only hook.
+Callbacks resolve their original target before installation. If a failed mount
+times out, the harness waits for both Mount and Unmount to leave the DLL before
+restoring the hook. Failure to prove quiescence aborts the disposable native test
+process with exit 2, without running DLL restoration/unload cleanups underneath
+active calls. This is a failed test, never a successful rollback result.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

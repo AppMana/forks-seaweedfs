@@ -1,6 +1,7 @@
 package winfsp
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,9 +67,16 @@ func TestMountManagerRegistrationRollback(t *testing.T) {
 				t.Fatal(err)
 			}
 			var calls, fired atomic.Int32
-			var original uintptr
 			var callback uintptr
 			symbol := "FindFirstVolumeW"
+			if fault == "guid-reparse" {
+				symbol = "DeviceIoControl"
+			}
+			api := windows.NewLazySystemDLL("kernel32.dll").NewProc(symbol)
+			if err := api.Find(); err != nil {
+				t.Fatal(err)
+			}
+			original := api.Addr() // immutable and initialized before hook installation
 			if fault == "guid-lookup" {
 				callback = syscall.NewCallback(func(name, size uintptr) uintptr {
 					calls.Add(1)
@@ -77,7 +85,6 @@ func TestMountManagerRegistrationRollback(t *testing.T) {
 					return ^uintptr(0)
 				})
 			} else {
-				symbol = "DeviceIoControl"
 				callback = syscall.NewCallback(func(h, code, in, inSize, out, outSize, returned, overlapped uintptr) uintptr {
 					if code == uintptr(windows.FSCTL_SET_REPARSE_POINT) && calls.Add(1) == 2 {
 						fired.Add(1)
@@ -89,8 +96,10 @@ func TestMountManagerRegistrationRollback(t *testing.T) {
 					return r
 				})
 			}
-			var restore func()
-			original, restore = labImportHook(t, symbol, callback)
+			installedOriginal, restore := labImportHook(t, symbol, callback)
+			if installedOriginal != original {
+				t.Fatal("callback original differs from validated import")
+			}
 			host := fuse.NewFileSystemHost(&mountManagerRootFS{sentinel: "rollback-sentinel"})
 			done := make(chan bool, 1)
 			go func() { done <- host.Mount(`\\.\`+point, nil) }()
@@ -101,7 +110,12 @@ func TestMountManagerRegistrationRollback(t *testing.T) {
 				}
 			case <-time.After(10 * time.Second):
 				// A missing injection must fail, never become a passing mount.
-				go host.Unmount()
+				if !waitForLabMountQuiescence(host.Unmount, done, 5*time.Second) {
+					// Do not run Go cleanups which would mutate/unload a live DLL.
+					// This process and all its paths are owned by the isolated VM.
+					fmt.Fprintln(os.Stderr, "FATAL: mount DLL did not quiesce; aborting isolated test process without hook restoration")
+					os.Exit(2)
+				}
 				t.Fatal("injected mount did not fail within deadline")
 			}
 			wantCalls := int32(1)

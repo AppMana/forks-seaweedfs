@@ -571,6 +571,18 @@ passed all eight process-crash cycles with FSD registration in
 post-crash junction/mapping checks were immediate, with no polling or repair.
 Log SHA-256:
 `8755465461b05345fec557ca7992da6e9d63de0463f5f0734bad4af388e2d854`.
+The same hardened executable passed eight default-registration crash cycles in
+`/tmp/seaweedfs-windows-mount-results-3056222946` (31.48 seconds native,
+247.385 seconds full harness, exit 0), with the same immediate cleanup checks.
+Log SHA-256:
+`b8ca5994e3e1b51f118087c59e51a5199fe33ed1963b808582afd61d330bdb37`.
+These process-termination results do not cover failure after registration but
+before the candidate's GUID-junction rewrite completes. Upstream test API hooks
+are compiled into `winfsp-tests.exe`, not the DLL, and cannot inject that failure.
+Rollback qualification must prove that the intended DLL call actually failed,
+that the mount failed, that no owned path remains registered, and that restoring
+the normal call permits exact-path reuse. Do not substitute a service-stop race
+or a passing process-crash test for that missing evidence.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

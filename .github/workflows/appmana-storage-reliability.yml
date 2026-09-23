@@ -275,6 +275,8 @@ jobs:
           WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 }}
           SEAWEEDFS_GIT_INSTALLER: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH }}
           GIT_INSTALLER_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 }}
+          SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_PATH }}
+          GIT_LFS_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 }}
           LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
         run: |
           set -euo pipefail
@@ -284,6 +286,13 @@ jobs:
           [[ "$SEAWEEDFS_WINFSP_MSI" = /* && "$SEAWEEDFS_GIT_INSTALLER" = /* ]]
           printf '%s  %s\n' "$WINFSP_MSI_SHA256" "$SEAWEEDFS_WINFSP_MSI" | sha256sum -c -
           printf '%s  %s\n' "$GIT_INSTALLER_SHA256" "$SEAWEEDFS_GIT_INSTALLER" | sha256sum -c -
+          if [[ -n "$SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC" || -n "$GIT_LFS_SHA256" ]]; then
+            [[ "$SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC" = /* && "$GIT_LFS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            printf '%s  %s\n' "$GIT_LFS_SHA256" "$SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC" | sha256sum -c -
+            printf 'Explicit Windows Git LFS SHA-256: `%s`\n' "$GIT_LFS_SHA256" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Windows Git LFS: using the pinned Git installer bundle; see setup.log for its version.' >> "$GITHUB_STEP_SUMMARY"
+          fi
           candidate_sha=$(git rev-parse HEAD)
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_WINDOWS_WINFSP_TEST" ./test/winfsp

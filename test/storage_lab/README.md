@@ -226,6 +226,15 @@ The test logs input hashes and retains combined scenario stdout/stderr under the
 printed results directory (`RUNNER_TEMP` in CI, system temp otherwise). Guest
 logs are exported to `guest-logs.txt` (last 2,000 lines per top-level log file;
 not a complete recursive archive). Archive the complete Go test output as well.
+To reproduce a standalone-client comparison in Actions, configure the optional
+`SEAWEEDFS_RELIABILITY_GIT_LFS_PATH`/`SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` pair
+documented in the root README. Both must match the reviewed executable; omitting
+both deliberately uses bundled LFS and is reported in the job summary. The
+existing `SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC` runner input stages this executable
+even when it is an unmodified official release (the name is historical). Setup
+hash-checks installed copies, preserves Git's hard-linked launcher and records
+the actual LFS version. Local official 3.8.0 comparisons used executable SHA-256
+`d1a2b2a90a3b8d57e68db6a6d0daefc7c96e12a1abd1c0849f41d13839252857`.
 `SEAWEEDFS_WINDOWS_MOUNT_REPEATS` defaults to 1 and accepts 1..20 fresh scenario
 pairs within the existing 40-minute harness budget; raising the repeat count
 does not extend that budget. Verbosity defaults to 0 and accepts 0..4.

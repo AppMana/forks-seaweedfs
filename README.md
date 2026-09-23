@@ -84,6 +84,7 @@ Secrets and variables → Actions → Variables:
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Windows VM image including `@sha256:<64 hex>` | Preload the licensed image on the same dedicated runner. Run the native Windows core regressions and Labcontainers NTFS crash test before promotion. |
 | `SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256` | Absolute runner-local WinFsp MSI path and SHA-256 | Preload the reviewed installer. The VM gate verifies its hash before staging it offline. |
 | `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH` / `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256` | Absolute runner-local Git for Windows installer path and SHA-256 | Preload the reviewed installer including Git LFS; update path and digest together after qualification. Missing/mismatched installers fail the VM gate. |
+| `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH` / `SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` | Optional absolute runner-local standalone Windows `git-lfs.exe` path and SHA-256 | Set both to test an explicit client independently of the Git installer bundle; a partial pair or hash mismatch fails the gate. Leave both unset to test bundled LFS. Update deliberately after client qualification, never download `latest` during a regression run. |
 
 The initial baseline is `9ec822e2d634abc36eb2a113d0ddb4a844970873` (the audited
 4.40 fork source), and the initial Go-FUSE pin is
@@ -102,6 +103,9 @@ gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH --repo AppMana/forks-seawe
 gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_MSI_SHA256"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_INSTALLER_PATH"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_INSTALLER_SHA256"
+# Optional explicit Windows LFS client; configure both or neither.
+gh variable set SEAWEEDFS_RELIABILITY_GIT_LFS_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_LFS_PATH"
+gh variable set SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_LFS_SHA256"
 gh variable list --repo AppMana/forks-seaweedfs
 ```
 

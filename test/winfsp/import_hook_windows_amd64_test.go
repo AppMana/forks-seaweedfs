@@ -7,16 +7,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/windows"
 )
+
+var labImportHookMutex sync.Mutex
 
 // labImportHook changes one IAT pointer in the explicitly selected lab DLL.
 // Call only while no mount is running; restore before starting a normal mount.
 // The library reference and restoration are also registered as test cleanups.
 func labImportHook(t *testing.T, symbol string, callback uintptr) (uintptr, func()) {
 	t.Helper()
+	labImportHookMutex.Lock()
+	t.Cleanup(labImportHookMutex.Unlock)
 	path := os.Getenv("SEAWEEDFS_WINDOWS_EXPECT_WINFSP_DLL")
 	if os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB") != "1" || !filepath.IsAbs(path) || callback == 0 {
 		t.Fatal("IAT injection requires isolated lab, explicit absolute DLL and callback")
@@ -49,6 +54,18 @@ func labImportHook(t *testing.T, symbol string, callback uintptr) (uintptr, func
 	}
 	t.Logf("verified loaded lab WinFsp DLL: %s", path)
 	address := uintptr(dll.Handle) + uintptr(rva)
+	if address < uintptr(dll.Handle) || uint64(rva)+8 > uint64(len(image)) {
+		t.Fatal("IAT address overflow")
+	}
+	peOffset := binary.LittleEndian.Uint32(image[60:64])
+	liveHeader := make([]byte, 152)
+	var headerRead uintptr
+	if err := windows.ReadProcessMemory(windows.CurrentProcess(), uintptr(dll.Handle)+uintptr(peOffset), &liveHeader[0], uintptr(len(liveHeader)), &headerRead); err != nil || headerRead != uintptr(len(liveHeader)) {
+		t.Fatalf("read live PE header: %v bytes=%d", err, headerRead)
+	}
+	if string(liveHeader[:4]) != "PE\x00\x00" || binary.LittleEndian.Uint32(liveHeader[80:]) != uint32(len(image)) || binary.LittleEndian.Uint64(liveHeader[144:]) != binary.LittleEndian.Uint64(image[peOffset+144:]) {
+		t.Fatal("loaded image size/import directory differs from staged DLL")
+	}
 	read := func() (uintptr, error) {
 		var b [8]byte
 		var count uintptr
@@ -68,6 +85,9 @@ func labImportHook(t *testing.T, symbol string, callback uintptr) (uintptr, func
 	}
 	if original == 0 || original != api.Addr() {
 		t.Fatalf("unexpected original IAT target %#x != %#x", original, api.Addr())
+	}
+	if callback == original {
+		t.Fatal("IAT injection callback is a no-op")
 	}
 	write := func(value uintptr) (err error) {
 		var old uint32

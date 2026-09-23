@@ -28,10 +28,10 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash":
+		case "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
 			scenarios = []string{scenario}
 		default:
-			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO must be GitAtomicRenamePrimed, GitLfsTempMetadata, MountManagerDirectoryLifecycle or MountManagerProcessCrash")
+			t.Fatal("unknown SEAWEEDFS_WINDOWS_MOUNT_SCENARIO; see test/storage_lab/README.md")
 		}
 	}
 	repeats := 1
@@ -54,17 +54,21 @@ func TestWindowsMountLab(t *testing.T) {
 		verbosity = value
 	}
 	crashMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerProcessCrash"
-	isolateMountManager := crashMountManager || (len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle")
+	rollbackMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerRegistrationRollback"
+	isolateMountManager := rollbackMountManager || crashMountManager || (len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle")
 	cleanupMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP")
-	if cleanupMode != "" && (cleanupMode != "1" || !isolateMountManager || crashMountManager) {
+	if cleanupMode != "" && (cleanupMode != "1" || !isolateMountManager || crashMountManager || rollbackMountManager) {
 		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1 requires the isolated mount-manager scenario")
 	}
 	registrationMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD")
 	guidJunction := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION")
-	if crashMountManager && guidJunction != "" {
+	if (crashMountManager || rollbackMountManager) && guidJunction != "" {
 		t.Fatal("crash qualification cannot use a test-side junction intervention")
 	}
 	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
+	if rollbackMountManager && labDLL == "" {
+		t.Fatal("rollback injection requires an explicit lab DLL")
+	}
 	if err := validateWindowsMountModes(isolateMountManager, registrationMode, guidJunction, labDLL); err != nil {
 		t.Fatal(err)
 	}
@@ -238,6 +242,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		if crashMountManager {
 			lastCycle = "cycle=7: crash cleanup and sibling preservation succeeded"
 		}
+		if rollbackMountManager {
+			lastCycle = "rollback verified: guid-reparse fired once, mapping removed, same path reused"
+		}
 		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^` + nativeName + `$' '-test.v' '-test.count=1' '-test.timeout=5m'`
 		if labDLL != "" {
 			command = `$env:SEAWEEDFS_WINDOWS_EXPECT_WINFSP_DLL='C:\lab\winfsp-x64.dll'; ` + command
@@ -264,6 +271,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		}
 		if err := validateWindowsCommandOutput(result.GetExitCode(), output, nativeMarker); err != nil {
 			t.Fatal(err)
+		}
+		if rollbackMountManager && (!strings.Contains(output, "rollback verified: guid-lookup fired once, mapping removed, same path reused") || !strings.Contains(output, "restored lab DLL IAT: FindFirstVolumeW") || !strings.Contains(output, "restored lab DLL IAT: DeviceIoControl")) {
+			t.Fatal("rollback test did not verify both injected failures and restorations")
 		}
 		if cleanupMode == "1" && !strings.Contains(output, "cycle=63: owned junction removed and sibling preserved") {
 			t.Fatal("native probe did not complete same-path cleanup qualification")

@@ -583,6 +583,18 @@ Rollback qualification must prove that the intended DLL call actually failed,
 that the mount failed, that no owned path remains registered, and that restoring
 the normal call permits exact-path reuse. Do not substitute a service-stop race
 or a passing process-crash test for that missing evidence.
+Select `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerRegistrationRollback`
+with an explicit manifested `SEAWEEDFS_WINDOWS_WINFSP_DLL` and an amd64 native
+test executable for deterministic rollback injection. The test modifies only
+the loaded lab DLL's IAT in its own process, never the DLL file or global APIs.
+It fails `FindFirstVolumeW` or the second `FSCTL_SET_REPARSE_POINT`, requires exact
+hook counters and failed mounting, restores and verifies the original import,
+enumerates all volume paths to reject stale registration, and mounts the exact
+path normally. Sibling bytes must remain unchanged. Both registration modes are
+supported; junction interventions and the separate cleanup flag are rejected.
+PE-layout fixtures and live original-pointer checks guard the test-only hook.
+This scenario is not yet a completed qualification result merely because it
+builds; retain the native result and restoration markers from each live run.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after
@@ -623,6 +635,14 @@ The existing 2,000-line-per-file tail policy remains: this is not a full log
 archive. Collection has a separate two-minute deadline and now fails the harness
 on error rather than silently allowing missing auxiliary evidence. Unit coverage
 reproduces the old truncation failure with more than 3 MiB of diagnostic text.
+The companion candidate `GitAtomicRenamePrimed` run completed five cycles in
+`/tmp/seaweedfs-windows-mount-results-4001340908` (418.175 seconds, exit 0), each
+with 20 repeated Git config-lock replacement checks and graceful unmount.
+Cycle-5 log SHA-256:
+`cabd032651d168acf61671d59e71375fc4574255a16850f492d49fb9ac05c230`.
+The repaired collector downloaded 2,749,554 bytes successfully; host hash matched
+the guest hash recorded in `guest-logs-collection.txt`:
+`9b1fee83dff6bd423fc291e771b0237fa28674c3f1966441328050b1cc74b53a`.
 
 Related upstream [WinFsp issue 441](https://github.com/winfsp/winfsp/issues/441)
 was fixed by

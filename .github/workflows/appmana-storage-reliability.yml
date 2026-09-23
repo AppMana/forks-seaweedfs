@@ -76,9 +76,11 @@ jobs:
           set -euo pipefail
           [[ "$LABCONTAINERS_REF" =~ ^[0-9a-f]{40}$ && "$GO_FUSE_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$LABCONTAINERS_WINDOWS_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]]
+          [[ "$LABCONTAINERS_VM_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]]
           test -c /dev/kvm
           test "$(containerlab version --short 2>/dev/null | tr -d 'v')" = '0.79.0'
           docker image inspect "$LABCONTAINERS_WINDOWS_IMAGE" >/dev/null
+          docker image inspect "$LABCONTAINERS_VM_IMAGE" >/dev/null
           # Require an explicit LFS client for this release-build qualification.
           for pair in 'SEAWEEDFS_WINDOWS_MSVC_ISO SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256' 'SEAWEEDFS_WINFSP_MSI WINFSP_MSI_SHA256' 'SEAWEEDFS_GIT_INSTALLER GIT_INSTALLER_SHA256' 'SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC GIT_LFS_SHA256'; do
             read -r path_name hash_name <<< "$pair"
@@ -136,6 +138,20 @@ jobs:
           done
           unset SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD
           go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
+      - name: Mixed Windows and Linux mounted clients
+        env:
+          SEAWEEDFS_MIXED_LIVE: '1'
+          SEAWEEDFS_LINUX_WEED: ${{ runner.temp }}/mixed-weed-linux
+          SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/msvc-weed.exe
+          SEAWEEDFS_MIXED_LINUX_WORKLOAD: ${{ runner.temp }}/mixed-linux
+          SEAWEEDFS_MIXED_WINDOWS_WORKLOAD: ${{ runner.temp }}/mixed-windows.exe
+        run: |
+          set -euo pipefail
+          candidate_sha=$(git rev-parse HEAD)
+          GOWORK=off CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_LINUX_WEED" ./weed
+          CGO_ENABLED=0 go build -o "$SEAWEEDFS_MIXED_LINUX_WORKLOAD" ./test/storage_lab/vm/mixed_workload
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o "$SEAWEEDFS_MIXED_WINDOWS_WORKLOAD" ./test/storage_lab/vm/mixed_workload
+          go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=30m 2>&1 | tee "$RUNNER_TEMP/mixed-mount-test.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -143,6 +159,8 @@ jobs:
           path: |
             ${{ runner.temp }}/winfsp-msvc-ci.*/
             ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
+            ${{ runner.temp }}/seaweedfs-mixed-results-*/
+            ${{ runner.temp }}/mixed-mount-test.log
           if-no-files-found: error
           retention-days: 30
 
@@ -199,6 +217,8 @@ jobs:
         run: go test -race -count=1 ./test/winfsp -run '^TestCrashChildOwnership$|^TestMappedImportSlot$|^TestLabMappedPE$|^TestLabMountQuiescence$'
       - name: Lab isolation command contracts
         run: python3 -m unittest discover -s test/storage_lab -v
+      - name: Mixed workload oracle and corruption negative controls
+        run: cd test/storage_lab/vm && GOWORK=off go test -race -count=1 ./mixed_workload
       - name: Negative controls prove regressions turn red
         env:
           MUTANT_LOG_DIR: ${{ runner.temp }}/storage-mutant-logs

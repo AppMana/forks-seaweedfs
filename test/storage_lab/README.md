@@ -308,10 +308,13 @@ For additional teardown coverage, set
 `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1` with a freshly built native
 executable. This reuses one exact mount path across all 64 cycles, checks with
 `Lstat` that the owned junction disappears after every graceful unmount, and
-verifies an unrelated sibling file byte-for-byte. The runner requires the final
-cleanup marker, rejecting older executables that lack this check. Run with both
-registration modes. This does not yet verify absence of stale Mount Manager
-metadata, process-death cleanup, or registration-failure rollback.
+verifies an unrelated sibling file byte-for-byte. After the canonicalization
+probes it records the volume GUID and requires the exact path in
+`GetVolumePathNamesForVolumeNameW`; after unmount that association must be absent
+(or the GUID no longer found). No localized `mountvol` output is parsed.
+The runner requires final junction and mapping cleanup markers, rejecting
+older executables that lack these checks. Run with both registration modes.
+This does not yet verify process-death cleanup or registration-failure rollback.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 This minimal probe reproduced the DOS-path defect without Git, a weed binary,

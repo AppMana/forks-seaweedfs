@@ -698,6 +698,20 @@ passed `Get-AuthenticodeSignature` in a fresh isolated Windows guest: status
 guest hash matching the host, and `BOOTSTRAPPER_SIGNATURE_VERIFIED` with exit 0.
 The bootstrapper was inspected, not executed. Its valid signature does not
 resolve the separate catalog mismatch.
+The pinned 16.11.60 BuildTools link in Microsoft's release history yielded a
+different bootstrapper matching its URL hash
+`56c889adadf638062ef8e7b9421a988e8cb5441b3730e5ed28f777a538d9f69e`.
+Its embedded `installChannelUri`
+(`https://aka.ms/vs/16/release/392447893_1759027617/channel`) returned the same
+channel bytes/hash and therefore did not resolve the catalog mismatch. This
+pinned bootstrapper has not been executed or independently signature-checked.
+The alternative official VS2022 channel (17.14.41) was also checked, without
+changing the intended v142/19041 target: its catalog declared 30,443,537 bytes,
+SHA-256 `6e470016e4324c84c255ffd0beb3767d17ec89cc8561e9409ee3e1f6d29400f5`,
+but returned 17,954,732 bytes,
+SHA-256 `f0a50ea157222c29abd5ea6ff01bfc3c33b04e011c5e45ee2ca38ef0778e5643`.
+The alternate files are retained in the same cache; neither was used to install
+packages. A verified preprovisioned image/offline layout remains an alternative.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

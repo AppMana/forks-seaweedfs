@@ -336,7 +336,10 @@ power loss, and the synthetic filesystem cannot establish SeaweedFS durability.
 The parent creates a random ownership token and sibling fixture. Child mode
 requires that token, an absolute non-symlink root, intact sibling bytes and
 unused checkpoint/mount paths within that root; it never rewrites the sibling.
-Readiness is published by temporary-file rename. Child-exit waits are bounded.
+Readiness is published by temporary-file rename. The reader permits Windows
+delete-sharing while the publisher closes its rename handle; a deterministic
+held-DELETE-handle regression runs before the crash cycles. This does not retry
+failed mount queries or cleanup assertions. Child-exit waits are bounded.
 Post-termination absence checks are immediate and strict, with no repair or
 retry of a failed mapping assertion.
 The existing storage-reliability Actions workflow exposes these intensive checks
@@ -912,9 +915,39 @@ All 64 junction removals, mapping removals and sibling-preservation checks
 completed. Results: `/tmp/seaweedfs-windows-mount-results-1681277609/`
 (467.338 seconds including VM setup); native log SHA-256
 `dd11c612cdcaff65cd89ec70412d993979b8b16e875bd039d2f8d5664432c947`.
-Auxiliary guest-log transfer also passed. The new CI job additionally requires
-FSD process-crash/rollback and the separate atomic-rename workload; this local
-MSVC result set must not be represented as having run those additional gates.
+Auxiliary guest-log transfer also passed.
+
+The remaining local MSVC runtime gates subsequently completed:
+
+- FSD registration rollback: both injected faults passed in
+  `/tmp/seaweedfs-windows-mount-results-3001562771/` (193.505 seconds), native
+  log SHA-256 `e7aea404bc9280f850d17374b0388e1d68119b3f0a659e1c716fa2e546b69673`.
+- Five separate Git atomic-rename cycles passed in
+  `/tmp/seaweedfs-windows-mount-results-1113685136/` (382.081 seconds), each
+  verifying the loaded candidate DLL, 20 config-lock replacements, content,
+  graceful unmount and its unique completion marker.
+- FSD process-crash: eight cycles passed in
+  `/tmp/seaweedfs-windows-mount-results-212592130/` (462.083 seconds), native
+  log SHA-256 `3de1b37feb724366e30885e144e2c434ed7ddc1d08c50b7962a387f675b3118b`.
+- Default process-crash rerun: eight cycles passed in
+  `/tmp/seaweedfs-windows-mount-results-2944697379/` (458.651 seconds), native
+  log SHA-256 `612b999d383fa02be7fde074dad5e5592bdcfb24d76fe4d45b8c896b2f44047e`.
+
+The initial FSD crash run in `seaweedfs-windows-mount-results-2653445791`
+failed at the readiness file, not a mount assertion: `os.ReadFile` did not
+share DELETE access with a still-open rename handle. A deterministic regression
+held that access open and reproduced the same sharing violation before the fix
+in `seaweedfs-windows-mount-results-265296316`. The reader now explicitly permits
+delete-sharing. Both successful crash reruns include that regression and retain
+the unchanged strict mapping/junction/sibling checks. Their native executable
+SHA-256 is `cac553b3a8f60d799f0bed47001707cc608ea9f4c93fe7b160641be21d329be7`.
+This is a harness synchronization correction, not another SeaweedFS data-path fix.
+
+These checks ran locally through the same automated Labcontainers tests; the
+complete GitHub Actions native-build job has not run. The Windows deployment
+artifact is the sibling CSI repository's HostProcess image, which still bundles
+stock WinFsp until explicitly updated. Bare-executable/DLL results do not qualify
+that image's install/upgrade/rollback or the Synology SPK lifecycle.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

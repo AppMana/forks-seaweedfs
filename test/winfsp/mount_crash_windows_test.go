@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,9 @@ import (
 func TestMountManagerProcessCrash(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB") != "1" {
 		t.Skip("requires a disposable elevated Windows VM with WinFsp")
+	}
+	if !t.Run("readiness-rename-sharing", testCrashReadinessRenameSharing) {
+		t.FailNow()
 	}
 	root := t.TempDir()
 	var nonce [32]byte
@@ -70,7 +74,7 @@ func TestMountManagerProcessCrash(t *testing.T) {
 			}()
 			var guid string
 			for guid == "" {
-				data, err := os.ReadFile(ready)
+				data, err := readCrashReadiness(ready)
 				if err == nil && len(data) > 0 {
 					guid = string(data)
 					if len(guid) != 49 || !strings.HasPrefix(guid, `\\?\Volume{`) || !strings.HasSuffix(guid, `}\`) {
@@ -134,5 +138,45 @@ func TestMountManagerProcessCrash(t *testing.T) {
 			}
 			t.Logf("cycle=%d: crash cleanup and sibling preservation succeeded", cycle)
 		}()
+	}
+}
+
+func readCrashReadiness(path string) ([]byte, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	// os.ReadFile omits FILE_SHARE_DELETE on Windows. The publishing rename
+	// can still hold DELETE access when its new name first becomes visible.
+	// Share that access rather than retrying arbitrary readiness errors.
+	h, err := windows.CreateFile(p, windows.GENERIC_READ, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open readiness", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(h), path)
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// A published rename can remain open with DELETE access while the publisher
+// finishes closing its handle. Reproduce that state without timing or WinFsp.
+func testCrashReadinessRenameSharing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	const identity = `\\?\Volume{12345678-1234-1234-1234-123456789abc}\`
+	if err := os.WriteFile(path, []byte(identity), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(p, windows.DELETE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(h)
+	data, err := readCrashReadiness(path)
+	if err != nil || string(data) != identity {
+		t.Fatalf("read published readiness with rename handle still open: data=%q err=%v", data, err)
 	}
 }

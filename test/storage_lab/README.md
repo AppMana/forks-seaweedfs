@@ -704,6 +704,7 @@ rereads every acknowledged payload. The other requests a reservation larger
 than the entire disposable filesystem and requires volume creation to return an
 error without leaving a newly created candidate; a seeded volume at the same
 path must remain byte-for-byte intact. Running either guarded test outside this
+runner is not supported; never set its guard variable on a host filesystem.
 
 This qualifies native filesystem behavior on a file-backed block device, not
 physical-drive firmware, controller caches, actual power loss, DSM Btrfs, or

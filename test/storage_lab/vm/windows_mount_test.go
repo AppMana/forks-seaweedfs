@@ -54,6 +54,10 @@ func TestWindowsMountLab(t *testing.T) {
 		verbosity = value
 	}
 	isolateMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle"
+	cleanupMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP")
+	if cleanupMode != "" && (cleanupMode != "1" || !isolateMountManager) {
+		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1 requires the isolated mount-manager scenario")
+	}
 	registrationMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD")
 	guidJunction := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION")
 	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
@@ -87,6 +91,7 @@ func TestWindowsMountLab(t *testing.T) {
 	artifacts := map[string][]byte{}
 	var provenance strings.Builder
 	fmt.Fprintf(&provenance, "mount_manager_from_fsd=%q\n", registrationMode)
+	fmt.Fprintf(&provenance, "mount_manager_check_cleanup=%q\n", cleanupMode)
 	fmt.Fprintf(&provenance, "mount_manager_guid_junction=%q\n", guidJunction)
 	for target, path := range inputs {
 		if path == "" {
@@ -216,6 +221,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		} else if guidJunction == "nt-control" {
 			command += ` '-mount-manager-nt-junction-control'`
 		}
+		if cleanupMode == "1" {
+			command += ` '-mount-manager-check-cleanup'`
+		}
 		result, runErr := n.ExecWithTimeout(ctx, 6*time.Minute, ps, "-NoProfile", "-Command", command+`; $nativeExit=$LASTEXITCODE; if($nativeExit -eq 0){Write-Output '`+nativeMarker+`'}; exit $nativeExit`)
 		output := string(result.GetStdout()) + string(result.GetStderr())
 		if err := os.WriteFile(filepath.Join(resultDir, "mount-manager.log"), []byte(fmt.Sprintf("execution error: %v\n%s", runErr, output)), 0600); err != nil {
@@ -230,6 +238,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		}
 		if err := validateWindowsCommandOutput(result.GetExitCode(), output, nativeMarker); err != nil {
 			t.Fatal(err)
+		}
+		if cleanupMode == "1" && !strings.Contains(output, "cycle=63: owned junction removed and sibling preserved") {
+			t.Fatal("native probe did not complete same-path cleanup qualification")
 		}
 		return
 	}

@@ -19,6 +19,7 @@ import (
 
 var mountManagerGUIDJunction = flag.Bool("mount-manager-guid-junction", false, "lab experiment: replace only the owned junction's NT target with its volume GUID")
 var mountManagerNTJunctionControl = flag.Bool("mount-manager-nt-junction-control", false, "lab control: perform identical identity queries and rewrite the original NT junction target")
+var mountManagerCheckCleanup = flag.Bool("mount-manager-check-cleanup", false, "lab qualification: reuse the same mount path and verify junction removal and sibling preservation")
 
 // A root-only filesystem isolates mount-manager behavior from Git and filer
 // metadata. This opt-in test creates only disposable mounts below t.TempDir.
@@ -59,9 +60,19 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 	}
 	t.Logf("junction experiment: guid=%t nt-control=%t", *mountManagerGUIDJunction, *mountManagerNTJunctionControl)
 	root := t.TempDir()
+	sibling := filepath.Join(root, "unrelated-data.txt")
+	const siblingContent = "unrelated data must survive mount cleanup"
+	if *mountManagerCheckCleanup {
+		if err := os.WriteFile(sibling, []byte(siblingContent), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for cycle := 0; cycle < 64; cycle++ {
 		func() {
 			point := filepath.Join(root, fmt.Sprintf("mnt-%02d", cycle))
+			if *mountManagerCheckCleanup {
+				point = filepath.Join(root, "reused-mount")
+			}
 			sentinel := fmt.Sprintf("sentinel-%02d-%d", cycle, time.Now().UnixNano())
 			host := fuse.NewFileSystemHost(&mountManagerRootFS{sentinel: sentinel})
 			host.SetCapCaseInsensitive(true)
@@ -80,6 +91,20 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 					}
 				case <-time.After(10 * time.Second):
 					t.Fatal("WinFsp unmount did not complete")
+				}
+				if *mountManagerCheckCleanup {
+					// Lstat observes the junction itself: an inaccessible target
+					// must not masquerade as removal of a leftover junction.
+					if _, err := os.Lstat(point); !os.IsNotExist(err) {
+						t.Errorf("cycle=%d: mount point remains after unmount: %v", cycle, err)
+					}
+					data, err := os.ReadFile(sibling)
+					if err != nil || string(data) != siblingContent {
+						t.Errorf("cycle=%d: unrelated sibling changed: %v", cycle, err)
+					}
+					if !t.Failed() {
+						t.Logf("cycle=%d: owned junction removed and sibling preserved", cycle)
+					}
 				}
 			}()
 			deadline := time.Now().Add(10 * time.Second)

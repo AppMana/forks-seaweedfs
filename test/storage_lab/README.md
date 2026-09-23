@@ -233,6 +233,99 @@ at `/tmp/seaweedfs-vm-lab-results-716489505` records all nine pre/post-crash rep
 reads and Ubuntu image ID
 `sha256:21912f8a90fb3fb5ff965394a2921894d73e54b5ef7ae1b3c27f81dabe81e9a1`.
 
+## Mixed Windows and Linux mounted workloads
+
+`TestMixedOSMountLab` reuses Labcontainers to create a fresh Linux VM and a fresh
+Windows VM connected only to each other (`network-mode: none`, no default
+route). A Linux `weed server` supplies the master, volume server and filer;
+Linux FUSE and Windows WinFsp mount that same namespace. This is mounted file
+I/O, not two HTTP clients. Inputs are offline, their hashes and resolved VM
+image IDs are retained, and the Windows child must load the explicitly supplied
+manifest-verified candidate DLL. It never substitutes that DLL on the host.
+The offline Windows guest's clock is set from the controller before any mount
+starts; both guest Unix times must then be within five seconds of the controller
+RPC interval. This changes only the fresh VM, not the workstation or cluster.
+
+Both clients rendezvous through the shared mount for seven paired phases:
+concurrent creation of 24 files per OS; cross-client byte/inventory verification;
+overwrite/truncate of the other OS's files; another verification; cross-client
+rename/delete; final verification; and verification after fresh-cache remounts.
+Sizes include zero, 37, 4097 and 2 MiB + 103 bytes. Every writer requires
+successful write, fsync and close. Both readers independently regenerate the
+expected bytes; missing files, stale names, lost deletes, extra directory
+entries, skips or missing run-specific completion markers fail qualification.
+Only the coordination barrier/readiness waits retry; content assertions do not.
+The Windows mount is terminated after all writes are acknowledged and closed;
+that remount check is not graceful-unmount or VM power-loss qualification.
+
+Build both weed executables from the same reviewed application source with
+`5BytesOffset` and use the temporary Go workspace described above:
+
+```sh
+CGO_ENABLED=0 go build -o "$LAB_BUILD/mixed-linux" ./test/storage_lab/vm/mixed_workload
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o "$LAB_BUILD/mixed-windows.exe" ./test/storage_lab/vm/mixed_workload
+SEAWEEDFS_MIXED_LIVE=1 \
+SEAWEEDFS_LINUX_WEED="$LAB_BUILD/weed-linux" \
+SEAWEEDFS_WINDOWS_WEED="$LAB_BUILD/weed.exe" \
+SEAWEEDFS_MIXED_LINUX_WORKLOAD="$LAB_BUILD/mixed-linux" \
+SEAWEEDFS_MIXED_WINDOWS_WORKLOAD="$LAB_BUILD/mixed-windows.exe" \
+SEAWEEDFS_WINFSP_MSI=/absolute/winfsp.msi \
+SEAWEEDFS_WINDOWS_WINFSP_DLL=/absolute/candidate-winfsp-x64.dll \
+LABCONTAINERS_LABD=/absolute/labcontainers/bin/labd \
+LABCONTAINERS_VM_IMAGE="$LINUX_IMAGE_AT_DIGEST" \
+LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
+go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=30m
+```
+
+The DLL's adjacent `.manifest.txt` and `.source.patch` are required. Results
+remain in `seaweedfs-mixed-results-*`: provenance, topology, phase logs, guest
+diagnostics and a final manifest requiring all seven paired phases. The existing
+MSVC qualification job builds the two workload executables and invokes this
+gate after native WinFsp qualification; its upload retains the results and outer
+test log. Fast oracle tests run in the hosted Linux job, including deliberate
+corruption, truncation, missing/extra files and a lost-delete negative control.
+They are not VM passes. This coverage does not establish same-file concurrent
+write/locking semantics, case-collision behavior, CSI package lifecycle, mixed
+server OS deployments, replication durability, or Synology compatibility.
+
+Initial live evidence is retained, including failures: redirected detached
+Windows launch left QGA waiting after its PowerShell parent exited despite a
+healthy mounted path and the correct loaded DLL (`seaweedfs-mixed-results-2731523550`
+and `seaweedfs-mixed-results-1539312409` under `/tmp`). The launcher now matches
+the non-traced smoke harness and uses weed's own log directory rather than
+PowerShell child-output redirection. The subsequent run
+`/tmp/seaweedfs-mixed-results-3557902799` passed concurrent creation and Linux's
+byte verification of all 48 files, but Windows could not see the next Linux
+barrier entry. The filer recorded Linux's subscription at 23:01:49 UTC and
+Windows's at 06:01:52 UTC the following day: seven hours in the future.
+`WFS.StartBackgroundTasks` uses client `time.Now()` for `StartTsNs`, which is
+sent as `SubscribeMetadataRequest.SinceNs`. This explains why a future client
+clock can suppress current metadata events. The failed run is not a full
+qualification pass, and clock alignment is not an application-level fix for
+skew tolerance. Preserve this case for future clock-skew regression coverage.
+
+With verified aligned clocks, `/tmp/seaweedfs-mixed-results-1303311850` passed
+both clients' seed/read verification and cross-client rewrites. The immediate
+post-rewrite Linux check then read `linux-00.bin` as zero bytes instead of the
+113 bytes Windows had written, while Windows passed that same verification.
+The manifest remains failed (3/7 paired phases complete); rename/delete and
+remount were not reached. Linux's default kernel attribute TTL is one second,
+so this observation alone does not distinguish bounded attribute staleness
+from persistent incoherence or establish stored-data loss. Failure-only
+diagnostics now compare mounted bytes with filer bytes immediately and after
+three seconds; those observations never turn a failed assertion into a pass.
+The fresh repeat `/tmp/seaweedfs-mixed-results-2581553224` reproduced the exact
+same zero-versus-113-byte failure (214.05 seconds overall). By the separate
+diagnostic command, both the mount and filer returned 113 bytes with SHA-256
+`fe8556701ee430225ac5f568a2a6cb35e19551e37a5600597778b800243d1685`;
+they still matched after three seconds. This establishes transient visibility
+failure in the tested immediate handoff, not persisted data loss. It does not
+measure the exact staleness interval or prove the kernel TTL is the only cause.
+Keep the strict gate RED until its intended consistency contract and a
+source-level correction are resolved; do not silently add sleeps/retries.
+
+## Native Windows storage regressions
+
 For native Windows storage regressions, build the existing suite with
 `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -tags 5BytesOffset -o /absolute/storage.test.exe ./weed/storage`.
 Use the same temporary Go workspace as the VM runner (include this module and

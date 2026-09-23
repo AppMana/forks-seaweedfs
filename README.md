@@ -62,6 +62,11 @@ Native WinFsp compilation is also an opt-in VM gate:
 toolchain/source versions, media layout, and invocation are documented in the
 [existing lab instructions](test/storage_lab/README.md). It builds and retains
 matched baseline/candidate DLLs; compilation alone does not qualify deployment.
+That qualification job also runs `TestMixedOSMountLab`: concurrent native
+Windows WinFsp and Linux FUSE clients against one isolated Linux filer. It uses
+the exact compiled candidate DLL and additionally requires the configured,
+preloaded Linux VM image. The existing lab README documents local invocation,
+coverage, and limitations; its fast corruption-oracle tests run in Linux CI.
 
 Passing local tests does not authorize promotion; deployment requirements and
 current operational facts belong in the existing AppMana `docs/seaweedfs.md`

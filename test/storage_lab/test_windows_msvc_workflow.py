@@ -11,6 +11,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WindowsMSVCWorkflowTest(unittest.TestCase):
+    def test_mixed_clients_use_compiled_candidate_and_preserve_evidence(self):
+        workflow = (ROOT / '.github/workflows/appmana-storage-reliability.yml').read_text()
+        native = workflow.split('  windows-msvc-qualification:\n', 1)[1].split('  large-disk-regressions:', 1)[0]
+        self.assertIn('SEAWEEDFS_WINDOWS_WINFSP_DLL=%s', native)
+        self.assertIn('Mixed Windows and Linux mounted clients', native)
+        self.assertIn("SEAWEEDFS_MIXED_LIVE: '1'", native)
+        self.assertIn("-run '^TestMixedOSMountLab$' -count=1", native)
+        self.assertIn('seaweedfs-mixed-results-*/', native)
+        self.assertIn('GOWORK=off go test -race -count=1 ./mixed_workload', workflow)
+
     def test_privileged_jobs_exclude_pull_requests(self):
         workflow = (ROOT / '.github/workflows/appmana-storage-reliability.yml').read_text()
         native = workflow.split('  windows-msvc-qualification:\n', 1)[1].split('    runs-on:', 1)[0]

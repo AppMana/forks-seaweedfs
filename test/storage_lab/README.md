@@ -675,6 +675,29 @@ installation roots, and `Windows Kits\10\Include` were absent. This image cannot
 be assumed to contain the required compiler/SDK. Provision a separate build image
 or supply a verified existing toolchain image before running the MSVC recipe;
 this inventory does not rule out nonstandard toolchain locations in other images.
+Compiler provisioning has an unresolved download-integrity check. The official
+VS2019 channel fetched from `https://aka.ms/vs/16/release/channel` reports
+16.11.60 / 16.11.37627.13 (retained channel SHA-256
+`ce478cd78cce92c5c8bdcf4bd5cb17f90ec7be245a772a030563cc7aa096c4c6`).
+Its `Microsoft.VisualStudio.Manifests.VisualStudio` payload declares 19,253,644
+bytes and SHA-256
+`fb642c3f891b70947e0152275e1722ffb3cca7e8700eea0f0fa0f3a7645584cc`.
+Two fetches of that exact payload URL, including a cache-bypassing retry, instead
+returned 11,154,648 bytes with SHA-256
+`406969c30f4eb8bf0075a0850e339340ac83942705b76269156bb5b70f01b631`.
+Evidence is retained in `/tmp/seaweed-msvc-layout.4rUsHP2a/` as `channel.json`,
+`VisualStudio.vsman` and `VisualStudio.retry.vsman`. Do not use these mismatching
+catalog bytes to install packages or replace the expected hash with the received
+hash. Resolve the discrepancy or obtain an independently verified offline layout
+before provisioning. No compiler installation was attempted from this catalog.
+Separately, the downloaded `vs_buildtools.exe` (SHA-256
+`0a641c8f47df21f3569fbd87f1f2301ae82db9bc5669bb07b18fb623a207c9ba`)
+passed `Get-AuthenticodeSignature` in a fresh isolated Windows guest: status
+`Valid`, Microsoft Corporation signer, certificate thumbprint
+`AB172913A2960A224809EE8A0C371CD47A079B72`, product version 16.11.37627.13,
+guest hash matching the host, and `BOOTSTRAPPER_SIGNATURE_VERIFIED` with exit 0.
+The bootstrapper was inspected, not executed. Its valid signature does not
+resolve the separate catalog mismatch.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

@@ -155,10 +155,27 @@ func TestWindowsMountLab(t *testing.T) {
 	n := lab.Node("vm")
 	t.Log("Windows ready; staging offline inputs")
 	defer func() {
-		diagnosticCtx, stop := context.WithTimeout(context.Background(), time.Minute)
+		diagnosticCtx, stop := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer stop()
-		logs, logErr := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\smoke-*\logs\*,C:\lab\dependency-install.log -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.log','.txt' } | ForEach-Object { Write-Output ("FILE: " + $_.FullName); Get-Content -LiteralPath $_.FullName -Tail 2000 }`)
-		if writeErr := os.WriteFile(filepath.Join(resultDir, "guest-logs.txt"), []byte(fmt.Sprintf("collection error: %v\nexit: %d\n%s\n%s", logErr, logs.GetExitCode(), logs.GetStdout(), logs.GetStderr())), 0600); writeErr != nil {
+		logs, logErr := collectWindowsGuestLogs(func(command string) ([]byte, error) {
+			result, err := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", command)
+			if err != nil {
+				return nil, err
+			}
+			if result.GetExitCode() != 0 {
+				return nil, fmt.Errorf("guest log collection exit %d: %s", result.GetExitCode(), result.GetStderr())
+			}
+			return result.GetStdout(), nil
+		})
+		status := fmt.Sprintf("collection error: %v\nbytes: %d\nsha256: %s\n", logErr, len(logs), sha(logs))
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "guest-logs-collection.txt"), []byte(status), 0600); writeErr != nil {
+			t.Error(writeErr)
+		}
+		if logErr != nil {
+			t.Errorf("auxiliary guest log collection failed: %v", logErr)
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "guest-logs.txt"), logs, 0600); writeErr != nil {
 			t.Error(writeErr)
 		}
 	}()

@@ -377,6 +377,14 @@ It changes both registration modes but not ordinary unregistered mounts or
 drive mounts. It is experimental, not deployment-qualified; the unchanged
 native reproducer and real LFS workload must qualify it before adoption.
 
+Subsequent harness runs materialize auxiliary log tails in the guest and use the
+existing chunked, SHA-256-verified artifact transfer instead of one oversized
+exec response. `guest-logs.txt` contains the diagnostic text;
+`guest-logs-collection.txt` records collection status, byte count and SHA-256.
+The existing 2,000-line-per-file tail policy remains: this is not a full log
+archive. Collection has a separate two-minute deadline and now fails the harness
+on error rather than silently allowing missing auxiliary evidence. Unit coverage
+reproduces the old truncation failure with more than 3 MiB of diagnostic text.
 `hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
 commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of
 that exact source, apply the patch with `git apply`, then build:

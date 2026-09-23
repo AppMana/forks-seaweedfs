@@ -2,8 +2,10 @@ package winfsp
 
 import (
 	"bytes"
+	"debug/pe"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -14,7 +16,7 @@ import (
 func mappedImportSlot(image []byte, symbol string) (uint32, error) {
 	bad := func() (uint32, error) { return 0, fmt.Errorf("invalid or ambiguous PE64 import %q", symbol) }
 	span := func(off, n uint32) bool { return uint64(off)+uint64(n) <= uint64(len(image)) }
-	if len(image) < 64 || string(image[:2]) != "MZ" {
+	if len(image) < 64 || len(image) > 64<<20 || string(image[:2]) != "MZ" {
 		return bad()
 	}
 	pe := binary.LittleEndian.Uint32(image[60:64])
@@ -78,7 +80,7 @@ func mappedImportSlot(image []byte, symbol string) (uint32, error) {
 				return bad()
 			}
 			if name == symbol {
-				if found != 0 {
+				if found != 0 || binary.LittleEndian.Uint64(image[slot:slot+8]) == 0 {
 					return bad()
 				}
 				found = uint32(slot)
@@ -108,6 +110,7 @@ func TestMappedImportSlot(t *testing.T) {
 		binary.LittleEndian.PutUint32(b[528:], 832)
 		copy(b[768:], "KERNEL32.dll\x00")
 		binary.LittleEndian.PutUint64(b[800:], 896)
+		binary.LittleEndian.PutUint64(b[832:], 896)
 		copy(b[898:], "FindFirstVolumeW\x00")
 		return b
 	}
@@ -124,6 +127,7 @@ func TestMappedImportSlot(t *testing.T) {
 		{"ordinal only", func(b []byte) { binary.LittleEndian.PutUint64(b[800:], 1<<63|1) }, false},
 		{"bad thunk", func(b []byte) { binary.LittleEndian.PutUint64(b[800:], 0x100000000) }, false},
 		{"unaligned IAT", func(b []byte) { binary.LittleEndian.PutUint32(b[528:], 833) }, false},
+		{"empty IAT", func(b []byte) { binary.LittleEndian.PutUint64(b[832:], 0) }, false},
 		{"duplicate symbol", func(b []byte) { binary.LittleEndian.PutUint64(b[808:], 896) }, false},
 		{"missing terminator", func(b []byte) { binary.LittleEndian.PutUint32(b[276:], 20) }, false},
 	} {
@@ -135,5 +139,54 @@ func TestMappedImportSlot(t *testing.T) {
 				t.Fatalf("slot=%d err=%v", slot, err)
 			}
 		})
+	}
+}
+
+// Construct the mapped layout from the exact DLL file without reading discarded
+// or inaccessible pages of the loaded module. The live IAT target must still be
+// verified separately before any memory change. OFT-less images are unsupported.
+func labMappedPE(raw []byte) ([]byte, error) {
+	f, err := pe.NewFile(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h, ok := f.OptionalHeader.(*pe.OptionalHeader64)
+	if !ok || h.SizeOfImage == 0 || h.SizeOfImage > 64<<20 || h.SizeOfHeaders > h.SizeOfImage || uint64(h.SizeOfHeaders) > uint64(len(raw)) {
+		return nil, fmt.Errorf("unsupported lab PE image size/layout")
+	}
+	image := make([]byte, h.SizeOfImage)
+	copy(image, raw[:h.SizeOfHeaders])
+	for _, section := range f.Sections {
+		if section.Size == 0 {
+			continue
+		}
+		if uint64(section.VirtualAddress)+uint64(section.Size) > uint64(len(image)) || uint64(section.Offset)+uint64(section.Size) > uint64(len(raw)) {
+			return nil, fmt.Errorf("PE section outside file or mapped image")
+		}
+		copy(image[section.VirtualAddress:], raw[section.Offset:uint64(section.Offset)+uint64(section.Size)])
+	}
+	return image, nil
+}
+
+func TestMappedImportSlotCandidate(t *testing.T) {
+	path := os.Getenv("WINFSP_LAB_PE_TEST_DLL")
+	if path == "" {
+		t.Skip("optional local DLL import-layout check")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := labMappedPE(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"FindFirstVolumeW", "DeviceIoControl"} {
+		slot, err := mappedImportSlot(image, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s IAT RVA=%#x", name, slot)
 	}
 }

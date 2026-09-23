@@ -92,7 +92,7 @@ jobs:
           ./weed/storage ./weed/topology ./weed/shell ./weed/server
           ./weed/filer ./weed/filer/empty_folder_cleanup ./weed/mount ./weed/operation
       - name: Windows fault harness safety contracts
-        run: go test -race -count=1 ./test/winfsp -run '^TestCrashChildOwnership$|^TestMappedImportSlot$|^TestLabMappedPE$'
+        run: go test -race -count=1 ./test/winfsp -run '^TestCrashChildOwnership$|^TestMappedImportSlot$|^TestLabMappedPE$|^TestLabMountQuiescence$'
       - name: Lab isolation command contracts
         run: python3 -m unittest discover -s test/storage_lab -v
       - name: Negative controls prove regressions turn red

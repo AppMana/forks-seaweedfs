@@ -595,6 +595,22 @@ supported; junction interventions and the separate cleanup flag are rejected.
 PE-layout fixtures and live original-pointer checks guard the test-only hook.
 This scenario is not yet a completed qualification result merely because it
 builds; retain the native result and restoration markers from each live run.
+Callbacks resolve their original target before installation. If a failed mount
+times out, the harness waits for both Mount and Unmount to leave the DLL before
+restoring the hook. Failure to prove quiescence aborts the disposable native test
+process with exit 2, without running DLL restoration/unload cleanups underneath
+active calls. This is a failed test, never a successful rollback result.
+The initial default-mode rollback run passed both GUID-lookup and GUID-reparse
+fail points in `/tmp/seaweedfs-windows-mount-results-2345799113` (0.19 seconds
+native, 181.814 seconds complete harness, exit 0). Both hooks fired exactly once,
+imports were restored, global mapping/junction absence and same-path reuse were
+verified. Native executable SHA-256:
+`2a8ce8f7e8681867649ac66da7a630ff08ff8516cc06599c2358706ec6f2b434`;
+log SHA-256:
+`7b456302369fbb0e238f65c83b0f258e96a9753b078266be010fc5fd0d77edd8`.
+Auxiliary log collection succeeded. This initial executable predates the timeout
+quiescence and pre-install callback-target hardening; neither timeout path ran.
+Use the hardened executable for subsequent rollback qualification.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

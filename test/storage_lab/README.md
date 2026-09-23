@@ -775,6 +775,15 @@ Auxiliary collection succeeded: 5,863,822 bytes, matching guest/host SHA-256
 `255b59cba8a6b72ff9d6ed2c120c80bc068d49d1c44653cae8ed7318a050f952`.
 This closes the older-diagnostic-weed limitation for this workload; it still
 uses the lab MinGW DLL and is not MSVC/package or power-loss qualification.
+The companion current-build `GitAtomicRenamePrimed` run also passed all five
+cycles with the same executable/DLL hashes in
+`/tmp/seaweedfs-windows-mount-results-2116467326` (452.621 seconds, exit 0).
+Each retained log verified the loaded DLL, namespace/content checks, all 20
+Git `config.lock` replacement iterations, graceful unmount and its completion
+marker. Cycle-5 log SHA-256:
+`dc6d2d961de7b907ec499b6ed79fc80e75942c79bf903988630dcce1e83bc383`.
+Auxiliary transfer succeeded with 2,748,847 bytes and matching guest/host SHA-256
+`1f1ac8c6ab56bbd48204de5de633cd2bb3183ca12f2f8ff4fa3a0211bd0641f1`.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

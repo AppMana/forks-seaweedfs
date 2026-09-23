@@ -2,19 +2,37 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-winfsp-msvc.ps1')
 $actual = @(Get-WinFspMSBuildArguments 'C:\lab\winfsp' 'C:\lab\build-candidate' '14.29.30133' 'v142' '10.0.19041.0')
-foreach ($required in @(
-    'C:\lab\winfsp\build\VStudio\winfsp_dll.vcxproj', '/t:Build', '/m:1', '/nr:false',
+$expected = @(
+    'C:\lab\winfsp\build\VStudio\winfsp_dll.vcxproj', '/t:Build', '/m:1', '/nologo', '/nr:false',
     '/p:Configuration=Release', '/p:Platform=x64', '/p:PlatformToolset=v142',
-    '/p:VCToolsVersion=14.29.30133', '/p:WindowsTargetPlatformVersion=10.0.19041.0',
-    '/p:MyTargetPlatformVersion=10.0.19041.0', '/p:MyBuildNumber=25156',
+    '/p:VCToolsVersion=14.29.30133', '/p:MyTargetPlatformVersion=10.0.19041.0',
+    '/p:WindowsTargetPlatformVersion=10.0.19041.0', '/p:MyBuildNumber=25156',
     '/p:MyCopyright=2015-2025 Bill Zissimopoulos', '/p:MyGitRevision=ddca7bd',
-    '/p:OutDir=C:\lab\build-candidate\', '/p:IntDir=C:\lab\build-candidate\obj\',
-    '/p:UserRootDir=C:\lab\build-candidate\empty-user-props\', '/bl:C:\lab\build-candidate\build.binlog'
-)) {
-    if (@($actual | Where-Object { $_ -ceq $required }).Count -ne 1) { throw "Missing/duplicate argument: $required" }
+    '/p:SolutionDir=C:\lab\winfsp\', '/p:OutDir=C:\lab\build-candidate\',
+    '/p:IntDir=C:\lab\build-candidate\obj\',
+    '/p:UserRootDir=C:\lab\build-candidate\empty-user-props\', '/bl:C:\lab\build-candidate\build.binlog',
+    '/v:diagnostic'
+)
+function Assert-ExactBuildArguments {
+    param([string[]]$Observed)
+    if ($Observed.Count -ne $expected.Count) { throw 'Unexpected build argument count' }
+    for ($i = 0; $i -lt $expected.Count; $i++) {
+        if ($Observed[$i] -cne $expected[$i]) { throw "Unexpected build argument at index $i" }
+    }
 }
-if (@($actual | Where-Object { $_ -match '\.sln$|\.sys$|/t:(Rebuild|Clean|Install|Sign)' }).Count) {
-    throw 'Build must target only the user-mode DLL project'
+Assert-ExactBuildArguments -Observed $actual
+foreach ($mutation in @('extra target', 'combined target', 'extra project', 'missing diagnostic', 'duplicate target')) {
+    $changed = @($actual)
+    switch ($mutation) {
+        'extra target' { $changed += '/t:Build;Sign' }
+        'combined target' { $changed[1] = '/t:Build;Sign' }
+        'extra project' { $changed += 'C:\lab\winfsp\build\VStudio\winfsp.sln' }
+        'missing diagnostic' { $changed = @($changed | Where-Object { $_ -ne '/v:diagnostic' }) }
+        'duplicate target' { $changed += '/t:Build' }
+    }
+    $rejected = $false
+    try { Assert-ExactBuildArguments -Observed $changed } catch { $rejected = $true }
+    if (-not $rejected) { throw "Build argument mutation accepted: $mutation" }
 }
 foreach ($case in @(
     @('C:\space path', 'C:\out', '14.29.30133', 'v142', '10.0.19041.0'),

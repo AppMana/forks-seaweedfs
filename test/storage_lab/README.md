@@ -392,6 +392,18 @@ times out, the harness waits for both Mount and Unmount to leave the DLL before
 restoring the hook. Failure to prove quiescence aborts the disposable native test
 process with exit 2, without running DLL restoration/unload cleanups underneath
 active calls. This is a failed test, never a successful rollback result.
+
+Release-build follow-up must use upstream's `build/VStudio/winfsp_dll.vcxproj`
+in `Release|x64`, with the compiler and SDK versions recorded. The pinned v2.1
+`build.version.props` targets Windows SDK `10.0.19041.0`; its build number and
+copyright year otherwise depend on the current date, so reproducible comparison
+requires explicit recorded overrides. Build only the user-mode DLL project for
+this fix; replacing or rebuilding the signed kernel driver is not part of it.
+The generic Labcontainers Windows image provisions drivers/QGA, not MSVC.
+Use its existing project-specific `provisioning_scripts` extension for a separate
+compiler-enabled image. Neither a MinGW lab pass nor a successful MSVC compile
+alone establishes deployment qualification: test the resulting exact artifact
+and its packaging/load path before release.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

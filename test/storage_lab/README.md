@@ -299,7 +299,10 @@ power loss, and the synthetic filesystem cannot establish SeaweedFS durability.
 The parent creates a random ownership token and sibling fixture. Child mode
 requires that token, an absolute non-symlink root, intact sibling bytes and
 unused checkpoint/mount paths within that root; it never rewrites the sibling.
-Readiness is published by temporary-file rename. Child-exit waits are bounded.
+Readiness is published by temporary-file rename. The reader permits Windows
+delete-sharing while the publisher closes its rename handle; a deterministic
+held-DELETE-handle regression runs before the crash cycles. This does not retry
+failed mount queries or cleanup assertions. Child-exit waits are bounded.
 Post-termination absence checks are immediate and strict, with no repair or
 retry of a failed mapping assertion.
 The existing storage-reliability Actions workflow exposes these intensive checks

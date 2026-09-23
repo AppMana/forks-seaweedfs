@@ -677,6 +677,18 @@ builds a driver or produces an installer. Its host-independent argument/error
 contracts run in the existing reliability workflow; a passing contract does not
 prove compilation or runtime behavior. Windows-native build/runtime qualification
 remains outstanding until actual artifact results are recorded here.
+Source mode and patch digest now come from the same captured patch bytes, not
+an earlier `git status`: a deterministic reproduction showed that an intervening
+edit could otherwise produce a nonempty patch labeled baseline. Empty captured
+patches remain baseline even with candidate opt-in; nonempty patches require
+that opt-in. The recipe hash is captured before build execution and must still
+match before manifest publication. Contract fixtures cover these cases and
+reject extra/combined build targets using an exact ordered argument vector.
+These are consistency checks, not an attestation against transient edits or a
+hostile build host. In particular, manifest compiler/SDK fields currently record
+requested versions; verifying effective compiler/linker/resource-tool paths,
+versions and hashes against the retained build logs remains required before
+calling an MSVC artifact provenance-qualified.
 A read-only inventory in a fresh
 `labcontainers/windows-server-2022:lfs-qga-reap-da40c93` guest completed with exit
 0 and `TOOLCHAIN_INVENTORY_COMPLETE`: `vswhere.exe`, both standard Visual Studio

@@ -49,6 +49,7 @@ function Invoke-WinFspMSVCBuild {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw 'MSVC build requires a disposable Windows lab guest'
     }
+    $recipeHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
     foreach ($value in @($SourceDirectory, $OutputDirectory, $MSBuildPath, $VCToolsVersion)) {
         if ([string]::IsNullOrWhiteSpace($value)) { throw 'SourceDirectory, OutputDirectory, MSBuildPath and VCToolsVersion are required' }
     }
@@ -66,11 +67,6 @@ function Invoke-WinFspMSVCBuild {
     if (Invoke-WinFspGit -GitArguments @('-C', $source, 'ls-files', '--others', '--exclude-standard')) {
         throw 'Untracked source files are not allowed'
     }
-    $mode = 'baseline'
-    if (Invoke-WinFspGit -GitArguments @('-C', $source, 'status', '--porcelain', '--untracked-files=all')) {
-        if (-not $AllowTrackedPatch) { throw 'Tracked changes require -AllowTrackedPatch' }
-        $mode = 'candidate'
-    }
     $epoch = Invoke-WinFspGit -GitArguments @('-C', $source, 'show', '-s', '--format=%ct', 'HEAD')
     $msbuildVersion = (& $msbuild /nologo /version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $msbuildVersion -notmatch '^[0-9]+(\.[0-9]+)+$') {
@@ -80,7 +76,9 @@ function Invoke-WinFspMSVCBuild {
     New-Item -ItemType Directory -Path "$output\empty-user-props" | Out-Null
     $patch = "$output\winfsp-x64.dll.source.patch"
     Invoke-WinFspGit -GitArguments @('-C', $source, 'diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv', "--output=$patch")
-    $patchHash = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+    $evidence = Get-WinFspPatchEvidence -Patch $patch -AllowTrackedPatch:$AllowTrackedPatch
+    $mode = $evidence.Mode
+    $patchHash = $evidence.Hash
     $buildArguments | ConvertTo-Json | Set-Content -LiteralPath "$output\build-arguments.json" -Encoding UTF8
     & $msbuild @buildArguments 2>&1 | Tee-Object -FilePath "$output\build.log"
     if ($LASTEXITCODE -ne 0) { throw "MSBuild failed ($LASTEXITCODE); see $output\build.log" }
@@ -92,7 +90,7 @@ function Invoke-WinFspMSVCBuild {
         throw 'Source changed during build; artifact is not qualified for testing'
     }
     $dllHash = (Get-FileHash -LiteralPath "$output\winfsp-x64.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
-    $recipeHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-WinFspRecipeUnchanged -Path $PSCommandPath -ExpectedHash $recipeHash
     @(
         "source_revision=$revision", "source_mode=$mode", "source_date_epoch=$epoch",
         "dll_sha256=$dllHash", "source_patch_sha256=$patchHash", "build_script_sha256=$recipeHash",
@@ -101,6 +99,28 @@ function Invoke-WinFspMSVCBuild {
         'version_build_number=25156', 'version_copyright_year=2025'
     ) | Set-Content -LiteralPath "$output\winfsp-x64.dll.manifest.txt" -Encoding ASCII
     Write-Host "LAB DLL (not deployment-qualified): $output\winfsp-x64.dll"
+}
+
+function Get-WinFspPatchEvidence {
+    param([Parameter(Mandatory)][string]$Patch, [switch]$AllowTrackedPatch)
+    # Derive both the label and digest from the same captured bytes, not an
+    # earlier git status that can race with a tracked edit or index change.
+    $bytes = [IO.File]::ReadAllBytes($Patch)
+    if ($bytes.Length -ne 0 -and -not $AllowTrackedPatch) {
+        throw 'Tracked changes require -AllowTrackedPatch'
+    }
+    $mode = if ($bytes.Length -eq 0) { 'baseline' } else { 'candidate' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    [pscustomobject]@{ Mode = $mode; Hash = $hash }
+}
+
+function Assert-WinFspRecipeUnchanged {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedHash)
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ine $ExpectedHash) {
+        throw 'Build recipe changed during compilation; refusing to publish manifest'
+    }
 }
 
 if ($MyInvocation.InvocationName -ne '.') { Invoke-WinFspMSVCBuild }

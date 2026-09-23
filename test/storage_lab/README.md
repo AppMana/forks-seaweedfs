@@ -324,6 +324,12 @@ only that child, checks junction/mapping removal and sibling bytes, and mounts
 the same path in the next cycle. Both registration modes are supported; test-side
 junction interventions are rejected. This is abrupt process termination, not VM
 power loss, and the synthetic filesystem cannot establish SeaweedFS durability.
+The parent creates a random ownership token and sibling fixture. Child mode
+requires that token, an absolute non-symlink root, intact sibling bytes and
+unused checkpoint/mount paths within that root; it never rewrites the sibling.
+Readiness is published by temporary-file rename. Child-exit waits are bounded.
+Post-termination absence checks are immediate and strict, with no repair or
+retry of a failed mapping assertion.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 This minimal probe reproduced the DOS-path defect without Git, a weed binary,

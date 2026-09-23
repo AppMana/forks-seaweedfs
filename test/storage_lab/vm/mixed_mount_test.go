@@ -88,8 +88,8 @@ func TestMixedOSMountLab(t *testing.T) {
 	if err := writeNetworkConfigs(network); err != nil {
 		t.Fatal(err)
 	}
-	topology := []byte(fmt.Sprintf("name: ignored\ntopology:\n  nodes:\n    linux:\n      kind: generic_vm\n      image: %q\n      network-mode: none\n      binds:\n        - %q\n    windows:\n      kind: generic_vm\n      image: %q\n      network-mode: none\n  links:\n    - endpoints: [linux:eth1, windows:eth1]\n", linuxImage, filepath.Join(network, "controller.yaml")+":/extra-network.yaml:ro", windowsImage))
-	if err := os.WriteFile(filepath.Join(results, "topology.yml"), topology, 0600); err != nil {
+	topology, err := mixedTopology(linuxImage, windowsImage, network)
+	if err != nil {
 		t.Fatal(err)
 	}
 	c, err := client.Launch(ctx, client.Options{LabdPath: os.Getenv("LABCONTAINERS_LABD")})
@@ -101,7 +101,7 @@ func TestMixedOSMountLab(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: &labv1.TopologySource{Source: &labv1.TopologySource_Yaml{Yaml: topology}}, Nodes: map[string]*labv1.NodeExtension{"linux": {Control: "qga"}, "windows": {Control: "qga"}}, ArtifactDirectory: results}, 28*time.Minute)
+	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: topology, Nodes: map[string]*labv1.NodeExtension{"linux": {Control: "qga"}, "windows": {Control: "qga"}}, ArtifactDirectory: results}, 28*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

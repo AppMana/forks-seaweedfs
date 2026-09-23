@@ -28,10 +28,10 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle":
+		case "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash":
 			scenarios = []string{scenario}
 		default:
-			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO must be GitAtomicRenamePrimed, GitLfsTempMetadata or MountManagerDirectoryLifecycle")
+			t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO must be GitAtomicRenamePrimed, GitLfsTempMetadata, MountManagerDirectoryLifecycle or MountManagerProcessCrash")
 		}
 	}
 	repeats := 1
@@ -53,13 +53,17 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 		verbosity = value
 	}
-	isolateMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle"
+	crashMountManager := len(scenarios) == 1 && scenarios[0] == "MountManagerProcessCrash"
+	isolateMountManager := crashMountManager || (len(scenarios) == 1 && scenarios[0] == "MountManagerDirectoryLifecycle")
 	cleanupMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP")
-	if cleanupMode != "" && (cleanupMode != "1" || !isolateMountManager) {
+	if cleanupMode != "" && (cleanupMode != "1" || !isolateMountManager || crashMountManager) {
 		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1 requires the isolated mount-manager scenario")
 	}
 	registrationMode := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD")
 	guidJunction := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION")
+	if crashMountManager && guidJunction != "" {
+		t.Fatal("crash qualification cannot use a test-side junction intervention")
+	}
 	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
 	if err := validateWindowsMountModes(isolateMountManager, registrationMode, guidJunction, labDLL); err != nil {
 		t.Fatal(err)
@@ -212,7 +216,12 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	}
 	if isolateMountManager {
 		nativeMarker := "NATIVE_COMPLETE:" + filepath.Base(resultDir)
-		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^TestMountManagerDirectoryLifecycle$' '-test.v' '-test.count=1' '-test.timeout=5m'`
+		nativeName := "Test" + scenarios[0]
+		lastCycle := "cycle=63: 256 DOS-path queries succeeded"
+		if crashMountManager {
+			lastCycle = "cycle=7: crash cleanup and sibling preservation succeeded"
+		}
+		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^` + nativeName + `$' '-test.v' '-test.count=1' '-test.timeout=5m'`
 		if labDLL != "" {
 			command = `$env:SEAWEEDFS_WINDOWS_EXPECT_WINFSP_DLL='C:\lab\winfsp-x64.dll'; ` + command
 		}
@@ -233,7 +242,7 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		if labDLL != "" && !strings.Contains(output, "verified loaded lab WinFsp DLL:") {
 			t.Fatal("native probe did not verify the requested lab DLL was loaded")
 		}
-		if runErr != nil || result.GetExitCode() != 0 || strings.Contains(output, "SKIP") || !strings.Contains(output, "--- PASS: TestMountManagerDirectoryLifecycle") || !strings.Contains(output, "cycle=63: 256 DOS-path queries succeeded") {
+		if runErr != nil || result.GetExitCode() != 0 || strings.Contains(output, "SKIP") || !strings.Contains(output, "--- PASS: "+nativeName) || !strings.Contains(output, lastCycle) {
 			t.Fatalf("mount-manager isolation test failed: %v exit=%d", runErr, result.GetExitCode())
 		}
 		if err := validateWindowsCommandOutput(result.GetExitCode(), output, nativeMarker); err != nil {

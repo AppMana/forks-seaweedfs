@@ -279,6 +279,15 @@ probes it records the volume GUID and requires the exact path in
 The runner requires final junction and mapping cleanup markers, rejecting
 older executables that lack these checks. Run with both registration modes.
 This does not yet verify process-death cleanup or registration-failure rollback.
+Use `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerProcessCrash` for a separate
+process-death check (leave `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP` unset).
+It launches eight owned child processes in turn at the same mount path. Each
+child completes the canonicalization and pre-unmount mapping oracle, signals a
+per-cycle readiness file, and waits without unmounting. The parent terminates
+only that child, checks junction/mapping removal and sibling bytes, and mounts
+the same path in the next cycle. Both registration modes are supported; test-side
+junction interventions are rejected. This is abrupt process termination, not VM
+power loss, and the synthetic filesystem cannot establish SeaweedFS durability.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 For a lab-only comparison of WinFsp's user-mode and driver-side registration,

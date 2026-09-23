@@ -733,6 +733,30 @@ but returned 17,954,732 bytes,
 SHA-256 `f0a50ea157222c29abd5ea6ff01bfc3c33b04e011c5e45ee2ca38ef0778e5643`.
 The alternate files are retained in the same cache; neither was used to install
 packages. A verified preprovisioned image/offline layout remains an alternative.
+The supplied Harbor alternative is
+`harbor.appmana.com/appmana-shared/buildervscuda`. Its `latest` tag resolved to
+Linux at inspection; use the Windows variant `windows-latest-ltsc2022` by pinned
+digest instead. Observed index digest:
+`sha256:a7d1b85e139f694cc6078e58f479a4d0acbc1a715f08e066fe255fe6930cea1e`;
+Windows/amd64 manifest:
+`sha256:6b4f65440f9e1162929da3c491a37b06bdf9100b7f4ea1b825b178b712a070ac`
+(OS version 10.0.20348.1547). The compiler-installation layer (index 27) is
+`sha256:f8fbf23ad44b41aed722d760e5395a133271087b6b5ece9e4119886d0a71c23b`,
+10,183,219,906 compressed bytes. Its downloaded bytes passed that SHA-256 check
+and are retained at `/tmp/seaweed-buildervs.7a54qiGW/toolchain-layer.tar.gz`.
+The adjacent image-baked install recipe installs VS2022 Build Tools with the
+C++ workload and Clang. This is an offline payload source, not yet a tested
+compiler environment: inventory its actual MSVC/SDK versions and verify tool
+execution before building. The completed archive inventory found MSVC
+`14.44.35207` (`v143`), Windows SDK `10.0.26100.0`, and
+`MSBuild/Current/Bin/MSBuild.exe`. These differ from upstream's older v142/19041
+comparison parameters: record explicit overrides and qualify both baseline and
+candidate with the same supplied toolchain; do not label it a v142/19041 build.
+A Linux Docker daemon cannot run this Windows image
+natively. Do not import its OS/registry layers into an existing machine. Inspect
+Windows tar metadata with `tar --warning=no-unknown-keyword` to avoid flooding
+logs with unsupported metadata warnings; suppressing warnings is not validation
+of an extracted filesystem.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

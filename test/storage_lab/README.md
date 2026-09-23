@@ -330,6 +330,13 @@ unused checkpoint/mount paths within that root; it never rewrites the sibling.
 Readiness is published by temporary-file rename. Child-exit waits are bounded.
 Post-termination absence checks are immediate and strict, with no repair or
 retry of a failed mapping assertion.
+The existing storage-reliability Actions workflow exposes these intensive checks
+through the optional `windows_mount_cleanup` dispatch input. It runs graceful
+same-path cleanup and process-crash cleanup in fresh VMs for default and FSD
+registration, before the unchanged real Git/LFS gate, and retains each log.
+It uses the workflow's pinned MSI, not an implicitly substituted lab DLL.
+Ownership negative controls run in the Linux job on every matching workflow run;
+changes under `test/winfsp/` now trigger that workflow too.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 This minimal probe reproduced the DOS-path defect without Git, a weed binary,
@@ -546,6 +553,16 @@ registration in `/tmp/seaweedfs-windows-mount-results-364112300`
 exact-GUID mapping removal, sibling bytes and same-path remount were verified.
 Log SHA-256:
 `7f00fc7e82997bc41db4a24e2b31dd4644f9c2a8ea22c068f5ab762f84e8b675`.
+The first process-crash probe passed eight owned-process terminations in default
+mode in `/tmp/seaweedfs-windows-mount-results-2336498633` (31.46 seconds native,
+238.954 seconds full harness, exit 0), with immediate junction/mapping absence,
+sibling preservation and same-path reuse. Executable SHA-256:
+`8ec77d409fc4bcc7226e7930ba5e89dfd1c9b528f769878c85431a0ae0b3182a`;
+log SHA-256:
+`33dca74b7610cbb3aa12459de6d1114f01888cd524d8ddf880485fc9cdc60f61`.
+This predates child ownership-token enforcement; the parent supplied its own
+fresh temporary directory, but direct child invocation was insufficiently guarded.
+Use the ownership-hardened executable for subsequent qualification.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

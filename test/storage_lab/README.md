@@ -869,6 +869,53 @@ ISO bytes include generation metadata: configure the digest actually emitted
 by the helper, not a copied historical digest. These are build results, not
 package, signing, or deployment qualification.
 
+The exact MSVC candidate above subsequently passed the default-registration
+64-cycle lifecycle/cleanup gate (16,384 successful DOS-path queries, owned
+junction/mapping removed each cycle, sibling preserved), with no test-side
+junction rewrite. Results: `/tmp/seaweedfs-windows-mount-results-370816417/`;
+native log SHA-256
+`ec0fadff1a43d310fabc81958e34ac66140d6ed7bce6528e1f150deacfc20855`.
+It also passed both injected registration rollback cases in default mode,
+each fault firing exactly once with mapping removal and same-path reuse:
+`/tmp/seaweedfs-windows-mount-results-712374489/`, native log SHA-256
+`610ff260d044a84fa5e889218d623f76402508d3c0770ac2b79294b4686f72b9`.
+Both auxiliary guest-log collections passed their guest-to-host hash checks.
+
+Five real Git LFS cycles with this exact MSVC DLL also passed in 841.708 seconds:
+`/tmp/seaweedfs-windows-mount-results-295293714/`. Each cycle verified the loaded
+candidate DLL, all 20 LFS status checks with 32 modified assets, the native
+directory-canonicalization and `.git`/`.GIT` object-rename/content tests, and
+graceful unmount, with its own completion marker and no skips. The client was
+the pinned standalone Git LFS 3.8.0; the tested `weed.exe` SHA-256 was
+`58577fe7eb71ffac12aa8d0f540cd3953ffda891d974222c71bc7d7cc30a5c1c`.
+Its application source and module files remain unchanged since embedded commit
+`79936b2ead2ba87a3399a1f2249a0fa08aa4480e`; later commits affect build/lab tooling.
+Final cycle log SHA-256:
+`193a7babaa5cca27a4fce24a12dbcc96582371b4edafa6ccaa7af1178119aead`.
+Auxiliary logs passed their transfer hash check (5,404 bytes, SHA-256
+`d0301bf9bebf4b9ce7c5374833d1f16d22118a99deaf6e8cfa21e5c77df04bd3`).
+This closes the earlier MinGW-only compiler limitation for these tests. It does
+not constitute a signed package, Synology SPK, or VM-power-loss qualification.
+
+The same MSVC DLL passed eight abrupt mount-process termination cycles in
+default registration mode, including loaded-DLL verification, mapping/junction
+cleanup, same-path reuse, and sibling preservation. Results:
+`/tmp/seaweedfs-windows-mount-results-2647464651/` (306.767 seconds including VM
+setup); native log SHA-256
+`533c75becedae6c3cecdd275c5103a8a0fbe4a755f9542c4061d3eed3bc94053`.
+Auxiliary log collection passed. This kills the owned mount process, not the VM,
+and must not be described as storage power-loss testing.
+
+Alternate FSD registration (`MountUseMountmgrFromFSD=1`) passed the same
+64-cycle/16,384-query lifecycle and same-path cleanup gate with this MSVC DLL.
+All 64 junction removals, mapping removals and sibling-preservation checks
+completed. Results: `/tmp/seaweedfs-windows-mount-results-1681277609/`
+(467.338 seconds including VM setup); native log SHA-256
+`dd11c612cdcaff65cd89ec70412d993979b8b16e875bd039d2f8d5664432c947`.
+Auxiliary guest-log transfer also passed. The new CI job additionally requires
+FSD process-crash/rollback and the separate atomic-rename workload; this local
+MSVC result set must not be represented as having run those additional gates.
+
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after
 2193.456 seconds with all 20 workload logs containing the native rename/content

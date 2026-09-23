@@ -1,5 +1,5 @@
 diff --git a/src/dll/mount.c b/src/dll/mount.c
-index c7b94e8..10f95db 100644
+index c7b94e8..6012ca8 100644
 --- a/src/dll/mount.c
 +++ b/src/dll/mount.c
 @@ -93,6 +93,55 @@ static BOOL WINAPI FspMountInitialize(
@@ -26,7 +26,7 @@ index c7b94e8..10f95db 100644
 +    do
 +    {
 +        Length = lstrlenW(GuidName);
-+        if (49 != Length || 0 != wcsncmp(GuidName, L"\\\\?\\Volume{", 11) ||
++        if (49 != Length || 0 != invariant_wcsncmp(GuidName, L"\\\\?\\Volume{", 11) ||
 +            L'\\' != GuidName[Length - 1])
 +        {
 +            Result = STATUS_INVALID_PARAMETER;

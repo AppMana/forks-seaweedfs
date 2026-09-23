@@ -57,6 +57,12 @@ It reuses existing tests with bounded resources and no production network or
 writable host mounts. Linux, native Windows, and Synology SPK qualification are
 separate gates; passing the Linux lab does not qualify the other packages.
 
+Native WinFsp compilation is also an opt-in VM gate:
+`TestWindowsWinFspMSVCBuildLab`. Its offline compiler ISO path/hash, pinned
+toolchain/source versions, media layout, and invocation are documented in the
+[existing lab instructions](test/storage_lab/README.md). It builds and retains
+matched baseline/candidate DLLs; compilation alone does not qualify deployment.
+
 Passing local tests does not authorize promotion; deployment requirements and
 current operational facts belong in the existing AppMana `docs/seaweedfs.md`
 runbook, not a second document in this source repository.
@@ -85,6 +91,15 @@ Secrets and variables → Actions → Variables:
 | `SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256` | Absolute runner-local WinFsp MSI path and SHA-256 | Preload the reviewed installer. The VM gate verifies its hash before staging it offline. |
 | `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH` / `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256` | Absolute runner-local Git for Windows installer path and SHA-256 | Preload the reviewed installer including Git LFS; update path and digest together after qualification. Missing/mismatched installers fail the VM gate. |
 | `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH` / `SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` | Optional absolute runner-local standalone Windows `git-lfs.exe` path and SHA-256 | Set both to test an explicit client independently of the Git installer bundle; a partial pair or hash mismatch fails the gate. Leave both unset to test bundled LFS. Update deliberately after client qualification, never download `latest` during a regression run. |
+| `SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED` | Set to `1` to run native WinFsp build/qualification on applicable trusted pushes | Otherwise use manual dispatch input `windows_msvc_build`. Never runs for pull requests. Requires the dedicated isolated KVM runner; an omitted job is not a qualification pass. |
+| `SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH` / `SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256` | Absolute runner-local offline compiler ISO and its SHA-256 | Generate with `bash hack/appmana/prepare-winfsp-msvc-media.sh`, preload on the dedicated runner, and update both variables together. Review the pinned source, image-layer, Git and compiler/SDK versions in the existing lab instructions when replacing the payload. |
+
+The native MSVC qualification job additionally **requires** both explicit Git LFS
+variables above (bundled LFS is not its default). It uploads the exact baseline
+and candidate DLLs with manifests, patches, compiler logs/binlogs and runtime
+evidence, then tests the candidate app-locally with the pinned signed WinFsp MSI.
+It does not replace the installed driver, sign/publish a release, or deploy.
+No repository variables are changed by the build itself.
 
 The initial baseline is `9ec822e2d634abc36eb2a113d0ddb4a844970873` (the audited
 4.40 fork source), and the initial Go-FUSE pin is
@@ -103,9 +118,14 @@ gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH --repo AppMana/forks-seawe
 gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_MSI_SHA256"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_INSTALLER_PATH"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_INSTALLER_SHA256"
-# Optional explicit Windows LFS client; configure both or neither.
+# Optional for the stock-MSI gate, mandatory for MSVC qualification.
 gh variable set SEAWEEDFS_RELIABILITY_GIT_LFS_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_LFS_PATH"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_LFS_SHA256"
+# Native MSVC qualification: preload the helper-generated ISO on the runner.
+gh variable set SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_MSVC_ISO_PATH"
+gh variable set SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256 --repo AppMana/forks-seaweedfs --body "$MSVC_ISO_SHA256"
+# Enable only after runner provisioning and a successful manual qualification.
+gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED --repo AppMana/forks-seaweedfs --body 1
 gh variable list --repo AppMana/forks-seaweedfs
 ```
 
@@ -122,6 +142,9 @@ Docker, Containerlab 0.79.0, and the digest-pinned VM image, but no production
 routes or credentials. Four fresh isolated labs test replicated concurrent
 vacuum, acknowledged-write power loss, graceful baseline/candidate/rollback
 migration, and power loss after observing the vacuum `.cpd` copy.
+Both self-hosted VM jobs are restricted to pushes and deliberate manual runs;
+pull requests run hosted checks only. Review the selected ref before manually
+dispatching: the selected code can control Docker/KVM on the dedicated runner.
 
 Workflow-level variables `STORAGE_BUILD_TAGS`, `STORAGE_UNIT_TEST_TIMEOUT`, and
 `STORAGE_PROCESS_TEST_TIMEOUT` define the build format and test deadlines in

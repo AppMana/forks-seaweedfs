@@ -745,9 +745,9 @@ Windows/amd64 manifest:
 10,183,219,906 compressed bytes. Its downloaded bytes passed that SHA-256 check
 and are retained at `/tmp/seaweed-buildervs.7a54qiGW/toolchain-layer.tar.gz`.
 The adjacent image-baked install recipe installs VS2022 Build Tools with the
-C++ workload and Clang. This is an offline payload source, not yet a tested
-compiler environment: inventory its actual MSVC/SDK versions and verify tool
-execution before building. The completed archive inventory found MSVC
+C++ workload and Clang. Inventory its actual MSVC/SDK versions and verify tool
+execution before building; the native build evidence below supersedes the
+initial payload-only inventory. That inventory found MSVC
 `14.44.35207` (`v143`), Windows SDK `10.0.26100.0`, and
 `MSBuild/Current/Bin/MSBuild.exe`. These differ from upstream's older v142/19041
 comparison parameters: record explicit overrides and qualify both baseline and
@@ -757,6 +757,117 @@ natively. Do not import its OS/registry layers into an existing machine. Inspect
 Windows tar metadata with `tar --warning=no-unknown-keyword` to avoid flooding
 logs with unsupported metadata warnings; suppressing warnings is not validation
 of an extracted filesystem.
+
+The native compiler lab is automated by `TestWindowsWinFspMSVCBuildLab` in the
+existing VM test module. It uses Labcontainers/QGA and a read-only attached ISO;
+the guest has no external network. Required inputs are
+`LABCONTAINERS_WINDOWS_IMAGE`, `LABCONTAINERS_LABD`,
+`SEAWEEDFS_WINDOWS_MSVC_ISO` (absolute host path), and
+`SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256`. Explicitly opt in with
+`SEAWEEDFS_WINDOWS_MSVC_BUILD_LIVE=1`, then run:
+
+```sh
+go test ./test/storage_lab/vm -run '^TestWindowsWinFspMSVCBuildLab$' -v -count=1 -timeout 65m
+```
+
+Use the same workspace/module setup as the other VM tests. This expensive gate
+is separate from normal unit tests; an unset opt-in skips it, not a native-build
+pass. The ISO must have label `WINFSP_BUILD`, the verified image-layer trees
+`Files/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools` and
+`Files/Program Files (x86)/Windows Kits/10`, the verified
+`Git-2.51.0-64-bit.exe`, and a `winfsp.bundle` advertising the pinned WinFsp HEAD.
+Generate media with deep directories enabled (`genisoimage -D -udf -iso-level 3
+-J -joliet-long`); omitting `-D` silently omits deeply nested compiler files.
+Windows layer entries can have zero Unix permissions: give the isolated staging
+tree owner read/traverse permission before generating media. Do not import
+registry hives or OS trees from the container image.
+
+`hack/appmana/provision-winfsp-msvc-lab.ps1` copies the toolchain into the fresh
+guest, configures only its SDK discovery roots, and selects x64-hosted MSVC
+14.44.35207/v143 with SDK 10.0.26100.0. These explicit versions, the Git installer
+filename, and the pinned source/shallow boundary must be reviewed when changing
+the payload. Windows' existing UCRT props also read SDK registry roots; setting
+only `WindowsSdkDir` is insufficient (the native compiler reported missing
+`ctype.h` despite that header being present). The shallow source bundle needs
+its pinned shallow boundary restored after clone. Line-ending conversion is
+disabled during clone to preserve tracked source bytes.
+
+Prepare media using the checked-in, hash-verifying helper, not an ad-hoc ISO:
+
+```sh
+bash hack/appmana/prepare-winfsp-msvc-media.sh \
+  /runner/cache/toolchain-layer.tar.gz /runner/src/winfsp-v2.1 \
+  /runner/cache/Git-2.51.0-64-bit.exe /runner/cache
+```
+
+The output parent must already exist; the helper creates a fresh child directory
+and retains the extracted payload plus ISO (allow roughly 25 GiB beyond the
+downloaded layer). It rejects incorrect layer/installer hashes, a wrong source
+HEAD, symbolic links, and missing compiler inputs. It emits the ISO path and
+digest. Copy/preload that ISO on the dedicated runner and set the Actions
+variables `SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH` and
+`SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256`. Set
+`SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED=1` for continuous qualification, or use
+workflow dispatch `windows_msvc_build=true`. Also configure the pinned
+Labcontainers source/Windows image, Go-FUSE source, WinFsp MSI, Git installer,
+and explicit standalone LFS path/hash variables documented in the root README.
+The MSVC job requires standalone LFS rather than silently using the bundle.
+Its inputs are supplied as environment variables, not interpolated into scripts.
+Compiler/image/Git/source pins in the media helper and provisioning/build
+scripts must move together with the manifest assertions and qualification data.
+
+The workflow runs the exact compiled candidate through graceful same-path
+cleanup, process-crash cleanup, and injected registration rollback in both
+registration modes, then five real Git atomic-rename and LFS cycles. It retains
+build and runtime evidence for 30 days even on failure. It has no signing,
+registry publishing, release creation, or production deployment step; app-local
+DLL loading in a test does not establish the eventual package's load path.
+
+The caller stages the current checked-in build recipe and candidate patch,
+not copies embedded in the ISO. Each run builds baseline then candidate using
+the same guest/toolchain. Fresh completion tokens, mandatory DLL/log/binlog/
+argument/manifest retrieval, guest-to-host SHA-256 verification, clean baseline,
+and exact candidate patch comparison are required. Results are retained outside
+the repository under the printed `winfsp-msvc-results-*` directory, including
+toolchain executable paths/versions/hashes. Inspect the diagnostic build logs
+for the effective compiler/linker/resource-compiler paths before making stronger
+toolchain provenance claims; requested versions alone are not attestation.
+
+The first actual MSVC comparison on 2026-09-23 compiled the baseline with zero
+warnings/errors, then rejected the old candidate at link time with unresolved
+`wcsncmp`. Upstream's x64 DLL deliberately excludes the normal C runtime.
+The candidate now uses the existing `invariant_wcsncmp` helper from WinFsp's
+minimal runtime; do not add CRT linkage to hide this incompatibility. The RED
+link evidence is retained in `/tmp/winfsp-msvc-results-2260008932/`.
+Native Windows manifests also exposed a CRLF parsing defect in the lab verifier;
+its regression failed before the parser was corrected to remove the line-ending
+carriage return while retaining duplicate-field/hash checks.
+
+The corrected automated MSVC build passed on 2026-09-23 in 648.923 seconds,
+retaining both modes in `/tmp/winfsp-msvc-results-3500757848/`. Both builds
+reported zero warnings/errors. Baseline DLL SHA-256:
+`decde1c8627d5b9017784d34c07f908a4926b9eb197279b36ebe0861d316f944`;
+candidate DLL SHA-256:
+`565139f596f5ed173dda267894b4d36ac7a2c33aa604f8bf023ad9d062cc1952`.
+The candidate's captured patch exactly matched
+`4e02e14eb19629e32f5fc640c6445e41e02f40d1c47e03e0a78b442753760db8`.
+Diagnostic logs show `HostX64/x64/CL.exe` and `link.exe` from MSVC 14.44.35207,
+SDK 10.0.26100.0 `x64/rc.exe`, and `/NODEFAULTLIB`; no CRT dependency was added.
+An earlier successful MSVC baseline DLL
+`5c28c38b92ad7d62977ca06b2e99a0d4d6b8637d94d84a7fb434541688f2380c`
+reproduced the runtime failure at cycle 40/probe 200: DOS paths failed while
+GUID/NT paths worked, and Mount Manager showed no mount point. Evidence:
+`/tmp/seaweedfs-windows-mount-results-485402644/`.
+
+The checked-in media-preparation helper was also executed end-to-end against
+the real pinned layer/source/installer. It produced
+`/tmp/winfsp-msvc-media.BcAIo4RK/compiler.iso`, SHA-256
+`bc1ad029c75a4d8588043e473f2fe87dc54b4f367fdd192c0e96c36a5c989a02`.
+The earlier build run used equivalent manually prepared media with digest
+`75e868b4056c2b4114b1527f54ab5903d5b21f88097190cf639f7bfbf70d1dcd`.
+ISO bytes include generation metadata: configure the digest actually emitted
+by the helper, not a copied historical digest. These are build results, not
+package, signing, or deployment qualification.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

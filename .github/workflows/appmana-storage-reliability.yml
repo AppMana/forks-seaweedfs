@@ -61,6 +61,7 @@ jobs:
           python3 -m unittest discover -s hack/appmana -p 'test_analyze_fileio.py'
           pwsh -NoProfile -File hack/appmana/mount-smoke-contract-test.ps1
           pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1
+          pwsh -NoProfile -File hack/appmana/build-winfsp-msvc-test.ps1
       - name: Validate explicit compatibility inputs
         run: |
           for name in BASELINE_REF GO_FUSE_REF; do

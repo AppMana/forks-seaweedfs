@@ -645,6 +645,29 @@ An MSVC manifest must not claim `build_shim_sha256`. Existing MinGW manifests
 (absent toolchain field or `build_toolchain=mingw`) still require that shim hash;
 unknown toolchains fail validation. These checks establish evidence consistency,
 not compiler trust, reproducibility, or a successful Windows-native build.
+`hack/appmana/build-winfsp-msvc.ps1` builds that DLL project only. In a disposable
+compiler-enabled Windows guest, use separate source checkouts and fresh output
+directories for baseline and candidate, for example:
+
+```powershell
+.\hack\appmana\build-winfsp-msvc.ps1 -SourceDirectory C:\lab\winfsp-candidate `
+  -OutputDirectory C:\lab\msvc-candidate -AllowTrackedPatch `
+  -MSBuildPath 'C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Current\Bin\MSBuild.exe' `
+  -VCToolsVersion 14.29.30133 -PlatformToolset v142 -WindowsSDKVersion 10.0.19041.0
+```
+
+The example compiler version/path are explicit inputs, not evidence that this
+toolchain is installed. Pin the same installed versions for both builds and omit
+`-AllowTrackedPatch` for the clean baseline. Source/output paths cannot contain
+spaces or shell metacharacters because upstream's `.pc` generation is unquoted.
+The recipe rejects preexisting outputs, fixes date-dependent version fields,
+retains diagnostic MSBuild output, a binary log, exact arguments and source patch,
+and writes the harness-compatible manifest only after successful compilation and
+a source-stability check. It never registers a DLL, replaces installed files,
+builds a driver or produces an installer. Its host-independent argument/error
+contracts run in the existing reliability workflow; a passing contract does not
+prove compilation or runtime behavior. Windows-native build/runtime qualification
+remains outstanding until actual artifact results are recorded here.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

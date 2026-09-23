@@ -611,6 +611,26 @@ log SHA-256:
 Auxiliary log collection succeeded. This initial executable predates the timeout
 quiescence and pre-install callback-target hardening; neither timeout path ran.
 Use the hardened executable for subsequent rollback qualification.
+The hardened executable
+`71e02b7d5c3255c3f5010bd81a5b4b4db80ebc73996cd4495ba6d334055d33c4`
+passed both rollback fail points under FSD registration in
+`/tmp/seaweedfs-windows-mount-results-4150295100` (0.19 seconds native,
+188.225 seconds full harness, exit 0). Restored import markers, global mapping
+absence, exact-path reuse and sibling checks all passed; auxiliary log transfer
+also succeeded. Native log SHA-256:
+`b4af7fba93e1192a821c6e06c257f3a4719d574986b1b84f17ecc49368864d52`.
+
+Release-build follow-up must use upstream's `build/VStudio/winfsp_dll.vcxproj`
+in `Release|x64`, with the compiler and SDK versions recorded. The pinned v2.1
+`build.version.props` targets Windows SDK `10.0.19041.0`; its build number and
+copyright year otherwise depend on the current date, so reproducible comparison
+requires explicit recorded overrides. Build only the user-mode DLL project for
+this fix; replacing or rebuilding the signed kernel driver is not part of it.
+The generic Labcontainers Windows image provisions drivers/QGA, not MSVC.
+Use its existing project-specific `provisioning_scripts` extension for a separate
+compiler-enabled image. Neither a MinGW lab pass nor a successful MSVC compile
+alone establishes deployment qualification: test the resulting exact artifact
+and its packaging/load path before release.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

@@ -315,6 +315,15 @@ probes it records the volume GUID and requires the exact path in
 The runner requires final junction and mapping cleanup markers, rejecting
 older executables that lack these checks. Run with both registration modes.
 This does not yet verify process-death cleanup or registration-failure rollback.
+Use `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerProcessCrash` for a separate
+process-death check (leave `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP` unset).
+It launches eight owned child processes in turn at the same mount path. Each
+child completes the canonicalization and pre-unmount mapping oracle, signals a
+per-cycle readiness file, and waits without unmounting. The parent terminates
+only that child, checks junction/mapping removal and sibling bytes, and mounts
+the same path in the next cycle. Both registration modes are supported; test-side
+junction interventions are rejected. This is abrupt process termination, not VM
+power loss, and the synthetic filesystem cannot establish SeaweedFS durability.
 The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
 instead of) the regular Windows qualification gate. It defaults off.
 This minimal probe reproduced the DOS-path defect without Git, a weed binary,
@@ -508,6 +517,23 @@ This run used the corrected `lfs-qga-reap-da40c93` helper image and verified
 run-specific setup/native completion tokens and the loaded candidate DLL.
 It extends native registration coverage, not real-workload or crash safety
 qualification; the real LFS qualification continues using default registration.
+
+Same-path graceful cleanup qualification with the candidate subsequently passed
+64 cycles under default registration in
+`/tmp/seaweedfs-windows-mount-results-68763737` (192.39 seconds native,
+384.441 seconds full harness, exit 0). This first cleanup executable,
+`26fc92fb8d8a0d23055fc4f21f4a5f5dd8a992e5313b4042f42e38cc7e3bf3ee`,
+checked junction removal and sibling bytes but predates the volume-mapping
+assertion. Log SHA-256:
+`993b38e6d5f098353d0dfe79181fa5c9750455eb0625e1ccad644713472c99dc`.
+The stronger mapping-cleanup executable,
+`9d3bfba645e8f4524f9bc2c148f4c3a001c747f6a06dd1aeacfe03e819cf1bd1`,
+passed all 64 cycles with FSD registration in
+`/tmp/seaweedfs-windows-mount-results-3521072933` (191.75 seconds native,
+403.812 seconds full harness, exit 0), verifying both junction and exact-GUID
+mapping removal and sibling preservation. Log SHA-256:
+`882a322d728b13c7bd4142baede8019ddb8462eee2ea69eeb6d508b4ed6f3b03`.
+Neither result establishes process-death cleanup or registration rollback.
 
 An exploratory real-LFS candidate run in
 `/tmp/seaweedfs-windows-mount-results-77732198` returned harness exit 0 after

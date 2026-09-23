@@ -20,6 +20,7 @@ import (
 var mountManagerGUIDJunction = flag.Bool("mount-manager-guid-junction", false, "lab experiment: replace only the owned junction's NT target with its volume GUID")
 var mountManagerNTJunctionControl = flag.Bool("mount-manager-nt-junction-control", false, "lab control: perform identical identity queries and rewrite the original NT junction target")
 var mountManagerCheckCleanup = flag.Bool("mount-manager-check-cleanup", false, "lab qualification: reuse the same mount path and verify junction removal and sibling preservation")
+var mountManagerCrashChild = flag.Bool("mount-manager-crash-child", false, "internal lab child: signal readiness and await termination before unmount")
 
 // A root-only filesystem isolates mount-manager behavior from Git and filer
 // metadata. This opt-in test creates only disposable mounts below t.TempDir.
@@ -60,6 +61,12 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 	}
 	t.Logf("junction experiment: guid=%t nt-control=%t", *mountManagerGUIDJunction, *mountManagerNTJunctionControl)
 	root := t.TempDir()
+	if *mountManagerCrashChild {
+		root = os.Getenv("SEAWEEDFS_MOUNT_CRASH_ROOT")
+		if root == "" || !*mountManagerCheckCleanup || os.Getenv("SEAWEEDFS_MOUNT_CRASH_READY") == "" {
+			t.Fatal("crash child requires parent-owned root, readiness path and cleanup checks")
+		}
+	}
 	sibling := filepath.Join(root, "unrelated-data.txt")
 	const siblingContent = "unrelated data must survive mount cleanup"
 	if *mountManagerCheckCleanup {
@@ -223,6 +230,14 @@ func TestMountManagerDirectoryLifecycle(t *testing.T) {
 				}
 				if !found {
 					t.Fatalf("mounted path %q absent from GUID %q paths %q", point, mountedGUID, paths)
+				}
+				if *mountManagerCrashChild {
+					if err := os.WriteFile(os.Getenv("SEAWEEDFS_MOUNT_CRASH_READY"), []byte(mountedGUID), 0600); err != nil {
+						t.Fatal(err)
+					}
+					// The parent terminates this process. No Unmount or deferred
+					// cleanup runs; the guest OS must release the mount handles.
+					select {}
 				}
 			}
 		}()

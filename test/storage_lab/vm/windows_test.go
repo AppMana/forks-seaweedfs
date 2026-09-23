@@ -18,7 +18,21 @@ func TestWindowsStorageLab(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_WINDOWS_LIVE") != "1" {
 		t.Skip("set SEAWEEDFS_WINDOWS_LIVE=1")
 	}
-	binary, err := os.ReadFile(os.Getenv("SEAWEEDFS_WINDOWS_STORAGE_TEST"))
+	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_STORAGE_TEST"), []string{"TestWriteNeedle2FsyncsInlineWhileStopping", "TestWriteNeedle2FsyncsIndexBeforeAcknowledging", "TestWriteNeedle2RejectsFailedIndexFsync", "TestWriteNeedle2TruncatesWhenInlineFsyncFails", "TestWriteNeedle2DropsIndexOfUnflushedNewNeedle", "TestStoreWriteVolumeNeedleStaysDurableWhileStopping", "TestReconcileRollForwardMarkerOnly", "TestReconcileRollForwardPartialRename", "TestReconcileRollBackNoMarker", "TestApplyCompactSwapMissingTempFilesPreservesLive"})
+}
+
+func TestWindowsMountXAttrLab(t *testing.T) {
+	if os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE") != "1" {
+		t.Skip("set SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE=1")
+	}
+	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_TEST"), []string{"TestXAttrOnUnlinkedOpenFile", "TestXAttrOnRemovedOpenDir", "TestSetAttrOnUnlinkedOpenFile", "TestGetAttrOnUnlinkedOpenFile", "TestSetAttrOnRemovedOpenDir", "TestForgetReleasesRemovedOpenDir"})
+}
+
+// Share the isolated Windows VM, staging and strict inventory checks with the
+// storage suite; the assertions remain in the original application packages.
+func runWindowsUnitLab(t *testing.T, executable string, names []string) {
+	t.Helper()
+	binary, err := os.ReadFile(executable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,12 +64,11 @@ func TestWindowsStorageLab(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Log("Windows ready; staging existing storage tests")
+	t.Logf("Windows ready; staging unit tests SHA-256=%s", sha(binary))
 	n := lab.Node("vm")
 	if err := n.Put(ctx, `C:\storage.test.exe`, 0600, binary); err != nil {
 		t.Fatal(err)
 	}
-	names := []string{"TestWriteNeedle2FsyncsInlineWhileStopping", "TestWriteNeedle2FsyncsIndexBeforeAcknowledging", "TestWriteNeedle2RejectsFailedIndexFsync", "TestWriteNeedle2TruncatesWhenInlineFsyncFails", "TestWriteNeedle2DropsIndexOfUnflushedNewNeedle", "TestStoreWriteVolumeNeedleStaysDurableWhileStopping", "TestReconcileRollForwardMarkerOnly", "TestReconcileRollForwardPartialRename", "TestReconcileRollBackNoMarker", "TestApplyCompactSwapMissingTempFilesPreservesLive"}
 	pattern := "^(" + strings.Join(names, "|") + ")$"
 	listed, err := n.Exec(ctx, `C:\storage.test.exe`, "-test.list", pattern)
 	if err != nil {
@@ -74,7 +87,7 @@ func TestWindowsStorageLab(t *testing.T) {
 	output := string(result.GetStdout()) + string(result.GetStderr())
 	t.Log(output)
 	if result.GetExitCode() != 0 || strings.Contains(output, "--- SKIP:") {
-		t.Fatalf("Windows storage tests failed/skipped, exit %d", result.GetExitCode())
+		t.Fatalf("Windows unit tests failed/skipped, exit %d", result.GetExitCode())
 	}
 	for _, name := range names {
 		if !strings.Contains(output, "--- PASS: "+name+" ") {

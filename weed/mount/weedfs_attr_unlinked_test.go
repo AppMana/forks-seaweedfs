@@ -1,7 +1,10 @@
 package mount
 
 import (
+	"bytes"
 	"os"
+	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -9,6 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 // newUnlinkedOpenFile builds a WFS holding one open handle whose name has
@@ -118,7 +122,14 @@ func TestGetAttrOnUnlinkedOpenFile(t *testing.T) {
 // TestXAttrOnUnlinkedOpenFile covers fsetxattr/fgetxattr/fremovexattr on a
 // descriptor whose file has been unlinked.
 func TestXAttrOnUnlinkedOpenFile(t *testing.T) {
-	wfs, inode, _ := newUnlinkedOpenFile(t)
+	wfs, inode, fh := newUnlinkedOpenFile(t)
+	if runtime.GOOS == "windows" || runtime.GOOS == "freebsd" {
+		assertUnlinkedXAttrsUnsupported(t, wfs, inode, fh.GetEntry().GetEntry())
+		if fh.dirtyMetadata {
+			t.Fatal("unsupported xattr operation dirtied the open file")
+		}
+		return
+	}
 
 	setIn := &fuse.SetXAttrIn{}
 	setIn.NodeId = inode
@@ -231,6 +242,10 @@ func TestSetAttrOnRemovedOpenDir(t *testing.T) {
 // descriptor whose directory has been removed.
 func TestXAttrOnRemovedOpenDir(t *testing.T) {
 	wfs, inode := newRemovedOpenDir(t)
+	if runtime.GOOS == "windows" || runtime.GOOS == "freebsd" {
+		assertUnlinkedXAttrsUnsupported(t, wfs, inode, wfs.removedDirs[inode])
+		return
+	}
 
 	setIn := &fuse.SetXAttrIn{}
 	setIn.NodeId = inode
@@ -253,6 +268,35 @@ func TestXAttrOnRemovedOpenDir(t *testing.T) {
 	}
 	if _, status := wfs.GetXAttr(nil, header, "user.k", dest); status != fuse.ENOATTR {
 		t.Fatalf("GetXAttr after remove: got %v, want ENOATTR", status)
+	}
+}
+
+// Windows and FreeBSD deliberately implement all raw-mount xattr operations
+// as ENOTSUP. Exercise that contract rather than skipping these fixtures or
+// requiring the POSIX implementation (which is excluded on these platforms).
+func assertUnlinkedXAttrsUnsupported(t *testing.T, wfs *WFS, inode uint64, entry *filer_pb.Entry) {
+	t.Helper()
+	entry.Extended = map[string][]byte{"xattr-user.k": []byte("preserve")}
+	before := proto.Clone(entry)
+	header := &fuse.InHeader{NodeId: inode}
+	set := &fuse.SetXAttrIn{InHeader: *header}
+	want := fuse.Status(syscall.ENOTSUP)
+	if got := wfs.SetXAttr(nil, set, "user.k", []byte("replacement")); got != want {
+		t.Errorf("unsupported SetXAttr: got %v, want %v", got, want)
+	}
+	dest := bytes.Repeat([]byte{0xa5}, 32)
+	unchanged := append([]byte(nil), dest...)
+	if n, got := wfs.GetXAttr(nil, header, "user.k", dest); n != 0 || got != want {
+		t.Errorf("unsupported GetXAttr: got (%d, %v), want (0, %v)", n, got, want)
+	}
+	if n, got := wfs.ListXAttr(nil, header, dest); n != 0 || got != want {
+		t.Errorf("unsupported ListXAttr: got (%d, %v), want (0, %v)", n, got, want)
+	}
+	if got := wfs.RemoveXAttr(nil, header, "user.k"); got != want {
+		t.Errorf("unsupported RemoveXAttr: got %v, want %v", got, want)
+	}
+	if !proto.Equal(before, entry) || !bytes.Equal(dest, unchanged) {
+		t.Fatal("unsupported xattr operation modified retained metadata or output buffer")
 	}
 }
 

@@ -202,6 +202,28 @@ requires every selected test to be listed and pass without skips. This verifies
 core NTFS behavior; WinFsp mounts, CSI, and packaged service upgrades are separate
 runtime gates. Labcontainers also provides `TestLiveWindows` for NTFS crash persistence.
 
+The same VM runner can execute the raw-mount xattr platform contracts and
+retained-open-file/directory metadata tests (no WinFsp mount or MSI needed):
+
+```sh
+GOWORK=off GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -tags 5BytesOffset -o /absolute/mount.test.exe ./weed/mount
+SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE=1 \
+SEAWEEDFS_WINDOWS_MOUNT_UNIT_TEST=/absolute/mount.test.exe \
+LABCONTAINERS_LABD=/absolute/labcontainers/bin/labd \
+LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
+go test ./test/storage_lab/vm -run '^TestWindowsMountXAttrLab$' -count=1 -v -timeout=20m
+```
+
+The six-test inventory rejects omissions and skips. Windows and FreeBSD already
+return `ENOTSUP` for raw-mount xattrs; their tests require that result for set,
+get, list and remove, zero result lengths, unchanged retained metadata and
+unchanged output buffers. Supported platforms retain the original POSIX
+set/get/remove assertions. This corrects the platform mismatch seen in hosted
+Windows CI run `35901912420` in both CGO modes; it does not implement Windows
+xattrs or weaken the Linux regression. The existing native Windows CI job runs
+these tests as part of `./weed/mount` in both CGO modes automatically.
+
 For WinFsp/Git runtime coverage in a disposable Windows VM, supply the candidate
 and offline installers from the host (the guest has no external network):
 

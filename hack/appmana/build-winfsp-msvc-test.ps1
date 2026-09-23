@@ -63,3 +63,35 @@ try {
     if (-not $rejected) { throw 'Git error was swallowed' }
 } finally { Remove-Item Function:git }
 Write-Host 'PASS: Git argument forwarding and native failure propagation'
+$evidenceRoot = Join-Path ([IO.Path]::GetTempPath()) ('winfsp-evidence-' + [guid]::NewGuid())
+try {
+    New-Item -ItemType Directory -Path $evidenceRoot | Out-Null
+    $patch = Join-Path $evidenceRoot 'source.patch'
+    [IO.File]::WriteAllBytes($patch, [byte[]]@())
+    foreach ($allow in @($false, $true)) {
+        $evidence = Get-WinFspPatchEvidence -Patch $patch -AllowTrackedPatch:$allow
+        if ($evidence.Mode -ne 'baseline' -or $evidence.Hash -ne (Get-FileHash $patch -Algorithm SHA256).Hash) {
+            throw 'Empty captured patch was not an exact baseline'
+        }
+    }
+    # Simulate an edit after an earlier clean status: only captured bytes count.
+    [IO.File]::WriteAllBytes($patch, [Text.Encoding]::UTF8.GetBytes('late tracked edit'))
+    $evidence = Get-WinFspPatchEvidence -Patch $patch -AllowTrackedPatch
+    if ($evidence.Mode -ne 'candidate' -or $evidence.Hash -ne (Get-FileHash $patch -Algorithm SHA256).Hash) {
+        throw 'Nonempty captured patch was not an exact candidate'
+    }
+    $rejected = $false
+    try { Get-WinFspPatchEvidence -Patch $patch | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Late tracked edit bypassed candidate opt-in' }
+    $recipe = Join-Path $evidenceRoot 'recipe.ps1'
+    [IO.File]::WriteAllText($recipe, 'original recipe')
+    $before = (Get-FileHash $recipe -Algorithm SHA256).Hash
+    Assert-WinFspRecipeUnchanged -Path $recipe -ExpectedHash $before
+    [IO.File]::WriteAllText($recipe, 'edited during compilation')
+    $rejected = $false
+    try { Assert-WinFspRecipeUnchanged -Path $recipe -ExpectedHash $before } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Changed build recipe was accepted' }
+} finally {
+    if (Test-Path -LiteralPath $evidenceRoot) { Remove-Item -LiteralPath $evidenceRoot -Recurse -Force }
+}
+Write-Host 'PASS: captured source mode/hash, candidate opt-in and recipe stability'

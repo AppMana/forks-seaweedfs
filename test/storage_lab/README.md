@@ -51,7 +51,19 @@ Fresh binaries and retained mutant logs are in
 `/tmp/seaweedfs-linux-qualification.DhA7LkYz/`; application source is unchanged
 from `d711e7e38104f84d4fe3d89edb15da3b01cab484`, with Go-FUSE pinned to
 `1bdeec4d57d1e9ee85d4938f36f2ed876dd7bd5e`. Core Linux race suites and the
-focused streamed-S3-copy durability tests also passed. These process/filesystem
+focused streamed-S3-copy durability tests also passed. The full Linux package
+selection from the Windows workflow (`./weed/mount/... ./weed/command/...
+./weed/filer/... ./weed/pb/... ./weed/s3api/...`, with `5BytesOffset`) passed.
+Migration result `/tmp/seaweedfs-lab-results-u0yfwbm0` passed the required
+`TestVolumeBinaryUpgradeVacuumRollback`; replicated admission result
+`/tmp/seaweedfs-lab-results-dlgh3wpj` passed
+`TestUploadLimitTimeoutIncludesReplication`. Migration used the clean baseline
+`9ec822e2d634abc36eb2a113d0ddb4a844970873` (binary SHA-256
+`0089736446a3668762ec72b677b04bcf1720810150d1830ffb9ea7b6650e5580`)
+and candidate `d711e7e38104f84d4fe3d89edb15da3b01cab484` (binary SHA-256
+`34912961e14c1d9876ab08aac282fbf381c4655b48aed8ce1647f1b17c9b3160`).
+All six reviewed compaction/fsck/offset mutants and the separate preallocation
+mutant made their expected regressions fail. These process/filesystem
 checks are not additional power-loss or package-lifecycle qualification.
 
 Do not increase limits without checking host capacity. Building is a separate
@@ -1317,6 +1329,7 @@ rereads every acknowledged payload. The other requests a reservation larger
 than the entire disposable filesystem and requires volume creation to return an
 error without leaving a newly created candidate; a seeded volume at the same
 path must remain byte-for-byte intact. Running either guarded test outside this
+runner is not supported; never set its guard variable on a host filesystem.
 
 This qualifies native filesystem behavior on a file-backed block device, not
 physical-drive firmware, controller caches, actual power loss, DSM Btrfs, or

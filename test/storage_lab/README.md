@@ -404,6 +404,14 @@ Use its existing project-specific `provisioning_scripts` extension for a separat
 compiler-enabled image. Neither a MinGW lab pass nor a successful MSVC compile
 alone establishes deployment qualification: test the resulting exact artifact
 and its packaging/load path before release.
+The DLL manifest verifier accepts `build_toolchain=msvc` only with recorded
+`platform_toolset`, `vc_tools_version`, `windows_sdk_version`, `msbuild_version`,
+`version_build_number` and `version_copyright_year`, in addition to the existing
+source revision, source mode, source epoch, patch/DLL hashes and recipe hash.
+An MSVC manifest must not claim `build_shim_sha256`. Existing MinGW manifests
+(absent toolchain field or `build_toolchain=mingw`) still require that shim hash;
+unknown toolchains fail validation. These checks establish evidence consistency,
+not compiler trust, reproducibility, or a successful Windows-native build.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

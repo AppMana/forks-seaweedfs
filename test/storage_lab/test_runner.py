@@ -18,6 +18,24 @@ spec.loader.exec_module(lab)
 
 
 class IsolationContract(unittest.TestCase):
+    def test_bwrap_requires_bounded_tmpfs_features(self):
+        for help_text, accepted in [('--size BYTES\n--perms OCTAL\n--remount-ro DEST', True),
+                                    ('--tmpfs DEST\n--remount-ro DEST', False),
+                                    ('--size BYTES\n--remount-ro DEST', False)]:
+            with self.subTest(help=help_text), mock.patch.object(lab.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess([], 0, help_text, '')):
+                if accepted:
+                    lab.require_bwrap_features()
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'Bubblewrap.*missing'):
+                        lab.require_bwrap_features()
+
+    def test_hosted_storage_runner_has_supported_bubblewrap(self):
+        workflow = (Path(__file__).resolve().parents[2] /
+                    '.github/workflows/appmana-storage-reliability.yml').read_text()
+        job = workflow.split('  large-disk-regressions:\n', 1)[1].split('\n  vm-fault-gates:', 1)[0]
+        self.assertIn('runs-on: ubuntu-24.04', job)
+
     def test_required_inventory_rejects_missing_skipped_or_failed_tests(self):
         for suite, names in lab.REQUIRED_TESTS.items():
             lines = ['--- PASS: ' + name + ' (0.01s)' for name in names]
@@ -37,6 +55,7 @@ class IsolationContract(unittest.TestCase):
             log.write(b'PASS: sandbox boundary probe\n--- PASS: TestVacuumStableLiveDatasetHasBoundedGrowth (0.01s)\nPASS\n')
             return 0
         with mock.patch.object(sys, 'argv', ['run.py', 'storage', '--tests', sys.executable]), \
+                mock.patch.object(lab, 'require_bwrap_features'), \
                 mock.patch.object(lab, 'run_bounded', side_effect=one_test_only), \
                 mock.patch.object(lab.subprocess, 'run'):
             self.assertEqual(lab.main(), 1, 'a partial suite was reported as qualified')

@@ -147,7 +147,8 @@ jobs:
           retention-days: 30
 
   large-disk-regressions:
-    runs-on: ubuntu-22.04
+    # 22.04's Bubblewrap lacks --size; never drop the bounded-tmpfs guard.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -160,6 +161,7 @@ jobs:
       - name: Windows trace tooling contracts
         run: |
           python3 -m unittest discover -s hack/appmana -p 'test_analyze_fileio.py'
+          python3 -m unittest discover -s hack/appmana -p 'test_smoke_contract_exit.py' -v
           pwsh -NoProfile -File hack/appmana/mount-smoke-contract-test.ps1
           pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1
           pwsh -NoProfile -File hack/appmana/build-winfsp-msvc-test.ps1

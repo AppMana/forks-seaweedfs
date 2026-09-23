@@ -11,6 +11,11 @@ not a sandbox for hostile code or a substitute for a separate physical host.
 
 Linux with systemd, cgroup memory/CPU/PID controllers, `/usr/bin/bwrap`, Python 3,
 and noninteractive sudo for systemd-run/systemctl. Run as your ordinary user.
+The qualified hosted image is Ubuntu 24.04 with Bubblewrap 0.9. Both Linux
+runners check for `--size`, `--perms`, and `--remount-ro` before staging or
+privileged setup. Ubuntu 22.04's older Bubblewrap rejected `--size` in CI before
+any storage test ran. Do not remove bounded tmpfs or read-only artifact options
+to accommodate an older installation; update the runner instead.
 Privilege establishes isolation; the test payload runs as that user's UID/GID
 with zero capabilities. A preflight inside the same sandbox verifies loopback
 only, no host home/devices/Docker socket, a read-only artifact mount, and bounded
@@ -23,6 +28,31 @@ inside the sandbox; selected executable copies are read-only. The host receives
 the manifest and stdout/stderr log, not test volumes. Staging copies are removed
 afterward. Results remain in the printed `seaweedfs-lab-results-*` directory.
 Sparse 64–200 GiB files consume only their written pages, within the tmpfs limit.
+
+The September 23 Linux CI repair also fixes the smoke-contract test's exit
+status: its final intentionally failed WPR mock left `LASTEXITCODE=1` for the
+Actions PowerShell wrapper despite every contract passing. The script now
+clears that mock result only after all assertions and cleanup succeed, never in
+`finally`. `hack/appmana/test_smoke_contract_exit.py` executes the real Actions
+wrapper and checks both successful negative controls and an injected unexpected
+assertion failure; the success case was RED before the correction. Both Linux
+workflows run this regression. This is harness repair, not a storage-code fix.
+
+Fresh local Ubuntu 24.04/Bubblewrap 0.9 qualification after the repair passed
+all 18 required storage cases on tmpfs (`seaweedfs-lab-results-bsom_wtu`), XFS
+(`seaweedfs-fs-results-k3taa8uc`) and Btrfs (`seaweedfs-fs-results-yd8r_vt3`).
+Both required ENOSPC cases passed on XFS (`seaweedfs-fs-results-83lidthp`) and
+Btrfs (`seaweedfs-fs-results-48g6szi9`). All result directories are under `/tmp`
+and contain artifact hashes and inventories. The preallocation mutant in
+`seaweedfs-fs-results-osonf31c` failed **only** its required preallocation test
+while the adjacent compaction-preservation control passed. Its failed manifest
+is intentional negative-control evidence, not a failed candidate qualification.
+Fresh binaries and retained mutant logs are in
+`/tmp/seaweedfs-linux-qualification.DhA7LkYz/`; application source is unchanged
+from `d711e7e38104f84d4fe3d89edb15da3b01cab484`, with Go-FUSE pinned to
+`1bdeec4d57d1e9ee85d4938f36f2ed876dd7bd5e`. Core Linux race suites and the
+focused streamed-S3-copy durability tests also passed. These process/filesystem
+checks are not additional power-loss or package-lifecycle qualification.
 
 Do not increase limits without checking host capacity. Building is a separate
 step and may download dependencies: apply resource limits to builds too. Never

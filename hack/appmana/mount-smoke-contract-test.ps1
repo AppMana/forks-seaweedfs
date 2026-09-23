@@ -130,3 +130,7 @@ try {
     # Only this script's newly created temporary fixtures, never mounted data.
     Remove-Item -LiteralPath $root -Recurse -Force
 }
+# All expected failures have been asserted, and cleanup has succeeded. Do not
+# leak the deliberately injected WPR exit code into Actions' pwsh wrapper.
+# Keep this outside finally: an unexpected assertion/cleanup failure must throw.
+$global:LASTEXITCODE = 0

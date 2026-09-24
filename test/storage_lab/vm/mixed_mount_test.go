@@ -54,6 +54,8 @@ func TestMixedOSMountLab(t *testing.T) {
 	inputs["winfsp-x64.dll.source.patch"] = inputs["winfsp-x64.dll"] + ".source.patch"
 	artifacts := map[string][]byte{}
 	var provenance strings.Builder
+	traceLinux := os.Getenv("SEAWEEDFS_MIXED_TRACE") == "1"
+	fmt.Fprintf(&provenance, "linux_fuse_trace=%t\n", traceLinux)
 	for name, path := range inputs {
 		if !filepath.IsAbs(path) {
 			t.Fatalf("absolute input required for %s", name)
@@ -150,6 +152,11 @@ func TestMixedOSMountLab(t *testing.T) {
 		defer stop()
 		for _, node := range []string{"linux", "windows"} {
 			argv := []string{"sh", "-c", "tail -n 200 /var/log/mixed-*.log"}
+			if traceLinux && node == "linux" {
+				// Bounded diagnostic output, never a replacement for the strict
+				// workload oracle. Record file sizes so truncation is visible.
+				argv = []string{"sh", "-c", "echo TRACE_TAIL_LIMIT_BYTES=3000000; wc -c /var/log/mixed-mount-*.log; tail -c 3000000 /var/log/mixed-mount-*.log"}
+			}
 			if node == "windows" {
 				argv = []string{ps, "-NoProfile", "-Command", `Get-ChildItem C:\lab\logs-* -Directory | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File } | ForEach-Object { $_.Name; Get-Content -LiteralPath $_.FullName -Tail 200 }`}
 			}
@@ -202,7 +209,11 @@ Write-Output SETUP_COMPLETE`))
 	_, err = lab.RunTimeline(ctx, &labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{Exec: &labv1.ExecRequest{Node: &labv1.NodeRef{Node: "linux"}, Argv: []string{"python3", "-c", "import urllib.request; urllib.request.urlopen('http://192.0.2.10:8888/',timeout=2).read(); print('filer-ready')"}, TimeoutMillis: 5000}, TimeoutMillis: 120000, RetryMillis: 1000, StdoutContains: []byte("filer-ready")}}})
 	must(err)
 	startMounts := func(round string) {
-		must(run("linux", "mount-"+round, "sh", "-ec", `mkdir -p /var/cache/mixed-`+round+`; nohup /opt/weed mount -filer=192.0.2.10:8888 -dir=/mnt/shared -cacheDir=/var/cache/mixed-`+round+` >/var/log/mixed-mount-`+round+`.log 2>&1 </dev/null &`))
+		linuxMount := "/opt/weed mount"
+		if traceLinux {
+			linuxMount = "/opt/weed -v=4 mount -debug.fuse=true"
+		}
+		must(run("linux", "mount-"+round, "sh", "-ec", `mkdir -p /var/cache/mixed-`+round+`; nohup `+linuxMount+` -filer=192.0.2.10:8888 -dir=/mnt/shared -cacheDir=/var/cache/mixed-`+round+` >/var/log/mixed-mount-`+round+`.log 2>&1 </dev/null &`))
 		_, err := lab.RunTimeline(ctx, &labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{Exec: &labv1.ExecRequest{Node: &labv1.NodeRef{Node: "linux"}, Argv: []string{"sh", "-ec", "mountpoint -q /mnt/shared; echo mounted"}, TimeoutMillis: 5000}, TimeoutMillis: 60000, RetryMillis: 500, StdoutContains: []byte("mounted")}}})
 		must(err)
 		// Match the non-traced mount-smoke.ps1 launch: no PowerShell output

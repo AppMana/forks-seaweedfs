@@ -142,6 +142,10 @@ type Option struct {
 	uniqueCacheDirForWrite string
 }
 
+type inodeNotifier interface {
+	InodeNotify(uint64, int64, int64) fuse.Status
+}
+
 type WFS struct {
 	// https://dl.acm.org/doi/fullHtml/10.1145/3310148
 	// follow https://github.com/hanwen/go-fuse/blob/master/fuse/api.go
@@ -161,7 +165,7 @@ type WFS struct {
 	inodeToPath           *InodeToPath
 	fhMap                 *FileHandleToInode
 	dhMap                 *DirectoryHandleToInode
-	fuseServer            *fuse.Server
+	fuseServer            inodeNotifier
 	IsOverQuota           bool
 	fhLockTable           *util.LockTable[FileHandleId]
 	hardLinkLockTable     *util.LockTable[string]
@@ -961,6 +965,33 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 	// no other handle's lock.
 	if replacedInode != 0 {
 		wfs.markHandleDeleted(replacedInode)
+	}
+	wfs.invalidateKernelFileAttributes(invalidation)
+}
+
+// Run only from the metadata invalidation worker, after refreshing the handle
+// and releasing its locks. Updating our entry or clearing FOPEN_KEEP_CACHE does
+// not update Linux's cached i_size: even a correct FUSE READ can appear as EOF.
+func (wfs *WFS) invalidateKernelFileAttributes(invalidation meta_cache.EntryInvalidation) {
+	server := wfs.fuseServer
+	if server == nil || invalidation.Entry == nil || invalidation.Entry.IsDirectory {
+		return
+	}
+	for _, signature := range invalidation.Signatures {
+		if signature == wfs.signature {
+			return // The initiating kernel already knows its own writes.
+		}
+	}
+	inode, found := wfs.inodeToPath.GetInode(invalidation.Path)
+	if !found {
+		return
+	}
+	// A negative offset expires attributes only. Do not invalidate data pages:
+	// they may contain dirty local writes, and data invalidation can wait on
+	// kernel writeback. Normal read/getattr revalidation observes the new size
+	// and mtime; Open also compares mtime before retaining the page cache.
+	if status := server.InodeNotify(inode, -1, 0); status != fuse.OK && status != fuse.ENOENT && status != fuse.ENOSYS {
+		glog.V(4).Infof("invalidate kernel attributes of %s: %v", invalidation.Path, status)
 	}
 }
 

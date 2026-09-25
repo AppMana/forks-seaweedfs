@@ -28,7 +28,7 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
+		case "All", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
 			scenarios = []string{scenario}
 		default:
 			t.Fatal("unknown SEAWEEDFS_WINDOWS_MOUNT_SCENARIO; see test/storage_lab/README.md")
@@ -93,8 +93,16 @@ func TestWindowsMountLab(t *testing.T) {
 	if nativeTest := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST"); nativeTest != "" {
 		inputs[`C:\lab\winfsp.test.exe`] = nativeTest
 	}
+	if len(scenarios) == 1 && scenarios[0] == "Conformance" {
+		inputs[`C:\lab\winfsp-tests-x64.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_CONFORMANCE_EXE")
+		inputs[`C:\lab\conformance.ps1`] = filepath.Join("..", "..", "winfsp-conformance", "run.ps1")
+		inputs[`C:\lab\known_failures.txt`] = filepath.Join("..", "..", "winfsp-conformance", "known_failures.txt")
+	}
 	if isolateMountManager && os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") == "" {
 		t.Fatal("mount-manager isolation test requires SEAWEEDFS_WINDOWS_WINFSP_TEST")
+	}
+	if len(scenarios) == 1 && scenarios[0] == "All" && os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") == "" {
+		t.Fatal("full mounted suite requires SEAWEEDFS_WINDOWS_WINFSP_TEST")
 	}
 	artifacts := map[string][]byte{}
 	var provenance strings.Builder
@@ -301,7 +309,14 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			if os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") != "" {
 				command = strings.Replace(command, " -TestCase ", ` -WinFspTestExe C:\lab\winfsp.test.exe -TestCase `, 1)
 			}
-			r, err := n.ExecWithTimeout(ctx, 8*time.Minute, ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command)
+			if scenario == "Conformance" {
+				command = strings.Replace(command, " -TestCase ", ` -WinFspConformanceExe C:\lab\winfsp-tests-x64.exe -TestCase `, 1)
+			}
+			scenarioTimeout := 8 * time.Minute
+			if scenario == "All" || scenario == "Conformance" {
+				scenarioTimeout = 25 * time.Minute
+			}
+			r, err := n.ExecWithTimeout(ctx, scenarioTimeout, ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command)
 			if trace {
 				decodeCtx, finishDecode := context.WithTimeout(context.Background(), time.Minute)
 				decoded, decodeErr := n.ExecWithTimeout(decodeCtx, 55*time.Second, ps, "-NoProfile", "-Command", `$ErrorActionPreference='Stop'; & tracerpt.exe 'C:\lab\smoke-`+caseName+`\logs\fileio.etl' -of XML -o 'C:\lab\smoke-`+caseName+`\logs\fileio.xml' -y; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; Compress-Archive -LiteralPath 'C:\lab\smoke-`+caseName+`\logs\fileio.xml' -DestinationPath 'C:\lab\smoke-`+caseName+`\logs\fileio.xml.zip'`)
@@ -358,6 +373,16 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 				t.Fatalf("%s failed: exit %d", scenario, r.GetExitCode())
 			}
 			marker := "PASS: git init iteration 20 leaves no stale config.lock"
+			if scenario == "Conformance" {
+				marker = "PASS: upstream conformance including known failures"
+			}
+			if scenario == "All" {
+				for _, required := range []string{"PASS: native mounted suite completes without skips", "PASS: native persistence write completes without skips", "PASS: native persistence verify completes without skips"} {
+					if !strings.Contains(output, required) {
+						t.Fatalf("full suite missing evidence: %s", required)
+					}
+				}
+			}
 			if scenario == "GitLfsTempMetadata" {
 				marker = "PASS: Git LFS status iteration 20 reports all 32 modified assets"
 				for _, required := range []string{"PASS: Git LFS filter is active", "PASS: Git LFS seed commit succeeds"} {

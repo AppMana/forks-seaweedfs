@@ -11,6 +11,7 @@ param(
     [Parameter(Mandatory = $true)][string]$WeedExe,
     [string]$ServerWeedExe,
     [string]$WinFspTestExe,
+    [string]$WinFspConformanceExe,
     [string]$ExpectedWinFspDll,
     [string]$WorkRoot,
     [int]$LargeFileMB = 100,
@@ -20,7 +21,7 @@ param(
     [switch]$EtwFileIO,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
-    [ValidateSet('All', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
+    [ValidateSet('All', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +48,43 @@ function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
         throw "Mount process $TargetProcessId did not load requested WinFsp DLL $ExpectedPath"
     }
     Write-Host "verified mount process lab WinFsp DLL: $($modules[0].FileName)"
+}
+
+# Enumerate the actual executable: adding a mounted test must automatically add
+# coverage. Only tests with their own isolated-VM driver and the separate
+# remount phases are excluded here; the lab runner executes those separately.
+function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '') {
+    if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
+    $env:WINFSP_LAB_PE_TEST_DLL = $ExpectedWinFspDll
+    if (-not $env:WINFSP_LAB_PE_TEST_DLL) {
+        $env:WINFSP_LAB_PE_TEST_DLL = (Get-Process -Id $mount.Id).Modules |
+            Where-Object { $_.ModuleName -ieq 'winfsp-x64.dll' } |
+            Select-Object -First 1 -ExpandProperty FileName
+        if (-not $env:WINFSP_LAB_PE_TEST_DLL) { throw 'cannot identify loaded WinFsp DLL for native suite' }
+    }
+    if ($Phase) {
+        $names = @('TestPersistence')
+        $label = "native persistence $Phase"
+    } else {
+        $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
+        $separate = @('TestPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback')
+        $names = @($listing | Where-Object { $_ -match '^Test\w+$' -and $_ -notin $separate })
+        if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
+        $label = 'native mounted suite'
+    }
+    $pattern = '^(' + (($names | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
+    $nativeArgs = @("-mountpoint=$mnt", "-test.run=$pattern", '-test.v', '-test.count=1', '-test.timeout=20m')
+    if ($Phase) { $nativeArgs += @("-phase=$Phase", '-filer=127.0.0.1:8888') }
+    $output = @(& $WinFspTestExe @nativeArgs 2>&1)
+    $code = $LASTEXITCODE
+    $output | ForEach-Object { Write-Host $_ }
+    $text = $output | Out-String
+    $complete = $code -eq 0 -and $text -notmatch '--- SKIP:'
+    foreach ($name in $names) {
+        if ($text -notmatch ('(?m)^--- PASS: ' + [regex]::Escape($name) + ' ')) { $complete = $false }
+    }
+    Assert $complete "$label completes without skips"
 }
 
 function Invoke-GitAtomicRenameTest([string]$mnt) {
@@ -310,6 +348,11 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 $cacheDir = Join-Path $WorkRoot 'cache'
 New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 $mnt = Join-Path $WorkRoot 'mnt'   # must NOT pre-exist; WinFsp creates it
+if ($TestCase -eq 'Conformance') {
+    if (Test-Path 'S:\') { throw 'isolated conformance drive S: is already occupied' }
+    if (-not $WinFspConformanceExe) { throw 'offline conformance executable required' }
+    $mnt = 'S:'
+}
 
 Write-Host '== starting weed server'
 New-Item -ItemType Directory -Force -Path (Join-Path $logDir 'server') | Out-Null
@@ -349,6 +392,22 @@ try {
     $mount = Start-Mount $mnt $cacheDir $logDir 'mount1'
     if ($ExpectedWinFspDll) { Assert-WinFspModule $mount.Id $ExpectedWinFspDll }
 
+    if ($TestCase -eq 'Conformance') {
+        # Run the newly exposed access/notification cases on the guest's local
+        # NTFS too. A control failure must remain visible, not be called a mount bug.
+        $controlRoot = Join-Path $WorkRoot 'ntfs-control'
+        New-Item -ItemType Directory -Path $controlRoot | Out-Null
+        & "$PSScriptRoot\conformance.ps1" -MountPoint $controlRoot -WinFspTestsExe $WinFspConformanceExe -IncludeKnownFailures -TestNames @('create_backup_test', 'create_restore_test', 'dirnotify_test')
+        $controlExit = $LASTEXITCODE
+        Assert ($controlExit -eq 0) 'upstream access and notification NTFS controls'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\conformance.ps1" -MountPoint 'S:\' -WinFspTestsExe $WinFspConformanceExe -IncludeKnownFailures -IncludeOptional
+        $conformanceExit = $LASTEXITCODE
+        Assert ($conformanceExit -eq 0) 'upstream conformance including known failures'
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
+
     if ($TestCase -eq 'NamespaceCoherence') {
         Invoke-NamespaceCoherenceTest $mnt
         Stop-Mount $mount $mnt
@@ -386,6 +445,10 @@ try {
         exit 0
     }
 
+    if ($WinFspTestExe) {
+        Invoke-NativeMountedSuite $mnt
+        Invoke-NativeMountedSuite $mnt 'write'
+    }
     Invoke-GitAtomicRenamePrelude $mnt
     Invoke-GitAtomicRenameTest $mnt
 
@@ -436,6 +499,7 @@ try {
     New-Item -ItemType Directory -Force -Path $cache2 | Out-Null
     $mount2 = Start-Mount $mnt $cache2 $logDir 'mount2'
     if ($ExpectedWinFspDll) { Assert-WinFspModule $mount2.Id $ExpectedWinFspDll }
+    if ($WinFspTestExe) { Invoke-NativeMountedSuite $mnt 'verify' }
     Assert ((Get-Content "$mnt\append.txt").Count -eq 2) 'append.txt survives remount'
     Assert ((Get-Item "$mnt\large.bin").Length -eq 1MB) 'large.bin truncation survives remount'
     Assert (-not (Test-Path "$mnt\victim.txt")) 'deleted file stays deleted after remount'

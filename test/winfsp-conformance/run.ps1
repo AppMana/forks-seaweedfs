@@ -8,11 +8,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$MountPoint,
-    [string]$KnownFailures = "$PSScriptRoot\known_failures.txt",
-    [string]$WinFspTestsVersion = '2.1.25156'
+    [string]$KnownFailures,
+    [string]$WinFspTestsVersion = '2.1.25156',
+    [string]$WinFspTestsExe,
+    [switch]$IncludeKnownFailures,
+    [switch]$IncludeOptional,
+    [string[]]$TestNames
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $KnownFailures) { $KnownFailures = Join-Path $PSScriptRoot 'known_failures.txt' }
 
 # "S:" and "S:\" mean different things to Join-Path: without the separator the
 # result is relative to the drive's current directory, not its root.
@@ -29,6 +34,10 @@ foreach ($candidate in @("${env:ProgramFiles(x86)}\WinFsp\bin", "$env:ProgramFil
 
 $toolDir = Join-Path $env:TEMP 'winfsp-tests'
 $exe = Join-Path $toolDir 'winfsp-tests-x64.exe'
+if ($WinFspTestsExe) {
+    if (-not (Test-Path -LiteralPath $WinFspTestsExe)) { throw 'explicit offline conformance executable absent' }
+    $exe = $WinFspTestsExe
+}
 if (-not (Test-Path $exe)) {
     # Shipped as its own archive rather than in the MSI.
     $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-tests-$WinFspTestsVersion.zip"
@@ -69,15 +78,22 @@ try {
     # really one. This costs a process start per test and makes the list mean
     # what it says.
     $base = @('--fuse-external', '--resilient')
-    $names = @(& $exe @base '--list' 2>&1 |
+    $selection = if ($IncludeOptional) { @('+*') } else { @() }
+    $names = @(& $exe @base '--list' @selection 2>&1 |
         ForEach-Object { if ($_ -match '^([a-z_0-9]+)\s*$') { $Matches[1] } })
     if ($names.Count -eq 0) { throw "could not list tests" }
+    if ($TestNames) {
+        foreach ($requested in $TestNames) {
+            if ($requested -notin $names) { throw "requested conformance test absent: $requested" }
+        }
+        $names = @($names | Where-Object { $_ -in $TestNames })
+    }
     Write-Host "listed $($names.Count) tests"
 
     $failed = @()
     $ran = 0
     foreach ($name in $names) {
-        if ($excluded | Where-Object { $name -like $_ }) { continue }
+        if (-not $IncludeKnownFailures -and ($excluded | Where-Object { $name -like $_ })) { continue }
         $ran++
         $caseDir = Join-Path $workDir $name
         # -Force creates the directory but leaves anything already in it, and
@@ -86,9 +102,16 @@ try {
         New-Item -ItemType Directory -Force -Path $caseDir | Out-Null
         Push-Location $caseDir
         try {
-            $out = & $exe @base $name 2>&1
+            # Windows PowerShell wraps native stderr as ErrorRecord objects.
+            # Preserve the exit status and continue the inventory after a KO.
+            $savedPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $out = & $exe @base "+$name" 2>&1
+                $nativeExit = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $savedPreference }
             $out | ForEach-Object { Write-Host $_ }
-            if ($out -match '\s+KO\s*$' -or $LASTEXITCODE -ne 0) { $failed += $name }
+            if ($out -match '\s+KO\s*$' -or $nativeExit -ne 0) { $failed += $name }
         } finally {
             Pop-Location
             Remove-Item $caseDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -102,7 +125,9 @@ try {
 }
 
 if ($failed.Count -gt 0) {
-    Write-Host "::error::winfsp-tests failures outside known_failures.txt: $($failed -join ', ')"
+    $unexpected = @($failed | Where-Object { $name = $_; -not ($excluded | Where-Object { $name -like $_ }) })
+    Write-Host "::error::winfsp-tests failures: $($failed -join ', ')"
+    Write-Host "Failures outside known_failures.txt: $($unexpected -join ', ')"
     exit 1
 }
 if ($code -ne 0) {

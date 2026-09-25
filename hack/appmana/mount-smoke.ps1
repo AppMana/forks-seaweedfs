@@ -15,6 +15,7 @@ param(
     [string]$ExpectedWinFspDll,
     [string]$WorkRoot,
     [int]$LargeFileMB = 100,
+    [ValidateRange(1, 65535)][int]$FilerMaxFileNameBytes = 1020,
     [ValidateRange(1, 1000)][int]$GitIterations = 1,
     [switch]$Trace,
     [switch]$TraceSummary,
@@ -380,7 +381,14 @@ if ($Verbosity -gt 0) {
     $serverStartArgs.RedirectStandardOutput = Join-Path $logDir 'server-stdout.log'
     $serverStartArgs.RedirectStandardError = Join-Path $logDir 'server-stderr.log'
 }
-$server = Start-Process @serverStartArgs
+# Filer policy is byte-based; Windows components use UTF-16 units. Keep the
+# server byte budget explicit while the mount still enforces 255 UTF-16 units.
+Write-Host "FILER_CONFIG: max_file_name_length=$FilerMaxFileNameBytes bytes"
+$savedNameLimit = $env:WEED_FILER_OPTIONS_MAX_FILE_NAME_LENGTH
+try {
+    $env:WEED_FILER_OPTIONS_MAX_FILE_NAME_LENGTH = "$FilerMaxFileNameBytes"
+    $server = Start-Process @serverStartArgs
+} finally { $env:WEED_FILER_OPTIONS_MAX_FILE_NAME_LENGTH = $savedNameLimit }
 $mount = $null
 $mount2 = $null
 $mountB = $null

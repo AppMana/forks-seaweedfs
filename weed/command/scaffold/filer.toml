@@ -13,6 +13,11 @@
 # recursive_delete will delete all sub folders and files, similar to "rm -Rf"
 recursive_delete = false
 #max_file_name_length = 255
+# This limit is UTF-8 bytes, not characters. For Windows clients using the
+# 255 UTF-16-unit component limit, configure 1020 on every serving filer (or
+# WEED_FILER_OPTIONS_MAX_FILE_NAME_LENGTH=1020). Unix mounts still enforce
+# their own 255-byte component limit: longer Windows names cannot be accessed
+# through a Unix mount. Check the selected metadata store's key-size limits.
 # for S3: how long to wait before deleting an empty folder.
 # increase this if using tools like Spark that create temporary directories.
 #s3.empty_folder_cleanup_delay = "2m"
@@ -481,5 +486,4 @@ user = "guest"
 password = ""
 timeout = "5s"
 maxReconnects = 1000
-
 

@@ -28,7 +28,7 @@ func TestMixedOSMountLab(t *testing.T) {
 	}
 	t.Logf("retained results: %s", results)
 	completed := 0
-	required := 7
+	required := 8
 	if os.Getenv("SEAWEEDFS_MIXED_CACHE_COHERENCE") == "1" {
 		required++
 	}
@@ -285,8 +285,11 @@ inspect('after-3s')`
 	}
 	for _, action := range []string{"seed", "verify-seed", "rewrite", "verify-rewrite", "rename-delete", "verify-final"} {
 		pair(action)
-		if action == "verify-seed" && required == 8 {
-			pair("cache-coherence")
+		if action == "verify-seed" {
+			pair("cache-coherence-files")
+			if required == 9 {
+				pair("cache-coherence")
+			}
 		}
 	}
 	// All payload handles were Sync'ed and closed; Windows restart is abrupt,

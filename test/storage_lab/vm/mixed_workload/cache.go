@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
 // Keep the descriptor and mapping open across a peer's same-size rewrite.
 // Rendezvous is explicit; data mismatches are never retried into a pass.
-func cacheCoherence(root, owner, peer string) error {
-	path := filepath.Join(root, ".sync", "cache-"+owner)
-	peerPath := filepath.Join(root, ".sync", "cache-"+peer)
+func cacheCoherence(root, owner, peer, action string) error {
+	path := filepath.Join(root, ".sync", action+"-"+owner)
+	peerPath := filepath.Join(root, ".sync", action+"-"+peer)
 	before, after := bytes.Repeat([]byte{0x35}, 8192), bytes.Repeat([]byte{0xca}, 8192)
 	stamp := time.Unix(1700000000, 0)
 	if err := write(path, before); err != nil {
@@ -22,7 +23,7 @@ func cacheCoherence(root, owner, peer string) error {
 	if err := os.Chtimes(path, stamp, stamp); err != nil {
 		return err
 	}
-	if err := barrier(root, owner, "cache-seeded"); err != nil {
+	if err := barrier(root, owner, action+"-seeded"); err != nil {
 		return err
 	}
 	f, err := os.Open(path)
@@ -41,15 +42,22 @@ func cacheCoherence(root, owner, peer string) error {
 	if err := readFD(before); err != nil {
 		return err
 	}
-	mapped, unmap, err := mapReadOnly(f, len(before))
-	if err != nil {
-		return err
+	// Ordinary file coherence is mandatory. Keep the original strict probe
+	// (cache-coherence) requiring Windows mmap too; do not turn its known
+	// platform limitation into a silently passing test.
+	var mapped []byte
+	if runtime.GOOS != "windows" || action == "cache-coherence" {
+		var unmap func()
+		mapped, unmap, err = mapReadOnly(f, len(before))
+		if err != nil {
+			return err
+		}
+		defer unmap()
+		if !bytes.Equal(mapped, before) {
+			return fmt.Errorf("initial mapping differs")
+		}
 	}
-	defer unmap()
-	if !bytes.Equal(mapped, before) {
-		return fmt.Errorf("initial mapping differs")
-	}
-	if err := barrier(root, owner, "cache-primed"); err != nil {
+	if err := barrier(root, owner, action+"-primed"); err != nil {
 		return err
 	}
 	// No truncate or rename: neither a size transition nor a new inode can
@@ -66,13 +74,13 @@ func cacheCoherence(root, owner, peer string) error {
 	if err := os.Chtimes(peerPath, stamp, stamp); err != nil {
 		return err
 	}
-	if err := barrier(root, owner, "cache-rewritten"); err != nil {
+	if err := barrier(root, owner, action+"-rewritten"); err != nil {
 		return err
 	}
 	// Report all three paths, not just whichever happened to fail first.
 	fdErr := readFD(after)
 	var mapErr error
-	if !bytes.Equal(mapped, after) {
+	if mapped != nil && !bytes.Equal(mapped, after) {
 		mapErr = fmt.Errorf("existing mmap has stale bytes")
 	}
 	got, reopenErr := os.ReadFile(path)

@@ -31,6 +31,19 @@ func TestMixedLifecycle(t *testing.T) {
 	}
 }
 
+func TestMixedOpenDescriptorCoherence(t *testing.T) {
+	root := seeded(t)
+	errs := make(chan error, 2)
+	for _, owner := range []string{"linux", "windows"} {
+		go func(owner string) { errs <- phase(root, owner, "cache-coherence-files") }(owner)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
 func TestMixedOracleRejectsDamage(t *testing.T) {
 	for _, damage := range []string{"corrupt", "truncate", "missing", "unexpected"} {
 		t.Run(damage, func(t *testing.T) {

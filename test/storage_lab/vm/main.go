@@ -329,7 +329,7 @@ func (h *harness) execOK(node string, argv ...string) error {
 func (h *harness) collectFailureDiagnostics() {
 	for _, name := range append([]string{controller}, volumes...) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		result, err := h.lab.Node(name).Exec(ctx, "sh", "-c", "date -Ins; mount; ls -la /mnt/volume; tail -200 /var/log/seaweedfs/*.log /tmp/vacuum-power.log; dmesg | tail -100")
+		result, err := h.lab.Node(name).Exec(ctx, "sh", "-c", "date -Ins; mount; ls -la /mnt/volume; tail -n 200 /var/log/seaweedfs/*.log /tmp/vacuum-power.log; dmesg | tail -n 100")
 		cancel()
 		data := []byte(fmt.Sprintf("diagnostic error: %v\n", err))
 		if result != nil {
@@ -424,7 +424,7 @@ const workload = `import hashlib,json,sys,time,urllib.request
 MASTER='http://192.0.2.10:9333'
 def payload(seq):
     head=('sequence:%08d\n'%seq).encode()
-    return head + hashlib.sha256(head).digest() * 65536
+    return head + hashlib.shake_256(head).digest(2*1024*1024)
 def post(url,data):
     boundary='labcontainers-seaweedfs'
     body=('--'+boundary+'\r\nContent-Disposition: form-data; name="file"; filename="payload"\r\nContent-Type: application/octet-stream\r\n\r\n').encode()+data+('\r\n--'+boundary+'--\r\n').encode()

@@ -117,6 +117,36 @@ func TestWindowsCreationTimeStable(t *testing.T) {
 	}
 }
 
+func TestWindowsNFSReparseRoundTrip(t *testing.T) {
+	name := filepath.Join(testRoot(t), "special")
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(p, windows.FILE_WRITE_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(h)
+	var data [24]byte
+	binary.LittleEndian.PutUint32(data[:4], 0x80000014) // IO_REPARSE_TAG_NFS
+	binary.LittleEndian.PutUint16(data[4:6], 16)
+	binary.LittleEndian.PutUint64(data[8:16], 0x524843) // NFS_SPECFILE_CHR
+	binary.LittleEndian.PutUint32(data[16:20], 0x42)
+	binary.LittleEndian.PutUint32(data[20:24], 0x62)
+	var count uint32
+	if err := windows.DeviceIoControl(h, windows.FSCTL_SET_REPARSE_POINT, &data[0], uint32(len(data)), nil, 0, &count, nil); err != nil {
+		t.Fatal(err)
+	}
+	var got [16384]byte
+	if err := windows.DeviceIoControl(h, windows.FSCTL_GET_REPARSE_POINT, nil, 0, &got[0], uint32(len(got)), &count, nil); err != nil {
+		t.Fatal(err)
+	}
+	if count != uint32(len(data)) || string(got[:count]) != string(data[:]) {
+		t.Fatalf("reparse data=%x count=%d want=%x", got[:count], count, data)
+	}
+}
+
 func assertWindowsAttributes(t *testing.T, name string, want uint32) {
 	t.Helper()
 	p, err := windows.UTF16PtrFromString(name)

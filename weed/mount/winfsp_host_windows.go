@@ -2,10 +2,12 @@ package mount
 
 import (
 	"fmt"
+	"strings"
 
 	cgofuse "github.com/winfsp/cgofuse/fuse"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 )
 
 // WinFspHost serves a WFS through WinFsp. Mount blocks until the
@@ -16,11 +18,35 @@ type WinFspHost struct {
 
 // NewWinFspHost wraps wfs in the cgofuse adapter.
 func NewWinFspHost(wfs *WFS, caseSensitive bool) *WinFspHost {
-	host := cgofuse.NewFileSystemHost(newWinfspFS(wfs, caseSensitive))
+	adapter := newWinfspFS(wfs, caseSensitive)
+	host := cgofuse.NewFileSystemHost(adapter)
 	// WinFsp-only optimization: Readdir fills full stats, so the FSD can
 	// answer directory queries without per-entry Getattr round trips.
 	host.SetCapReaddirPlus(true)
 	host.SetCapCaseInsensitive(winFspCaseInsensitive(caseSensitive))
+	wfs.SetEntryChangeListener(func(event meta_cache.EntryInvalidation) {
+		for _, signature := range event.Signatures {
+			if signature == wfs.signature {
+				return
+			}
+		}
+		if inode, found := wfs.inodeToPath.GetInode(event.Path); found {
+			adapter.readAhead.Invalidate(inode)
+		}
+		if event.Entry == nil || event.Entry.IsDirectory {
+			return
+		}
+		root := strings.TrimRight(wfs.option.FilerMountRootPath, "/")
+		path := string(event.Path)
+		if !strings.HasPrefix(path, root+"/") {
+			return
+		}
+		// The earlier subscription notification can race handle refresh.
+		// Re-notify only after our read-ahead generation and WFS entry advance.
+		if !host.Notify(strings.TrimPrefix(path, root), NotifyTruncate|NotifyUtime) {
+			glog.V(4).Infof("winfsp post-refresh notify rejected for %s", path)
+		}
+	})
 	go logWinfspStatsLoop()
 	return &WinFspHost{host: host}
 }

@@ -831,10 +831,13 @@ func (mc *MetaCache) handleApplyRequest(req metadataApplyRequest) error {
 // EntryInvalidation describes one path's metadata change for an open-handle
 // refresh.
 type EntryInvalidation struct {
-	Path    util.FullPath
-	Entry   *filer_pb.Entry // entry now at path per the event; nil when the path was vacated
-	TsNs    int64           // the event's filer log position; 0 for locally built events
-	Deleted bool            // vacated by a delete, not a rename away — the file lives on elsewhere
+	// PreviousEntry is present for an in-place update. Consumers can detect
+	// content changes even when size and timestamps are deliberately retained.
+	PreviousEntry *filer_pb.Entry
+	Path          util.FullPath
+	Entry         *filer_pb.Entry // entry now at path per the event; nil when the path was vacated
+	TsNs          int64           // the event's filer log position; 0 for locally built events
+	Deleted       bool            // vacated by a delete, not a rename away — the file lives on elsewhere
 	// RenamedTo is the destination when a rename vacated this path: the file
 	// lives on there, so an open handle follows it rather than being orphaned.
 	RenamedTo util.FullPath
@@ -1325,7 +1328,7 @@ func collectEntryInvalidations(resp *filer_pb.SubscribeMetadataResponse) []Entry
 			invalidations = append(invalidations, EntryInvalidation{Path: oldKey, TsNs: resp.TsNs, Signatures: signatures, RenamedTo: newKey, WasDirectory: message.OldEntry.IsDirectory})
 			invalidations = append(invalidations, EntryInvalidation{Path: newKey, Entry: message.NewEntry, TsNs: resp.TsNs, Signatures: signatures})
 		} else {
-			invalidations = append(invalidations, EntryInvalidation{Path: oldKey, Entry: message.NewEntry, TsNs: resp.TsNs, Signatures: signatures})
+			invalidations = append(invalidations, EntryInvalidation{Path: oldKey, PreviousEntry: message.OldEntry, Entry: message.NewEntry, TsNs: resp.TsNs, Signatures: signatures})
 		}
 		return invalidations
 	}

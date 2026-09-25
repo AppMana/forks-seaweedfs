@@ -148,6 +148,9 @@ func run(cfg config) (runErr error) {
 		"production_access": false, "started": time.Now().UTC(), "status": "running",
 	}
 	defer func() {
+		if runErr != nil && h.lab != nil {
+			h.collectFailureDiagnostics()
+		}
 		if runErr != nil && cfg.keep && h.lab != nil {
 			if err := h.lab.Keep(context.Background(), 2*time.Hour); err != nil {
 				runErr = errors.Join(runErr, fmt.Errorf("keep failed session: %w", err))
@@ -319,6 +322,22 @@ func (h *harness) execOK(node string, argv ...string) error {
 		return fmt.Errorf("exit %d: %s%s", result.GetExitCode(), result.GetStdout(), result.GetStderr())
 	}
 	return nil
+}
+
+// Collect before teardown, including when --keep was not requested. These are
+// bounded, read-only observations; a failed data assertion is never retried.
+func (h *harness) collectFailureDiagnostics() {
+	for _, name := range append([]string{controller}, volumes...) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		result, err := h.lab.Node(name).Exec(ctx, "sh", "-c", "date -Ins; mount; ls -la /mnt/volume; tail -200 /var/log/seaweedfs/*.log /tmp/vacuum-power.log; dmesg | tail -100")
+		cancel()
+		data := []byte(fmt.Sprintf("diagnostic error: %v\n", err))
+		if result != nil {
+			data = append(data, result.GetStdout()...)
+			data = append(data, result.GetStderr()...)
+		}
+		_ = os.WriteFile(filepath.Join(h.cfg.results, name+"-failure.log"), data, 0o600)
+	}
 }
 
 func (h *harness) output(node string, argv ...string) (string, error) {
@@ -587,6 +606,16 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	for sequence := 1100; sequence < 1160; sequence++ {
 		if err := h.execOK(controller, "python3", "/opt/workload.py", "write", fid, addresses["volume1"], strconv.Itoa(sequence)); err != nil {
 			return err
+		}
+	}
+	// Establish that this exact live set exists on every replica before the
+	// fault, rather than only checking an unrelated seed volume.
+	if err := h.verify(fid, 1159); err != nil {
+		return fmt.Errorf("pre-vacuum overwrite: %w", err)
+	}
+	for _, liveFID := range liveFIDs[1:] {
+		if err := h.verify(liveFID, 0); err != nil {
+			return fmt.Errorf("pre-vacuum live set: %w", err)
 		}
 	}
 	commands := "lock\nvolume.vacuum -volumeId=" + volumeID(fid) + " -garbageThreshold=0\nunlock\n"

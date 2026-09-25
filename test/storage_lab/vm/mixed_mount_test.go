@@ -28,12 +28,16 @@ func TestMixedOSMountLab(t *testing.T) {
 	}
 	t.Logf("retained results: %s", results)
 	completed := 0
+	required := 7
+	if os.Getenv("SEAWEEDFS_MIXED_CACHE_COHERENCE") == "1" {
+		required++
+	}
 	t.Cleanup(func() {
 		status := "passed"
-		if t.Failed() || completed != 7 {
+		if t.Failed() || completed != required {
 			status = "failed"
 		}
-		data, err := json.MarshalIndent(map[string]any{"status": status, "completed_paired_phases": completed, "required_paired_phases": 7, "scope": "Linux filer with native Linux FUSE and Windows WinFsp mounts; not CSI, shared-file locking, or power loss"}, "", "  ")
+		data, err := json.MarshalIndent(map[string]any{"status": status, "completed_paired_phases": completed, "required_paired_phases": required, "scope": "Linux filer with native Linux FUSE and Windows WinFsp mounts; not CSI, shared-file locking, or power loss"}, "", "  ")
 		if err != nil {
 			t.Error(err)
 			return
@@ -281,6 +285,9 @@ inspect('after-3s')`
 	}
 	for _, action := range []string{"seed", "verify-seed", "rewrite", "verify-rewrite", "rename-delete", "verify-final"} {
 		pair(action)
+		if action == "verify-seed" && required == 8 {
+			pair("cache-coherence")
+		}
 	}
 	// All payload handles were Sync'ed and closed; Windows restart is abrupt,
 	// not a claim of graceful unmount or VM power-loss qualification.

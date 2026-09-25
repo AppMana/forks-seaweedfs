@@ -25,6 +25,8 @@ func (interval *ChunkWrittenInterval) isComplete(chunkSize int64) bool {
 type ChunkWrittenIntervalList struct {
 	head *ChunkWrittenInterval
 	tail *ChunkWrittenInterval
+	// Written coverage only grows, even when a newer write replaces timestamps.
+	coveredPrefix int64
 }
 
 func newChunkWrittenIntervalList() *ChunkWrittenIntervalList {
@@ -53,6 +55,14 @@ func (list *ChunkWrittenIntervalList) MarkWritten(startOffset, stopOffset, tsNs 
 		TsNs:        tsNs,
 	}
 	list.addInterval(interval)
+	if startOffset <= list.coveredPrefix && stopOffset > list.coveredPrefix {
+		list.coveredPrefix = stopOffset
+		for next := interval.next; next != list.tail && next.StartOffset <= list.coveredPrefix; next = next.next {
+			if next.stopOffset > list.coveredPrefix {
+				list.coveredPrefix = next.stopOffset
+			}
+		}
+	}
 }
 
 // IsComplete reports whether every byte of [0, chunkSize) has been
@@ -65,19 +75,10 @@ func (list *ChunkWrittenIntervalList) MarkWritten(startOffset, stopOffset, tsNs 
 // -writeBufferSizeMB started reserving a global slot per writable
 // chunk: the chunks never got sealed, no uploader ran, no slot was
 // ever released, and the FUSE writer blocked in Reserve forever
-// (seaweedfs issue #8777 / PR #9066). Walking the list and tracking
-// the furthest covered offset detects adjacency correctly.
+// (seaweedfs issue #8777 / PR #9066). MarkWritten tracks the covered
+// prefix incrementally so checking after every small write stays cheap.
 func (list *ChunkWrittenIntervalList) IsComplete(chunkSize int64) bool {
-	var covered int64
-	for t := list.head.next; t != list.tail; t = t.next {
-		if t.StartOffset > covered {
-			return false // gap before this interval
-		}
-		if t.stopOffset > covered {
-			covered = t.stopOffset
-		}
-	}
-	return covered >= chunkSize
+	return list.coveredPrefix >= chunkSize
 }
 func (list *ChunkWrittenIntervalList) WrittenSize() (writtenByteCount int64) {
 	for t := list.head; t != nil; t = t.next {
@@ -96,15 +97,19 @@ func (list *ChunkWrittenIntervalList) IsContiguouslyWritten() bool {
 	if first == list.tail || first.StartOffset != 0 {
 		return false
 	}
-	for t := first; t.next != list.tail; t = t.next {
-		if t.stopOffset != t.next.StartOffset {
-			return false
-		}
-	}
-	return true
+	return list.coveredPrefix == list.tail.prev.stopOffset
 }
 
 func (list *ChunkWrittenIntervalList) addInterval(interval *ChunkWrittenInterval) {
+	// Preserve distinct timestamps, but avoid scanning the entire history for
+	// sequential writes (including appends beyond a gap).
+	if last := list.tail.prev; last == list.head || last.stopOffset <= interval.StartOffset {
+		last.next = interval
+		interval.prev = last
+		interval.next = list.tail
+		list.tail.prev = interval
+		return
+	}
 
 	//t := list.head
 	//for ; t.next != nil; t = t.next {

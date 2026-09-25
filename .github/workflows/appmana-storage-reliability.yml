@@ -36,6 +36,8 @@ permissions:
 # HEAD~1 or a moving branch as a compatibility baseline. See README.md.
 env:
   BASELINE_REF: ${{ inputs.baseline_ref || vars.SEAWEEDFS_RELIABILITY_BASELINE_REF }}
+  # Vanilla 4.47: independent of the deployment migration baseline above.
+  PERFORMANCE_BASELINE_REF: ${{ vars.SEAWEEDFS_PERFORMANCE_BASELINE_REF || 'c5073360007d28385a33426a42ac3e4ec504c5a3' }}
   GO_FUSE_REF: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
   LABCONTAINERS_REF: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF || '56e537c59dcb051ae6dba677a557db2483b6fefc' }}
   LABCONTAINERS_VM_IMAGE: ${{ vars.SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE }}
@@ -367,6 +369,28 @@ jobs:
           vm_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-vm-work.XXXXXXXX")
           (cd "$vm_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           GOWORK="$vm_work/go.work" go test ./test/storage_lab/vm/...
+      - name: Compare interval performance with vanilla upstream in an isolated VM
+        env:
+          SEAWEEDFS_INTERVAL_PERFORMANCE_LIVE: '1'
+          LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
+          SEAWEEDFS_PERFORMANCE_BASELINE: ${{ runner.temp }}/interval-baseline.test
+          SEAWEEDFS_PERFORMANCE_CANDIDATE: ${{ runner.temp }}/interval-candidate.test
+        run: |
+          set -euo pipefail
+          [[ "$PERFORMANCE_BASELINE_REF" =~ ^[0-9a-f]{40}$ ]]
+          export SEAWEEDFS_PERFORMANCE_BASELINE_COMMIT=$(git rev-parse --verify "${PERFORMANCE_BASELINE_REF}^{commit}")
+          export SEAWEEDFS_PERFORMANCE_CANDIDATE_COMMIT=$(git rev-parse HEAD)
+          vanilla="$GITHUB_WORKSPACE/seaweed-vanilla-performance"
+          git worktree add --detach "$vanilla" "$SEAWEEDFS_PERFORMANCE_BASELINE_COMMIT"
+          # Only the identical benchmark instrumentation is added to vanilla;
+          # no application source or dependency overrides are copied across.
+          cp weed/mount/page_writer/interval_performance_test.go "$vanilla/weed/mount/page_writer/"
+          (cd "$vanilla" && GOWORK=off CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_PERFORMANCE_BASELINE" ./weed/mount/page_writer)
+          GOWORK=off CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_PERFORMANCE_CANDIDATE" ./weed/mount/page_writer
+          (cd "$GITHUB_WORKSPACE/labcontainers" && go build -o "$LABCONTAINERS_LABD" ./cmd/labd)
+          perf_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-performance-work.XXXXXXXX")
+          (cd "$perf_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
+          GOWORK="$perf_work/go.work" go test ./test/storage_lab/vm -run '^TestIntervalPerformanceLab$' -count=1 -v -timeout=20m
       - name: Run isolated four-VM durability gates
         env:
           LABCONTAINERS_SOURCE: ${{ github.workspace }}/labcontainers
@@ -454,6 +478,8 @@ jobs:
           name: storage-reliability-vm-lab-results
           path: |
             /tmp/seaweedfs-vm-lab-results-*/
+            /tmp/seaweedfs-interval-results-*/
+            ${{ runner.temp }}/seaweedfs-interval-results-*/
             /tmp/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/windows-mount-test.log

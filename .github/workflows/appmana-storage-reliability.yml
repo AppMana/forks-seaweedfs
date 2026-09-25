@@ -431,7 +431,7 @@ jobs:
           export GOWORK="$windows_work/go.work"
           go test ./test/storage_lab/vm -list '^TestWindowsStorageLab$' | grep -Fx TestWindowsStorageLab
           go test ./test/storage_lab/vm -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
-          go test ./test/storage_lab/vm -run '^TestWindowsMountXAttrLab$' -count=1 -v -timeout=18m
+          go test ./test/storage_lab/vm -run '^TestWindows(MountXAttr|Adapter)Lab$' -count=1 -v -timeout=35m
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:
           SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'

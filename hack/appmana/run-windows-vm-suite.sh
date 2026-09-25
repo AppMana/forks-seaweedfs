@@ -32,7 +32,7 @@ run() {
   printf '%s exit=%s\n' "$name" "$status" | tee -a "$suite_results/status.txt"
   if ((status != 0)); then failed=1; fi
 }
-run storage-xattr '^TestWindows(Storage|MountXAttr)Lab$'
+run storage-xattr-adapter '^TestWindows(Storage|MountXAttr|Adapter)Lab$'
 run git-lfs '^TestWindowsMountLab$'
 for registration in '' 1; do
   export SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD="$registration"

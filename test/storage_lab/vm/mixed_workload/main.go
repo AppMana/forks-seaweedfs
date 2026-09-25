@@ -100,6 +100,8 @@ func phase(root, owner, action string) error {
 		return fmt.Errorf("invalid owner %q", owner)
 	}
 	switch action {
+	case "cache-coherence":
+		return cacheCoherence(root, owner, peer)
 	case "seed", "rewrite", "rename-delete":
 		for i := 0; i < files; i++ {
 			var err error

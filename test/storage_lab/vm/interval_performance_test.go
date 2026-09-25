@@ -82,12 +82,20 @@ func TestIntervalPerformanceLab(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_INTERVAL_PERFORMANCE_LIVE") != "1" {
 		t.Skip("set SEAWEEDFS_INTERVAL_PERFORMANCE_LIVE=1")
 	}
-	results, err := os.MkdirTemp(os.Getenv("RUNNER_TEMP"), "seaweedfs-interval-results-")
+	runNativePerformanceLab(t, "interval", "BenchmarkIntervalAppendAndCompletion", "page-writer interval CPU scaling; not mounted IO throughput", intervalSamples, qualifyIntervalPerformance)
+}
+
+func runNativePerformanceLab(t *testing.T, name, benchmark, scope string, parse func(string) (map[string][]float64, error), qualify func(map[string][]float64, map[string][]float64) error) {
+	t.Helper()
+	results, err := os.MkdirTemp(os.Getenv("RUNNER_TEMP"), "seaweedfs-"+name+"-results-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("retained results: %s", results)
-	manifest := map[string]any{"status": "failed", "baseline_commit": os.Getenv("SEAWEEDFS_PERFORMANCE_BASELINE_COMMIT"), "candidate_commit": os.Getenv("SEAWEEDFS_PERFORMANCE_CANDIDATE_COMMIT"), "scope": "page-writer interval CPU scaling; not mounted IO throughput", "max_scaling_ratio": 8, "max_baseline_ratio": 1.25}
+	manifest := map[string]any{"status": "failed", "baseline_commit": os.Getenv("SEAWEEDFS_PERFORMANCE_BASELINE_COMMIT"), "candidate_commit": os.Getenv("SEAWEEDFS_PERFORMANCE_CANDIDATE_COMMIT"), "scope": scope, "benchmark": benchmark, "max_baseline_ratio": 1.25}
+	if name == "interval" {
+		manifest["max_scaling_ratio"] = 8
+	}
 	defer func() {
 		data, err := json.MarshalIndent(manifest, "", "  ")
 		if err == nil {
@@ -120,7 +128,7 @@ func TestIntervalPerformanceLab(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	config := windowsTopologyConfig(image)
-	config.Name = "seaweedfs-interval-performance"
+	config.Name = "seaweedfs-" + name + "-performance"
 	source, err := clab.Source(config)
 	if err != nil {
 		t.Fatal(err)
@@ -154,14 +162,14 @@ func TestIntervalPerformanceLab(t *testing.T) {
 			order[0], order[1] = order[1], order[0]
 		}
 		for _, name := range order {
-			r, err := lab.Node("vm").ExecWithTimeout(ctx, time.Minute, "env", "GOMAXPROCS=1", "/tmp/"+name+".test", "-test.run=^$", "-test.bench=^BenchmarkIntervalAppendAndCompletion$", "-test.benchtime=100ms", "-test.count=1")
+			r, err := lab.Node("vm").ExecWithTimeout(ctx, time.Minute, "env", "GOMAXPROCS=1", "/tmp/"+name+".test", "-test.run=^$", "-test.bench=^"+benchmark+"$", "-test.benchtime=1s", "-test.count=1")
 			if writeErr := os.WriteFile(filepath.Join(results, fmt.Sprintf("%d-%s.log", trial, name)), []byte(fmt.Sprintf("error=%v\n%s\n%s", err, r.GetStdout(), r.GetStderr())), 0600); writeErr != nil {
 				t.Fatal(writeErr)
 			}
 			if err != nil || r.GetExitCode() != 0 {
 				t.Fatalf("%s trial %d failed: %v exit=%d", name, trial, err, r.GetExitCode())
 			}
-			parsed, err := intervalSamples(string(r.GetStdout()))
+			parsed, err := parse(string(r.GetStdout()))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -173,7 +181,7 @@ func TestIntervalPerformanceLab(t *testing.T) {
 		}
 	}
 	manifest["samples_ns"] = samples
-	if err := qualifyIntervalPerformance(samples["BASELINE"], samples["CANDIDATE"]); err != nil {
+	if err := qualify(samples["BASELINE"], samples["CANDIDATE"]); err != nil {
 		t.Fatal(err)
 	}
 	manifest["status"] = "passed"

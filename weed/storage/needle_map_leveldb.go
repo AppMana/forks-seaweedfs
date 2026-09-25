@@ -1,9 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,13 +48,8 @@ type LevelDbNeedleMap struct {
 func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Options, ldbTimeout int64, version needle.Version) (m *LevelDbNeedleMap, err error) {
 	m = &LevelDbNeedleMap{dbFileName: dbFileName}
 	m.indexFile = indexFile
-	if !isLevelDbFresh(dbFileName, indexFile) {
-		glog.V(1).Infof("Start to Generate %s from %s", dbFileName, indexFile.Name())
-		generateLevelDbFile(dbFileName, indexFile)
-		glog.V(1).Infof("Finished Generating %s from %s", dbFileName, indexFile.Name())
-	}
 	if stat, err := indexFile.Stat(); err != nil {
-		glog.Fatalf("stat file %s: %v", indexFile.Name(), err)
+		return nil, fmt.Errorf("stat index %s: %w", indexFile.Name(), err)
 	} else {
 		m.indexFileOffset = stat.Size()
 	}
@@ -68,17 +64,26 @@ func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Option
 				return
 			}
 		}
+		// LOG is diagnostic output, not a durable index checkpoint. Its mtime
+		// may advance independently of the WAL, including during compaction.
+		// Always replay the authoritative index tail from the stored watermark.
+		// Reuse this open DB rather than opening/closing it a second time.
+		if err = replayLevelDbIndex(m.db, dbFileName, indexFile); err != nil {
+			_ = m.db.Close()
+			return nil, fmt.Errorf("replay index %s: %w", indexFile.Name(), err)
+		}
 		glog.V(1).Infof("Loading %s... , watermark: %d", dbFileName, getWatermark(m.db))
 		m.recordCount = uint64(m.indexFileOffset / NeedleMapEntrySize)
 		watermark := (m.recordCount / watermarkBatchSize) * watermarkBatchSize
 		err = setWatermark(m.db, watermark)
 		if err != nil {
-			glog.Fatalf("set watermark for %s error: %s\n", dbFileName, err)
-			return
+			_ = m.db.Close()
+			return nil, err
 		}
 	}
 	mm, indexLoadError := newNeedleMapMetricFromIndexFile(indexFile, version)
 	if indexLoadError != nil {
+		_ = m.db.Close()
 		return nil, indexLoadError
 	}
 	m.mapMetric = *mm
@@ -92,34 +97,23 @@ func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Option
 	return
 }
 
-func isLevelDbFresh(dbFileName string, indexFile *os.File) bool {
-	// normally we always write to index file first
-	dbLogFile, err := os.Open(filepath.Join(dbFileName, "LOG"))
-	if err != nil {
-		return false
-	}
-	defer dbLogFile.Close()
-	dbStat, dbStatErr := dbLogFile.Stat()
-	indexStat, indexStatErr := indexFile.Stat()
-	if dbStatErr != nil || indexStatErr != nil {
-		glog.V(0).Infof("Can not stat file: %v and %v", dbStatErr, indexStatErr)
-		return false
-	}
-
-	return dbStat.ModTime().After(indexStat.ModTime())
-}
-
-func generateLevelDbFile(dbFileName string, indexFile *os.File) error {
+func generateLevelDbFile(dbFileName string, indexFile *os.File) (err error) {
 	db, err := leveldb.OpenFile(dbFileName, nil)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() {
+		if closeErr := db.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	return replayLevelDbIndex(db, dbFileName, indexFile)
+}
 
+func replayLevelDbIndex(db *leveldb.DB, dbFileName string, indexFile *os.File) error {
 	watermark := getWatermark(db)
 	if stat, err := indexFile.Stat(); err != nil {
-		glog.Fatalf("stat file %s: %v", indexFile.Name(), err)
-		return err
+		return fmt.Errorf("stat index %s: %w", indexFile.Name(), err)
 	} else {
 		// A watermark past the end of the .idx means the .ldb is stale relative
 		// to the index it must mirror (e.g. an interrupted compaction left the
@@ -134,14 +128,82 @@ func generateLevelDbFile(dbFileName string, indexFile *os.File) error {
 		}
 		glog.V(1).Infof("generateLevelDbFile %s, watermark %d, num of entries:%d", dbFileName, watermark, (uint64(stat.Size())-watermark*NeedleMapEntrySize)/NeedleMapEntrySize)
 	}
-	return idx.WalkIndexFile(indexFile, watermark, func(key NeedleId, offset Offset, size Size) error {
-		if !offset.IsZero() && !size.IsDeleted() {
-			levelDbWrite(db, key, offset, size, false, 0)
-		} else {
-			levelDbDelete(db, key)
+	// Keep replay bounded in memory and avoid a WAL record/transaction per
+	// entry. Do not advance the watermark until the whole replay succeeds.
+	type replayValue struct {
+		offset Offset
+		size   Size
+	}
+	pending := make(map[NeedleId]replayValue)
+	records := 0
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		keys := make([]NeedleId, 0, len(pending))
+		for key := range pending {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+		// One iterator amortizes lookup setup across the bounded batch. Seek
+		// directly to requested keys, never scan unrelated database ranges.
+		iterator := db.NewIterator(nil, nil)
+		defer iterator.Release()
+		batch := new(leveldb.Batch)
+		positioned, valid := false, false
+		for _, key := range keys {
+			value := pending[key]
+			entry := needle_map.ToBytes(key, value.offset, value.size)
+			if !positioned || (valid && bytes.Compare(iterator.Key(), entry[:NeedleIdSize]) < 0) {
+				valid = iterator.Seek(entry[:NeedleIdSize])
+				positioned = true
+			}
+			found := valid && bytes.Equal(iterator.Key(), entry[:NeedleIdSize])
+			if err := iterator.Error(); err != nil {
+				return err
+			}
+			same := found && bytes.Equal(iterator.Value(), entry[NeedleIdSize:])
+			if found {
+				// Adjacent needle IDs need only Next, not another tree seek.
+				// Gaps still jump directly, so unrelated ranges are not scanned.
+				valid = iterator.Next()
+				if err := iterator.Error(); err != nil {
+					return err
+				}
+			}
+			live := !value.offset.IsZero() && !value.size.IsDeleted()
+			if live {
+				if same {
+					continue
+				}
+				batch.Put(entry[:NeedleIdSize], entry[NeedleIdSize:])
+			} else if found {
+				batch.Delete(entry[:NeedleIdSize])
+			}
+		}
+		if batch.Len() > 0 {
+			if err := db.Write(batch, nil); err != nil {
+				return err
+			}
+		}
+		clear(pending)
+		records = 0
+		return nil
+	}
+	err := idx.WalkIndexFile(indexFile, watermark, func(key NeedleId, offset Offset, size Size) error {
+		// The final record for a repeated key wins inside each batch. A fresh
+		// iterator in the next batch observes all prior applied mutations.
+		pending[key] = replayValue{offset, size}
+		records++
+		if records >= 4096 {
+			return flush()
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return flush()
 }
 
 func (m *LevelDbNeedleMap) Get(key NeedleId) (element *needle_map.NeedleValue, ok bool) {

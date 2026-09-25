@@ -369,7 +369,7 @@ jobs:
           vm_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-vm-work.XXXXXXXX")
           (cd "$vm_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           GOWORK="$vm_work/go.work" go test ./test/storage_lab/vm/...
-      - name: Compare interval performance with vanilla upstream in an isolated VM
+      - name: Compare interval and index startup performance with vanilla upstream
         env:
           SEAWEEDFS_INTERVAL_PERFORMANCE_LIVE: '1'
           LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
@@ -391,6 +391,12 @@ jobs:
           perf_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-performance-work.XXXXXXXX")
           (cd "$perf_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           GOWORK="$perf_work/go.work" go test ./test/storage_lab/vm -run '^TestIntervalPerformanceLab$' -count=1 -v -timeout=20m
+          cp weed/storage/needle_map_recovery_performance_test.go "$vanilla/weed/storage/"
+          export SEAWEEDFS_PERFORMANCE_BASELINE="$RUNNER_TEMP/index-baseline.test"
+          export SEAWEEDFS_PERFORMANCE_CANDIDATE="$RUNNER_TEMP/index-candidate.test"
+          (cd "$vanilla" && GOWORK=off CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_PERFORMANCE_BASELINE" ./weed/storage)
+          GOWORK=off CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_PERFORMANCE_CANDIDATE" ./weed/storage
+          SEAWEEDFS_INDEX_PERFORMANCE_LIVE=1 GOWORK="$perf_work/go.work" go test ./test/storage_lab/vm -run '^TestIndexRecoveryPerformanceLab$' -count=1 -v -timeout=20m
       - name: Run isolated four-VM durability gates
         env:
           LABCONTAINERS_SOURCE: ${{ github.workspace }}/labcontainers
@@ -480,6 +486,8 @@ jobs:
             /tmp/seaweedfs-vm-lab-results-*/
             /tmp/seaweedfs-interval-results-*/
             ${{ runner.temp }}/seaweedfs-interval-results-*/
+            /tmp/seaweedfs-index-recovery-results-*/
+            ${{ runner.temp }}/seaweedfs-index-recovery-results-*/
             /tmp/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/windows-mount-test.log

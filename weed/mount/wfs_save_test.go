@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -8,6 +9,34 @@ import (
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 )
+
+func TestCheckNamePlatformUnits(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		windowsOK, unixOK bool
+	}{
+		{strings.Repeat("a", 255), true, true},
+		{strings.Repeat("a", 256), false, false},
+		{strings.Repeat("界", 85), true, true},
+		{strings.Repeat("界", 255), true, false},
+		{strings.Repeat("界", 256), false, false},
+		{strings.Repeat("🐟", 127) + "a", true, false},
+		{strings.Repeat("🐟", 128), false, false},
+	} {
+		wantOK := test.unixOK
+		if runtime.GOOS == "windows" {
+			wantOK = test.windowsOK
+		}
+		got, status := checkName(test.name)
+		want := fuse.Status(syscall.ENAMETOOLONG)
+		if wantOK {
+			want = fuse.OK
+		}
+		if got != test.name || status != want {
+			t.Errorf("%d-byte name on %s: status=%v want %v (identity=%v)", len(test.name), runtime.GOOS, status, want, got == test.name)
+		}
+	}
+}
 
 // TestSanitizeFuseName_InvalidBytesReplaced reproduces the filename from
 // seaweedfs#9139: GNOME Trash "partial" files carry raw binary bytes

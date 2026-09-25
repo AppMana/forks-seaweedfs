@@ -42,6 +42,41 @@ func TestWindowsAttributesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWindowsUnicodeComponentLimits(t *testing.T) {
+	root := testRoot(t)
+	for _, name := range []string{strings.Repeat("a", 255), strings.Repeat("界", 255), strings.Repeat("🐟", 127) + "a"} {
+		path := filepath.Join(root, name)
+		if err := writeAndSync(path, []byte("unicode intact payload")); err != nil {
+			t.Errorf("create %d-byte valid Windows name: %v", len(name), err)
+			continue
+		}
+		if data, err := os.ReadFile(path); err != nil || string(data) != "unicode intact payload" {
+			t.Errorf("read valid name: %q %v", data, err)
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, entry := range entries {
+			if entry.Name() == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("directory listing lost Unicode filename")
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{strings.Repeat("a", 256), strings.Repeat("界", 256), strings.Repeat("🐟", 128)} {
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0666); err == nil {
+			t.Errorf("accepted overlong Windows component: %d bytes", len(name))
+		}
+	}
+}
+
 func assertWindowsAttributes(t *testing.T, name string, want uint32) {
 	t.Helper()
 	p, err := windows.UTF16PtrFromString(name)

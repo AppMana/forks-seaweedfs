@@ -41,7 +41,7 @@ func TestAttrToStatMapsEveryField(t *testing.T) {
 	attrToStat(attr, &st)
 
 	for _, c := range []struct {
-		name     string
+		name      string
 		got, want int64
 	}{
 		{"Ino", int64(st.Ino), 42},
@@ -63,6 +63,45 @@ func TestAttrToStatMapsEveryField(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("attrToStat %s = %d; want %d", c.name, c.got, c.want)
 		}
+	}
+}
+
+func TestAttrToStatWindowsArchiveFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mode, want uint32
+	}{
+		{"regular file", cgofuse.S_IFREG | 0644, cgofuse.UF_ARCHIVE},
+		{"directory", cgofuse.S_IFDIR | 0755, 0},
+		{"symlink", cgofuse.S_IFLNK | 0777, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := cgofuse.Stat_t{Flags: cgofuse.UF_HIDDEN | cgofuse.UF_READONLY}
+			attrToStat(&fuse.Attr{Mode: tc.mode}, &st)
+			if st.Flags != tc.want {
+				t.Fatalf("Windows flags=%#x, want %#x", st.Flags, tc.want)
+			}
+		})
+	}
+}
+
+func TestWinfspGetpathReportsVolumeRelativeCanonicalName(t *testing.T) {
+	for _, root := range []string{"/", "/buckets/pvc-1"} {
+		t.Run(root, func(t *testing.T) {
+			wfs := &WFS{option: &Option{FilerMountRootPath: root}, inodeToPath: NewInodeToPath(util.FullPath(root), 0)}
+			a := newWinfspFS(wfs, false)
+			wfs.inodeToPath.Lookup(a.fullPath("/Subdirectory/File.txt"), 1, false, false, 42, false)
+			canonicalizer, ok := any(a).(cgofuse.FileSystemGetpath)
+			if !ok {
+				t.Fatal("active case-insensitive adapter does not implement WinFsp Getpath")
+			}
+			for _, name := range []string{"/", "/Subdirectory/File.txt"} {
+				status, got := canonicalizer.Getpath(name, invalidFh)
+				if status != 0 || got != name {
+					t.Fatalf("Getpath(%q)=%d,%q; want 0,%q", name, status, got, name)
+				}
+			}
+		})
 	}
 }
 

@@ -21,7 +21,7 @@ param(
     [switch]$EtwFileIO,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
-    [ValidateSet('All', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
+    [ValidateSet('All', 'NativeMetadata', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +53,7 @@ function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
 # Enumerate the actual executable: adding a mounted test must automatically add
 # coverage. Only tests with their own isolated-VM driver and the separate
 # remount phases are excluded here; the lab runner executes those separately.
-function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '') {
+function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly) {
     if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
     $env:WINFSP_LAB_PE_TEST_DLL = $ExpectedWinFspDll
     if (-not $env:WINFSP_LAB_PE_TEST_DLL) {
@@ -65,6 +65,9 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '') {
     if ($Phase) {
         $names = @('TestPersistence')
         $label = "native persistence $Phase"
+    } elseif ($MetadataOnly) {
+        $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase')
+        $label = 'native metadata regressions'
     } else {
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
@@ -391,6 +394,13 @@ try {
     Write-Host '== server up; mounting'
     $mount = Start-Mount $mnt $cacheDir $logDir 'mount1'
     if ($ExpectedWinFspDll) { Assert-WinFspModule $mount.Id $ExpectedWinFspDll }
+
+    if ($TestCase -eq 'NativeMetadata') {
+        Invoke-NativeMountedSuite $mnt -MetadataOnly
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
 
     if ($TestCase -eq 'Conformance') {
         # Run the newly exposed access/notification cases on the guest's local

@@ -28,7 +28,7 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "All", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
+		case "All", "NativeMetadata", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
 			scenarios = []string{scenario}
 		default:
 			t.Fatal("unknown SEAWEEDFS_WINDOWS_MOUNT_SCENARIO; see test/storage_lab/README.md")
@@ -373,6 +373,9 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 				t.Fatalf("%s failed: exit %d", scenario, r.GetExitCode())
 			}
 			marker := "PASS: git init iteration 20 leaves no stale config.lock"
+			if scenario == "NativeMetadata" {
+				marker = "PASS: native metadata regressions completes without skips"
+			}
 			if scenario == "Conformance" {
 				marker = "PASS: upstream conformance including known failures"
 			}

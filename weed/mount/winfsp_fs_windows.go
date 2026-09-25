@@ -264,7 +264,7 @@ func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 		return toWinErrno(status)
 	}
 	attrToStat(&out.Attr, st)
-	return 0
+	return a.getattrWindowsFlags(in.NodeId, st)
 }
 
 func (a *winfspFS) Mkdir(path string, mode uint32) int {
@@ -283,6 +283,31 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 	var out fuse.EntryOut
 	in := fuse.MkdirIn{InHeader: a.header(parent), Mode: mode & 07777}
 	return toWinErrno(a.wfs.Mkdir(nil, &in, name, &out))
+}
+
+// WinFsp converts NFS special-file reparse points through Mknod and Rename.
+// Store the type and device number in the filer; no host device is created.
+func (a *winfspFS) Mknod(path string, mode uint32, device uint64) int {
+	if device > uint64(^uint32(0)) {
+		return -cgofuse.EINVAL
+	}
+	if a.wfs.IsOverQuotaWithUncommitted() {
+		return -cgofuse.ENOSPC
+	}
+	parent, name, status := a.resolveParent(path)
+	if status != fuse.OK {
+		return toWinErrno(status)
+	}
+	name, exists, status := a.resolveMutationName(parent, name)
+	if status != fuse.OK {
+		return toWinErrno(status)
+	}
+	if exists {
+		return -cgofuse.EEXIST
+	}
+	in := fuse.MknodIn{InHeader: a.header(parent), Mode: mode, Rdev: uint32(device)}
+	var out fuse.EntryOut
+	return toWinErrno(a.wfs.Mknod(nil, &in, name, &out))
 }
 
 func (a *winfspFS) Rmdir(path string) int {
@@ -662,6 +687,7 @@ func (a *winfspFS) Readdir(path string,
 
 	var attr fuse.Attr
 	var stat cgofuse.Stat_t
+	var metadataError int
 	listErr := a.wfs.listDirectoryForAdapter(context.Background(), dirPath, func(entry *filer.Entry) (bool, error) {
 		childPath := dirPath.Child(entry.Name())
 		childIno := a.wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, false)
@@ -669,6 +695,10 @@ func (a *winfspFS) Readdir(path string,
 		a.wfs.setAttrByFilerEntry(&attr, childIno, entry)
 		stat = cgofuse.Stat_t{}
 		attrToStat(&attr, &stat)
+		stat.Birthtim = cgofuse.Timespec{Sec: entry.Crtime.Unix(), Nsec: int64(entry.Crtime.Nanosecond())}
+		if metadataError = applyWindowsFlags(&stat, entry.Extended); metadataError != 0 {
+			return false, nil
+		}
 		if !fill(entry.Name(), &stat, 0) {
 			return false, nil
 		}
@@ -679,7 +709,7 @@ func (a *winfspFS) Readdir(path string,
 		return -cgofuse.EIO
 	}
 	_ = ino
-	return 0
+	return metadataError
 }
 
 func (a *winfspFS) Releasedir(path string, fh uint64) int {

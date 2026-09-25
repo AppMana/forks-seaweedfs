@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -117,10 +118,20 @@ func sanitizeFuseName(name string) string {
 
 func checkName(name string) (string, fuse.Status) {
 	name = sanitizeFuseName(name)
-	// The Linux FUSE kernel module enforces NAME_MAX=255 at the VFS layer.
-	// Return ENAMETOOLONG early to avoid creating entries that cannot be
-	// looked up via normal syscalls (stat, chmod, etc.).
-	if len(name) > 255 {
+	// Unix limits components to 255 bytes; Windows limits them to 255
+	// UTF-16 code units. Counting UTF-8 bytes on Windows rejects valid
+	// Japanese names. Count supplementary characters twice, without allocating.
+	units := len(name)
+	if runtime.GOOS == "windows" {
+		units = 0
+		for _, r := range name {
+			units++
+			if r > 0xffff {
+				units++
+			}
+		}
+	}
+	if units > 255 {
 		return name, fuse.Status(syscall.ENAMETOOLONG)
 	}
 	return name, fuse.OK

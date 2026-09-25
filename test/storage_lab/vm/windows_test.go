@@ -31,7 +31,7 @@ func TestWindowsAdapterLab(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE") != "1" {
 		t.Skip("set SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE=1")
 	}
-	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_TEST"), []string{"TestAttrToStatWindowsArchiveFlags", "TestWinfspGetpathReportsVolumeRelativeCanonicalName", "TestWinfspGetpathResolvesCaseThroughRealMetadataCache", "TestWinfspGetpathPreservesExactHardLinkAlias", "TestAttrToStatMapsEveryField", "TestAttrToStatSynthesizesBirthTimeFromCtime", "TestAttrToStatDefaultsZeroBlksize", "TestAttrToStatOverwritesReusedBuffer", "TestWinfspFSFullPath", "TestWinfspFSFullPathDoesNotDoubleSlashAtRoot", "TestInodeFromFhRejectsSentinel"})
+	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_TEST"), []string{"TestWindowsFlagsEncoding", "TestCheckNamePlatformUnits", "TestAttrToStatWindowsArchiveFlags", "TestWinfspGetpathReportsVolumeRelativeCanonicalName", "TestWinfspGetpathResolvesCaseThroughRealMetadataCache", "TestWinfspGetpathPreservesExactHardLinkAlias", "TestAttrToStatMapsEveryField", "TestAttrToStatSynthesizesBirthTimeFromCtime", "TestAttrToStatDefaultsZeroBlksize", "TestAttrToStatOverwritesReusedBuffer", "TestWinfspFSFullPath", "TestWinfspFSFullPathDoesNotDoubleSlashAtRoot", "TestInodeFromFhRejectsSentinel"})
 }
 
 // Share the isolated Windows VM, staging and strict inventory checks with the

@@ -3,6 +3,7 @@
 package mount
 
 import (
+	"encoding/binary"
 	"testing"
 
 	cgofuse "github.com/winfsp/cgofuse/fuse"
@@ -10,6 +11,25 @@ import (
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
+
+func TestWindowsFlagsEncoding(t *testing.T) {
+	st := cgofuse.Stat_t{Flags: cgofuse.UF_ARCHIVE}
+	if code := applyWindowsFlags(&st, nil); code != 0 || st.Flags != cgofuse.UF_ARCHIVE {
+		t.Fatal("legacy default lost")
+	}
+	for _, flags := range []uint32{0, cgofuse.UF_READONLY, cgofuse.UF_SYSTEM | cgofuse.UF_HIDDEN, windowsFlagsMask} {
+		encoded := make([]byte, 4)
+		binary.LittleEndian.PutUint32(encoded, flags)
+		if code := applyWindowsFlags(&st, map[string][]byte{windowsFlagsKey: encoded}); code != 0 || st.Flags != flags {
+			t.Fatalf("decode %x: %d %x", flags, code, st.Flags)
+		}
+	}
+	for _, malformed := range [][]byte{nil, {0}, {0, 0, 0}, {0, 0, 0, 0, 0}} {
+		if code := applyWindowsFlags(&st, map[string][]byte{windowsFlagsKey: malformed}); code != -cgofuse.EIO {
+			t.Fatalf("accepted corrupt flags %x: %d", malformed, code)
+		}
+	}
+}
 
 // winfspFS is the fork's cgofuse adapter: it is the entire Windows mount, and
 // at ~680 lines it is the largest piece of code upstream does not have. Its

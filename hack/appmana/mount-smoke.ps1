@@ -63,15 +63,15 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         if (-not $env:WINFSP_LAB_PE_TEST_DLL) { throw 'cannot identify loaded WinFsp DLL for native suite' }
     }
     if ($Phase) {
-        $names = @('TestPersistence')
+        $names = @('TestPersistence', 'TestWindowsAttributesPersistence')
         $label = "native persistence $Phase"
     } elseif ($MetadataOnly) {
-        $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase')
+        $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase', 'TestWindowsAttributesRoundTrip')
         $label = 'native metadata regressions'
     } else {
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
-        $separate = @('TestPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback')
+        $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback')
         $names = @($listing | Where-Object { $_ -match '^Test\w+$' -and $_ -notin $separate })
         if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
         $label = 'native mounted suite'

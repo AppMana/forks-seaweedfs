@@ -66,6 +66,31 @@ func (a *winfspFS) resolveInode(path string) (uint64, fuse.Status) {
 	return ino, fuse.OK
 }
 
+// Getpath supplies WinFsp's normalized name for a case-insensitive mount.
+// Without it WinFsp falls back to an uppercased name in file information and
+// directory-change notifications, even though the filer preserves spelling.
+// Resolve the requested link rather than an inode's primary path: hard links
+// must not silently acquire another link's name here.
+func (a *winfspFS) Getpath(path string, _ uint64) (int, string) {
+	if path == "/" || path == "" {
+		return 0, "/"
+	}
+	if _, found := a.wfs.inodeToPath.GetInode(a.fullPath(path)); found {
+		return 0, path
+	}
+	parent := uint64(1)
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for index, component := range parts {
+		child, canonical, status := a.lookupChild(parent, component)
+		if status != fuse.OK {
+			return toWinErrno(status), ""
+		}
+		parts[index] = canonical
+		parent = child
+	}
+	return 0, "/" + strings.Join(parts, "/")
+}
+
 // lookupChild resolves a child exactly first. Case-folded directory scans are
 // only used for mismatched Windows paths, keeping the normal lookup fast.
 func (a *winfspFS) lookupChild(parent uint64, requested string) (uint64, string, fuse.Status) {
@@ -172,6 +197,12 @@ func (a *winfspFS) inodeFromFh(fh uint64) (uint64, bool) {
 }
 
 func attrToStat(attr *fuse.Attr, st *cgofuse.Stat_t) {
+	// Stat_t buffers may be reused. Never inherit another entry's Windows
+	// attributes, and report the normal archive flag for a regular file.
+	st.Flags = 0
+	if attr.Mode&cgofuse.S_IFMT == cgofuse.S_IFREG {
+		st.Flags = cgofuse.UF_ARCHIVE
+	}
 	st.Ino = attr.Ino
 	st.Mode = attr.Mode
 	st.Nlink = attr.Nlink

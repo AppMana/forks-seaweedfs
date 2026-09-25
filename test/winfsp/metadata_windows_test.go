@@ -3,6 +3,7 @@ package winfsp
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,85 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+// These are native Windows attributes, not POSIX mode approximations. Clearing
+// ARCHIVE must also persist: backup software uses that bit as mutable state.
+func TestWindowsAttributesRoundTrip(t *testing.T) {
+	root := testRoot(t)
+	for _, flags := range []uint32{windows.FILE_ATTRIBUTE_HIDDEN, windows.FILE_ATTRIBUTE_SYSTEM, windows.FILE_ATTRIBUTE_READONLY | windows.FILE_ATTRIBUTE_ARCHIVE, windows.FILE_ATTRIBUTE_NORMAL} {
+		t.Run(fmt.Sprintf("%x", flags), func(t *testing.T) {
+			name := filepath.Join(root, fmt.Sprintf("file-%x", flags))
+			if err := writeAndSync(name, []byte("intact attribute payload")); err != nil {
+				t.Fatal(err)
+			}
+			p, err := windows.UTF16PtrFromString(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer windows.SetFileAttributes(p, windows.FILE_ATTRIBUTE_NORMAL)
+			if err := windows.SetFileAttributes(p, flags); err != nil {
+				t.Fatal(err)
+			}
+			assertWindowsAttributes(t, name, flags)
+			if data, err := os.ReadFile(name); err != nil || string(data) != "intact attribute payload" {
+				t.Fatalf("attribute update damaged data: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func assertWindowsAttributes(t *testing.T, name string, want uint32) {
+	t.Helper()
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := windows.GetFileAttributes(p)
+	if err != nil || got != want {
+		t.Fatalf("attributes of %s = %#x, %v; want %#x", name, got, err, want)
+	}
+}
+
+func TestWindowsAttributesPersistence(t *testing.T) {
+	if *mountPoint == "" || (*phase != "write" && *phase != "verify") {
+		t.Skip("requires mounted write/remount/verify phases")
+	}
+	root := filepath.Join(*mountPoint, "winfsp-attributes-persist")
+	if *phase == "write" {
+		if err := os.Mkdir(root, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, flags := range []uint32{windows.FILE_ATTRIBUTE_HIDDEN | windows.FILE_ATTRIBUTE_SYSTEM, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_ATTRIBUTE_READONLY | windows.FILE_ATTRIBUTE_ARCHIVE} {
+		name := filepath.Join(root, fmt.Sprintf("file-%x", flags))
+		p, err := windows.UTF16PtrFromString(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *phase == "write" {
+			if err := writeAndSync(name, []byte("persistent intact payload")); err != nil {
+				t.Fatal(err)
+			}
+			if err := windows.SetFileAttributes(p, flags); err != nil {
+				t.Fatal(err)
+			}
+		}
+		assertWindowsAttributes(t, name, flags)
+		if data, err := os.ReadFile(name); err != nil || string(data) != "persistent intact payload" {
+			t.Fatalf("persistent payload differs: %q %v", data, err)
+		}
+		if *phase == "verify" {
+			if err := windows.SetFileAttributes(p, windows.FILE_ATTRIBUTE_NORMAL); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if *phase == "verify" {
+		if err := os.RemoveAll(root); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestDefaultFileAttributesArchive(t *testing.T) {
 	name := filepath.Join(testRoot(t), "ArchiveFile.txt")

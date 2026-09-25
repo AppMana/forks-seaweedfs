@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -61,9 +62,21 @@ func approveRecovery(plan *core.ApplyResult, victim string) error {
 }
 
 func (h *harness) recoverNode(victim string) error {
+	// Crash leaves the runtime container stopped, not replacement-pending.
+	// Start the exact retained VM first: the SDK restores persisted peer bridge
+	// attachments and verifies runtime isolation. Planning a stopped endpoint
+	// fails before recovery, and replacing it would reset its disposable disks.
+	startErr := h.lab.Node(victim).Start(h.ctx)
+	if startErr != nil {
+		// Native start can boot the retained VM but cannot recreate a lost
+		// veth. Preserve that failure, then explicitly inspect/approve repair;
+		// Apply restores the SDK's saved bridge journal after recreating links.
+		failures, _ := h.manifest["native_start_errors"].([]string)
+		h.manifest["native_start_errors"] = append(failures, victim+": "+startErr.Error())
+	}
 	plan, err := h.lab.Plan(h.ctx, nil)
 	if err != nil {
-		return err
+		return errors.Join(startErr, err)
 	}
 	if err := approveRecovery(plan, victim); err != nil {
 		return err

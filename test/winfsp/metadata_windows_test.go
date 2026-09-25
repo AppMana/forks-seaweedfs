@@ -77,6 +77,46 @@ func TestWindowsUnicodeComponentLimits(t *testing.T) {
 	}
 }
 
+func TestWindowsCreationTimeStable(t *testing.T) {
+	name := filepath.Join(testRoot(t), "birth.txt")
+	if err := writeAndSync(name, []byte("birth time payload")); err != nil {
+		t.Fatal(err)
+	}
+	p, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(p, windows.FILE_READ_ATTRIBUTES|windows.FILE_WRITE_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(h)
+	var before, after windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &before); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Unix(1700000000, 123456700)
+	if err := os.Chtimes(name, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.GetFileInformationByHandle(h, &after); err != nil {
+		t.Fatal(err)
+	}
+	if before.CreationTime != after.CreationTime {
+		t.Errorf("changing modification time changed creation time: %v -> %v", before.CreationTime, after.CreationTime)
+	}
+	want := windows.NsecToFiletime(stamp.UnixNano())
+	if err := windows.SetFileTime(h, &want, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.GetFileInformationByHandle(h, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.CreationTime != want {
+		t.Errorf("creation time=%v want exact 100ns value %v", after.CreationTime, want)
+	}
+}
+
 func assertWindowsAttributes(t *testing.T, name string, want uint32) {
 	t.Helper()
 	p, err := windows.UTF16PtrFromString(name)

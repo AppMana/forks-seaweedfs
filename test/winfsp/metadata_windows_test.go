@@ -1,10 +1,15 @@
 package winfsp
 
 import (
+	"context"
 	"encoding/binary"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
@@ -31,6 +36,27 @@ func TestDefaultFileAttributesArchive(t *testing.T) {
 // Register the real Windows watcher before creating a file; no sleeps, polling,
 // or retries can turn an incorrect notification name into a passing result.
 func TestDirectoryChangeNotificationPreservesCase(t *testing.T) {
+	if *mountPoint == "" {
+		t.Skip("requires a real mounted filesystem")
+	}
+	if os.Getenv("SEAWEEDFS_NOTIFICATION_CHILD") != "1" {
+		// A broken driver can hang cancellation too. A bounded child owns the
+		// kernel I/O and pinned memory until completion or process teardown.
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, executable, "-test.run=^TestDirectoryChangeNotificationPreservesCase$", "-test.v", "-test.count=1", "-test.timeout=15s", "-mountpoint="+*mountPoint)
+		cmd.Env = append(os.Environ(), "SEAWEEDFS_NOTIFICATION_CHILD=1")
+		output, err := cmd.CombinedOutput()
+		t.Logf("notification child:\n%s", output)
+		if err != nil || ctx.Err() != nil || !strings.Contains(string(output), "--- PASS: TestDirectoryChangeNotificationPreservesCase ") || strings.Contains(string(output), "--- SKIP:") {
+			t.Fatalf("native notification probe failed: %v deadline=%v", err, ctx.Err())
+		}
+		return
+	}
 	dir := testRoot(t)
 	if err := os.Mkdir(filepath.Join(dir, "Subdirectory"), 0777); err != nil {
 		t.Fatal(err)
@@ -53,14 +79,20 @@ func TestDirectoryChangeNotificationPreservesCase(t *testing.T) {
 	defer windows.CloseHandle(event)
 	overlap := windows.Overlapped{HEvent: event}
 	buf := make([]byte, 4096)
+	var pinned runtime.Pinner
+	pinned.Pin(&overlap)
+	pinned.Pin(&buf[0])
+	defer pinned.Unpin()
 	var count uint32
 	if err := windows.ReadDirectoryChanges(h, &buf[0], uint32(len(buf)), true,
-		windows.FILE_NOTIFY_CHANGE_FILE_NAME, &count, &overlap, 0); err != nil && err != windows.ERROR_IO_PENDING {
+		windows.FILE_NOTIFY_CHANGE_FILE_NAME, nil, &overlap, 0); err != nil && err != windows.ERROR_IO_PENDING {
 		t.Fatal(err)
 	}
 	defer func() {
 		windows.CancelIoEx(h, &overlap)
 		windows.GetOverlappedResult(h, &overlap, &count, true)
+		runtime.KeepAlive(buf)
+		runtime.KeepAlive(&overlap)
 	}()
 	if err := os.WriteFile(filepath.Join(dir, "Subdirectory", "file0"), []byte("payload"), 0666); err != nil {
 		t.Fatal(err)

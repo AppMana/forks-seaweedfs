@@ -77,10 +77,15 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         $label = 'native mounted suite'
     }
     $pattern = '^(' + (($names | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
-    $nativeArgs = @("-mountpoint=$mnt", "-test.run=$pattern", '-test.v', '-test.count=1', '-test.timeout=20m')
+    $nativeTimeout = if ($MetadataOnly) { '90s' } else { '20m' }
+    $nativeArgs = @("-mountpoint=$mnt", "-test.run=$pattern", '-test.v', '-test.count=1', "-test.timeout=$nativeTimeout")
     if ($Phase) { $nativeArgs += @("-phase=$Phase", '-filer=127.0.0.1:8888') }
-    $output = @(& $WinFspTestExe @nativeArgs 2>&1)
-    $code = $LASTEXITCODE
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $WinFspTestExe @nativeArgs 2>&1 | Tee-Object -FilePath (Join-Path $logDir "$label.log"))
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference }
     $output | ForEach-Object { Write-Host $_ }
     $text = $output | Out-String
     $complete = $code -eq 0 -and $text -notmatch '--- SKIP:'

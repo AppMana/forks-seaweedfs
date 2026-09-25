@@ -105,6 +105,34 @@ func TestWinfspGetpathReportsVolumeRelativeCanonicalName(t *testing.T) {
 	}
 }
 
+func TestWinfspGetpathResolvesCaseThroughRealMetadataCache(t *testing.T) {
+	for _, caseSensitive := range []bool{false, true} {
+		wfs := newPagingWFS(t, "/Subdirectory", []string{"Leaf.txt"}, 0)
+		a := newWinfspFS(wfs, caseSensitive)
+		status, name := a.Getpath("/subdirectory/LEAF.TXT", invalidFh)
+		if caseSensitive {
+			if status != -cgofuse.ENOENT {
+				t.Fatalf("case-sensitive mismatch=%d,%q; want ENOENT", status, name)
+			}
+		} else if status != 0 || name != "/Subdirectory/Leaf.txt" {
+			t.Fatalf("case-folded path=%d,%q; want canonical component spelling", status, name)
+		}
+		if status, name := a.Getpath("/missing", invalidFh); status != -cgofuse.ENOENT {
+			t.Fatalf("missing path=%d,%q; want ENOENT", status, name)
+		}
+	}
+}
+
+func TestWinfspGetpathPreservesExactHardLinkAlias(t *testing.T) {
+	wfs := &WFS{option: &Option{FilerMountRootPath: "/"}, inodeToPath: NewInodeToPath("/", 0)}
+	wfs.inodeToPath.Lookup("/Original", 1, false, true, 42, false)
+	wfs.inodeToPath.Lookup("/Alias", 1, false, true, 42, false)
+	a := newWinfspFS(wfs, false)
+	if status, name := a.Getpath("/Alias", invalidFh); status != 0 || name != "/Alias" {
+		t.Fatalf("hard-link alias=%d,%q; must not become primary path /Original", status, name)
+	}
+}
+
 // WinFsp surfaces a creation time in every directory listing and Explorer
 // property sheet. Linux FUSE attrs carry no birth time, so the fork
 // deliberately substitutes ctime. If a merge ever leaves Birthtim zeroed,

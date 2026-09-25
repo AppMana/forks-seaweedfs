@@ -33,6 +33,11 @@ func TestMixedLifecycle(t *testing.T) {
 
 func TestMixedOpenDescriptorCoherence(t *testing.T) {
 	root := seeded(t)
+	for _, owner := range []string{"linux", "windows"} {
+		if err := write(filepath.Join(root, ".sync", "cache-coherence-files-"+owner), []byte(owner)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	errs := make(chan error, 2)
 	for _, owner := range []string{"linux", "windows"} {
 		go func(owner string) { errs <- phase(root, owner, "cache-coherence-files") }(owner)
@@ -40,6 +45,12 @@ func TestMixedOpenDescriptorCoherence(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		if err := <-errs; err != nil {
 			t.Error(err)
+		}
+	}
+	for _, owner := range []string{"linux", "windows"} {
+		got, err := os.ReadFile(filepath.Join(root, ".sync", "cache-coherence-files-"+owner))
+		if err != nil || string(got) != owner {
+			t.Errorf("cache data overwrote outer rendezvous marker for %s: err=%v size=%d", owner, err, len(got))
 		}
 	}
 }

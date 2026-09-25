@@ -13,8 +13,8 @@ import (
 // Keep the descriptor and mapping open across a peer's same-size rewrite.
 // Rendezvous is explicit; data mismatches are never retried into a pass.
 func cacheCoherence(root, owner, peer, action string) error {
-	path := filepath.Join(root, ".sync", action+"-"+owner)
-	peerPath := filepath.Join(root, ".sync", action+"-"+peer)
+	path := filepath.Join(root, ".sync", action+"-data-"+owner)
+	peerPath := filepath.Join(root, ".sync", action+"-data-"+peer)
 	before, after := bytes.Repeat([]byte{0x35}, 8192), bytes.Repeat([]byte{0xca}, 8192)
 	stamp := time.Unix(1700000000, 0)
 	if err := write(path, before); err != nil {
@@ -46,6 +46,7 @@ func cacheCoherence(root, owner, peer, action string) error {
 	// (cache-coherence) requiring Windows mmap too; do not turn its known
 	// platform limitation into a silently passing test.
 	var mapped []byte
+	var immutableMapping []byte
 	if runtime.GOOS != "windows" || action == "cache-coherence" {
 		var unmap func()
 		mapped, unmap, err = mapReadOnly(f, len(before))
@@ -55,6 +56,27 @@ func cacheCoherence(root, owner, peer, action string) error {
 		defer unmap()
 		if !bytes.Equal(mapped, before) {
 			return fmt.Errorf("initial mapping differs")
+		}
+	} else {
+		// Deployment contract: Windows mapped files are immutable while in
+		// use. Keep a separate immutable view open across unrelated peer IO.
+		immutablePath := filepath.Join(root, ".sync", action+"-immutable-"+owner)
+		if err := write(immutablePath, before); err != nil {
+			return err
+		}
+		immutableFile, err := os.Open(immutablePath)
+		if err != nil {
+			return err
+		}
+		defer immutableFile.Close()
+		var unmap func()
+		immutableMapping, unmap, err = mapReadOnly(immutableFile, len(before))
+		if err != nil {
+			return err
+		}
+		defer unmap()
+		if !bytes.Equal(immutableMapping, before) {
+			return fmt.Errorf("initial immutable mapping differs")
 		}
 	}
 	if err := barrier(root, owner, action+"-primed"); err != nil {
@@ -82,6 +104,9 @@ func cacheCoherence(root, owner, peer, action string) error {
 	var mapErr error
 	if mapped != nil && !bytes.Equal(mapped, after) {
 		mapErr = fmt.Errorf("existing mmap has stale bytes")
+	}
+	if immutableMapping != nil && !bytes.Equal(immutableMapping, before) {
+		mapErr = fmt.Errorf("immutable mapping changed during unrelated peer writes")
 	}
 	got, reopenErr := os.ReadFile(path)
 	if reopenErr == nil && !bytes.Equal(got, after) {

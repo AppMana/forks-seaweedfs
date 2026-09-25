@@ -28,6 +28,17 @@ type ChunkGroup struct {
 	// sectionsLock. Reads must fail with this error instead of silently
 	// zero-filling the unresolved sections as if they were sparse holes.
 	resolveErr error
+	// maxModifiedTsNs is computed while resolving chunks, so mount writes can
+	// advance past observed versions without scanning every chunk per write.
+	maxModifiedTsNs int64
+}
+
+// WriteTimestampFloor returns the greatest resolved chunk version. An
+// unresolved manifest must fail a write, not hide a possibly newer version.
+func (group *ChunkGroup) WriteTimestampFloor() (int64, error) {
+	group.sectionsLock.RLock()
+	defer group.sectionsLock.RUnlock()
+	return group.maxModifiedTsNs, group.resolveErr
 }
 
 // NewChunkGroup creates a ChunkGroup with configurable concurrency.
@@ -84,6 +95,7 @@ func (group *ChunkGroup) AddChunk(chunk *filer_pb.FileChunk) error {
 
 	group.sectionsLock.Lock()
 	defer group.sectionsLock.Unlock()
+	group.maxModifiedTsNs = max(group.maxModifiedTsNs, chunk.ModifiedTsNs)
 
 	sectionIndexStart, sectionIndexStop := SectionIndex(chunk.Offset/SectionSize), SectionIndex((chunk.Offset+int64(chunk.Size))/SectionSize)
 	for si := sectionIndexStart; si < sectionIndexStop+1; si++ {
@@ -263,8 +275,10 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 	}
 
 	sections := make(map[SectionIndex]*FileChunkSection)
+	var maxModifiedTsNs int64
 
 	for _, chunk := range dataChunks {
+		maxModifiedTsNs = max(maxModifiedTsNs, chunk.ModifiedTsNs)
 		sectionIndexStart, sectionIndexStop := SectionIndex(chunk.Offset/SectionSize), SectionIndex((chunk.Offset+int64(chunk.Size))/SectionSize)
 		for si := sectionIndexStart; si < sectionIndexStop+1; si++ {
 			section, found := sections[si]
@@ -277,6 +291,7 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 	}
 
 	group.sections = sections
+	group.maxModifiedTsNs = maxModifiedTsNs
 	group.resolveErr = nil
 	return nil
 }

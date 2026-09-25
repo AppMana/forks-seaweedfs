@@ -1,6 +1,10 @@
 package mount
 
 import (
+	"fmt"
+	"math"
+	"sync/atomic"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount/page_writer"
 )
@@ -12,7 +16,8 @@ type PageWriter struct {
 	chunkSize     int64
 	writerPattern *WriterPattern
 
-	randomWriter page_writer.DirtyPages
+	randomWriter  page_writer.DirtyPages
+	lastWriteTsNs atomic.Int64
 }
 
 var (
@@ -30,6 +35,32 @@ func newPageWriter(fh *FileHandle, chunkSize int64) *PageWriter {
 }
 
 func (pw *PageWriter) AddPage(offset int64, data []byte, isSequential bool, tsNs int64) error {
+	if len(data) == 0 {
+		return nil
+	}
+	// Chunk conflict resolution uses timestamps, not append order. A client
+	// with a slow clock must still supersede the chunks it has already seen.
+	// Keep this separate from POSIX mtime and O(1) in the number of chunks.
+	var floor int64
+	if pw.fh.entryChunkGroup != nil {
+		var err error
+		floor, err = pw.fh.entryChunkGroup.WriteTimestampFloor()
+		if err != nil {
+			return fmt.Errorf("resolve write timestamp floor: %w", err)
+		}
+	}
+	for {
+		previous := pw.lastWriteTsNs.Load()
+		minimum := max(floor, previous)
+		if minimum == math.MaxInt64 {
+			return fmt.Errorf("chunk write timestamp exhausted")
+		}
+		next := max(tsNs, minimum+1)
+		if pw.lastWriteTsNs.CompareAndSwap(previous, next) {
+			tsNs = next
+			break
+		}
+	}
 
 	glog.V(4).Infof("%v AddPage [%d, %d)", pw.fh.fh, offset, offset+int64(len(data)))
 

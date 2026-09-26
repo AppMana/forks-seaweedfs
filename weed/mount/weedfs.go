@@ -85,6 +85,8 @@ type Option struct {
 	// lookup attributes before it ever calls Open/Create/Mknod, so the mount
 	// skips its own redundant permission checks (and the group lookups behind
 	// them) on those hot paths.
+	// The Windows host also sets this when WinFsp performs token-based
+	// access checks against its mode-derived security descriptors.
 	DefaultPermissions bool
 
 	// Periodic metadata flush interval in seconds (0 to disable)

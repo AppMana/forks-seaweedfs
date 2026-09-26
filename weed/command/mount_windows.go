@@ -290,7 +290,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
-	host := mount.NewWinFspHost(seaweedFileSystem, *option.winfspCaseSensitive)
+	host := mount.NewWinFspHost(seaweedFileSystem, *option.winfspCaseSensitive, *option.winfspPermissions)
 	winFspHost = host
 	// Both CTRL_C_EVENT and CTRL_BREAK_EVENT are delivered as
 	// os.Interrupt by the Go runtime; the CSI mount supervisor stops this

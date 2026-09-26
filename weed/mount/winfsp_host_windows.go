@@ -13,12 +13,23 @@ import (
 // WinFspHost serves a WFS through WinFsp. Mount blocks until the
 // filesystem is unmounted.
 type WinFspHost struct {
-	host *cgofuse.FileSystemHost
+	host             *cgofuse.FileSystemHost
+	basicPermissions bool
 }
 
 // NewWinFspHost wraps wfs in the cgofuse adapter.
-func NewWinFspHost(wfs *WFS, caseSensitive bool) *WinFspHost {
+func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions bool) *WinFspHost {
+	// WinFsp checks the caller's Windows token against the mode-derived
+	// security descriptor before dispatching Open/Create. Rechecking with
+	// the adapter's synthetic Unix identity would reject authorized backup/
+	// restore operations. This skips only the redundant Unix access checks;
+	// retention, quota and parent-existence checks remain in WFS. No extra
+	// permission RPC or per-read/per-write check is introduced.
+	if basicPermissions {
+		wfs.option.DefaultPermissions = true
+	}
 	adapter := newWinfspFS(wfs, caseSensitive)
+	adapter.basicPermissions = basicPermissions
 	host := cgofuse.NewFileSystemHost(adapter)
 	// WinFsp-only optimization: Readdir fills full stats, so the FSD can
 	// answer directory queries without per-entry Getattr round trips.
@@ -48,23 +59,19 @@ func NewWinFspHost(wfs *WFS, caseSensitive bool) *WinFspHost {
 		}
 	})
 	go logWinfspStatsLoop()
-	return &WinFspHost{host: host}
+	return &WinFspHost{host: host, basicPermissions: basicPermissions}
 }
 
 // Mount mounts at dir (which must not exist; WinFsp creates the mount
 // point) and blocks until unmount. volumeLabel is shown in Explorer.
 func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string) error {
 	options := []string{
-		// Map all files to the mounting user (SYSTEM under HostProcess)
-		// instead of translating uid/gid to SIDs.
-		"-o", "uid=-1,gid=-1",
-		"-o", "umask=000",
-		// Present an Everyone-full-access DACL for every file. Without
-		// this, files created by a pod user get mode-derived DACLs owned
-		// by the mounting user (SYSTEM), and reopening them for write
-		// from the pod fails with access denied. Mirrors the Linux CSI
-		// mount's -umask=000 (any pod uid can use the volume).
-		"-o", "FileSecurity=D:P(A;;FA;;;WD)",
+		// Preserve WinFsp's stored uid/gid/mode translation. Global uid/gid
+		// overrides can assign another identity's mode bits to the caller
+		// (e.g. an Administrators-owned, SYSTEM-group 0570 directory).
+		// The synthetic root alone gets a local owner during adapter Init.
+		// A fixed FileSecurity DACL or umask=000 would hide restrictions.
+		// This opt-in mode is basic access control, not arbitrary ACL storage.
 		"-o", fmt.Sprintf("volname=%s", volumeLabel),
 		// FileInfoTimeout=-1 would engage the NT cache manager for file
 		// DATA (40-90x on warm/small reads, measured), but it also
@@ -84,6 +91,13 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		"-o", "DirInfoTimeout=2000",
 		"-o", "VolumeInfoTimeout=5000",
 		"-o", "FileSystemName=seaweedfs",
+	}
+	if !h.basicPermissions {
+		// Preserve existing shared-volume behavior on upgrades. Old metadata
+		// may have restrictive modes previously hidden by these overrides;
+		// silently enforcing them would make intact data inaccessible.
+		options = append(options, "-o", "uid=-1,gid=-1", "-o", "umask=000",
+			"-o", "FileSecurity=D:P(A;;FA;;;WD)")
 	}
 	options = append(options, extraOptions...)
 	glog.V(0).Infof("winfsp mount %s (volume %q) options %v", dir, volumeLabel, options)

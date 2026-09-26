@@ -1,0 +1,85 @@
+diff --git a/src/dll/fuse/fuse_intf.c b/src/dll/fuse/fuse_intf.c
+index 37acd0f..3c07a2f 100644
+--- a/src/dll/fuse/fuse_intf.c
++++ b/src/dll/fuse/fuse_intf.c
+@@ -873,6 +873,66 @@ static VOID fsp_fuse_intf_GetOpenFileInfoPath(
+     }
+ }
+ 
++/*
++ * SYSTEM's default token DACL gives SYSTEM full access and Administrators
++ * read/execute, but its default owner/group are BA/SY. Mapping that to 0570
++ * synthesizes a BA deny-write ACE on the next GetSecurity. SYSTEM belongs
++ * to BA, so it cannot reopen its own ordinary files. For this exact implicit
++ * default only, transpose owner/group and their data permissions: SY/BA 0750.
++ * Do not normalize explicit, inherited, customized, or non-SYSTEM security.
++ */
++static BOOLEAN fsp_fuse_intf_IsImplicitSystemSecurity(FSP_FILE_SYSTEM *FileSystem,
++    struct fuse_context *context, PSECURITY_DESCRIPTOR SecurityDescriptor)
++{
++    FSP_FILE_SYSTEM_OPERATION_CONTEXT *Operation = FspFileSystemGetOperationContext();
++    struct fuse *f = FileSystem->UserContext;
++    FSP_FSCTL_TRANSACT_REQ *Request;
++    PSID Owner, Group;
++    PACL Acl;
++    BOOL Defaulted, Present;
++    BOOLEAN SeenSystem = FALSE, SeenAdministrators = FALSE;
++    GENERIC_MAPPING Mapping =
++        { FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
++
++    /* Otherwise fsop.c could return/cache the original owner instead of the
++     * persisted one. FUSE currently leaves this capability disabled. */
++    if (0 != f->FileSecurity || f->VolumeParams.AllowOpenInKernelMode ||
++        18 != context->uid || 18 != context->gid ||
++        0 == Operation || 0 == Operation->Request || 0 == SecurityDescriptor)
++        return FALSE;
++    Request = Operation->Request;
++    if (FspFsctlTransactCreateKind != Request->Kind ||
++        0 != Request->Req.Create.SecurityDescriptor.Offset ||
++        0 != Request->Req.Create.SecurityDescriptor.Size)
++        return FALSE;
++    if (!GetSecurityDescriptorOwner(SecurityDescriptor, &Owner, &Defaulted) ||
++        !IsWellKnownSid(Owner, WinBuiltinAdministratorsSid) ||
++        !GetSecurityDescriptorGroup(SecurityDescriptor, &Group, &Defaulted) ||
++        !IsWellKnownSid(Group, WinLocalSystemSid) ||
++        !GetSecurityDescriptorDacl(SecurityDescriptor, &Present, &Acl, &Defaulted) ||
++        !Present || 0 == Acl || 2 != Acl->AceCount)
++        return FALSE;
++    for (ULONG Index = 0; 2 > Index; Index++)
++    {
++        PACCESS_ALLOWED_ACE Ace;
++        ACCESS_MASK Mask;
++        if (!GetAce(Acl, Index, (PVOID *)&Ace) ||
++            ACCESS_ALLOWED_ACE_TYPE != Ace->Header.AceType || 0 != Ace->Header.AceFlags)
++            return FALSE;
++        Mask = Ace->Mask;
++        MapGenericMask(&Mask, &Mapping);
++        if (IsWellKnownSid(&Ace->SidStart, WinLocalSystemSid) &&
++            FILE_ALL_ACCESS == Mask && !SeenSystem)
++            SeenSystem = TRUE;
++        else if (IsWellKnownSid(&Ace->SidStart, WinBuiltinAdministratorsSid) &&
++            (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) == Mask && !SeenAdministrators)
++            SeenAdministrators = TRUE;
++        else
++            return FALSE;
++    }
++    return SeenSystem && SeenAdministrators;
++}
++
+ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
+     PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess,
+     UINT32 FileAttributes, PSECURITY_DESCRIPTOR SecurityDescriptor, UINT64 AllocationSize,
+@@ -926,6 +986,13 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
+         if (!NT_SUCCESS(Result))
+             goto exit;
+     }
++    if (544 == Uid && 18 == Gid && 0570 == Mode &&
++        fsp_fuse_intf_IsImplicitSystemSecurity(FileSystem, context, SecurityDescriptor))
++    {
++        Uid = 18;
++        Gid = 544;
++        Mode = 0750;
++    }
+     Mode &= ~context->umask;
+     if (CreateOptions & FILE_DIRECTORY_FILE)
+     {

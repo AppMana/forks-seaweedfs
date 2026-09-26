@@ -44,6 +44,8 @@ foreach($mode in @('baseline','candidate')) {
  if($mode -eq 'candidate') {
   & git -C C:\lab\winfsp apply C:\lab\winfsp-guid-mount.patch
   if($LASTEXITCODE -ne 0){throw 'Patch failed'}
+  & git -C C:\lab\winfsp apply C:\lab\winfsp-default-security.patch
+  if($LASTEXITCODE -ne 0){throw 'Default security patch failed'}
  }
  & C:\lab\build-winfsp-msvc.ps1 -SourceDirectory C:\lab\winfsp -OutputDirectory "C:\lab\$mode" -MSBuildPath $tools[0] -VCToolsVersion 14.44.35207 -PlatformToolset v143 -WindowsSDKVersion 10.0.26100.0 -AllowTrackedPatch:($mode -eq 'candidate') *> "C:\lab\$mode-console.log"
  Write-Output "BUILD_COMPLETE_${mode}:$CompletionToken"

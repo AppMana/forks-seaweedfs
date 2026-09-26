@@ -88,7 +88,7 @@ func TestWindowsWinFspMSVCBuildLab(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := lab.Node("vm")
-	for _, name := range []string{"build-winfsp-msvc.ps1", "provision-winfsp-msvc-lab.ps1", "winfsp-guid-mount.patch"} {
+	for _, name := range []string{"build-winfsp-msvc.ps1", "provision-winfsp-msvc-lab.ps1", "winfsp-guid-mount.patch", "winfsp-default-security.patch"} {
 		b, err := os.ReadFile(filepath.Join("..", "..", "..", "hack", "appmana", name))
 		if err != nil {
 			t.Fatal(err)
@@ -165,8 +165,13 @@ func TestWindowsWinFspMSVCBuildLab(t *testing.T) {
 		}
 		write(mode+"-winfsp-x64.dll.source.patch", patch)
 		if mode == "candidate" {
-			expected, e := os.ReadFile(filepath.Join(out, "input-winfsp-guid-mount.patch"))
-			if e != nil || !bytes.Equal(patch, expected) {
+			// git diff orders paths lexically: fuse/fuse_intf.c then mount.c.
+			securityPatch, e := os.ReadFile(filepath.Join(out, "input-winfsp-default-security.patch"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			mountPatch, e := os.ReadFile(filepath.Join(out, "input-winfsp-guid-mount.patch"))
+			if e != nil || !bytes.Equal(patch, append(securityPatch, mountPatch...)) {
 				t.Fatal("candidate differs from the exact staged patch", e)
 			}
 		}

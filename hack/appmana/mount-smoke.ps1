@@ -82,11 +82,28 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
         $label = 'native mounted suite'
     }
+    # Different policies have deliberately different contracts. Report the
+    # selected inventory explicitly; never turn enforcement failures into skips.
+    if ($BasicPermissions) {
+        $names = @($names | Where-Object { $_ -ne 'TestWindowsLegacyPermissionCompatibility' })
+        Write-Host 'PERMISSION_POLICY: basic (access-denial enforcement)'
+    } else {
+        $names = @($names | Where-Object { $_ -notin @('TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity', 'TestWindowsPermissionsPersistence') })
+        if ($MetadataOnly) { $names += 'TestWindowsLegacyPermissionCompatibility' }
+        Write-Host 'PERMISSION_POLICY: legacy (permissive compatibility; not access-denial qualification)'
+    }
+    if (-not $Phase -and -not $PerformanceOnly) {
+        $required = if ($BasicPermissions) { @('TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity') } else { @('TestWindowsLegacyPermissionCompatibility') }
+        foreach ($name in $required) {
+            if ($names -notcontains $name) { throw "Native executable lacks required permission policy test $name" }
+        }
+    }
     $pattern = '^(' + (($names | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
     $nativeTimeout = if ($MetadataOnly) { '90s' } else { '20m' }
     $nativeArgs = @("-mountpoint=$mnt", "-test.run=$pattern", '-test.v', '-test.count=1', "-test.timeout=$nativeTimeout")
     if ($Phase) { $nativeArgs += @("-phase=$Phase", '-filer=127.0.0.1:8888') }
     if ($BasicPermissions -and -not $Phase) { $nativeArgs += @('-check-basic-permissions', '-filer=127.0.0.1:8888') }
+    if (-not $BasicPermissions -and -not $Phase) { $nativeArgs += @('-check-legacy-permissions', '-filer=127.0.0.1:8888') }
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {

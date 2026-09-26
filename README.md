@@ -103,6 +103,11 @@ The native MSVC qualification job additionally **requires** both explicit Git LF
 variables above (bundled LFS is not its default). It uploads the exact baseline
 and candidate DLLs with manifests, patches, compiler logs/binlogs and runtime
 evidence, then tests the candidate app-locally with the pinned signed WinFsp MSI.
+The rebuilt-DLL job runs both legacy sharing and opt-in basic permission suites.
+`weed mount -winfspBasicPermissions` selects basic stored-mode enforcement;
+leave it off for existing shared volumes until their metadata is audited.
+The local VM equivalent is `SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1` (default `0`).
+Basic mode rejects raw identity/DACL/permission overrides in `-winfspOptions`.
 It does not replace the installed driver, sign/publish a release, or deploy.
 No repository variables are changed by the build itself.
 

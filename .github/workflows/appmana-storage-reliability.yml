@@ -145,7 +145,10 @@ jobs:
           done
           unset SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD
           go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
-          SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=All SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1 go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
+          for policy in 0 1; do
+            SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$policy" SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=All SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1 go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/msvc-permissions-$policy.log"
+          done
+          printf 'Rebuilt DLL qualified with explicit legacy compatibility and basic permission enforcement inventories.\n' >> "$GITHUB_STEP_SUMMARY"
       - name: Mixed Windows and Linux mounted clients
         env:
           SEAWEEDFS_MIXED_LIVE: '1'

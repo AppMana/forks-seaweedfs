@@ -2,10 +2,36 @@ package winfsp
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
+
+// Query through an open handle; never rewrite the mount junction to make a
+// failing pathname work. The literal directory-mounted case remains separate.
+func symlinkGUIDTarget(t *testing.T, name string) (string, string) {
+	t.Helper()
+	f, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	buf := make([]uint16, 32768)
+	n, err := windows.GetFinalPathNameByHandle(windows.Handle(f.Fd()), &buf[0], uint32(len(buf)), 1)
+	if err != nil || n == 0 || n >= uint32(len(buf)) {
+		t.Fatalf("query canonical symlink target: n=%d err=%v", n, err)
+	}
+	canonical := windows.UTF16ToString(buf[:n])
+	volume, _, ok := strings.Cut(canonical, `}\`)
+	if !ok || !strings.HasPrefix(canonical, `\\?\Volume{`) {
+		t.Fatalf("expected canonical volume GUID path, got %q", canonical)
+	}
+	return canonical, volume + "}"
+}
 
 // Distinguish a genuinely relative sibling target from a same-volume absolute
 // target. Upstream's "relative" test starts with a volume-absolute target and
@@ -17,9 +43,11 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 	if err := writeAndSync(target, payload); err != nil {
 		t.Fatal(err)
 	}
+	canonical, volume := symlinkGUIDTarget(t, target)
 	for _, tc := range []struct{ name, target string }{
 		{"relative", "target.bin"},
 		{"absolute_same_volume", target},
+		{"absolute_volume_guid", canonical},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			link := filepath.Join(root, "link-"+tc.name)
@@ -41,4 +69,22 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 			}
 		})
 	}
+	t.Run("cross_volume_rejected", func(t *testing.T) {
+		external := filepath.Join(t.TempDir(), "external.bin")
+		if err := writeAndSync(external, payload); err != nil {
+			t.Fatal(err)
+		}
+		_, externalVolume := symlinkGUIDTarget(t, external)
+		if strings.EqualFold(volume, externalVolume) {
+			t.Fatal("cross-volume fixture must be on a different volume")
+		}
+		link := filepath.Join(root, "cross-volume")
+		defer os.Remove(link)
+		if err := os.Symlink(external, link); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			t.Fatalf("cross-volume target must remain denied: %v", err)
+		}
+		if got, err := os.ReadFile(external); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("rejected symlink damaged external target: %q %v", got, err)
+		}
+	})
 }

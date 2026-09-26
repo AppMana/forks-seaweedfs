@@ -42,6 +42,13 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 	}
 	verbosity := "0"
+	diagnosticHold := 0
+	if value := os.Getenv("SEAWEEDFS_WINDOWS_DIAGNOSTIC_HOLD_SECONDS"); value != "" {
+		diagnosticHold, err = strconv.Atoi(value)
+		if err != nil || diagnosticHold < 0 || diagnosticHold > 900 || len(scenarios) != 1 || scenarios[0] != "NativeMetadata" {
+			t.Fatal("diagnostic hold requires NativeMetadata and 0..900 seconds")
+		}
+	}
 	trace := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_TRACE") == "1"
 	if value := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_TRACE"); value != "" && value != "0" && value != "1" {
 		t.Fatal("SEAWEEDFS_WINDOWS_MOUNT_TRACE must be 0 or 1")
@@ -82,6 +89,7 @@ func TestWindowsMountLab(t *testing.T) {
 		inputs[`C:\lab\weed.exe`] = os.Getenv("SEAWEEDFS_WINDOWS_WEED")
 		inputs[`C:\lab\git-installer.exe`] = os.Getenv("SEAWEEDFS_GIT_INSTALLER")
 		inputs[`C:\lab\mount-smoke.ps1`] = filepath.Join("..", "..", "..", "hack", "appmana", "mount-smoke.ps1")
+		inputs[`C:\lab\windows-token-security.ps1`] = filepath.Join("..", "..", "..", "hack", "appmana", "windows-token-security.ps1")
 	}
 	if trace && !isolateMountManager {
 		inputs[`C:\lab\seaweed-fileio.wprp`] = filepath.Join("..", "..", "..", "hack", "appmana", "seaweed-fileio.wprp")
@@ -313,13 +321,16 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			if trace {
 				command = strings.Replace(command, " -TraceSummary ", " -TraceSummary -Trace -EtwFileIO ", 1)
 			}
+			if diagnosticHold > 0 {
+				command = strings.Replace(command, " -TestCase ", fmt.Sprintf(" -DiagnosticHoldSeconds %d -TestCase ", diagnosticHold), 1)
+			}
 			if os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") != "" {
 				command = strings.Replace(command, " -TestCase ", ` -WinFspTestExe C:\lab\winfsp.test.exe -TestCase `, 1)
 			}
 			if scenario == "Conformance" {
 				command = strings.Replace(command, " -TestCase ", ` -WinFspConformanceExe C:\lab\winfsp-tests-x64.exe -TestCase `, 1)
 			}
-			scenarioTimeout := 8 * time.Minute
+			scenarioTimeout := 8*time.Minute + time.Duration(diagnosticHold)*time.Second
 			if scenario == "All" || scenario == "Conformance" {
 				scenarioTimeout = 25 * time.Minute
 			}

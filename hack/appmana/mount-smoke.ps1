@@ -22,6 +22,7 @@ param(
     [switch]$EtwFileIO,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
+    [ValidateRange(0, 900)][int]$DiagnosticHoldSeconds = 0,
     [ValidateSet('All', 'NativeMetadata', 'AccessPerformance', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
@@ -70,7 +71,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         $names = @('TestWindowsAccessPerformance')
         $label = 'native access performance'
     } elseif ($MetadataOnly) {
-        $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase', 'TestWindowsAttributesRoundTrip', 'TestWindowsCreationTimeStable', 'TestWindowsUnicodeComponentLimits', 'TestWindowsBasicAccessDenial', 'TestWindowsAccessPerformance')
+        $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase', 'TestWindowsAttributesRoundTrip', 'TestWindowsCreationTimeStable', 'TestWindowsUnicodeComponentLimits', 'TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity', 'TestWindowsAccessPerformance')
         $label = 'native metadata regressions'
     } else {
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
@@ -412,10 +413,18 @@ try {
     if ($ExpectedWinFspDll) { Assert-WinFspModule $mount.Id $ExpectedWinFspDll }
 
     if ($TestCase -eq 'NativeMetadata') {
+        $permissionControl = Join-Path $WorkRoot 'permission-ntfs-control'
+        New-Item -ItemType Directory -Path $permissionControl | Out-Null
+        $controlOutput = @(& $WinFspTestExe "-mountpoint=$permissionControl" '-test.run=^TestWindows(BasicAccessDenial|CreateSecurity)$' '-test.v' '-test.count=1' '-test.timeout=45s' 2>&1)
+        $controlExit = $LASTEXITCODE
+        $controlOutput | ForEach-Object { Write-Host $_ }
+        Assert ($controlExit -eq 0 -and ($controlOutput -join "`n") -match '(?m)^--- PASS: TestWindowsBasicAccessDenial ') 'basic access denial NTFS control'
+        Assert ($controlExit -eq 0 -and ($controlOutput -join "`n") -match '(?m)^--- PASS: TestWindowsCreateSecurity ') 'create security NTFS control'
         if ($Verbosity -ge 1) {
             # Retain the actual Windows identity/descriptor and persisted
             # filer mode together; diagnostic runs are not timing baselines.
             & whoami.exe /all
+            & "$PSScriptRoot\windows-token-security.ps1"
             Write-Host "SECURITY_ROOT: $((Get-Acl -LiteralPath $mnt).Sddl)"
             $securityProbe = Join-Path $mnt 'native-security-diagnostic'
             New-Item -ItemType Directory -Path $securityProbe | Out-Null
@@ -425,6 +434,10 @@ try {
             Remove-Item -LiteralPath $securityProbe
         }
         Invoke-NativeMountedSuite $mnt -MetadataOnly
+        if ($DiagnosticHoldSeconds -gt 0) {
+            Write-Host "DIAGNOSTIC_HOLD: mounted lab available for $DiagnosticHoldSeconds seconds; test status unchanged"
+            Start-Sleep -Seconds $DiagnosticHoldSeconds
+        }
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }
         exit 0

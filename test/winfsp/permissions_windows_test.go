@@ -5,11 +5,108 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// Keep explicit create descriptors separate from descriptor-less nested
+// creates. A fix for a token's default DACL must not relax an application's
+// deliberately supplied restriction (including at initial creation).
+func TestWindowsCreateSecurity(t *testing.T) {
+	if *mountPoint == "" {
+		t.Skip("requires a mounted filesystem")
+	}
+	t.Run("default_nested", func(t *testing.T) {
+		root := testRoot(t)
+		dir := filepath.Join(root, "nested")
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Join(dir, "payload.bin")
+		payload := []byte("descriptor-less create must reopen intact")
+		if err := writeAndSync(name, payload); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("default create/reopen: %q %v", got, err)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		sddl string
+		deny bool
+	}{
+		{"explicit_delete_only", "D:P(A;;SD;;;WD)", true},
+		{"explicit_full_access", "D:P(A;;FA;;;WD)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Use a unique leaf directly under the supplied root, so broken
+			// default directory creation cannot mask this independent check.
+			name := filepath.Join(*mountPoint, "winfsp-create-security-"+tc.name+".bin")
+			p, err := windows.UTF16PtrFromString(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sd, err := windows.SecurityDescriptorFromString(tc.sddl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+			// A newly created handle has the requested access; the new DACL
+			// governs subsequent opens, as in upstream create_backup_test.
+			h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
+				windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+				&sa, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+			runtime.KeepAlive(sd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
+					t.Errorf("restore explicit create: %v", err)
+					return
+				}
+				if err := os.Remove(name); err != nil {
+					t.Errorf("remove explicit create: %v", err)
+				}
+			})
+			f := os.NewFile(uintptr(h), name)
+			payload := []byte("explicit create restriction preserves intact bytes")
+			if n, err := f.Write(payload); err != nil || n != len(payload) {
+				f.Close()
+				t.Fatalf("initial handle write: %d %v", n, err)
+			}
+			if err := f.Sync(); err != nil {
+				f.Close()
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if tc.deny {
+				if _, err := os.ReadFile(name); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+					t.Errorf("explicit create read restriction lost: %v", err)
+				}
+				if f, err := os.OpenFile(name, os.O_WRONLY, 0); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+					if f != nil {
+						f.Close()
+					}
+					t.Errorf("explicit create write restriction lost: %v", err)
+				}
+				if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("explicit create payload: %q %v", got, err)
+			}
+		})
+	}
+}
 
 func setWindowsBasicSecurity(name, sddl string) error {
 	sd, err := windows.SecurityDescriptorFromString(sddl)

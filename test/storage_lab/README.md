@@ -423,6 +423,18 @@ reads through an open handle, not bulk throughput or complete qualification.
 Use the pre-change Windows fork build to isolate permission overhead; do not
 label that comparison as a vanilla-upstream baseline.
 
+For the strict upstream WinFsp inventory, reuse those offline VM inputs and set
+`SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=Conformance`,
+`SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1`,
+`SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1`, and
+`SEAWEEDFS_WINDOWS_CONFORMANCE_EXE=/absolute/winfsp-tests-x64.exe` before running
+`TestWindowsMountLab`. Use the qualified basic-permissions DLL. The scenario
+runs local NTFS controls and mounts SeaweedFS on an unused `S:` drive; it includes
+optional and known-failure cases under upstream's `--fuse-external --resilient`
+contract. This is separate from the native directory-mounted `All` suite and
+does not certify arbitrary ACL fidelity. Actions requires the conformance EXE
+path/hash variables documented in the root README.
+
 To reproduce a standalone-client comparison in Actions, configure the optional
 `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH`/`SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` pair
 documented in the root README. Both must match the reviewed executable; omitting

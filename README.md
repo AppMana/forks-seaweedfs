@@ -94,6 +94,7 @@ Secrets and variables → Actions → Variables:
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE` | Qualified Ubuntu VM image reference including `@sha256:<64 hex>` | Build from the pinned source, publish and preload it on the dedicated runner, and update only after its live KVM smoke test passes. Mutable tags are rejected. |
 | `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Windows VM image including `@sha256:<64 hex>` | Preload the licensed image on the same dedicated runner. Run the native Windows core regressions and Labcontainers NTFS crash test before promotion. |
 | `SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256` | Absolute runner-local WinFsp MSI path and SHA-256 | Preload the reviewed installer. The VM gate verifies its hash before staging it offline. |
+| `SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_SHA256` | Absolute runner-local upstream `winfsp-tests-x64.exe` path and SHA-256 | Required by native MSVC qualification. Preload the reviewed conformance executable; update path and hash together. The VM runs all listed cases, including optional and known-failure cases, with basic permissions enabled. No download occurs inside the VM. |
 | `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH` / `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256` | Absolute runner-local Git for Windows installer path and SHA-256 | Preload the reviewed installer including Git LFS; update path and digest together after qualification. Missing/mismatched installers fail the VM gate. |
 | `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH` / `SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` | Optional absolute runner-local standalone Windows `git-lfs.exe` path and SHA-256 | Set both to test an explicit client independently of the Git installer bundle; a partial pair or hash mismatch fails the gate. Leave both unset to test bundled LFS. Update deliberately after client qualification, never download `latest` during a regression run. |
 | `SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED` | Set to `1` to run native WinFsp build/qualification on applicable trusted pushes | Otherwise use manual dispatch input `windows_msvc_build`. Never runs for pull requests. Requires the dedicated isolated KVM runner; an omitted job is not a qualification pass. |
@@ -108,6 +109,12 @@ The rebuilt-DLL job runs both legacy sharing and opt-in basic permission suites.
 leave it off for existing shared volumes until their metadata is audited.
 The local VM equivalent is `SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1` (default `0`).
 Basic mode rejects raw identity/DACL/permission overrides in `-winfspOptions`.
+Windows mounts interpret absolute POSIX symlink targets within the mounted
+volume (`rellinks`); `-winfspOptions=norellinks` restores rejection of these
+targets. This does not make Windows drive paths portable to Linux. Prefer
+relative symlinks for shared workloads. Creating an absolute Windows target
+through a directory-junction mount remains unqualified; enabling `rellinks`
+does not bypass WinFsp's cross-volume target check.
 It does not replace the installed driver, sign/publish a release, or deploy.
 No repository variables are changed by the build itself.
 
@@ -126,6 +133,8 @@ gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE --repo AppMana/fork
 gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE --repo AppMana/forks-seaweedfs --body "$WINDOWS_IMAGE_AT_DIGEST"
 gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_WINFSP_MSI_PATH"
 gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_MSI_SHA256"
+gh variable set SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_WINFSP_TESTS_EXE_PATH"
+gh variable set SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_TESTS_EXE_SHA256"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_INSTALLER_PATH"
 gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_INSTALLER_SHA256"
 # Optional for the stock-MSI gate, mandatory for MSVC qualification.

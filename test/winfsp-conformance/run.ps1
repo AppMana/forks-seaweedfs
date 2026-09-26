@@ -81,6 +81,7 @@ try {
     $selection = if ($IncludeOptional) { @('+*') } else { @() }
     $names = @(& $exe @base '--list' @selection 2>&1 |
         ForEach-Object { if ($_ -match '^([a-z_0-9]+)\s*$') { $Matches[1] } })
+    if ($LASTEXITCODE -ne 0) { throw "test inventory command failed: $LASTEXITCODE" }
     if ($names.Count -eq 0) { throw "could not list tests" }
     if ($TestNames) {
         foreach ($requested in $TestNames) {
@@ -111,12 +112,20 @@ try {
                 $nativeExit = $LASTEXITCODE
             } finally { $ErrorActionPreference = $savedPreference }
             $out | ForEach-Object { Write-Host $_ }
-            if ($out -match '\s+KO\s*$' -or $nativeExit -ne 0) { $failed += $name }
+            # Exit zero alone is not evidence that the requested case ran.
+            # Upstream prints durations after OK/KO; anchor the case name and
+            # require exactly one positive result, with no failure anywhere.
+            $positive = '^\s*' + [regex]::Escape($name) + '[. ]+OK(?:\s+[0-9]+(?:\.[0-9]+)?s)?\s*$'
+            if (@($out | Where-Object { $_ -match $positive }).Count -ne 1 -or
+                $out -match '\s+KO(?:\s|$)' -or $nativeExit -ne 0) {
+                $failed += $name
+            }
         } finally {
             Pop-Location
             Remove-Item $caseDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    if ($ran -eq 0) { throw 'no conformance cases executed' }
     Write-Host "ran $ran tests, $($failed.Count) failed"
     $code = if ($failed.Count -gt 0) { 1 } else { 0 }
 } finally {

@@ -22,7 +22,7 @@ param(
     [switch]$EtwFileIO,
     [string]$WinFspOptions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
-    [ValidateSet('All', 'NativeMetadata', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
+    [ValidateSet('All', 'NativeMetadata', 'AccessPerformance', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,7 +54,7 @@ function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
 # Enumerate the actual executable: adding a mounted test must automatically add
 # coverage. Only tests with their own isolated-VM driver and the separate
 # remount phases are excluded here; the lab runner executes those separately.
-function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly) {
+function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly, [switch]$PerformanceOnly) {
     if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
     $env:WINFSP_LAB_PE_TEST_DLL = $ExpectedWinFspDll
     if (-not $env:WINFSP_LAB_PE_TEST_DLL) {
@@ -64,15 +64,18 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         if (-not $env:WINFSP_LAB_PE_TEST_DLL) { throw 'cannot identify loaded WinFsp DLL for native suite' }
     }
     if ($Phase) {
-        $names = @('TestPersistence', 'TestWindowsAttributesPersistence')
+        $names = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence')
         $label = "native persistence $Phase"
+    } elseif ($PerformanceOnly) {
+        $names = @('TestWindowsAccessPerformance')
+        $label = 'native access performance'
     } elseif ($MetadataOnly) {
         $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase', 'TestWindowsAttributesRoundTrip', 'TestWindowsCreationTimeStable', 'TestWindowsUnicodeComponentLimits', 'TestWindowsBasicAccessDenial', 'TestWindowsAccessPerformance')
         $label = 'native metadata regressions'
     } else {
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
-        $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback')
+        $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback')
         $names = @($listing | Where-Object { $_ -match '^Test\w+$' -and $_ -notin $separate })
         if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
         $label = 'native mounted suite'
@@ -410,6 +413,13 @@ try {
 
     if ($TestCase -eq 'NativeMetadata') {
         Invoke-NativeMountedSuite $mnt -MetadataOnly
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
+
+    if ($TestCase -eq 'AccessPerformance') {
+        Invoke-NativeMountedSuite $mnt -PerformanceOnly
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }
         exit 0

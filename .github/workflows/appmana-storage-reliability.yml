@@ -64,6 +64,8 @@ jobs:
       SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256 }}
       SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
       WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 }}
+      SEAWEEDFS_WINDOWS_CONFORMANCE_EXE: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_PATH }}
+      WINFSP_TESTS_EXE_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_SHA256 }}
       SEAWEEDFS_GIT_INSTALLER: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH }}
       GIT_INSTALLER_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 }}
       SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_PATH }}
@@ -87,7 +89,7 @@ jobs:
             test "$(docker image inspect --format '{{ index .Config.Labels "appmana.labcontainers.revision" }}' "$image")" = "$LABCONTAINERS_REF"
           done
           # Require an explicit LFS client for this release-build qualification.
-          for pair in 'SEAWEEDFS_WINDOWS_MSVC_ISO SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256' 'SEAWEEDFS_WINFSP_MSI WINFSP_MSI_SHA256' 'SEAWEEDFS_GIT_INSTALLER GIT_INSTALLER_SHA256' 'SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC GIT_LFS_SHA256'; do
+          for pair in 'SEAWEEDFS_WINDOWS_MSVC_ISO SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256' 'SEAWEEDFS_WINFSP_MSI WINFSP_MSI_SHA256' 'SEAWEEDFS_WINDOWS_CONFORMANCE_EXE WINFSP_TESTS_EXE_SHA256' 'SEAWEEDFS_GIT_INSTALLER GIT_INSTALLER_SHA256' 'SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC GIT_LFS_SHA256'; do
             read -r path_name hash_name <<< "$pair"
             [[ "${!path_name}" = /* && "${!hash_name}" =~ ^[0-9a-f]{64}$ ]]
             printf '%s  %s\n' "${!hash_name}" "${!path_name}" | sha256sum -c -
@@ -136,6 +138,9 @@ jobs:
           candidate_sha=$(git rev-parse HEAD)
           GOWORK=off GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_WINDOWS_WINFSP_TEST" ./test/winfsp
           GOWORK=off GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
+          # Strict upstream inventory, including optional/known-failure cases.
+          # Legacy sharing intentionally does not promise basic access denial.
+          SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1 SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=Conformance SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1 go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/msvc-conformance.log"
           for registration in '' 1; do
             export SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD="$registration"
             SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1 SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
@@ -174,6 +179,7 @@ jobs:
             ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/seaweedfs-mixed-results-*/
             ${{ runner.temp }}/mixed-mount-test.log
+            ${{ runner.temp }}/msvc-conformance.log
           if-no-files-found: error
           retention-days: 30
 
@@ -194,6 +200,7 @@ jobs:
           python3 -m unittest discover -s hack/appmana -p 'test_analyze_fileio.py'
           python3 -m unittest discover -s hack/appmana -p 'test_smoke_contract_exit.py' -v
           pwsh -NoProfile -File hack/appmana/mount-smoke-contract-test.ps1
+          pwsh -NoProfile -File test/winfsp-conformance/contract-test.ps1
           pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1
           pwsh -NoProfile -File hack/appmana/build-winfsp-msvc-test.ps1
       - name: Validate explicit compatibility inputs

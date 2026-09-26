@@ -96,6 +96,11 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		"-o", "DirInfoTimeout=2000",
 		"-o", "VolumeInfoTimeout=5000",
 		"-o", "FileSystemName=seaweedfs",
+		// Filer symlink targets use POSIX paths. Interpret /target inside
+		// this mounted volume, never against the Windows host's root.
+		// Without this, WinFsp creates same-volume absolute links but
+		// refuses to resolve them. A later norellinks explicitly opts out.
+		"-o", "rellinks",
 	}
 	if !h.basicPermissions {
 		// Preserve existing shared-volume behavior on upgrades. Old metadata

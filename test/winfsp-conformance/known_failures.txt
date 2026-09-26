@@ -18,8 +18,6 @@
 # Alternate data streams: the filer stores one byte range per entry, and the
 # mount exposes no second stream.
 stream_*
-# Reparse points: Symlink is refused, so there is nothing to resolve.
-reparse_*
 # Byte-range locks live in the WinFsp driver, so they never reach the mount.
 lock_*
 

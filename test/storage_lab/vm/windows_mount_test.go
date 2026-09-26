@@ -28,7 +28,7 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "All", "NativeMetadata", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
+		case "All", "NativeMetadata", "AccessPerformance", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
 			scenarios = []string{scenario}
 		default:
 			t.Fatal("unknown SEAWEEDFS_WINDOWS_MOUNT_SCENARIO; see test/storage_lab/README.md")
@@ -302,6 +302,13 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			command := `$env:PATH='C:\Program Files\Git\cmd;'+$env:PATH; & C:\lab\mount-smoke.ps1 -WeedExe C:\lab\weed.exe -WorkRoot C:\lab\smoke-` + caseName + ` -TestCase ` + scenario + ` -GitIterations 20 -TraceSummary -Verbosity ` + verbosity + ` *>&1 | Tee-Object -FilePath ` + guestLog + `; $scenarioExit=$LASTEXITCODE; if($scenarioExit -eq 0){Write-Output '` + caseMarker + `'}; exit $scenarioExit`
 			if labDLL != "" {
 				command = strings.Replace(command, " -TestCase ", ` -ExpectedWinFspDll C:\lab\winfsp-x64.dll -TestCase `, 1)
+			}
+			if options := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_OPTIONS"); options != "" {
+				// A single literal argument: SDDL contains semicolons and must
+				// never be interpolated as PowerShell statements.
+				quoted := "'" + strings.ReplaceAll(options, "'", "''") + "'"
+				command = strings.Replace(command, " -TestCase ", " -WinFspOptions "+quoted+" -TestCase ", 1)
+				t.Logf("explicit WinFsp options: %s", options)
 			}
 			if trace {
 				command = strings.Replace(command, " -TraceSummary ", " -TraceSummary -Trace -EtwFileIO ", 1)

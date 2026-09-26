@@ -11,6 +11,57 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func setWindowsBasicSecurity(name, sddl string) error {
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(name, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+}
+
+// The verify phase runs in a fresh mount/process: cached descriptors cannot
+// satisfy this assertion. Restoring access must recover exactly the old bytes.
+func TestWindowsPermissionsPersistence(t *testing.T) {
+	if *mountPoint == "" || (*phase != "write" && *phase != "verify") {
+		t.Skip("requires a mounted write/verify persistence phase")
+	}
+	name := filepath.Join(*mountPoint, "winfsp-permissions-persist.bin")
+	payload := []byte("intact permissions remount payload")
+	if *phase == "write" {
+		if err := writeAndSync(name, payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := setWindowsBasicSecurity(name, "D:P(A;;SD;;;WD)"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.ReadFile(name); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Errorf("%s: persisted read restriction not enforced: %v", *phase, err)
+	}
+	if f, err := os.OpenFile(name, os.O_WRONLY, 0); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		if f != nil {
+			f.Close()
+		}
+		t.Errorf("%s: persisted write restriction not enforced: %v", *phase, err)
+	}
+	if *phase == "verify" {
+		if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("remount damaged protected payload: %q %v", got, err)
+		}
+		if err := os.Remove(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // Exercise the native security boundary, not os.Chmod's Windows readonly bit.
 // The upstream backup/restore tests separately exercise privilege bypass.
 func TestWindowsBasicAccessDenial(t *testing.T) {

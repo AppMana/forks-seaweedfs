@@ -21,10 +21,11 @@ import (
 )
 
 var checkBasicPermissions = flag.Bool("check-basic-permissions", false, "assert persisted SYSTEM default identity via -filer (basic-permissions lab only)")
+var checkLegacyPermissions = flag.Bool("check-legacy-permissions", false, "assert preserved legacy identity via -filer (compatibility lab only)")
 
 func assertStoredWindowsPermissions(t *testing.T, name string, uid, gid, mode uint32) {
 	t.Helper()
-	if !*checkBasicPermissions {
+	if !*checkBasicPermissions && !*checkLegacyPermissions {
 		return
 	}
 	if *filerAddr == "" {
@@ -67,6 +68,38 @@ func assertStoredWindowsPermissions(t *testing.T, name string, uid, gid, mode ui
 		}
 	}
 	t.Fatalf("filer omitted %s", wantPath)
+}
+
+// Legacy sharing is intentionally permissive. Keep a separate, explicit
+// contract so upgrades cannot accidentally rewrite hidden metadata or claim
+// denial enforcement. The basic-policy suite tests actual access denial.
+func TestWindowsLegacyPermissionCompatibility(t *testing.T) {
+	root := testRoot(t)
+	name := filepath.Join(root, "legacy.bin")
+	payload := []byte("legacy sharing preserves existing access and bytes")
+	if err := writeAndSync(name, payload); err != nil {
+		t.Fatal(err)
+	}
+	assertStoredWindowsPermissions(t, root, 544, 18, 0570)
+	assertStoredWindowsPermissions(t, name, 544, 18, 0570)
+	defer func() {
+		if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
+			t.Errorf("restore compatibility fixture: %v", err)
+		}
+	}()
+	if err := setWindowsBasicSecurity(name, "D:P(A;;SD;;;WD)"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("legacy compatibility access changed: %q %v", got, err)
+	}
+	f, err := os.OpenFile(name, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Keep explicit create descriptors separate from descriptor-less nested

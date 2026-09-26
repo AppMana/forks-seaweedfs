@@ -65,6 +65,11 @@ func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions bool) *WinFspHost {
 // Mount mounts at dir (which must not exist; WinFsp creates the mount
 // point) and blocks until unmount. volumeLabel is shown in Explorer.
 func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string) error {
+	if h.basicPermissions {
+		if err := validateWinFspBasicOptions(extraOptions); err != nil {
+			return err
+		}
+	}
 	options := []string{
 		// Preserve WinFsp's stored uid/gid/mode translation. Global uid/gid
 		// overrides can assign another identity's mode bits to the caller

@@ -5,7 +5,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $PSScriptRoot 'mount-smoke.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Assert', 'Invoke-GitLfsTempMetadataTest', 'Assert-WinFspModule')) {
+foreach ($name in @('Assert', 'Invoke-GitLfsTempMetadataTest', 'Assert-WinFspModule', 'Start-Mount', 'Invoke-NativeMountedSuite')) {
     $definition = $ast.Find({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
@@ -70,6 +70,59 @@ function fsutil.exe {
 $root = Join-Path ([IO.Path]::GetTempPath()) ('weed-smoke-contract-' + [guid]::NewGuid())
 [void][IO.Directory]::CreateDirectory($root)
 try {
+    # Execute the actual command builders with process boundaries mocked.
+    # This proves the mount policy and the independent filer oracle are wired
+    # together; it is not filesystem qualification (that runs in real VMs).
+    function Start-Process {
+        param($FilePath, [switch]$PassThru, $WindowStyle, $ArgumentList,
+              $RedirectStandardOutput, $RedirectStandardError)
+        $script:capturedMountArgs = @($ArgumentList)
+        [pscustomobject]@{ Id = 42 }
+    }
+    function Wait-PathExists { param($Path, $Timeout) return $true }
+    function Invoke-NativeContract {
+        $script:capturedNativeArgs = @($args)
+        $global:LASTEXITCODE = 0
+        $pattern = @($args | Where-Object { $_ -like '-test.run=*' })[0].Substring(10)
+        foreach ($name in $pattern.Substring(2, $pattern.Length - 4).Split('|')) {
+            "--- PASS: $([regex]::Unescape($name)) (0.01s)"
+        }
+    }
+    $script:WeedExe = 'contract-weed'
+    $script:WinFspTestExe = 'Invoke-NativeContract'
+    $script:ExpectedWinFspDll = $expectedDLL
+    $script:Trace = $script:TraceSummary = $false
+    $script:Verbosity = 0
+    $script:WinFspOptions = ''
+    $logDir = $root
+    foreach ($script:BasicPermissions in @($false, $true)) {
+        $script:failures = 0
+        $null = Start-Mount $root $root $root 'policy-contract'
+        if (($script:capturedMountArgs -contains '-winfspBasicPermissions') -ne $script:BasicPermissions) {
+            throw 'Mount permission switch does not match policy'
+        }
+        Invoke-NativeMountedSuite $root -MetadataOnly
+        if (($script:capturedNativeArgs -contains '-check-basic-permissions') -ne $script:BasicPermissions -or
+            ($script:capturedNativeArgs -contains '-check-legacy-permissions') -eq $script:BasicPermissions -or
+            $script:capturedNativeArgs -notcontains '-filer=127.0.0.1:8888') {
+            throw 'Permission policy lost independent filer metadata oracle'
+        }
+        $selected = @($script:capturedNativeArgs | Where-Object { $_ -like '-test.run=*' })[0]
+        if ($selected.Contains('TestWindowsBasicAccessDenial') -ne $script:BasicPermissions -or
+            $selected.Contains('TestWindowsCreateSecurity') -ne $script:BasicPermissions -or
+            $selected.Contains('TestWindowsLegacyPermissionCompatibility') -eq $script:BasicPermissions) {
+            throw 'Wrong policy-specific test inventory'
+        }
+        Invoke-NativeMountedSuite $root -Phase 'write'
+        $selected = @($script:capturedNativeArgs | Where-Object { $_ -like '-test.run=*' })[0]
+        if ($selected.Contains('TestWindowsPermissionsPersistence') -ne $script:BasicPermissions -or
+            -not $selected.Contains('TestWindowsAttributesPersistence') -or
+            -not $selected.Contains('TestPersistence') -or $script:failures -ne 0) {
+            throw 'Wrong persistence policy inventory or incomplete execution'
+        }
+    }
+    Remove-Item Function:Start-Process, Function:Wait-PathExists, Function:Invoke-NativeContract
+    Write-Host 'PASS: basic/legacy mount switches, filer oracles and explicit test inventories'
     $cases = @('init', 'config user.name AppMana mount smoke',
         'config user.email mount-smoke@appmana.invalid', 'lfs version',
         'lfs install --local', 'lfs track *.lfs', 'check-attr filter asset-1.lfs',

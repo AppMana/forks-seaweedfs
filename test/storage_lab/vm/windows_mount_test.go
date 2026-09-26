@@ -42,10 +42,14 @@ func TestWindowsMountLab(t *testing.T) {
 		}
 	}
 	verbosity := "0"
+	basicPermissions := os.Getenv("SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS")
+	if basicPermissions != "" && basicPermissions != "0" && basicPermissions != "1" {
+		t.Fatal("SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS must be 0 or 1")
+	}
 	diagnosticHold := 0
 	if value := os.Getenv("SEAWEEDFS_WINDOWS_DIAGNOSTIC_HOLD_SECONDS"); value != "" {
 		diagnosticHold, err = strconv.Atoi(value)
-		if err != nil || diagnosticHold < 0 || diagnosticHold > 900 || len(scenarios) != 1 || scenarios[0] != "NativeMetadata" {
+		if err != nil || diagnosticHold < 0 || diagnosticHold > 900 || (diagnosticHold > 0 && (len(scenarios) != 1 || scenarios[0] != "NativeMetadata")) {
 			t.Fatal("diagnostic hold requires NativeMetadata and 0..900 seconds")
 		}
 	}
@@ -319,7 +323,11 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 				t.Logf("explicit WinFsp options: %s", options)
 			}
 			if trace {
+				// Tracing is separate from the permission policy under test.
 				command = strings.Replace(command, " -TraceSummary ", " -TraceSummary -Trace -EtwFileIO ", 1)
+			}
+			if basicPermissions == "1" {
+				command = strings.Replace(command, " -TestCase ", " -BasicPermissions -TestCase ", 1)
 			}
 			if diagnosticHold > 0 {
 				command = strings.Replace(command, " -TestCase ", fmt.Sprintf(" -DiagnosticHoldSeconds %d -TestCase ", diagnosticHold), 1)

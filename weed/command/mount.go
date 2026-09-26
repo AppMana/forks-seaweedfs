@@ -50,6 +50,7 @@ type MountOptions struct {
 	disableXAttr         *bool
 	volumeLabel          *string
 	winfspOptions        *string
+	winfspPermissions    *bool
 	winfspCaseSensitive  *bool
 	windowsUid           *int
 	windowsGid           *int
@@ -140,6 +141,7 @@ func init() {
 	mountOptions.disableXAttr = cmdMount.Flag.Bool("disableXAttr", false, "disable xattr")
 	mountOptions.volumeLabel = cmdMount.Flag.String("volumeLabel", "SeaweedFS", "volume label shown by Windows (winfsp mounts only)")
 	mountOptions.winfspOptions = cmdMount.Flag.String("winfspOptions", "", "comma-separated extra WinFsp -o options, e.g. FileInfoTimeout=-1,DirInfoTimeout=2000 (winfsp mounts only)")
+	mountOptions.winfspPermissions = cmdMount.Flag.Bool("winfspBasicPermissions", false, "enforce basic stored uid/gid/mode permissions instead of legacy permissive sharing; requires qualified WinFsp DLL and fresh or explicitly audited volume metadata (Windows only)")
 	mountOptions.winfspCaseSensitive = cmdMount.Flag.Bool("winfspCaseSensitive", mount.DefaultWinFspCaseSensitive, "advertise a case-sensitive Windows filesystem (winfsp mounts only)")
 	mountOptions.windowsUid = cmdMount.Flag.Int("windows.uid", 0, "windows only: uid recorded on entries this mount creates, which other clients read")
 	mountOptions.windowsGid = cmdMount.Flag.Int("windows.gid", 0, "windows only: gid recorded on entries this mount creates, which other clients read")

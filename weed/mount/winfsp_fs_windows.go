@@ -22,9 +22,11 @@ const invalidFh = ^uint64(0)
 // and cgofuse structs to go-fuse structs.
 type winfspFS struct {
 	cgofuse.FileSystemBase
-	wfs           *WFS
-	readAhead     *readAheadCache
-	caseSensitive bool
+	wfs              *WFS
+	readAhead        *readAheadCache
+	caseSensitive    bool
+	identityError    error
+	basicPermissions bool
 }
 
 func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
@@ -222,8 +224,6 @@ func attrToStat(attr *fuse.Attr, st *cgofuse.Stat_t) {
 	st.Blocks = int64(attr.Blocks)
 }
 
-func (a *winfspFS) Init() {}
-
 func (a *winfspFS) Destroy() { writeWinfspStatsTrace() }
 
 func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
@@ -248,6 +248,9 @@ func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
 
 func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 	defer track(opGetattr)()
+	if a.identityError != nil {
+		return -cgofuse.EIO
+	}
 	in := fuse.GetAttrIn{}
 	if ino, ok := a.inodeFromFh(fh); ok {
 		in.InHeader = a.header(ino)
@@ -281,7 +284,7 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 		return -cgofuse.EEXIST
 	}
 	var out fuse.EntryOut
-	in := fuse.MkdirIn{InHeader: a.header(parent), Mode: mode & 07777}
+	in := fuse.MkdirIn{InHeader: a.creationHeader(parent), Mode: mode & 07777}
 	return toWinErrno(a.wfs.Mkdir(nil, &in, name, &out))
 }
 
@@ -305,7 +308,7 @@ func (a *winfspFS) Mknod(path string, mode uint32, device uint64) int {
 	if exists {
 		return -cgofuse.EEXIST
 	}
-	in := fuse.MknodIn{InHeader: a.header(parent), Mode: mode, Rdev: uint32(device)}
+	in := fuse.MknodIn{InHeader: a.creationHeader(parent), Mode: mode, Rdev: uint32(device)}
 	var out fuse.EntryOut
 	return toWinErrno(a.wfs.Mknod(nil, &in, name, &out))
 }
@@ -389,7 +392,7 @@ func (a *winfspFS) Symlink(target string, newpath string) int {
 		return -cgofuse.EEXIST
 	}
 	var out fuse.EntryOut
-	hdr := a.header(parent)
+	hdr := a.creationHeader(parent)
 	return toWinErrno(a.wfs.Symlink(nil, &hdr, target, name, &out))
 }
 
@@ -488,8 +491,9 @@ func (a *winfspFS) Utimens(path string, tmsp []cgofuse.Timespec) int {
 }
 
 func (a *winfspFS) Access(path string, mask uint32) int {
-	// HostProcess mounts run as SYSTEM; enforcement is delegated to the
-	// filer-side permission checks in the WFS handlers.
+	// WinFsp enforces access using the Windows caller's token before
+	// dispatch. WFS's synthetic Unix identity cannot model that token or
+	// its backup/restore privileges. Independent WFS protections still apply.
 	return 0
 }
 
@@ -507,7 +511,7 @@ func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
 		return -cgofuse.EEXIST, invalidFh
 	}
 	in := fuse.CreateIn{
-		InHeader: a.header(parent),
+		InHeader: a.creationHeader(parent),
 		Flags:    toGoOpenFlags(flags),
 		Mode:     mode & 07777,
 	}

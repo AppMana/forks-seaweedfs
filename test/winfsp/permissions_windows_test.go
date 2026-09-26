@@ -2,16 +2,72 @@ package winfsp
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"flag"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+var checkBasicPermissions = flag.Bool("check-basic-permissions", false, "assert persisted SYSTEM default identity via -filer (basic-permissions lab only)")
+
+func assertStoredWindowsPermissions(t *testing.T, name string, uid, gid, mode uint32) {
+	t.Helper()
+	if !*checkBasicPermissions {
+		return
+	}
+	if *filerAddr == "" {
+		t.Fatal("basic permission metadata checks require -filer")
+	}
+	rel, err := filepath.Rel(*mountPoint, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := "/" + filepath.ToSlash(rel)
+	u := url.URL{Scheme: "http", Host: *filerAddr, Path: strings.TrimSuffix(path.Dir(wantPath), "/") + "/"}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "application/json")
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("filer listing status: %s", response.Status)
+	}
+	var listing struct {
+		Entries []struct {
+			FullPath       string
+			Uid, Gid, Mode uint32
+		}
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&listing); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range listing.Entries {
+		if entry.FullPath == wantPath {
+			if entry.Uid != uid || entry.Gid != gid || entry.Mode&0777 != mode {
+				t.Fatalf("persisted %s: uid=%d gid=%d mode=%#o; want %d/%d/%#o", wantPath, entry.Uid, entry.Gid, entry.Mode&0777, uid, gid, mode)
+			}
+			return
+		}
+	}
+	t.Fatalf("filer omitted %s", wantPath)
+}
 
 // Keep explicit create descriptors separate from descriptor-less nested
 // creates. A fix for a token's default DACL must not relax an application's
@@ -34,14 +90,18 @@ func TestWindowsCreateSecurity(t *testing.T) {
 		if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, payload) {
 			t.Fatalf("default create/reopen: %q %v", got, err)
 		}
+		assertStoredWindowsPermissions(t, dir, 18, 544, 0750)
+		assertStoredWindowsPermissions(t, name, 18, 544, 0750)
 	})
 	for _, tc := range []struct {
-		name string
-		sddl string
-		deny bool
+		name      string
+		sddl      string
+		deny      bool
+		canonical bool
 	}{
-		{"explicit_delete_only", "D:P(A;;SD;;;WD)", true},
-		{"explicit_full_access", "D:P(A;;FA;;;WD)", false},
+		{"explicit_delete_only", "D:P(A;;SD;;;WD)", true, false},
+		{"explicit_full_access", "D:P(A;;FA;;;WD)", false, false},
+		{"explicit_system_default", "O:BAG:SYD:(A;;GA;;;SY)(A;;RCGXGR;;;BA)", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Use a unique leaf directly under the supplied root, so broken
@@ -86,6 +146,15 @@ func TestWindowsCreateSecurity(t *testing.T) {
 			}
 			if err := f.Close(); err != nil {
 				t.Fatal(err)
+			}
+			if tc.canonical {
+				// The same DACL explicitly supplied must not be normalized.
+				// Basic POSIX mapping cannot faithfully represent overlapping
+				// group rights; this is not an arbitrary-ACL support claim.
+				assertStoredWindowsPermissions(t, name, 544, 18, 0570)
+				if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if tc.deny {
 				if _, err := os.ReadFile(name); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {

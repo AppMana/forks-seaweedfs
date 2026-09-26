@@ -21,6 +21,7 @@ param(
     [switch]$TraceSummary,
     [switch]$EtwFileIO,
     [string]$WinFspOptions,
+    [switch]$BasicPermissions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
     [ValidateRange(0, 900)][int]$DiagnosticHoldSeconds = 0,
     [ValidateSet('All', 'NativeMetadata', 'AccessPerformance', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
@@ -85,6 +86,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
     $nativeTimeout = if ($MetadataOnly) { '90s' } else { '20m' }
     $nativeArgs = @("-mountpoint=$mnt", "-test.run=$pattern", '-test.v', '-test.count=1', "-test.timeout=$nativeTimeout")
     if ($Phase) { $nativeArgs += @("-phase=$Phase", '-filer=127.0.0.1:8888') }
+    if ($BasicPermissions -and -not $Phase) { $nativeArgs += @('-check-basic-permissions', '-filer=127.0.0.1:8888') }
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -282,6 +284,7 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     )
     if ($Trace) { $mountArgs += '-winfspOptions=debug' }
     if ($WinFspOptions) { $mountArgs += "-winfspOptions=$WinFspOptions" }
+    if ($BasicPermissions) { $mountArgs += '-winfspBasicPermissions' }
     $startArgs = @{
         FilePath = $WeedExe
         PassThru = $true

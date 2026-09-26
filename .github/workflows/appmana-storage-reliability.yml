@@ -25,9 +25,9 @@ on:
         default: false
   push:
     branches: [master, main, 'merge/**']
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
   pull_request:
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
 
 permissions:
   contents: read

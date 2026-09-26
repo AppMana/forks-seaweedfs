@@ -390,6 +390,39 @@ The test logs input hashes and retains combined scenario stdout/stderr under the
 printed results directory (`RUNNER_TEMP` in CI, system temp otherwise). Guest
 logs are exported to `guest-logs.txt` (last 2,000 lines per top-level log file;
 not a complete recursive archive). Archive the complete Go test output as well.
+
+For a paired Windows ordinary-access latency comparison, keep the same matched
+SDK/daemon, VM image, offline installers, native test executable and host. Set
+`RUNNER_TEMP` to a persistent artifact directory and run no other qualification
+VMs or heavy builds concurrently. Supply two reviewed Windows executables:
+
+```sh
+export SEAWEEDFS_WINDOWS_ACCESS_BASELINE_BASIC_PERMISSIONS=0
+export SEAWEEDFS_WINDOWS_ACCESS_CANDIDATE_BASIC_PERMISSIONS=1
+export SEAWEEDFS_WINDOWS_ACCESS_BASELINE_DLL=/absolute/baseline-winfsp-x64.dll
+export SEAWEEDFS_WINDOWS_ACCESS_CANDIDATE_DLL=/absolute/candidate-winfsp-x64.dll
+bash hack/appmana/windows-access-regression.sh /absolute/baseline-weed.exe /absolute/candidate-weed.exe
+```
+
+Each DLL requires adjacent `.manifest.txt` and `.source.patch` files. The policy
+inputs accept only `0`/`1`; baseline defaults to `0`, and candidate defaults to
+the baseline policy. DLL inputs default to `SEAWEEDFS_WINDOWS_WINFSP_DLL` and
+then the baseline DLL respectively. Set both explicitly when comparing native
+changes. `SEAWEEDFS_WINDOWS_MOUNT_OPTIONS`, if supplied, applies to both builds.
+Keep `SEAWEEDFS_WINDOWS_DIAGNOSTIC_HOLD_SECONDS=0` for this scenario.
+The script disables tracing/debug verbosity and runs three independent VMs per
+build in alternating order. Each workload checks every returned byte, records
+five samples per operation, and discards only the predefined first warm-up
+sample. The gate compares medians of per-VM medians, rejecting missing samples,
+failed outer VM tests and absent scenario completion markers. The default
+maximum latency regression is 15%; set
+`SEAWEEDFS_WINDOWS_ACCESS_MAX_REGRESSION_PERCENT` before the campaign if another
+budget is required. Retain `windows-access-regression.*` together with the VM
+result directories. This measures small-file open/read/close and repeated
+reads through an open handle, not bulk throughput or complete qualification.
+Use the pre-change Windows fork build to isolate permission overhead; do not
+label that comparison as a vanilla-upstream baseline.
+
 To reproduce a standalone-client comparison in Actions, configure the optional
 `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH`/`SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` pair
 documented in the root README. Both must match the reviewed executable; omitting

@@ -18,7 +18,10 @@ OPERATIONS = {"open_read_close": 256, "handle_read": 4096}
 def load_runs(paths):
     runs = {op: [] for op in OPERATIONS}
     for path in paths:
-        text = Path(path).read_text(encoding="utf-8", errors="strict")
+        # PowerShell can emit truncated/non-UTF8 diagnostic filenames. Timing
+        # records are strictly ASCII; escape unrelated bytes rather than
+        # silently dropping them or losing the actual test-failure diagnostic.
+        text = Path(path).read_text(encoding="utf-8", errors="backslashreplace")
         if "--- PASS: TestWindowsAccessPerformance" not in text:
             raise ValueError(f"{path}: performance test did not pass")
         samples = {op: {} for op in OPERATIONS}

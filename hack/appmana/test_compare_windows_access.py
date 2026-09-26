@@ -40,6 +40,10 @@ class SamplesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.load(self.text.replace("iterations=256", "iterations=1"))
 
+    def test_non_utf8_diagnostic(self):
+        self.path.write_bytes(b"diagnostic: \xff\n" + self.text.encode())
+        self.assertEqual(compare.load_runs([self.path]), {op: [102.5] for op in compare.OPERATIONS})
+
 
 if __name__ == "__main__":
     unittest.main()

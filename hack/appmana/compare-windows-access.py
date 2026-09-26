@@ -24,6 +24,12 @@ def load_runs(paths):
         text = Path(path).read_text(encoding="utf-8", errors="backslashreplace")
         if "--- PASS: TestWindowsAccessPerformance" not in text:
             raise ValueError(f"{path}: performance test did not pass")
+        if re.search(r"(?m)^\s*(?:--- FAIL:|FAIL:|FAIL(?:\s|$))", text):
+            raise ValueError(f"{path}: workload or outer VM gate failed")
+        if not re.search(r"(?m)^\s*--- PASS: TestWindowsMountLab \(", text):
+            raise ValueError(f"{path}: outer VM gate did not pass")
+        if not re.search(r"(?m)^\s*SCENARIO_COMPLETE:[^\r\n]+:AccessPerformance-\d+\s*$", text):
+            raise ValueError(f"{path}: performance scenario did not complete")
         samples = {op: {} for op in OPERATIONS}
         for index, op, iterations, value in SAMPLE.findall(text):
             if op not in OPERATIONS or int(iterations) != OPERATIONS[op] or int(value) <= 0:

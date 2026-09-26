@@ -398,30 +398,8 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 			if r.GetExitCode() != 0 || strings.Contains(output, "FAIL:") {
 				t.Fatalf("%s failed: exit %d", scenario, r.GetExitCode())
 			}
-			marker := "PASS: git init iteration 20 leaves no stale config.lock"
-			if scenario == "NativeMetadata" {
-				marker = "PASS: native metadata regressions completes without skips"
-			}
-			if scenario == "Conformance" {
-				marker = "PASS: upstream conformance including known failures"
-			}
-			if scenario == "All" {
-				for _, required := range []string{"PASS: native mounted suite completes without skips", "PASS: native persistence write completes without skips", "PASS: native persistence verify completes without skips"} {
-					if !strings.Contains(output, required) {
-						t.Fatalf("full suite missing evidence: %s", required)
-					}
-				}
-			}
-			if scenario == "GitLfsTempMetadata" {
-				marker = "PASS: Git LFS status iteration 20 reports all 32 modified assets"
-				for _, required := range []string{"PASS: Git LFS filter is active", "PASS: Git LFS seed commit succeeds"} {
-					if !strings.Contains(output, required) {
-						t.Fatalf("%s missing prerequisite evidence: %s", scenario, required)
-					}
-				}
-			}
-			if !strings.Contains(output, marker) {
-				t.Fatalf("%s did not complete all required iterations", scenario)
+			if err := validateWindowsScenarioEvidence(scenario, output); err != nil {
+				t.Fatal(err)
 			}
 			if scenario == "GitLfsTempMetadata" && os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_TEST") != "" && !strings.Contains(output, "PASS: native Git LFS object rename reproducer completes without skips") {
 				t.Fatal("native object-rename regression did not complete")

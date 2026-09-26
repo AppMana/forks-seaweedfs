@@ -412,6 +412,18 @@ try {
     if ($ExpectedWinFspDll) { Assert-WinFspModule $mount.Id $ExpectedWinFspDll }
 
     if ($TestCase -eq 'NativeMetadata') {
+        if ($Verbosity -ge 1) {
+            # Retain the actual Windows identity/descriptor and persisted
+            # filer mode together; diagnostic runs are not timing baselines.
+            & whoami.exe /all
+            Write-Host "SECURITY_ROOT: $((Get-Acl -LiteralPath $mnt).Sddl)"
+            $securityProbe = Join-Path $mnt 'native-security-diagnostic'
+            New-Item -ItemType Directory -Path $securityProbe | Out-Null
+            Write-Host "SECURITY_DIRECTORY: $((Get-Acl -LiteralPath $securityProbe).Sddl)"
+            $listing = Invoke-RestMethod -Uri 'http://127.0.0.1:8888/?pretty=y' -Headers @{Accept='application/json'}
+            $listing | ConvertTo-Json -Depth 8 | Write-Host
+            Remove-Item -LiteralPath $securityProbe
+        }
         Invoke-NativeMountedSuite $mnt -MetadataOnly
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }

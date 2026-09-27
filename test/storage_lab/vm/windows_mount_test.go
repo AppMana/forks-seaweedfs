@@ -77,6 +77,10 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal("crash qualification cannot use a test-side junction intervention")
 	}
 	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
+	nativePackage := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_NATIVE_PACKAGE")
+	if nativePackage != "" && labDLL != "" {
+		t.Fatal("native package selects a matched DLL; unset SEAWEEDFS_WINDOWS_WINFSP_DLL")
+	}
 	if rollbackMountManager && labDLL == "" {
 		t.Fatal("rollback injection requires an explicit lab DLL")
 	}
@@ -117,6 +121,12 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal("full mounted suite requires SEAWEEDFS_WINDOWS_WINFSP_TEST")
 	}
 	artifacts := map[string][]byte{}
+	if nativePackage != "" {
+		artifacts, err = nativeWinFspInputs(nativePackage, os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_FORK"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	var provenance strings.Builder
 	fmt.Fprintf(&provenance, "mount_manager_from_fsd=%q\n", registrationMode)
 	fmt.Fprintf(&provenance, "mount_manager_check_cleanup=%q\n", cleanupMode)
@@ -142,6 +152,17 @@ func TestWindowsMountLab(t *testing.T) {
 		for name, data := range map[string][]byte{"winfsp-build-manifest.txt": manifest, "winfsp-source.patch": patch} {
 			if err := os.WriteFile(filepath.Join(resultDir, name), data, 0600); err != nil {
 				t.Fatal(err)
+			}
+		}
+	}
+	if nativePackage != "" {
+		labDLL = filepath.Join(nativePackage, "winfsp-x64.dll")
+		for name, data := range artifacts {
+			if strings.Contains(name, `\output\`) || strings.HasSuffix(name, "install-native-winfsp.ps1") {
+				fmt.Fprintf(&provenance, "native_artifact=%s sha256=%s\n", name, sha(data))
+				if err := os.WriteFile(filepath.Join(resultDir, "native-"+strings.ReplaceAll(name, `\`, "_")), data, 0600); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}
@@ -257,6 +278,28 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	}
 	if err := validateWindowsCommandOutput(r.GetExitCode(), string(r.GetStdout()), setupMarker); err != nil {
 		t.Fatal(err)
+	}
+	if nativePackage != "" {
+		token := filepath.Base(resultDir)
+		install, err := n.ExecWithTimeout(ctx, 5*time.Minute, ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `C:\lab\install-native-winfsp.ps1`, "-Token", token)
+		output := string(install.GetStdout()) + string(install.GetStderr())
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "native-install.log"), []byte(output), 0600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateWindowsCommandOutput(install.GetExitCode(), output, "INSTALL_COMPLETE:"+token); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.Restart(ctx); err != nil {
+			t.Fatal(err)
+		}
+		verify := `$ErrorActionPreference='Stop'; $m=Get-Content C:\lab\output\manifest.json -Raw|ConvertFrom-Json; if((Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToFileTimeUtc() -le [long](Get-Content C:\lab\pre-reboot.txt)){throw 'reboot not observed'}; & sc.exe start WinFsp; if($LASTEXITCODE -notin @(0,1056)){throw 'candidate driver failed to load'}; $drivers=@(Get-CimInstance Win32_SystemDriver|Where-Object {$_.Name -like 'WinFsp*' -and $_.State -eq 'Running'}); if($drivers.Count -ne 1 -or $drivers[0].Name -ne 'WinFsp' -or $drivers[0].PathName.Trim('"') -notin @('C:\lab\output\winfsp-x64.sys','\??\C:\lab\output\winfsp-x64.sys')){throw 'wrong loaded driver'}; if((Get-FileHash C:\lab\output\winfsp-x64.sys).Hash -ine $m.driver_sha256){throw 'driver changed'}; Write-Output 'NATIVE_DRIVER_READY:` + token + `'`
+		_, err = lab.RunTimeline(ctx, &labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{Exec: &labv1.ExecRequest{Node: n.Ref(), Argv: []string{ps, "-NoProfile", "-Command", verify}, TimeoutMillis: 30000}, TimeoutMillis: 600000, RetryMillis: 2000, StdoutContains: []byte("NATIVE_DRIVER_READY:" + token)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if isolateMountManager {
 		nativeMarker := "NATIVE_COMPLETE:" + filepath.Base(resultDir)

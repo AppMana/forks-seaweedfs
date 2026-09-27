@@ -44,10 +44,19 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	canonical, volume := symlinkGUIDTarget(t, target)
+	nested := filepath.Join(root, "parent", "child", "target.bin")
+	if err := os.MkdirAll(filepath.Dir(nested), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAndSync(nested, payload); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct{ name, target string }{
 		{"relative", "target.bin"},
 		{"absolute_same_volume", target},
 		{"absolute_volume_guid", canonical},
+		{"absolute_nested", nested},
+		{"absolute_casefold", strings.ToLower(target)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			link := filepath.Join(root, "link-"+tc.name)
@@ -69,6 +78,26 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 			}
 		})
 	}
+	t.Run("absolute_dangling", func(t *testing.T) {
+		missing := filepath.Join(root, "not-yet", "target.bin")
+		link := filepath.Join(root, "dangling")
+		if err := os.Symlink(missing, link); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(link)
+		if _, err := os.ReadFile(link); !os.IsNotExist(err) {
+			t.Fatalf("dangling target must be absent: %v", err)
+		}
+		if err := os.Mkdir(filepath.Dir(missing), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeAndSync(missing, payload); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(link); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("created dangling target: %q %v", got, err)
+		}
+	})
 	t.Run("cross_volume_rejected", func(t *testing.T) {
 		external := filepath.Join(t.TempDir(), "external.bin")
 		if err := writeAndSync(external, payload); err != nil {

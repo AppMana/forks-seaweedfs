@@ -20,12 +20,14 @@ import (
 )
 
 type nativeWinFspManifest struct {
-	Revision       string `json:"source_revision"`
-	DriverRevision string `json:"driver_source_revision"`
-	DriverSHA      string `json:"driver_sha256"`
-	DLLSHA         string `json:"dll_sha256"`
-	Thumbprint     string `json:"certificate_thumbprint"`
-	LabOnly        bool   `json:"lab_only"`
+	Revision         string `json:"source_revision"`
+	DriverRevision   string `json:"driver_source_revision"`
+	SourceArchiveSHA string `json:"source_archive_sha256"`
+	DriverArchiveSHA string `json:"driver_source_archive_sha256"`
+	DriverSHA        string `json:"driver_sha256"`
+	DLLSHA           string `json:"dll_sha256"`
+	Thumbprint       string `json:"certificate_thumbprint"`
+	LabOnly          bool   `json:"lab_only"`
 }
 
 func validateNativeWinFsp(manifest, driver, dll, certificate []byte) (nativeWinFspManifest, error) {
@@ -66,8 +68,13 @@ func nativeWinFspInputs(directory, fork string) (map[string][]byte, error) {
 		}
 		files[`C:\lab\output\`+name] = b
 	}
-	_, err := validateNativeWinFsp(files[`C:\lab\output\manifest.json`], files[`C:\lab\output\winfsp-x64.sys`], files[`C:\lab\output\winfsp-x64.dll`], files[`C:\lab\output\lab.cer`])
+	m, err := validateNativeWinFsp(files[`C:\lab\output\manifest.json`], files[`C:\lab\output\winfsp-x64.sys`], files[`C:\lab\output\winfsp-x64.dll`], files[`C:\lab\output\lab.cer`])
 	if err != nil {
+		return nil, err
+	}
+	if err := validateNativeWinFspSources(m, func(revision string) ([]byte, error) {
+		return exec.Command("git", "-C", fork, "archive", "--format=zip", revision).Output()
+	}); err != nil {
 		return nil, err
 	}
 	revision, err := exec.Command("git", "-C", fork, "rev-parse", "--verify", "HEAD^{commit}").Output()
@@ -82,6 +89,59 @@ func nativeWinFspInputs(directory, fork string) (map[string][]byte, error) {
 	files[`C:\lab\output\installer-revision.txt`] = revision
 	files[`C:\lab\winfsp-x64.dll`] = files[`C:\lab\output\winfsp-x64.dll`]
 	return files, nil
+}
+
+// Reconstruct exact commit archives locally. These attest the source snapshot,
+// not a reproducible-build proof; binary digests and signer are checked too.
+func validateNativeWinFspSources(m nativeWinFspManifest, archive func(string) ([]byte, error)) error {
+	if m.DriverArchiveSHA == "" && m.DriverRevision == m.Revision {
+		m.DriverArchiveSHA = m.SourceArchiveSHA // Earlier same-source manifests.
+	}
+	for _, pair := range [][2]string{{m.Revision, m.SourceArchiveSHA}, {m.DriverRevision, m.DriverArchiveSHA}} {
+		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(pair[0]) || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(pair[1]) {
+			return fmt.Errorf("native source commit/archive digest required")
+		}
+		b, err := archive(pair[0])
+		if err != nil {
+			return fmt.Errorf("native source archive %s: %w", pair[0], err)
+		}
+		if sha(b) != pair[1] {
+			return fmt.Errorf("native source archive mismatch: %s", pair[0])
+		}
+	}
+	return nil
+}
+
+func TestNativeWinFspSourceArchives(t *testing.T) {
+	app, driver := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	archive := func(rev string) ([]byte, error) {
+		if rev != app && rev != driver {
+			return nil, fmt.Errorf("missing commit")
+		}
+		return []byte(rev), nil
+	}
+	m := nativeWinFspManifest{Revision: app, DriverRevision: driver, SourceArchiveSHA: sha([]byte(app)), DriverArchiveSHA: sha([]byte(driver))}
+	if err := validateNativeWinFspSources(m, archive); err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*nativeWinFspManifest){
+		func(m *nativeWinFspManifest) { m.SourceArchiveSHA = "" },
+		func(m *nativeWinFspManifest) { m.DriverArchiveSHA = "" },
+		func(m *nativeWinFspManifest) { m.DriverArchiveSHA = m.SourceArchiveSHA },
+		func(m *nativeWinFspManifest) { m.Revision = strings.Repeat("c", 40) },
+		func(m *nativeWinFspManifest) { m.Revision = "HEAD" },
+	} {
+		bad := m
+		change(&bad)
+		if err := validateNativeWinFspSources(bad, archive); err == nil {
+			t.Fatal("invalid source claim accepted")
+		}
+	}
+	m.DriverRevision = app
+	m.DriverArchiveSHA = ""
+	if err := validateNativeWinFspSources(m, archive); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestNativeWinFspManifestRejectsMismatchedArtifacts(t *testing.T) {

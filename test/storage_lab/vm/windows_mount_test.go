@@ -292,8 +292,11 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		if err := validateWindowsCommandOutput(install.GetExitCode(), output, "INSTALL_COMPLETE:"+token); err != nil {
 			t.Fatal(err)
 		}
-		if err := n.Restart(ctx); err != nil {
-			t.Fatal(err)
+		// Driver installation needs a clean guest reboot; restarting the VM's
+		// container may interrupt pending NTFS writes like a power loss.
+		reboot, err := n.ExecWithTimeout(ctx, time.Minute, `C:\Windows\System32\shutdown.exe`, "/r", "/t", "5")
+		if err != nil || reboot.GetExitCode() != 0 {
+			t.Fatalf("schedule native-driver reboot: %v %s", err, reboot.GetStderr())
 		}
 		verify := `$ErrorActionPreference='Stop'; $m=Get-Content C:\lab\output\manifest.json -Raw|ConvertFrom-Json; if((Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToFileTimeUtc() -le [long](Get-Content C:\lab\pre-reboot.txt)){throw 'reboot not observed'}; & sc.exe start WinFsp; if($LASTEXITCODE -notin @(0,1056)){throw 'candidate driver failed to load'}; $drivers=@(Get-CimInstance Win32_SystemDriver|Where-Object {$_.Name -like 'WinFsp*' -and $_.State -eq 'Running'}); if($drivers.Count -ne 1 -or $drivers[0].Name -ne 'WinFsp' -or $drivers[0].PathName.Trim('"') -notin @('C:\lab\output\winfsp-x64.sys','\??\C:\lab\output\winfsp-x64.sys')){throw 'wrong loaded driver'}; if((Get-FileHash C:\lab\output\winfsp-x64.sys).Hash -ine $m.driver_sha256){throw 'driver changed'}; Write-Output 'NATIVE_DRIVER_READY:` + token + `'`
 		_, err = lab.RunTimeline(ctx, &labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{Exec: &labv1.ExecRequest{Node: n.Ref(), Argv: []string{ps, "-NoProfile", "-Command", verify}, TimeoutMillis: 30000}, TimeoutMillis: 600000, RetryMillis: 2000, StdoutContains: []byte("NATIVE_DRIVER_READY:" + token)}}})

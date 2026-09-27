@@ -430,14 +430,30 @@ func TestHardLinkUnsupported(t *testing.T) {
 
 // Symlinks are refused rather than half-supported: WinFsp needs a reparse
 // point to follow one, and an entry it cannot follow reads back empty.
-func TestSymlinkUnsupported(t *testing.T) {
+func TestSymlinkUnlinkPreservesTarget(t *testing.T) {
 	dir := testRoot(t)
 	target := filepath.Join(dir, "target.txt")
 	if err := os.WriteFile(target, []byte("pointed at"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := os.Symlink(target, filepath.Join(dir, "link.txt")); err == nil {
-		t.Fatal("symlink creation reported success")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("same-volume symlink: %v", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected a symlink: %v %v", info, err)
+	}
+	if data, err := os.ReadFile(link); err != nil || string(data) != "pointed at" {
+		t.Fatalf("symlink payload: %q %v", data, err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("link remains after unlink: %v", err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "pointed at" {
+		t.Fatalf("unlink changed target data: %q %v", data, err)
 	}
 }
 

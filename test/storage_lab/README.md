@@ -435,6 +435,29 @@ contract. This is separate from the native directory-mounted `All` suite and
 does not certify arbitrary ACL fidelity. Actions requires the conformance EXE
 path/hash variables documented in the root README.
 
+To qualify an actual patched kernel driver rather than a DLL with the stock
+driver, build the native package using
+[AppMana/forks-winfsp-fixes](https://github.com/AppMana/forks-winfsp-fixes)'s
+`tools/lab` harness, then use the same `TestWindowsMountLab` scenarios:
+
+```sh
+unset SEAWEEDFS_WINDOWS_WINFSP_DLL
+export SEAWEEDFS_WINDOWS_WINFSP_NATIVE_PACKAGE=/absolute/extracted/output
+export SEAWEEDFS_WINDOWS_WINFSP_FORK=/absolute/forks-winfsp-fixes
+```
+
+The package directory must contain `manifest.json`, `winfsp-x64.sys`,
+`winfsp-x64.dll`, and `lab.cer`. Preserve Windows ZIP paths when extracting;
+some Linux extractors leave backslashes in filenames instead of creating
+directories. Driver/DLL hashes, certificate thumbprint, and source revisions
+are checked before starting the VM. The committed installer from the supplied
+fork's HEAD is captured with its own revision and hash. Installation, lab
+certificate trust and test-signing changes occur only inside the fresh VM;
+the harness reboots it and verifies the running driver before invoking the
+unchanged mounted, Git/LFS and conformance tests. Do not set both the native
+package and DLL-only inputs. These lab-signed packages must never be installed
+on cluster hosts; the existing CSI MSI pins remain unchanged.
+
 To reproduce a standalone-client comparison in Actions, configure the optional
 `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH`/`SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` pair
 documented in the root README. Both must match the reviewed executable; omitting

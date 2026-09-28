@@ -58,8 +58,9 @@ func verify(root string, generation int, final bool) error {
 		for i := 0; i < files; i++ {
 			path := name(root, owner, i, final)
 			if final {
-				if _, err := os.Stat(name(root, owner, i, false)); !os.IsNotExist(err) {
-					return fmt.Errorf("old name survives: %s: %v", path, err)
+				oldPath := name(root, owner, i, false)
+				if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+					return fmt.Errorf("old name survives: %s: %v", oldPath, err)
 				}
 				if i%2 == 0 {
 					if _, err := os.Stat(path); !os.IsNotExist(err) {

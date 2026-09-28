@@ -33,6 +33,25 @@ func symlinkGUIDTarget(t *testing.T, name string) (string, string) {
 	return canonical, volume + "}"
 }
 
+func symlinkHandleIdentity(t *testing.T, name, canonicalVolume string) symlinkFilesystemIdentity {
+	t.Helper()
+	f, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var serial, componentLength, flags uint32
+	var filesystem [256]uint16
+	if err := windows.GetVolumeInformationByHandle(windows.Handle(f.Fd()), nil, 0,
+		&serial, &componentLength, &flags, &filesystem[0], uint32(len(filesystem))); err != nil {
+		t.Fatalf("query filesystem identity of %q: %v", name, err)
+	}
+	identity := symlinkFilesystemIdentity{canonicalVolume, windows.UTF16ToString(filesystem[:]), serial}
+	t.Logf("filesystem identity %q: GUID=%q filesystem=%q serial=%08x", name,
+		identity.canonicalVolume, identity.filesystem, identity.serial)
+	return identity
+}
+
 // Distinguish a genuinely relative sibling target from a same-volume absolute
 // target. Upstream's "relative" test starts with a volume-absolute target and
 // aborts before reaching its nested relative-link cases when rellinks is off.
@@ -104,8 +123,10 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, externalVolume := symlinkGUIDTarget(t, external)
-		if strings.EqualFold(volume, externalVolume) {
-			t.Fatal("cross-volume fixture must be on a different volume")
+		mountedIdentity := symlinkHandleIdentity(t, target, volume)
+		externalIdentity := symlinkHandleIdentity(t, external, externalVolume)
+		if !distinctSymlinkFilesystems(mountedIdentity, externalIdentity) {
+			t.Fatalf("cross-volume fixture is not proven external: mounted=%+v external=%+v; provide a temporary directory on a distinguishable filesystem", mountedIdentity, externalIdentity)
 		}
 		link := filepath.Join(root, "cross-volume")
 		defer os.Remove(link)

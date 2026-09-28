@@ -56,7 +56,8 @@ function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
 # Enumerate the actual executable: adding a mounted test must automatically add
 # coverage. Only tests with their own isolated-VM driver and the separate
 # remount phases are excluded here; the lab runner executes those separately.
-function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly, [switch]$PerformanceOnly) {
+function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly, [switch]$PerformanceOnly,
+    [string]$FilerEndpoint = '127.0.0.1:8888', [string]$FilerRootPrefix = '/') {
     if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
     $env:WINFSP_LAB_PE_TEST_DLL = $ExpectedWinFspDll
     if (-not $env:WINFSP_LAB_PE_TEST_DLL) {
@@ -101,9 +102,10 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
     $pattern = '^(' + (($names | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
     $nativeTimeout = if ($MetadataOnly) { '90s' } else { '20m' }
     $nativeArgs = @("-mountpoint=$mnt", "-test.run=$pattern", '-test.v', '-test.count=1', "-test.timeout=$nativeTimeout")
-    if ($Phase) { $nativeArgs += @("-phase=$Phase", '-filer=127.0.0.1:8888') }
-    if ($BasicPermissions -and -not $Phase) { $nativeArgs += @('-check-basic-permissions', '-filer=127.0.0.1:8888') }
-    if (-not $BasicPermissions -and -not $Phase) { $nativeArgs += @('-check-legacy-permissions', '-filer=127.0.0.1:8888') }
+    $nativeArgs += @("-filer=$FilerEndpoint", "-filer-root=$FilerRootPrefix")
+    if ($Phase) { $nativeArgs += "-phase=$Phase" }
+    if ($BasicPermissions -and -not $Phase) { $nativeArgs += '-check-basic-permissions' }
+    if (-not $BasicPermissions -and -not $Phase) { $nativeArgs += '-check-legacy-permissions' }
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {

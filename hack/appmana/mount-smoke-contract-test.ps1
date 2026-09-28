@@ -121,6 +121,18 @@ try {
             throw 'Wrong persistence policy inventory or incomplete execution'
         }
     }
+    $script:BasicPermissions = $false
+    Invoke-NativeMountedSuite $root -MetadataOnly -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native'
+    if ($script:capturedNativeArgs -notcontains '-filer=192.0.2.10:8888' -or
+        $script:capturedNativeArgs -notcontains '-filer-root=/buckets/pvc-test/qualification-token/native' -or
+        $script:capturedNativeArgs -notcontains '-check-legacy-permissions') {
+        throw 'CSI native suite lost configured filer endpoint or namespace prefix'
+    }
+    Invoke-NativeMountedSuite $root -Phase 'write' -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native'
+    if ($script:capturedNativeArgs -notcontains '-filer=192.0.2.10:8888' -or
+        $script:capturedNativeArgs -notcontains '-filer-root=/buckets/pvc-test/qualification-token/native') {
+        throw 'CSI persistence lost configured filer endpoint or namespace prefix'
+    }
     Remove-Item Function:Start-Process, Function:Wait-PathExists, Function:Invoke-NativeContract
     Write-Host 'PASS: basic/legacy mount switches, filer oracles and explicit test inventories'
     $cases = @('init', 'config user.name AppMana mount smoke',

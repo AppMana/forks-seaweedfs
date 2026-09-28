@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +96,24 @@ func TestMixedOracleRejectsLostDelete(t *testing.T) {
 	}
 	if err := verify(root, 1, true); err == nil {
 		t.Fatal("lost delete accepted")
+	}
+}
+
+func TestMixedOracleNamesStaleRenameSource(t *testing.T) {
+	root := seeded(t)
+	for _, action := range []string{"rewrite", "rename-delete"} {
+		for _, owner := range []string{"linux", "windows"} {
+			if err := phase(root, owner, action); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	oldPath := name(root, "linux", 1, false)
+	if err := write(oldPath, payload("linux", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	err := verify(root, 1, true)
+	if err == nil || !strings.Contains(err.Error(), oldPath) {
+		t.Fatalf("stale source diagnostic = %v, want actual stale path %s", err, oldPath)
 	}
 }

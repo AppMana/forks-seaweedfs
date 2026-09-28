@@ -1,10 +1,12 @@
 package mount
 
 import (
+	"errors"
 	"strings"
 	"syscall"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -12,6 +14,11 @@ import (
 func grpcErrorToFuseStatus(err error) fuse.Status {
 	if err == nil {
 		return fuse.OK
+	}
+	// Unary and streamed CreateEntry reconstruct this sentinel from the
+	// structured filer response code after crossing the RPC boundary.
+	if errors.Is(err, filer_pb.ErrEntryNameTooLong) {
+		return fuse.Status(syscall.ENAMETOOLONG)
 	}
 
 	// Unpack error for inspection

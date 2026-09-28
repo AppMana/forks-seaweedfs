@@ -60,10 +60,19 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 		return 0, fuse.OK
 	}
 
-	entry.Content = nil
 	offset := int64(in.Offset)
 	oldFileSize := int64(entry.Attributes.FileSize)
 	newFileSize := max(offset+int64(len(data)), oldFileSize)
+
+	// A poisoned upload pipeline (for example, exhausted volume slots) can
+	// reject this write without accepting any data. Do not destroy inline
+	// content, enlarge the file, or charge quota for a rejected write.
+	if err := fh.dirtyPages.AddPage(offset, data, fh.dirtyPages.writerPattern.IsSequentialMode(), tsNs); err != nil {
+		glog.Errorf("AddPage error: %v", err)
+		return 0, writeErrorToFuseStatus(err)
+	}
+
+	entry.Content = nil
 	entry.Attributes.FileSize = uint64(newFileSize)
 
 	// POSIX: writes update mtime and ctime. Stamp the entry now so the
@@ -79,13 +88,6 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 	// Only count the new bytes being added beyond the current file size.
 	if newFileSize > oldFileSize {
 		wfs.AddUncommittedBytes(newFileSize - oldFileSize)
-	}
-
-	// glog.V(4).Infof("%v write [%d,%d) %d", fh.f.fullpath(), req.Offset, req.Offset+int64(len(req.Data)), len(req.Data))
-
-	if err := fh.dirtyPages.AddPage(offset, data, fh.dirtyPages.writerPattern.IsSequentialMode(), tsNs); err != nil {
-		glog.Errorf("AddPage error: %v", err)
-		return 0, writeErrorToFuseStatus(err)
 	}
 
 	written = uint32(len(data))

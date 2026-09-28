@@ -1,6 +1,7 @@
 package page_writer
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -191,6 +192,13 @@ func (sc *SwapFileChunk) LastWriteTsNs() int64 {
 	return sc.lastWriteTsNs.Load()
 }
 
+// SaveToStorageFunc has no error return, but its reader is the existing error
+// channel into the uploader. A failed swap read must use that channel rather
+// than skip the callback or upload a truncated successful prefix.
+type swapReadFailure struct{ err error }
+
+func (r swapReadFailure) Read([]byte) (int, error) { return 0, r.err }
+
 func (sc *SwapFileChunk) SaveContent(saveFn SaveToStorageFunc) {
 	sc.RLock()
 	defer sc.RUnlock()
@@ -210,7 +218,16 @@ func (sc *SwapFileChunk) SaveContent(saveFn SaveToStorageFunc) {
 		}
 
 		data := mem.Allocate(int(stopOffset - startOffset))
-		n, _ := sc.swapfile.file.ReadAt(data, startOffset+int64(sc.actualChunkIndex)*sc.swapfile.chunkSize)
+		n, err := sc.swapfile.file.ReadAt(data, startOffset+int64(sc.actualChunkIndex)*sc.swapfile.chunkSize)
+		if err != nil || n != len(data) {
+			if err == nil || err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			mem.Free(data)
+			saveFn(swapReadFailure{fmt.Errorf("read swap content: %w", err)},
+				int64(sc.logicChunkIndex)*sc.swapfile.chunkSize+startOffset, stopOffset-startOffset, tsNs, func() {})
+			return
+		}
 		if n > 0 {
 			reader := util.NewBytesReader(data[:n])
 			saveFn(reader, int64(sc.logicChunkIndex)*sc.swapfile.chunkSize+startOffset, int64(n), tsNs, func() {

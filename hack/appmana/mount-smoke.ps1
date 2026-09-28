@@ -57,15 +57,9 @@ function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
 # coverage. Only tests with their own isolated-VM driver and the separate
 # remount phases are excluded here; the lab runner executes those separately.
 function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly, [switch]$PerformanceOnly,
-    [string]$FilerEndpoint = '127.0.0.1:8888', [string]$FilerRootPrefix = '/') {
+    [string]$FilerEndpoint = '127.0.0.1:8888', [string]$FilerRootPrefix = '/',
+    [uint32]$LegacyPermissionUID = 544, [uint32]$LegacyPermissionGID = 18, [uint32]$LegacyPermissionMode = 376) {
     if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
-    $env:WINFSP_LAB_PE_TEST_DLL = $ExpectedWinFspDll
-    if (-not $env:WINFSP_LAB_PE_TEST_DLL) {
-        $env:WINFSP_LAB_PE_TEST_DLL = (Get-Process -Id $mount.Id).Modules |
-            Where-Object { $_.ModuleName -ieq 'winfsp-x64.dll' } |
-            Select-Object -First 1 -ExpandProperty FileName
-        if (-not $env:WINFSP_LAB_PE_TEST_DLL) { throw 'cannot identify loaded WinFsp DLL for native suite' }
-    }
     if ($Phase) {
         $names = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence')
         $label = "native persistence $Phase"
@@ -78,7 +72,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
     } else {
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
-        $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback')
+        $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback', 'TestMappedImportSlotCandidate')
         $names = @($listing | Where-Object { $_ -match '^Test\w+$' -and $_ -notin $separate })
         if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
         $label = 'native mounted suite'
@@ -105,7 +99,10 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
     $nativeArgs += @("-filer=$FilerEndpoint", "-filer-root=$FilerRootPrefix")
     if ($Phase) { $nativeArgs += "-phase=$Phase" }
     if ($BasicPermissions -and -not $Phase) { $nativeArgs += '-check-basic-permissions' }
-    if (-not $BasicPermissions -and -not $Phase) { $nativeArgs += '-check-legacy-permissions' }
+    if (-not $BasicPermissions -and -not $Phase) {
+        $nativeArgs += '-check-legacy-permissions'
+        $nativeArgs += @("-legacy-permission-uid=$LegacyPermissionUID", "-legacy-permission-gid=$LegacyPermissionGID", "-legacy-permission-mode=$LegacyPermissionMode")
+    }
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {

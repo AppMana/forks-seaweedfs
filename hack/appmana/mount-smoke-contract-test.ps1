@@ -122,11 +122,18 @@ try {
         }
     }
     $script:BasicPermissions = $false
-    Invoke-NativeMountedSuite $root -MetadataOnly -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native'
+    Invoke-NativeMountedSuite $root -MetadataOnly -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native' -LegacyPermissionUID 0 -LegacyPermissionGID 0 -LegacyPermissionMode 504
     if ($script:capturedNativeArgs -notcontains '-filer=192.0.2.10:8888' -or
         $script:capturedNativeArgs -notcontains '-filer-root=/buckets/pvc-test/qualification-token/native' -or
-        $script:capturedNativeArgs -notcontains '-check-legacy-permissions') {
-        throw 'CSI native suite lost configured filer endpoint or namespace prefix'
+        $script:capturedNativeArgs -notcontains '-check-legacy-permissions' -or
+        $script:capturedNativeArgs -notcontains '-legacy-permission-uid=0' -or
+        $script:capturedNativeArgs -notcontains '-legacy-permission-gid=0' -or
+        $script:capturedNativeArgs -notcontains '-legacy-permission-mode=504') {
+        throw 'CSI native suite lost configured filer namespace or identity'
+    }
+    $selected = @($script:capturedNativeArgs | Where-Object { $_ -like '-test.run=*' })[0]
+    if ($selected.Contains('TestMappedImportSlotCandidate')) {
+        throw 'stock mounted suite selected candidate-only DLL test'
     }
     Invoke-NativeMountedSuite $root -Phase 'write' -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native'
     if ($script:capturedNativeArgs -notcontains '-filer=192.0.2.10:8888' -or

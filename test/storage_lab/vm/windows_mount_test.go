@@ -14,6 +14,25 @@ import (
 	"github.com/appmana/labcontainers/pkg/client"
 )
 
+func isolatedNativeInventory(nativeName string, rollback bool) (string, []string) {
+	names := []string{nativeName}
+	if rollback {
+		names = append([]string{"TestMappedImportSlotCandidate"}, names...)
+	}
+	return "^(" + strings.Join(names, "|") + ")$", names
+}
+
+func TestIsolatedNativeInventorySeparatesCandidateDLL(t *testing.T) {
+	pattern, names := isolatedNativeInventory("TestMountManagerProcessCrash", false)
+	if pattern != "^(TestMountManagerProcessCrash)$" || len(names) != 1 {
+		t.Fatalf("ordinary isolation inventory: %q %v", pattern, names)
+	}
+	pattern, names = isolatedNativeInventory("TestMountManagerRegistrationRollback", true)
+	if pattern != "^(TestMappedImportSlotCandidate|TestMountManagerRegistrationRollback)$" || len(names) != 2 {
+		t.Fatalf("candidate isolation inventory: %q %v", pattern, names)
+	}
+}
+
 // Reuse the real WinFsp smoke reproducer unchanged, in a fresh isolated VM.
 // Installers are supplied from the host: the guest needs no Internet access.
 func TestWindowsMountLab(t *testing.T) {
@@ -307,6 +326,7 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	if isolateMountManager {
 		nativeMarker := "NATIVE_COMPLETE:" + filepath.Base(resultDir)
 		nativeName := "Test" + scenarios[0]
+		nativePattern, requiredNativeNames := isolatedNativeInventory(nativeName, rollbackMountManager)
 		lastCycle := "cycle=63: 256 DOS-path queries succeeded"
 		if crashMountManager {
 			lastCycle = "cycle=7: crash cleanup and sibling preservation succeeded"
@@ -314,9 +334,12 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		if rollbackMountManager {
 			lastCycle = "rollback verified: guid-reparse fired once, mapping removed, same path reused"
 		}
-		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=^` + nativeName + `$' '-test.v' '-test.count=1' '-test.timeout=5m'`
+		command := `$env:SEAWEEDFS_WINDOWS_MOUNT_MANAGER_LAB='1'; & C:\lab\winfsp.test.exe '-test.run=` + nativePattern + `' '-test.v' '-test.count=1' '-test.timeout=5m'`
 		if labDLL != "" {
 			command = `$env:SEAWEEDFS_WINDOWS_EXPECT_WINFSP_DLL='C:\lab\winfsp-x64.dll'; ` + command
+			if rollbackMountManager {
+				command = `$env:WINFSP_LAB_PE_TEST_DLL='C:\lab\winfsp-x64.dll'; ` + command
+			}
 		}
 		if guidJunction == "1" {
 			command += ` '-mount-manager-guid-junction'`
@@ -335,7 +358,12 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 		if labDLL != "" && !strings.Contains(output, "verified loaded lab WinFsp DLL:") {
 			t.Fatal("native probe did not verify the requested lab DLL was loaded")
 		}
-		if runErr != nil || result.GetExitCode() != 0 || strings.Contains(output, "SKIP") || !strings.Contains(output, "--- PASS: "+nativeName) || !strings.Contains(output, lastCycle) {
+		for _, requiredName := range requiredNativeNames {
+			if !strings.Contains(output, "--- PASS: "+requiredName) {
+				t.Fatalf("mount-manager isolation omitted %s", requiredName)
+			}
+		}
+		if runErr != nil || result.GetExitCode() != 0 || strings.Contains(output, "SKIP") || !strings.Contains(output, lastCycle) {
 			t.Fatalf("mount-manager isolation test failed: %v exit=%d", runErr, result.GetExitCode())
 		}
 		if err := validateWindowsCommandOutput(result.GetExitCode(), output, nativeMarker); err != nil {

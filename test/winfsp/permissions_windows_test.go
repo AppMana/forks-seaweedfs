@@ -22,6 +22,9 @@ import (
 
 var checkBasicPermissions = flag.Bool("check-basic-permissions", false, "assert persisted SYSTEM default identity via -filer (basic-permissions lab only)")
 var checkLegacyPermissions = flag.Bool("check-legacy-permissions", false, "assert preserved legacy identity via -filer (compatibility lab only)")
+var legacyPermissionUID = flag.Uint("legacy-permission-uid", 544, "expected configured legacy mount UID")
+var legacyPermissionGID = flag.Uint("legacy-permission-gid", 18, "expected configured legacy mount GID")
+var legacyPermissionMode = flag.Uint("legacy-permission-mode", 0570, "expected configured legacy mount mode")
 
 func assertStoredWindowsPermissions(t *testing.T, name string, uid, gid, mode uint32) {
 	t.Helper()
@@ -83,8 +86,10 @@ func TestWindowsLegacyPermissionCompatibility(t *testing.T) {
 	if err := writeAndSync(name, payload); err != nil {
 		t.Fatal(err)
 	}
-	assertStoredWindowsPermissions(t, root, 544, 18, 0570)
-	assertStoredWindowsPermissions(t, name, 544, 18, 0570)
+	uid, gid, mode := uint32(*legacyPermissionUID), uint32(*legacyPermissionGID), uint32(*legacyPermissionMode)
+	t.Logf("configured legacy identity: uid=%d gid=%d mode=%#o", uid, gid, mode)
+	assertStoredWindowsPermissions(t, root, uid, gid, mode)
+	assertStoredWindowsPermissions(t, name, uid, gid, mode)
 	defer func() {
 		if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
 			t.Errorf("restore compatibility fixture: %v", err)

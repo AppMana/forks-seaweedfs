@@ -2,6 +2,7 @@ package page_writer
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -144,12 +145,13 @@ func (up *UploadPipeline) SaveDataAt(p []byte, off int64, isSequential bool, tsN
 			pageChunk = NewMemChunk(logicChunkIndex, up.ChunkSize)
 			// fmt.Printf(" create mem  chunk %d\n", logicChunkIndex)
 		} else {
-			pageChunk = up.swapFile.NewSwapFileChunk(logicChunkIndex)
+			swapChunk := up.swapFile.NewSwapFileChunk(logicChunkIndex)
 			// fmt.Printf(" create file chunk %d\n", logicChunkIndex)
-			if pageChunk == nil {
+			if swapChunk == nil {
 				up.accountant.Release(up.ChunkSize)
 				return 0, fmt.Errorf("failed to create swap file chunk")
 			}
+			pageChunk = swapChunk
 		}
 		up.writableChunks[logicChunkIndex] = pageChunk
 	}
@@ -159,7 +161,13 @@ func (up *UploadPipeline) SaveDataAt(p []byte, off int64, isSequential bool, tsN
 	//if _, foundReading := up.activeReadChunks[logicChunkIndex]; foundReading {
 	//	println("found active read chunk", logicChunkIndex)
 	//}
-	n = pageChunk.WriteDataAt(p, off, tsNs)
+	n, err = pageChunk.WriteDataAt(p, off, tsNs)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return n, err
+	}
 	up.maybeMoveToSealed(pageChunk, logicChunkIndex)
 
 	return

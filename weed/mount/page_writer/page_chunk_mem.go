@@ -1,6 +1,7 @@
 package page_writer
 
 import (
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -43,12 +44,15 @@ func (mc *MemChunk) FreeResource() {
 	mem.Free(mc.buf)
 }
 
-func (mc *MemChunk) WriteDataAt(src []byte, offset int64, tsNs int64) (n int) {
+func (mc *MemChunk) WriteDataAt(src []byte, offset int64, tsNs int64) (n int, err error) {
 	mc.Lock()
 	defer mc.Unlock()
 
 	innerOffset := offset % mc.chunkSize
 	n = copy(mc.buf[innerOffset:], src)
+	if n != len(src) {
+		err = io.ErrShortWrite
+	}
 	mc.usage.MarkWritten(innerOffset, innerOffset+int64(n), tsNs)
 	mc.activityScore.MarkWrite()
 	mc.lastWriteTsNs.Store(tsNs)

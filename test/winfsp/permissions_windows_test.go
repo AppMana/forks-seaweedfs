@@ -35,7 +35,10 @@ func assertStoredWindowsPermissions(t *testing.T, name string, uid, gid, mode ui
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPath := "/" + filepath.ToSlash(rel)
+	wantPath, err := scopedFilerPath(*filerRoot, filepath.ToSlash(rel))
+	if err != nil {
+		t.Fatal(err)
+	}
 	u := url.URL{Scheme: "http", Host: *filerAddr, Path: strings.TrimSuffix(path.Dir(wantPath), "/") + "/"}
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {

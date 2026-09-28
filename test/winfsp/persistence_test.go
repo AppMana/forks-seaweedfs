@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,6 +26,7 @@ var (
 	// filerAddr enables a second check, that the bytes reached the filer and
 	// are servable without the mount in the path at all.
 	filerAddr = flag.String("filer", "", "filer host:port to cross-check through, e.g. localhost:8888")
+	filerRoot = flag.String("filer-root", "/", "absolute filer directory corresponding to -mountpoint, including any CSI/test subdirectory")
 
 	// persistSubdir is where the fixtures live, under both the mount and the
 	// filer's mount root.
@@ -172,7 +174,11 @@ func writeAndSync(path string, content []byte) error {
 }
 
 func fetchFromFiler(addr, filerPath string) ([]byte, error) {
-	endpoint := &url.URL{Scheme: "http", Host: addr, Path: "/" + filerPath}
+	fullPath, err := scopedFilerPath(*filerRoot, filerPath)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := &url.URL{Scheme: "http", Host: addr, Path: fullPath}
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(endpoint.String())
 	if err != nil {
@@ -183,4 +189,22 @@ func fetchFromFiler(addr, filerPath string) ([]byte, error) {
 		return nil, fmt.Errorf("GET %s: %s", endpoint, resp.Status)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// Both byte persistence and stored-permission checks must address the same
+// namespace. Reject escapes instead of accidentally validating another PVC.
+func scopedFilerPath(root, relative string) (string, error) {
+	relative = strings.ReplaceAll(relative, `\`, "/")
+	if root == "" {
+		root = "/"
+	}
+	if !strings.HasPrefix(root, "/") || strings.Contains(root, `\`) || strings.HasPrefix(relative, "/") {
+		return "", fmt.Errorf("invalid filer root/relative path: %q/%q", root, relative)
+	}
+	for _, component := range strings.Split(root+"/"+relative, "/") {
+		if component == ".." {
+			return "", fmt.Errorf("filer path must not escape supplied root: %q/%q", root, relative)
+		}
+	}
+	return path.Join(root, relative), nil
 }

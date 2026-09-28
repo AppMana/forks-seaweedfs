@@ -95,8 +95,18 @@ func TestEntryListenerSeesRefreshedOpenHandle(t *testing.T) {
 }
 
 type recordingInodeNotifier struct {
-	calls    []inodeNotification
-	onNotify func()
+	entryCalls    []entryNotification
+	onEntryNotify func(uint64, string)
+	calls         []inodeNotification
+	onNotify      func()
+}
+
+func (n *recordingInodeNotifier) EntryNotify(parent uint64, name string) fuse.Status {
+	n.entryCalls = append(n.entryCalls, entryNotification{parent, name})
+	if n.onEntryNotify != nil {
+		n.onEntryNotify(parent, name)
+	}
+	return fuse.OK
 }
 
 func (n *recordingInodeNotifier) InodeNotify(inode uint64, offset, length int64) fuse.Status {

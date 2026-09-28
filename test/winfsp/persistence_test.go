@@ -152,9 +152,8 @@ func persistenceVerify(t *testing.T) {
 		t.Fatal("mount root directory is empty after remount")
 	}
 
-	if err := os.RemoveAll(root); err != nil {
-		t.Errorf("cleanup: %v", err)
-	}
+	// Verification is observational: the same evidence is checked again after
+	// later remounts/reboots. Only the fixture owner may clean up its lifecycle.
 }
 
 func writeAndSync(path string, content []byte) error {

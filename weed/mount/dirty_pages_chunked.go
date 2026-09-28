@@ -51,6 +51,12 @@ func (pages *ChunkedDirtyPages) AddPage(offset int64, data []byte, isSequential 
 
 	glog.V(4).Infof("%v memory AddPage [%d, %d)", pages.fh.fh, offset, offset+int64(len(data)))
 	_, err := pages.uploadPipeline.SaveDataAt(data, offset, isSequential, tsNs)
+	if err != nil {
+		// Buffer failures are just as fatal as failed uploads: an earlier
+		// subchunk may already have been accepted. Never allow a later flush
+		// to acknowledge the incomplete request as successfully persisted.
+		pages.setLastError(err)
+	}
 
 	return err
 }

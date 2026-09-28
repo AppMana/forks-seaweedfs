@@ -111,14 +111,13 @@ func (sc *SwapFileChunk) FreeResource() {
 	// println(sc.logicChunkIndex, "|", "----", sc.actualChunkIndex, sc, sc.swapfile)
 }
 
-func (sc *SwapFileChunk) WriteDataAt(src []byte, offset int64, tsNs int64) (n int) {
+func (sc *SwapFileChunk) WriteDataAt(src []byte, offset int64, tsNs int64) (n int, err error) {
 	sc.Lock()
 	defer sc.Unlock()
 
 	// println(sc.logicChunkIndex, "|", tsNs, "write at", offset, len(src), sc.actualChunkIndex)
 
 	innerOffset := offset % sc.swapfile.chunkSize
-	var err error
 	n, err = sc.swapfile.file.WriteAt(src, int64(sc.actualChunkIndex)*sc.swapfile.chunkSize+innerOffset)
 	sc.usage.MarkWritten(innerOffset, innerOffset+int64(n), tsNs)
 	if err != nil {

@@ -8,7 +8,7 @@ type SaveToStorageFunc func(reader io.Reader, offset int64, size int64, modified
 
 type PageChunk interface {
 	FreeResource()
-	WriteDataAt(src []byte, offset int64, tsNs int64) (n int)
+	WriteDataAt(src []byte, offset int64, tsNs int64) (n int, err error)
 	ReadDataAt(p []byte, off int64, tsNs int64) (maxStop int64)
 	IsComplete() bool
 	IsContiguouslyWritten() bool

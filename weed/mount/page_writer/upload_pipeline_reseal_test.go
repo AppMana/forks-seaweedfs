@@ -24,14 +24,14 @@ func newGatedChunk() *gatedChunk {
 	}
 }
 
-func (c *gatedChunk) FreeResource()                         { c.freeCount.Add(1) }
-func (c *gatedChunk) WriteDataAt([]byte, int64, int64) int  { return 0 }
-func (c *gatedChunk) ReadDataAt([]byte, int64, int64) int64 { return 0 }
-func (c *gatedChunk) IsComplete() bool                      { return false }
-func (c *gatedChunk) IsContiguouslyWritten() bool           { return true }
-func (c *gatedChunk) ActivityScore() int64                  { return 0 }
-func (c *gatedChunk) WrittenSize() int64                    { return 0 }
-func (c *gatedChunk) LastWriteTsNs() int64                  { return 0 }
+func (c *gatedChunk) FreeResource()                                 { c.freeCount.Add(1) }
+func (c *gatedChunk) WriteDataAt([]byte, int64, int64) (int, error) { return 0, nil }
+func (c *gatedChunk) ReadDataAt([]byte, int64, int64) int64         { return 0 }
+func (c *gatedChunk) IsComplete() bool                              { return false }
+func (c *gatedChunk) IsContiguouslyWritten() bool                   { return true }
+func (c *gatedChunk) ActivityScore() int64                          { return 0 }
+func (c *gatedChunk) WrittenSize() int64                            { return 0 }
+func (c *gatedChunk) LastWriteTsNs() int64                          { return 0 }
 func (c *gatedChunk) SaveContent(saveFn SaveToStorageFunc) {
 	<-c.gate
 	c.freedBefore = c.freeCount.Load() > 0

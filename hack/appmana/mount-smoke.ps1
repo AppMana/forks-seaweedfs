@@ -62,6 +62,9 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
     if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
     if ($Phase) {
         $names = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence')
+        if ($Phase -eq 'verify') {
+            $names += @('TestWindowsAttributesPersistenceRepeatVerify', 'TestWindowsPermissionsPersistenceRepeatVerify')
+        }
         $label = "native persistence $Phase"
     } elseif ($PerformanceOnly) {
         $names = @('TestWindowsAccessPerformance')
@@ -73,6 +76,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
         $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback', 'TestMappedImportSlotCandidate')
+        $separate += @('TestWindowsAttributesPersistenceRepeatVerify', 'TestWindowsPermissionsPersistenceRepeatVerify')
         $names = @($listing | Where-Object { $_ -match '^Test\w+$' -and $_ -notin $separate })
         if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
         $label = 'native mounted suite'
@@ -83,7 +87,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         $names = @($names | Where-Object { $_ -ne 'TestWindowsLegacyPermissionCompatibility' })
         Write-Host 'PERMISSION_POLICY: basic (access-denial enforcement)'
     } else {
-        $names = @($names | Where-Object { $_ -notin @('TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity', 'TestWindowsPermissionsPersistence') })
+        $names = @($names | Where-Object { $_ -notin @('TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity', 'TestWindowsPermissionsPersistence', 'TestWindowsPermissionsPersistenceRepeatVerify') })
         if ($MetadataOnly) { $names += 'TestWindowsLegacyPermissionCompatibility' }
         Write-Host 'PERMISSION_POLICY: legacy (permissive compatibility; not access-denial qualification)'
     }

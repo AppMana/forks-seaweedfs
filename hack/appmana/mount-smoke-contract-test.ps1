@@ -120,6 +120,13 @@ try {
             -not $selected.Contains('TestPersistence') -or $script:failures -ne 0) {
             throw 'Wrong persistence policy inventory or incomplete execution'
         }
+        if ($selected.Contains('RepeatVerify')) { throw 'write phase must not run repeat verifiers' }
+        Invoke-NativeMountedSuite $root -Phase 'verify'
+        $selected = @($script:capturedNativeArgs | Where-Object { $_ -like '-test.run=*' })[0]
+        if (-not $selected.Contains('TestWindowsAttributesPersistenceRepeatVerify') -or
+            $selected.Contains('TestWindowsPermissionsPersistenceRepeatVerify') -ne $script:BasicPermissions) {
+            throw 'verify phase lost real mounted repeatability coverage'
+        }
     }
     $script:BasicPermissions = $false
     Invoke-NativeMountedSuite $root -MetadataOnly -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native' -LegacyPermissionUID 0 -LegacyPermissionGID 0 -LegacyPermissionMode 504

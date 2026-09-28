@@ -187,16 +187,6 @@ func TestWindowsAttributesPersistence(t *testing.T) {
 		if data, err := os.ReadFile(name); err != nil || string(data) != "persistent intact payload" {
 			t.Fatalf("persistent payload differs: %q %v", data, err)
 		}
-		if *phase == "verify" {
-			if err := windows.SetFileAttributes(p, windows.FILE_ATTRIBUTE_NORMAL); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if *phase == "verify" {
-		if err := os.RemoveAll(root); err != nil {
-			t.Fatal(err)
-		}
 	}
 }
 

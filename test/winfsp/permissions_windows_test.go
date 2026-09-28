@@ -232,7 +232,8 @@ func setWindowsBasicSecurity(name, sddl string) error {
 }
 
 // The verify phase runs in a fresh mount/process: cached descriptors cannot
-// satisfy this assertion. Restoring access must recover exactly the old bytes.
+// satisfy this assertion. Check protected bytes directly through the filer:
+// granting access here would destroy the restriction needed by later verifies.
 func TestWindowsPermissionsPersistence(t *testing.T) {
 	if *mountPoint == "" || (*phase != "write" && *phase != "verify") {
 		t.Skip("requires a mounted write/verify persistence phase")
@@ -257,14 +258,11 @@ func TestWindowsPermissionsPersistence(t *testing.T) {
 		t.Errorf("%s: persisted write restriction not enforced: %v", *phase, err)
 	}
 	if *phase == "verify" {
-		if err := setWindowsBasicSecurity(name, "D:P(A;;FA;;;WD)"); err != nil {
-			t.Fatal(err)
+		if *filerAddr == "" {
+			t.Fatal("read-only protected-payload verification requires -filer")
 		}
-		if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, payload) {
+		if got, err := fetchFromFiler(*filerAddr, "winfsp-permissions-persist.bin"); err != nil || !bytes.Equal(got, payload) {
 			t.Fatalf("remount damaged protected payload: %q %v", got, err)
-		}
-		if err := os.Remove(name); err != nil {
-			t.Fatal(err)
 		}
 	}
 }

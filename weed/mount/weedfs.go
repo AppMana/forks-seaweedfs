@@ -146,6 +146,7 @@ type Option struct {
 
 type inodeNotifier interface {
 	InodeNotify(uint64, int64, int64) fuse.Status
+	EntryNotify(uint64, string) fuse.Status
 }
 
 type WFS struct {
@@ -965,11 +966,40 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 	if replacedInode != 0 {
 		wfs.markHandleDeleted(replacedInode)
 	}
+	wfs.invalidateKernelEntry(invalidation)
 	wfs.invalidateKernelFileAttributes(invalidation)
 	// Cache invalidation can immediately re-enter Read/GetAttr. Notify front
 	// ends only after their shared handle has advanced and its locks are free.
 	if listener != nil {
 		listener(invalidation)
+	}
+}
+
+// Directory page-cache invalidation does not expire a cached name lookup.
+// Remote namespace changes must expire both positive and negative dentries;
+// rename events supply separate source and destination invalidations. Run on
+// the invalidation worker after moving paths and releasing handle locks, since
+// EntryNotify may cause the kernel to re-enter filesystem operations.
+func (wfs *WFS) invalidateKernelEntry(invalidation meta_cache.EntryInvalidation) {
+	server := wfs.fuseServer
+	if server == nil || invalidation.PreviousEntry != nil {
+		return // Ordinary content/attribute updates do not change the name.
+	}
+	if invalidation.Entry == nil && !invalidation.Deleted && invalidation.RenamedTo == "" {
+		return
+	}
+	for _, signature := range invalidation.Signatures {
+		if signature == wfs.signature {
+			return // The initiating kernel already changed its own namespace.
+		}
+	}
+	dir, name := invalidation.Path.DirAndName()
+	parent, found := wfs.inodeToPath.GetInode(util.FullPath(dir))
+	if !found {
+		return
+	}
+	if status := server.EntryNotify(parent, name); status != fuse.OK && status != fuse.ENOENT && status != fuse.ENOSYS {
+		glog.V(4).Infof("invalidate kernel name %s: %v", invalidation.Path, status)
 	}
 }
 

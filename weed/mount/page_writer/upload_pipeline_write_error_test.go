@@ -6,6 +6,8 @@ import (
 	"os"
 	"syscall"
 	"testing"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 )
 
 type failedWriteChunk struct {
@@ -49,5 +51,56 @@ func TestUploadPipelineReturnsSwapWriteError(t *testing.T) {
 	n, err := up.SaveDataAt([]byte("lost"), 5, false, 2)
 	if n != 0 || !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("failed swap write = (%d, %v), want (0, file closed)", n, err)
+	}
+}
+
+func TestSwapSaveContentReportsReadFailure(t *testing.T) {
+	for _, failure := range []string{"healthy", "closed", "truncated"} {
+		t.Run(failure, func(t *testing.T) {
+			sf := NewSwapFile(t.TempDir(), 1024)
+			defer sf.FreeResource()
+			chunk := sf.NewSwapFileChunk(0)
+			if n, err := chunk.WriteDataAt([]byte("intact"), 0, 1); n != 6 || err != nil {
+				t.Fatalf("initial write: %d, %v", n, err)
+			}
+			var failureErr error
+			if failure == "closed" {
+				failureErr = sf.file.Close()
+			} else if failure == "truncated" {
+				failureErr = sf.file.Truncate(1026) // physical chunk starts at 1024: leave only two of six bytes
+			}
+			if failureErr != nil {
+				t.Fatal(failureErr)
+			}
+			called := false
+			var readErr error
+			var content []byte
+			chunk.SaveContent(func(r io.Reader, offset, size, ts int64, cleanup func()) {
+				defer cleanup()
+				called = true
+				content, readErr = io.ReadAll(r)
+				if readErr != nil {
+					// The actual uploader must reject this reader before it
+					// touches the deliberately nil filer client or request.
+					uploader := operation.NewUploaderWithHttpClient(nil)
+					_, _, uploadErr, _ := uploader.UploadWithRetry(nil, nil, &operation.UploadOption{}, r)
+					if !errors.Is(uploadErr, readErr) {
+						t.Errorf("uploader lost swap read failure: %v", uploadErr)
+					}
+				}
+			})
+			if failure == "healthy" {
+				if !called || readErr != nil || string(content) != "intact" {
+					t.Fatalf("healthy save: called=%v content=%q error=%v", called, content, readErr)
+				}
+				return
+			}
+			if !called || readErr == nil {
+				t.Fatalf("failed swap read silently discarded: callback=%v error=%v", called, readErr)
+			}
+			if len(content) != 0 {
+				t.Fatalf("read failure exposed partial successful prefix %q", content)
+			}
+		})
 	}
 }

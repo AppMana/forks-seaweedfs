@@ -3,6 +3,7 @@ package page_writer
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,10 +68,17 @@ func TestSwapFile_MkdirAll_Permissions(t *testing.T) {
 		t.Errorf("expected %s to be a directory", swapDir)
 	}
 
-	// Check permissions - should be 0700
-	if info.Mode().Perm() != 0700 {
-		t.Errorf("expected permissions 0700, got %o", info.Mode().Perm())
-	}
+	t.Run("POSIXMode", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			// Go's Windows Mkdir ignores mode and Stat synthesizes Unix
+			// permission bits; these bits do not describe Windows ACLs.
+			// The directory/chunk creation assertions above still run.
+			t.Skip("Windows does not implement POSIX directory mode bits")
+		}
+		if info.Mode().Perm() != 0700 {
+			t.Errorf("expected permissions 0700, got %o", info.Mode().Perm())
+		}
+	})
 }
 
 func TestSwapFile_RecreateDir(t *testing.T) {

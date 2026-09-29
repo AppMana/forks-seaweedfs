@@ -28,7 +28,7 @@ unset SEAWEEDFS_MIXED_CACHE_COHERENCE
 failed=0
 run() {
   local name=$1 pattern=$2 status=0
-  go test ./test/storage_lab/vm -run "$pattern" -count=1 -v -timeout=50m > "$suite_results/$name.log" 2>&1 || status=$?
+  (cd test/storage_lab/vm && go test . -run "$pattern" -count=1 -v -timeout=50m) > "$suite_results/$name.log" 2>&1 || status=$?
   printf '%s exit=%s\n' "$name" "$status" | tee -a "$suite_results/status.txt"
   if ((status != 0)); then failed=1; fi
 }

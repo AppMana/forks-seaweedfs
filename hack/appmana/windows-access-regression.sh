@@ -6,6 +6,7 @@ test "$#" -eq 2 || { echo 'Supply baseline and candidate Windows executables' >&
 baseline=$(realpath "$1")
 candidate=$(realpath "$2")
 test -f "$baseline" && test -f "$candidate"
+cd "$(dirname "$0")/../.."
 test "$(sha256sum "$baseline" | cut -d' ' -f1)" != "$(sha256sum "$candidate" | cut -d' ' -f1)" || {
   echo 'Identical baseline and candidate binaries are not a comparison' >&2; exit 2;
 }
@@ -48,9 +49,10 @@ for repetition in 1 2 3; do
       dll=$candidate_dll
     fi
     log="$results/$label-$repetition.log"
-    SEAWEEDFS_WINDOWS_WEED="$binary" SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$basic" \
+    (cd test/storage_lab/vm && \
+      SEAWEEDFS_WINDOWS_WEED="$binary" SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$basic" \
       SEAWEEDFS_WINDOWS_WINFSP_DLL="$dll" \
-      go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=30m 2>&1 | tee "$log"
+      go test . -run '^TestWindowsMountLab$' -count=1 -v -timeout=30m) 2>&1 | tee "$log"
     args+=("--$label" "$log")
   done
 done

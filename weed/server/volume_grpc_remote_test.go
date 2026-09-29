@@ -645,6 +645,14 @@ func TestGuardedReplicaDialerRebind(t *testing.T) {
 // caller-influenced endpoint that resolves to a blocked address, and a gcs
 // credentials path, while allowUntrusted falls back to the plain builder.
 func TestBuildGuardedRemoteStorageClient(t *testing.T) {
+	// Client construction tests the endpoint policy, not public DNS service
+	// availability. Keep the real guard and builder, with the same explicit
+	// resolver seam used by the rebinding tests above; no network is needed.
+	originalLookup := lookupIPAddrFunc
+	t.Cleanup(func() { lookupIPAddrFunc = originalLookup })
+	lookupIPAddrFunc = stubLookup(t, map[string][]net.IP{
+		"oauth2.googleapis.com": {net.ParseIP("142.250.1.1")},
+	})
 	loopbackS3 := &remote_pb.RemoteConf{
 		Name:        "poc",
 		Type:        "s3",

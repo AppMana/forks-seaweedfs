@@ -2,6 +2,7 @@ package needle
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
@@ -31,17 +32,40 @@ func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset u
 		buffer_pool.SyncPoolPutBuffer(bytesBuffer)
 	}()
 
-	size, actualSize, err = writeNeedleByVersion(version, n, offset, bytesBuffer)
+	// The pooled buffer holds only the record's header and footer; the payload
+	// is written straight from n.Data. Copying n.Data into the buffer made
+	// every append, on the primary and on each replica, hold a second copy of
+	// the needle, and sync.Pool kept the grown buffer until two collections.
+	size, actualSize, dataAt, err := writeNeedleFramingByVersion(version, n, offset, bytesBuffer)
 	if err != nil {
 		return
 	}
 
-	_, err = w.WriteAt(bytesBuffer.Bytes(), int64(offset))
-	if err != nil {
-		err = fmt.Errorf("failed to write %d bytes to %s at offset %d: %w", actualSize, w.Name(), offset, err)
+	// The record is written as up to three contiguous WriteAt calls. Nothing
+	// else writes this file in between: a volume's appends and deletes run
+	// under Volume.dataFileAccessLock (syncWrite, the async request worker,
+	// deleteNeedle2), and vacuum and merge append to a destination file they
+	// own. Any failed or short segment returns an error, and the deferred
+	// Truncate(end) above removes every segment already written.
+	framing := bytesBuffer.Bytes()
+	at := int64(offset)
+	for _, segment := range [][]byte{framing[:dataAt], n.Data, framing[dataAt:]} {
+		if len(segment) == 0 {
+			continue
+		}
+		var written int
+		written, err = w.WriteAt(segment, at)
+		if err == nil && written != len(segment) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			err = fmt.Errorf("failed to write %d bytes to %s at offset %d: %w", actualSize, w.Name(), offset, err)
+			return offset, size, actualSize, err
+		}
+		at += int64(written)
 	}
 
-	return offset, size, actualSize, err
+	return offset, size, actualSize, nil
 }
 
 func WriteNeedleBlob(w backend.BackendStorageFile, dataSlice []byte, size Size, appendAtNs uint64, version Version) (offset uint64, err error) {

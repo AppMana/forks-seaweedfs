@@ -8,6 +8,12 @@ import (
 )
 
 func writeNeedleV1(n *Needle, offset uint64, bytesBuffer *bytes.Buffer) (size Size, actualSize int64, err error) {
+	size, actualSize, _, err = writeNeedleV1Framing(n, offset, bytesBuffer, true)
+	return
+}
+
+// writeNeedleV1Framing: see writeNeedleCommon for withData and dataAt.
+func writeNeedleV1Framing(n *Needle, offset uint64, bytesBuffer *bytes.Buffer, withData bool) (size Size, actualSize int64, dataAt int, err error) {
 	bytesBuffer.Reset()
 	header := make([]byte, NeedleHeaderSize)
 	CookieToBytes(header[0:CookieSize], n.Cookie)
@@ -17,10 +23,13 @@ func writeNeedleV1(n *Needle, offset uint64, bytesBuffer *bytes.Buffer) (size Si
 	size = n.Size
 	actualSize = NeedleHeaderSize + int64(n.Size)
 	bytesBuffer.Write(header)
-	bytesBuffer.Write(n.Data)
+	dataAt = bytesBuffer.Len()
+	if withData {
+		bytesBuffer.Write(n.Data)
+	}
 	padding := PaddingLength(n.Size, Version1)
 	util.Uint32toBytes(header[0:NeedleChecksumSize], uint32(n.Checksum))
 	bytesBuffer.Write(header[0 : NeedleChecksumSize+padding])
 
-	return size, actualSize, nil
+	return size, actualSize, dataAt, nil
 }

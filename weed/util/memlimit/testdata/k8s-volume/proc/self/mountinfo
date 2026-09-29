@@ -1,0 +1,8 @@
+8485 5610 0:210 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w
+8487 8485 0:681 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+8488 8485 0:682 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64
+8490 8488 0:683 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
+8508 8485 0:675 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro
+8509 8508 0:31 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw
+8510 8485 8:0 / /data rw,noatime - xfs /dev/sda rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+8573 8488 0:183 / /dev/shm rw,relatime - tmpfs shm rw,size=65536k,inode64

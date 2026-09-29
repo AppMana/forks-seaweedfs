@@ -86,7 +86,13 @@ type S3ApiServerOption struct {
 	// on 2026-08-24. Enable only when no S3 client of this gateway walks
 	// prefixes that way.
 	SurfaceEmptyDirectories bool
-	MaxMB                   int32 // filer's -maxMB, read from the filer configuration at startup
+	// ShareCopyChunks lets a whole-object CopyObject within an unversioned
+	// bucket give the destination the source's chunks instead of copying the
+	// bytes; the filer reference-counts the shared chunk list. Every filer must
+	// use one shared store: filers with separate stores do not see each other's
+	// references and would free chunks the other side still uses.
+	ShareCopyChunks bool
+	MaxMB           int32 // filer's -maxMB, read from the filer configuration at startup
 	// AllowUntrustedRemoteEndpoints lets a read of a remote-only object dial a
 	// mounted endpoint that resolves to a loopback / private / metadata host.
 	AllowUntrustedRemoteEndpoints bool

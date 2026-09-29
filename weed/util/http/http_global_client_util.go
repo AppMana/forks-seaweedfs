@@ -523,14 +523,28 @@ func ReadUrlAsReaderCloser(fileUrl string, jwt string, rangeHeader string) (*htt
 	return r, reader, nil
 }
 
+// maxResponseDrain bounds how much of an unread response body CloseResponse
+// reads to keep the connection reusable. A body that ends within it is
+// drained; a longer one is closed unread, which drops the connection and tells
+// the server to stop sending instead of streaming the rest of a chunk nobody
+// wants.
+const maxResponseDrain = 64 * 1024
+
+// CloseResponse releases resp. A short remainder is drained so the keep-alive
+// connection goes back to the pool; a long one is abandoned. Draining without
+// a bound made every failed or abandoned chunk read (a failed copy, a
+// cancelled GET) pull the rest of the chunk from the volume server first,
+// adding load to a server that was usually slow already.
 func CloseResponse(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
 	reader := &CountingReader{reader: resp.Body}
-	io.Copy(io.Discard, reader)
+	io.CopyN(io.Discard, reader, maxResponseDrain+1)
 	resp.Body.Close()
-	if reader.BytesRead > 0 {
+	if reader.BytesRead > maxResponseDrain {
+		glog.V(1).Infof("response closed with more than %d bytes unread", maxResponseDrain)
+	} else if reader.BytesRead > 0 {
 		glog.V(1).Infof("response leftover %d bytes", reader.BytesRead)
 	}
 }

@@ -496,12 +496,18 @@ func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, or
 		glog.V(0).InfolnCtx(ctx, "error closing body", err)
 		return nil, err
 	}
-	// framing is owned by this call and never reused, so the transport may keep
-	// reading it after Do returns (it can, when a server answers early).
+	// A transport may keep reading a request body after Do returns: when the
+	// server answers before consuming the body, RoundTrip returns while the
+	// write goroutine is still sending it. The body reads the caller's payload,
+	// which the caller owns again once this returns, so every body is detached
+	// before returning; a detached body fails further reads instead of touching
+	// the payload. framing is owned by this call, so it needs no such care.
 	preamble := framing.Bytes()[:preambleLen]
 	trailer := framing.Bytes()[preambleLen:]
-	newBody := func() io.Reader {
-		return io.MultiReader(bytes.NewReader(preamble), bytes.NewReader(payload), bytes.NewReader(trailer))
+	bodies := &detachableBodies{}
+	defer bodies.detach()
+	newBody := func() io.ReadCloser {
+		return bodies.add(io.MultiReader(bytes.NewReader(preamble), bytes.NewReader(payload), bytes.NewReader(trailer)))
 	}
 	req, postErr := http.NewRequestWithContext(ctx, http.MethodPost, option.UploadUrl, newBody())
 	if postErr != nil {
@@ -509,7 +515,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, or
 		return nil, fmt.Errorf("create upload request %s: %v", option.UploadUrl, postErr)
 	}
 	req.ContentLength = int64(len(preamble) + len(payload) + len(trailer))
-	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(newBody()), nil }
+	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
 	req.Header.Set("Content-Type", content_type)
 	for k, v := range option.PairMap {
 		req.Header.Set(k, v)
@@ -592,3 +598,43 @@ func getEtag(r *http.Response) (etag string) {
 	}
 	return
 }
+
+// errBodyDetached is returned by a request body read after the upload that
+// created it has returned.
+var errBodyDetached = errors.New("upload body read after the upload returned")
+
+// detachableBodies hands out request bodies over a caller-owned payload and
+// cuts all of them off at once. Reads hold the mutex, so once detach has
+// taken it no read is in progress and none can reach the payload again. This
+// does not depend on the transport closing the body, which it may do late or,
+// for some HTTPClient implementations, never.
+type detachableBodies struct {
+	mu       sync.Mutex
+	detached bool
+}
+
+func (d *detachableBodies) add(r io.Reader) io.ReadCloser {
+	return &detachableBody{owner: d, r: r}
+}
+
+func (d *detachableBodies) detach() {
+	d.mu.Lock()
+	d.detached = true
+	d.mu.Unlock()
+}
+
+type detachableBody struct {
+	owner *detachableBodies
+	r     io.Reader
+}
+
+func (b *detachableBody) Read(p []byte) (int, error) {
+	b.owner.mu.Lock()
+	defer b.owner.mu.Unlock()
+	if b.owner.detached {
+		return 0, errBodyDetached
+	}
+	return b.r.Read(p)
+}
+
+func (b *detachableBody) Close() error { return nil }

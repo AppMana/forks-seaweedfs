@@ -56,12 +56,13 @@ func TestApplyMemoryLimitsDerivesFromCgroup(t *testing.T) {
 	opts := VolumeServerOptions{concurrentUploadLimitMB: &upload, concurrentDownloadLimitMB: &download}
 	opts.applyMemoryLimits(cgroupRoot(t, "5368709120\n", "32000000"))
 
-	// 5 GiB available: Go limit 4 GiB, budget 4 GiB - 1.25 GiB = 2816 MiB, split 3:1.
-	if got := debug.SetMemoryLimit(-1); got != 4<<30 {
-		t.Fatalf("Go memory limit = %d, want %d", got, int64(4<<30))
+	// 5 GiB available: Go limit 4.5 GiB (90%), budget 4.5 GiB - 1.25 GiB =
+	// 3328 MiB, split 3:1.
+	if got := debug.SetMemoryLimit(-1); got != 4831838208 {
+		t.Fatalf("Go memory limit = %d, want %d", got, int64(4831838208))
 	}
-	if upload != 2112 || download != 704 {
-		t.Fatalf("admission = %d/%d MiB, want 2112/704", upload, download)
+	if upload != 2496 || download != 832 {
+		t.Fatalf("admission = %d/%d MiB, want 2496/832", upload, download)
 	}
 }
 
@@ -75,11 +76,11 @@ func TestApplyMemoryLimitsV1ParentSlice(t *testing.T) {
 	opts := VolumeServerOptions{concurrentUploadLimitMB: &upload, concurrentDownloadLimitMB: &download}
 	opts.applyMemoryLimits("../util/memlimit/testdata/synology")
 
-	if got := debug.SetMemoryLimit(-1); got != 4<<30 {
-		t.Fatalf("Go memory limit = %d, want %d", got, int64(4<<30))
+	if got := debug.SetMemoryLimit(-1); got != 4831838208 {
+		t.Fatalf("Go memory limit = %d, want %d", got, int64(4831838208))
 	}
-	if upload != 2112 || download != 704 {
-		t.Fatalf("admission = %d/%d MiB, want 2112/704", upload, download)
+	if upload != 2496 || download != 832 {
+		t.Fatalf("admission = %d/%d MiB, want 2496/832", upload, download)
 	}
 }
 
@@ -109,11 +110,11 @@ func TestApplyMemoryLimitsUnlimitedCgroupUsesPhysicalRAM(t *testing.T) {
 	opts := VolumeServerOptions{concurrentUploadLimitMB: &upload, concurrentDownloadLimitMB: &download}
 	opts.applyMemoryLimits(cgroupRoot(t, "max\n", "5242880")) // 5 GiB of RAM
 
-	if got := debug.SetMemoryLimit(-1); got != 4<<30 {
-		t.Fatalf("Go memory limit = %d, want %d", got, int64(4<<30))
+	if got := debug.SetMemoryLimit(-1); got != 4831838208 {
+		t.Fatalf("Go memory limit = %d, want %d", got, int64(4831838208))
 	}
-	if upload != 2112 || download != 704 {
-		t.Fatalf("admission = %d/%d MiB, want 2112/704", upload, download)
+	if upload != 2496 || download != 832 {
+		t.Fatalf("admission = %d/%d MiB, want 2496/832", upload, download)
 	}
 }
 

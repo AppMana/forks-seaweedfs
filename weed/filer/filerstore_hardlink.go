@@ -11,10 +11,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
-func (fsw *FilerStoreWrapper) handleUpdateToHardLinks(ctx context.Context, entry *Entry) error {
+// handleUpdateToHardLinks returns the entry stored at entry's path before the
+// write (nil if none), which the shared-chunks bookkeeping reuses.
+func (fsw *FilerStoreWrapper) handleUpdateToHardLinks(ctx context.Context, entry *Entry) (*Entry, error) {
 
 	if entry.IsDirectory() {
-		return nil
+		return nil, nil
 	}
 
 	if len(entry.HardLinkId) > 0 {
@@ -22,7 +24,7 @@ func (fsw *FilerStoreWrapper) handleUpdateToHardLinks(ctx context.Context, entry
 		glog.V(4).InfofCtx(ctx, "handleUpdateToHardLinks %s HardLinkId %x counter=%d chunks=%d",
 			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter, len(entry.GetChunks()))
 		if err := fsw.setHardLink(ctx, entry); err != nil {
-			return fmt.Errorf("setHardLink %d: %v", entry.HardLinkId, err)
+			return nil, fmt.Errorf("setHardLink %d: %v", entry.HardLinkId, err)
 		}
 	}
 
@@ -31,17 +33,20 @@ func (fsw *FilerStoreWrapper) handleUpdateToHardLinks(ctx context.Context, entry
 	actualStore := fsw.getActualStore(entry.FullPath)
 	existingEntry, err := actualStore.FindEntry(ctx, entry.FullPath)
 	if err != nil && err != filer_pb.ErrNotFound {
-		return fmt.Errorf("update existing entry %s: %v", entry.FullPath, err)
+		return nil, fmt.Errorf("update existing entry %s: %v", entry.FullPath, err)
+	}
+	if err != nil {
+		existingEntry = nil
 	}
 
 	// remove old hard link
-	if err == nil && len(existingEntry.HardLinkId) != 0 && bytes.Compare(existingEntry.HardLinkId, entry.HardLinkId) != 0 {
+	if existingEntry != nil && len(existingEntry.HardLinkId) != 0 && bytes.Compare(existingEntry.HardLinkId, entry.HardLinkId) != 0 {
 		glog.V(4).InfofCtx(ctx, "handleUpdateToHardLinks DeleteHardLink %s", entry.FullPath)
 		if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return existingEntry, nil
 }
 
 func (fsw *FilerStoreWrapper) setHardLink(ctx context.Context, entry *Entry) error {

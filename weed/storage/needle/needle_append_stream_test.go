@@ -203,3 +203,51 @@ func TestAppendDoesNotCopyPayload(t *testing.T) {
 		t.Fatalf("pooled write buffer retained %d bytes of capacity after an append", pooled.Cap())
 	}
 }
+
+// TestAppendWriteCountAroundSmallRecordLimit: payloads below
+// smallRecordPayloadLimit are written with one WriteAt, larger ones as
+// header, payload and footer; the record and returns are the same either way.
+func TestAppendWriteCountAroundSmallRecordLimit(t *testing.T) {
+	for _, version := range []Version{Version2, Version3} {
+		for _, tc := range []struct {
+			size   int
+			writes int
+		}{
+			{100, 1},
+			{smallRecordPayloadLimit - 1, 1},
+			{smallRecordPayloadLimit, 3},
+			{smallRecordPayloadLimit + 1, 3},
+		} {
+			t.Run(fmt.Sprintf("%s/%d", versionString(version), tc.size), func(t *testing.T) {
+				mk := func() *Needle {
+					n := appendTestNeedles()["all fields"]()
+					n.Data = n.Data[:0]
+					for i := 0; i < tc.size; i++ {
+						n.Data = append(n.Data, byte(i*13))
+					}
+					return n
+				}
+				want := new(bytes.Buffer)
+				wantSize, wantActual, err := mk().LegacyPrepareWriteBuffer(version, want)
+				if err != nil {
+					t.Fatal(err)
+				}
+				const start = 8 * 512
+				backend := &memBackend{keep: true, data: make([]byte, start), size: start}
+				offset, size, actual, err := mk().Append(backend, version)
+				if err != nil {
+					t.Fatalf("append: %v", err)
+				}
+				if backend.writes != tc.writes {
+					t.Fatalf("%d WriteAt calls, want %d", backend.writes, tc.writes)
+				}
+				if offset != start || size != wantSize || actual != wantActual {
+					t.Fatalf("returns offset=%d size=%d actual=%d, want %d/%d/%d", offset, size, actual, start, wantSize, wantActual)
+				}
+				if !bytes.Equal(backend.data[start:], want.Bytes()) {
+					t.Fatalf("record differs from the reference encoding: got %d bytes, want %d", len(backend.data)-start, want.Len())
+				}
+			})
+		}
+	}
+}

@@ -971,7 +971,9 @@ func benchmarkFind(b *testing.B, shared bool) {
 func BenchmarkSharedChunksFindPlain(b *testing.B)  { benchmarkFind(b, false) }
 func BenchmarkSharedChunksFindShared(b *testing.B) { benchmarkFind(b, true) }
 
-func benchmarkDelete(b *testing.B, shared bool) {
+// benchmarkDelete times one delete: of a plain object, of a link whose source
+// stays (the chunks are kept), or of the last link (the chunks are freed).
+func benchmarkDelete(b *testing.B, shared, last bool) {
 	fs, _ := newSharedStore(b)
 	f := newSharedFiler(b, fs)
 	b.ReportAllocs()
@@ -986,6 +988,10 @@ func benchmarkDelete(b *testing.B, shared bool) {
 				b.Fatalf("link: %v %v", linked, err)
 			}
 			target = dst
+			if last {
+				deleteObject(b, f, src)
+				drainDeleted(f)
+			}
 		}
 		b.StartTimer()
 		deleteObject(b, f, target)
@@ -995,8 +1001,9 @@ func benchmarkDelete(b *testing.B, shared bool) {
 	}
 }
 
-func BenchmarkSharedChunksDeletePlain(b *testing.B)  { benchmarkDelete(b, false) }
-func BenchmarkSharedChunksDeleteShared(b *testing.B) { benchmarkDelete(b, true) }
+func BenchmarkSharedChunksDeletePlain(b *testing.B)    { benchmarkDelete(b, false, false) }
+func BenchmarkSharedChunksDeleteShared(b *testing.B)   { benchmarkDelete(b, true, false) }
+func BenchmarkSharedChunksDeleteLastLink(b *testing.B) { benchmarkDelete(b, true, true) }
 
 // --- membership rules -------------------------------------------------------------
 

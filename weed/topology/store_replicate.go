@@ -19,7 +19,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc"
 )
@@ -120,9 +119,6 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 					pairMap[needle.PairNamePrefix+k] = v
 				}
 			}
-			bytesBuffer := buffer_pool.SyncPoolGetBuffer()
-			defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
-
 			// volume server do not know about encryption
 			// TODO optimize here to compress data only once
 			uploadOption := &operation.UploadOption{
@@ -135,7 +131,6 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 				PairMap:           pairMap,
 				Jwt:               jwt,
 				Md5:               contentMd5,
-				BytesBuffer:       bytesBuffer,
 				MaxAttempts:       1, // fail fast on a dead replica; the client write retries
 			}
 

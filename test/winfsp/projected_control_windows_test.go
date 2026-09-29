@@ -1,6 +1,8 @@
 package winfsp
 
 import (
+	"bytes"
+	"errors"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -39,6 +41,25 @@ func TestWindowsProjectedWinFspControl(t *testing.T) {
 			t.Logf("path=%q queryWinFsp=%v bytes=%d", tc.path, err, n)
 			if (err == nil) != tc.winfsp {
 				t.Fatalf("WinFsp control routing: %v", err)
+			}
+			// The projected-root helper uses a separate kernel-only query.
+			// User-mode callers must not receive its device pointer, including
+			// through a container projection. Older drivers may not know it.
+			const queryRootInternal = (9 << 16) | ((0x800 + 'R') << 2)
+			for _, size := range []int{0, 8, 16, 32} {
+				buffer := bytes.Repeat([]byte{0xa5}, size)
+				var output *byte
+				if size != 0 {
+					output = &buffer[0]
+				}
+				n = 0
+				err = windows.DeviceIoControl(h, queryRootInternal, nil, 0, output, uint32(size), &n, nil)
+				if !errors.Is(err, windows.ERROR_ACCESS_DENIED) && !errors.Is(err, windows.ERROR_INVALID_FUNCTION) {
+					t.Fatalf("private root query must be denied or unsupported: size=%d err=%v", size, err)
+				}
+				if n != 0 || !bytes.Equal(buffer, bytes.Repeat([]byte{0xa5}, size)) {
+					t.Fatalf("private root query returned data to user mode: size=%d bytes=%d", size, n)
+				}
 			}
 		})
 	}

@@ -435,7 +435,7 @@ func (s3a *S3ApiServer) renameKeyHoldingNestedKeys(bucket, srcObject, dstObject 
 	dstPath := util.FullPath(s3a.toFilerPath(bucket, dstObject))
 	dstDir, dstName := dstPath.DirAndName()
 
-	chunks, err := s3a.copyChunks(srcEntry, string(dstPath))
+	chunks, err := s3a.copyChunks(context.Background(), srcEntry, string(dstPath))
 	if err != nil {
 		glog.Errorf("RenameObject %s: copy chunks of %s: %v", bucket, srcObject, err)
 		return s3err.ErrInternalError

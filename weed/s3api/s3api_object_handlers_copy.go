@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -1067,7 +1068,7 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		dstEntry.Chunks = nil
 	} else {
 		// Copy chunks that overlap with the range
-		dstChunks, err := s3a.copyChunksForRange(entry, startOffset, endOffset, dstAssignPath)
+		dstChunks, err := s3a.copyChunksForRange(r.Context(), entry, startOffset, endOffset, dstAssignPath)
 		if err != nil {
 			glog.Errorf("CopyObjectPartHandler copy chunks error: %v", err)
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
@@ -1281,18 +1282,47 @@ func processMetadataBytes(reqHeader http.Header, existing map[string][]byte, rep
 }
 
 // copyChunks replicates chunks from source entry to destination entry
-func (s3a *S3ApiServer) copyChunks(entry *filer_pb.Entry, dstPath string) ([]*filer_pb.FileChunk, error) {
-	dstChunks := make([]*filer_pb.FileChunk, len(entry.GetChunks()))
-	const defaultChunkCopyConcurrency = 4
-	executor := util.NewLimitedConcurrentExecutor(defaultChunkCopyConcurrency) // Limit to configurable concurrent operations
-	errChan := make(chan error, len(entry.GetChunks()))
+// chunkCopyConcurrency is how many chunks one copy request moves at a time.
+const chunkCopyConcurrency = 4
 
-	for i, chunk := range entry.GetChunks() {
+// copyChunksConcurrently runs copyOne for chunk indexes 0..count-1,
+// chunkCopyConcurrency at a time, and returns the copied chunks in order.
+//
+// ctx is the S3 request's. When the client goes away, or when one chunk fails
+// and the whole copy is lost anyway, the chunk copies still running see a
+// cancelled context and the ones not yet started return without contacting a
+// volume server. The failing job cancels immediately rather than after every
+// chunk has been submitted, because submission blocks on the concurrency
+// limit.
+func copyChunksConcurrently(ctx context.Context, count int, copyOne func(ctx context.Context, i int) (*filer_pb.FileChunk, error)) ([]*filer_pb.FileChunk, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	dstChunks := make([]*filer_pb.FileChunk, count)
+	executor := util.NewLimitedConcurrentExecutor(chunkCopyConcurrency)
+	errChan := make(chan error, count)
+
+	// The chunk that fails first records its error before cancelling, so the
+	// caller sees that cause rather than a sibling's "context canceled".
+	var firstErrMu sync.Mutex
+	var firstErr error
+
+	for i := 0; i < count; i++ {
 		chunkIndex := i
 		executor.Execute(func() {
-			dstChunk, err := s3a.copySingleChunk(chunk, dstPath)
+			if err := ctx.Err(); err != nil {
+				errChan <- fmt.Errorf("chunk %d: %w", chunkIndex, err)
+				return
+			}
+			dstChunk, err := copyOne(ctx, chunkIndex)
 			if err != nil {
-				errChan <- fmt.Errorf("chunk %d: %v", chunkIndex, err)
+				err = fmt.Errorf("chunk %d: %w", chunkIndex, err)
+				firstErrMu.Lock()
+				if firstErr == nil && ctx.Err() == nil {
+					firstErr = err
+				}
+				firstErrMu.Unlock()
+				cancel()
+				errChan <- err
 				return
 			}
 			dstChunks[chunkIndex] = dstChunk
@@ -1301,8 +1331,13 @@ func (s3a *S3ApiServer) copyChunks(entry *filer_pb.Entry, dstPath string) ([]*fi
 	}
 
 	// Wait for all operations to complete and check for errors
-	for i := 0; i < len(entry.GetChunks()); i++ {
+	for i := 0; i < count; i++ {
 		if err := <-errChan; err != nil {
+			firstErrMu.Lock()
+			defer firstErrMu.Unlock()
+			if firstErr != nil {
+				return nil, firstErr
+			}
 			return nil, err
 		}
 	}
@@ -1310,11 +1345,20 @@ func (s3a *S3ApiServer) copyChunks(entry *filer_pb.Entry, dstPath string) ([]*fi
 	return dstChunks, nil
 }
 
+// copyChunks copies every chunk of entry; see copyChunksConcurrently for
+// concurrency and cancellation.
+func (s3a *S3ApiServer) copyChunks(ctx context.Context, entry *filer_pb.Entry, dstPath string) ([]*filer_pb.FileChunk, error) {
+	chunks := entry.GetChunks()
+	return copyChunksConcurrently(ctx, len(chunks), func(ctx context.Context, i int) (*filer_pb.FileChunk, error) {
+		return s3a.copySingleChunk(ctx, chunks[i], dstPath)
+	})
+}
+
 // copySingleChunk copies a single chunk from source to destination, preserving
 // the source's SSE tagging (the same-key copy fast path reuses the source
 // ciphertext as-is, so the destination chunk must keep the source's SSE_C /
 // SSE_KMS / SSE_S3 metadata or the read path will not decrypt — see #9281).
-func (s3a *S3ApiServer) copySingleChunk(chunk *filer_pb.FileChunk, dstPath string) (*filer_pb.FileChunk, error) {
+func (s3a *S3ApiServer) copySingleChunk(ctx context.Context, chunk *filer_pb.FileChunk, dstPath string) (*filer_pb.FileChunk, error) {
 	// Create destination chunk
 	dstChunk := s3a.createDestinationChunkPreservingSSE(chunk, chunk.Offset, chunk.Size)
 
@@ -1336,7 +1380,7 @@ func (s3a *S3ApiServer) copySingleChunk(chunk *filer_pb.FileChunk, dstPath strin
 	// the source volume for compressed bytes, so a gzipped chunk is
 	// forwarded to the destination without anyone having to decompress.
 	if canStreamCopyChunk(chunk) {
-		if err := s3a.streamCopyChunkRange(context.Background(), srcUrl, fileId, 0, int64(chunk.Size), true /*isFullChunk*/, assignResult); err != nil {
+		if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, 0, int64(chunk.Size), true /*isFullChunk*/, assignResult); err != nil {
 			return nil, fmt.Errorf("stream chunk: %w", err)
 		}
 		return dstChunk, nil
@@ -1344,12 +1388,12 @@ func (s3a *S3ApiServer) copySingleChunk(chunk *filer_pb.FileChunk, dstPath strin
 
 	// SSE / per-chunk-cipher: bytes need to be transformed in transit, so
 	// download into a buffer first.
-	chunkData, err := s3a.downloadChunkData(srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+	chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
 	if err != nil {
 		return nil, fmt.Errorf("download chunk data: %w", err)
 	}
 
-	if err := s3a.uploadChunkData(chunkData, assignResult, chunk.IsCompressed); err != nil {
+	if err := s3a.uploadChunkData(ctx, chunkData, assignResult, chunk.IsCompressed); err != nil {
 		return nil, fmt.Errorf("upload chunk data: %w", err)
 	}
 
@@ -1357,7 +1401,7 @@ func (s3a *S3ApiServer) copySingleChunk(chunk *filer_pb.FileChunk, dstPath strin
 }
 
 // copySingleChunkForRange copies a portion of a chunk for range operations
-func (s3a *S3ApiServer) copySingleChunkForRange(originalChunk, rangeChunk *filer_pb.FileChunk, rangeStart, rangeEnd int64, dstPath string) (*filer_pb.FileChunk, error) {
+func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChunk, rangeChunk *filer_pb.FileChunk, rangeStart, rangeEnd int64, dstPath string) (*filer_pb.FileChunk, error) {
 	// Create destination chunk
 	dstChunk := s3a.createDestinationChunk(rangeChunk, rangeChunk.Offset, rangeChunk.Size)
 
@@ -1391,19 +1435,19 @@ func (s3a *S3ApiServer) copySingleChunkForRange(originalChunk, rangeChunk *filer
 	// part-size = chunk-size assemble pattern hits this branch.
 	if canStreamCopyChunk(originalChunk) {
 		isFullChunk := offsetInChunk == 0 && rangeChunk.Size == originalChunk.Size
-		if err := s3a.streamCopyChunkRange(context.Background(), srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), isFullChunk, assignResult); err != nil {
+		if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), isFullChunk, assignResult); err != nil {
 			return nil, fmt.Errorf("stream chunk range: %w", err)
 		}
 		return dstChunk, nil
 	}
 
 	// Download and upload the chunk portion
-	chunkData, err := s3a.downloadChunkData(srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), originalChunk.CipherKey)
+	chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), originalChunk.CipherKey)
 	if err != nil {
 		return nil, fmt.Errorf("download chunk range data: %w", err)
 	}
 
-	if err := s3a.uploadChunkData(chunkData, assignResult, originalChunk.IsCompressed); err != nil {
+	if err := s3a.uploadChunkData(ctx, chunkData, assignResult, originalChunk.IsCompressed); err != nil {
 		return nil, fmt.Errorf("upload chunk range data: %w", err)
 	}
 
@@ -1466,8 +1510,9 @@ func parseRangeHeader(rangeHeader string, fileSize int64) (startOffset, endOffse
 	return startOffset, endOffset, nil
 }
 
-// copyChunksForRange copies chunks that overlap with the specified range
-func (s3a *S3ApiServer) copyChunksForRange(entry *filer_pb.Entry, startOffset, endOffset int64, dstPath string) ([]*filer_pb.FileChunk, error) {
+// copyChunksForRange copies chunks that overlap with the specified range; see
+// copyChunksConcurrently for concurrency and cancellation.
+func (s3a *S3ApiServer) copyChunksForRange(ctx context.Context, entry *filer_pb.Entry, startOffset, endOffset int64, dstPath string) ([]*filer_pb.FileChunk, error) {
 	var relevantChunks []*filer_pb.FileChunk
 	var originalChunks []*filer_pb.FileChunk
 
@@ -1499,33 +1544,9 @@ func (s3a *S3ApiServer) copyChunksForRange(entry *filer_pb.Entry, startOffset, e
 	}
 
 	// Copy the relevant chunks using a specialized method for range copies
-	dstChunks := make([]*filer_pb.FileChunk, len(relevantChunks))
-	const defaultChunkCopyConcurrency = 4
-	executor := util.NewLimitedConcurrentExecutor(defaultChunkCopyConcurrency)
-	errChan := make(chan error, len(relevantChunks))
-
-	for i, chunk := range relevantChunks {
-		chunkIndex := i
-		originalChunk := originalChunks[i] // Get the corresponding original chunk
-		executor.Execute(func() {
-			dstChunk, err := s3a.copySingleChunkForRange(originalChunk, chunk, startOffset, endOffset, dstPath)
-			if err != nil {
-				errChan <- fmt.Errorf("chunk %d: %v", chunkIndex, err)
-				return
-			}
-			dstChunks[chunkIndex] = dstChunk
-			errChan <- nil
-		})
-	}
-
-	// Wait for all operations to complete and check for errors
-	for i := 0; i < len(relevantChunks); i++ {
-		if err := <-errChan; err != nil {
-			return nil, err
-		}
-	}
-
-	return dstChunks, nil
+	return copyChunksConcurrently(ctx, len(relevantChunks), func(ctx context.Context, i int) (*filer_pb.FileChunk, error) {
+		return s3a.copySingleChunkForRange(ctx, originalChunks[i], relevantChunks[i], startOffset, endOffset, dstPath)
+	})
 }
 
 // Helper methods for copy operations to avoid code duplication
@@ -1696,13 +1717,13 @@ func (s3a *S3ApiServer) prepareChunkCopy(sourceFileId, dstPath string, expectedD
 
 // uploadChunkData uploads chunk data to the destination using common upload logic
 // isCompressed indicates if the data is already compressed and should not be compressed again
-func (s3a *S3ApiServer) uploadChunkData(chunkData []byte, assignResult *filer_pb.AssignVolumeResponse, isCompressed bool) error {
+func (s3a *S3ApiServer) uploadChunkData(ctx context.Context, chunkData []byte, assignResult *filer_pb.AssignVolumeResponse, isCompressed bool) error {
 	uploadOption := newChunkUploadOption(assignResult, isCompressed)
 	uploader, err := operation.NewUploader()
 	if err != nil {
 		return fmt.Errorf("create uploader: %w", err)
 	}
-	_, err = uploader.UploadData(context.Background(), chunkData, uploadOption)
+	_, err = uploader.UploadData(ctx, chunkData, uploadOption)
 	if err != nil {
 		return fmt.Errorf("upload chunk: %w", err)
 	}
@@ -1731,11 +1752,11 @@ func newChunkUploadOption(assignResult *filer_pb.AssignVolumeResponse, isCompres
 }
 
 // downloadChunkData downloads chunk data from the source URL
-func (s3a *S3ApiServer) downloadChunkData(srcUrl, fileId string, offset, size int64, cipherKey []byte) ([]byte, error) {
+func (s3a *S3ApiServer) downloadChunkData(ctx context.Context, srcUrl, fileId string, offset, size int64, cipherKey []byte) ([]byte, error) {
 	jwt := filer.JwtForVolumeServer(fileId)
 	// Only perform HEAD request for encrypted chunks to get physical size
 	if offset == 0 && len(cipherKey) > 0 {
-		req, err := http.NewRequest(http.MethodHead, srcUrl, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, srcUrl, nil)
 		if err == nil {
 			if jwt != "" {
 				req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
@@ -1770,7 +1791,7 @@ func (s3a *S3ApiServer) downloadChunkData(srcUrl, fileId string, offset, size in
 	// (Harbor-style assemble loops) this caused the runaway-RSS pattern in
 	// https://github.com/seaweedfs/seaweedfs/issues/6541.
 	chunkData := make([]byte, 0, sizeInt)
-	shouldRetry, err := util_http.ReadUrlAsStream(context.Background(), srcUrl, jwt, nil, false, false, offset, sizeInt, func(data []byte) {
+	shouldRetry, err := util_http.ReadUrlAsStream(ctx, srcUrl, jwt, nil, false, false, offset, sizeInt, func(data []byte) {
 		chunkData = append(chunkData, data...)
 	})
 	if err != nil {
@@ -1798,7 +1819,7 @@ func (s3a *S3ApiServer) copyMultipartSSECChunks(entry *filer_pb.Entry, copySourc
 	for _, chunk := range entry.GetChunks() {
 		if chunk.GetSseType() != filer_pb.SSEType_SSE_C {
 			// Non-SSE-C chunk, copy directly
-			copiedChunk, err := s3a.copySingleChunk(chunk, dstPath)
+			copiedChunk, err := s3a.copySingleChunk(context.Background(), chunk, dstPath)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to copy non-SSE-C chunk: %w", err)
 			}
@@ -1851,7 +1872,7 @@ func (s3a *S3ApiServer) copyMultipartSSEKMSChunks(entry *filer_pb.Entry, destKey
 	for _, chunk := range entry.GetChunks() {
 		if chunk.GetSseType() != filer_pb.SSEType_SSE_KMS {
 			// Non-SSE-KMS chunk, copy directly
-			copiedChunk, err := s3a.copySingleChunk(chunk, dstPath)
+			copiedChunk, err := s3a.copySingleChunk(context.Background(), chunk, dstPath)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to copy non-SSE-KMS chunk: %w", err)
 			}
@@ -1925,7 +1946,7 @@ func (s3a *S3ApiServer) copyMultipartSSEKMSChunk(chunk *filer_pb.FileChunk, sour
 	}
 
 	// Download encrypted chunk data
-	encryptedData, err := s3a.downloadChunkData(srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+	encryptedData, err := s3a.downloadChunkData(context.Background(), srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
 	if err != nil {
 		return nil, fmt.Errorf("download encrypted chunk data: %w", err)
 	}
@@ -1991,7 +2012,7 @@ func (s3a *S3ApiServer) copyMultipartSSEKMSChunk(chunk *filer_pb.FileChunk, sour
 	}
 
 	// Upload the final data
-	if err := s3a.uploadChunkData(finalData, assignResult, false); err != nil {
+	if err := s3a.uploadChunkData(context.Background(), finalData, assignResult, false); err != nil {
 		return nil, fmt.Errorf("upload chunk data: %w", err)
 	}
 
@@ -2022,7 +2043,7 @@ func (s3a *S3ApiServer) copyMultipartSSECChunk(chunk *filer_pb.FileChunk, copySo
 	}
 
 	// Download encrypted chunk data
-	encryptedData, err := s3a.downloadChunkData(srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+	encryptedData, err := s3a.downloadChunkData(context.Background(), srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("download encrypted chunk data: %w", err)
 	}
@@ -2121,7 +2142,7 @@ func (s3a *S3ApiServer) copyMultipartSSECChunk(chunk *filer_pb.FileChunk, copySo
 	}
 
 	// Upload the final data
-	if err := s3a.uploadChunkData(finalData, assignResult, false); err != nil {
+	if err := s3a.uploadChunkData(context.Background(), finalData, assignResult, false); err != nil {
 		return nil, nil, fmt.Errorf("upload chunk data: %w", err)
 	}
 
@@ -2193,7 +2214,7 @@ func (s3a *S3ApiServer) copyMultipartCrossEncryption(entry *filer_pb.Entry, r *h
 			if state.DstSSEC || state.DstSSEKMS || state.DstSSES3 {
 				copiedChunk, err = s3a.copyCrossEncryptionChunk(chunk, nil, destSSECKey, destKMSKeyID, destKMSEncryptionContext, destKMSBucketKeyEnabled, destSSES3Key, dstPath, dstBucket, state)
 			} else {
-				copiedChunk, err = s3a.copySingleChunk(chunk, dstPath)
+				copiedChunk, err = s3a.copySingleChunk(r.Context(), chunk, dstPath)
 			}
 		}
 
@@ -2316,7 +2337,7 @@ func (s3a *S3ApiServer) copyCrossEncryptionChunk(chunk *filer_pb.FileChunk, sour
 	}
 
 	// Download encrypted chunk data
-	encryptedData, err := s3a.downloadChunkData(srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+	encryptedData, err := s3a.downloadChunkData(context.Background(), srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
 	if err != nil {
 		return nil, fmt.Errorf("download encrypted chunk data: %w", err)
 	}
@@ -2510,7 +2531,7 @@ func (s3a *S3ApiServer) copyCrossEncryptionChunk(chunk *filer_pb.FileChunk, sour
 	// For unencrypted destination, finalData remains as decrypted plaintext
 
 	// Upload the final data
-	if err := s3a.uploadChunkData(finalData, assignResult, false); err != nil {
+	if err := s3a.uploadChunkData(context.Background(), finalData, assignResult, false); err != nil {
 		return nil, fmt.Errorf("upload chunk data: %w", err)
 	}
 
@@ -2572,7 +2593,7 @@ func (s3a *S3ApiServer) copyChunksWithSSEC(entry *filer_pb.Entry, r *http.Reques
 	case SSECCopyStrategyDirect:
 		// FAST PATH: Direct chunk copy
 		glog.V(2).Infof("Using fast path: direct chunk copy for %s", r.URL.Path)
-		chunks, err := s3a.copyChunks(entry, dstPath)
+		chunks, err := s3a.copyChunks(r.Context(), entry, dstPath)
 		return chunks, nil, err
 
 	case SSECCopyStrategyDecryptEncrypt:
@@ -2661,7 +2682,7 @@ func (s3a *S3ApiServer) copyChunkWithReencryption(chunk *filer_pb.FileChunk, cop
 	}
 
 	// Download encrypted chunk data
-	encryptedData, err := s3a.downloadChunkData(srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+	encryptedData, err := s3a.downloadChunkData(context.Background(), srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
 	if err != nil {
 		return nil, fmt.Errorf("download encrypted chunk data: %w", err)
 	}
@@ -2723,7 +2744,7 @@ func (s3a *S3ApiServer) copyChunkWithReencryption(chunk *filer_pb.FileChunk, cop
 	}
 
 	// Upload the processed data
-	if err := s3a.uploadChunkData(finalData, assignResult, false); err != nil {
+	if err := s3a.uploadChunkData(context.Background(), finalData, assignResult, false); err != nil {
 		return nil, fmt.Errorf("upload processed chunk data: %w", err)
 	}
 
@@ -2759,7 +2780,7 @@ func (s3a *S3ApiServer) copyChunksWithSSEKMS(entry *filer_pb.Entry, r *http.Requ
 	// Single-part SSE-KMS object: use existing logic
 	// If no SSE-KMS headers and source is not SSE-KMS encrypted, use regular copy
 	if destKeyID == "" && !IsSSEKMSEncrypted(entry.Extended) {
-		chunks, err := s3a.copyChunks(entry, dstPath)
+		chunks, err := s3a.copyChunks(r.Context(), entry, dstPath)
 		return chunks, nil, err
 	}
 
@@ -2798,7 +2819,7 @@ func (s3a *S3ApiServer) copyChunksWithSSEKMS(entry *filer_pb.Entry, r *http.Requ
 	case SSEKMSCopyStrategyDirect:
 		// FAST PATH: Direct chunk copy (same key or both unencrypted)
 		glog.V(2).Infof("Using fast path: direct chunk copy for %s", dstPath)
-		chunks, err := s3a.copyChunks(entry, dstPath)
+		chunks, err := s3a.copyChunks(r.Context(), entry, dstPath)
 		// For direct copy, generate destination metadata if we're encrypting to SSE-KMS
 		var dstMetadata map[string][]byte
 		if destKeyID != "" {
@@ -2992,7 +3013,7 @@ func (s3a *S3ApiServer) copyChunkWithSSEKMSReencryption(chunk *filer_pb.FileChun
 	}
 
 	// Download chunk data
-	chunkData, err := s3a.downloadChunkData(srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+	chunkData, err := s3a.downloadChunkData(context.Background(), srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
 	if err != nil {
 		return nil, fmt.Errorf("download chunk data: %w", err)
 	}
@@ -3079,7 +3100,7 @@ func (s3a *S3ApiServer) copyChunkWithSSEKMSReencryption(chunk *filer_pb.FileChun
 	}
 
 	// Upload the processed data
-	if err := s3a.uploadChunkData(finalData, assignResult, false); err != nil {
+	if err := s3a.uploadChunkData(context.Background(), finalData, assignResult, false); err != nil {
 		return nil, fmt.Errorf("upload processed chunk data: %w", err)
 	}
 

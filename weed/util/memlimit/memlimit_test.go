@@ -15,8 +15,7 @@ func TestPlanVolumeMemoryFromCgroup(t *testing.T) {
 		UploadMB:       AutoMB,
 		DownloadMB:     AutoMB,
 	})
-	limit := 5 * gib
-	wantGo := int64(float64(limit) * GoMemLimitRatio)
+	wantGo := int64(4831838208) // exactly 90% of 5 GiB
 	if !plan.SetGoMemLimit || plan.GoMemLimit != wantGo {
 		t.Fatalf("GoMemLimit = %d set=%v, want %d set", plan.GoMemLimit, plan.SetGoMemLimit, wantGo)
 	}
@@ -92,7 +91,7 @@ func TestPlanVolumeMemorySmallContainerKeepsAQuarter(t *testing.T) {
 		DownloadMB:     AutoMB,
 	})
 	limit := gib
-	goLimit := int64(float64(limit) * GoMemLimitRatio)
+	goLimit := GoMemLimitFor(limit)
 	budget := goLimit / 4
 	if plan.UploadLimitBytes+plan.DownloadLimitBytes != budget {
 		t.Fatalf("admission = %d, want the %d floor when the base heap does not fit", plan.UploadLimitBytes+plan.DownloadLimitBytes, budget)

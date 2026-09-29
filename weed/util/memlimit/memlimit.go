@@ -16,14 +16,17 @@ const (
 	// 9223372036854771712; anything this large is not a real limit.
 	cgroupV1Unlimited = int64(1) << 62
 
-	// GoMemLimitRatio is the share of the container limit given to the Go
-	// runtime as its soft memory limit. The remaining 20% is memory the Go
-	// limit does not bound but the cgroup charges: goroutine stacks (a
-	// saturated volume server queued 2,700 requests), runtime metadata and
-	// heap fragmentation, and file pages the kernel must be able to reclaim.
-	// A Go limit at the cgroup limit would let the heap alone reach the OOM
-	// killer before the collector reacts.
-	GoMemLimitRatio = 0.8
+	// The Go runtime gets GoMemLimitNumerator/GoMemLimitDenominator (90%) of
+	// the available memory as its soft memory limit. The Go limit already
+	// covers the heap, goroutine stacks and runtime metadata; the remaining
+	// 10% is for what the cgroup charges outside the Go runtime: kernel memory
+	// (slab, page tables; about 65 MiB measured on a volume server) and socket
+	// buffers, which grow with thousands of queued connections, plus the
+	// collector's overshoot when live data sits near a soft limit. Page cache
+	// needs no reserve: the kernel reclaims it before invoking the OOM killer.
+	// Integer arithmetic keeps the limit exact.
+	GoMemLimitNumerator   = 9
+	GoMemLimitDenominator = 10
 
 	// VolumeBaseHeapBytes is the heap a volume server holds with no transfer
 	// in flight: leveldb needle-map state, volume and EC metadata, caches.
@@ -37,6 +40,13 @@ const (
 	// limit". 0 keeps its existing meaning, unlimited.
 	AutoMB = -1
 )
+
+// GoMemLimitFor returns the Go soft memory limit for the given available
+// memory: GoMemLimitNumerator/GoMemLimitDenominator of it, computed exactly.
+func GoMemLimitFor(availableBytes int64) int64 {
+	return availableBytes/GoMemLimitDenominator*GoMemLimitNumerator +
+		availableBytes%GoMemLimitDenominator*GoMemLimitNumerator/GoMemLimitDenominator
+}
 
 // VolumeMemoryInput is everything PlanVolumeMemory depends on.
 type VolumeMemoryInput struct {
@@ -77,7 +87,7 @@ type VolumeMemoryPlan struct {
 // PlanVolumeMemory derives the Go memory limit and the transfer admission
 // budgets.
 //
-// Go limit: an explicit GOMEMLIMIT wins; otherwise GoMemLimitRatio of the
+// Go limit: an explicit GOMEMLIMIT wins; otherwise GoMemLimitFor of the
 // available memory, which is the effective cgroup limit capped at physical RAM,
 // or physical RAM on an unconstrained host; none only when neither is known.
 //
@@ -95,12 +105,12 @@ type VolumeMemoryPlan struct {
 // 1024 MB download limits. The goLimit/4 floor keeps a small container
 // serving when its base heap estimate does not fit. When the available memory
 // is unknown the budgets stay 0 (unlimited), which is upstream's default. For
-// 5 GiB available this gives a 4 GiB Go limit and 2112 MiB upload / 704 MiB
+// 5 GiB available this gives a 4.5 GiB Go limit and 2496 MiB upload / 832 MiB
 // download.
 func PlanVolumeMemory(in VolumeMemoryInput) VolumeMemoryPlan {
 	plan := VolumeMemoryPlan{GoMemLimit: in.RuntimeLimit}
 	if !in.EnvGOMEMLIMIT && in.AvailableBytes > 0 {
-		plan.GoMemLimit = int64(float64(in.AvailableBytes) * GoMemLimitRatio)
+		plan.GoMemLimit = GoMemLimitFor(in.AvailableBytes)
 		plan.SetGoMemLimit = true
 	}
 

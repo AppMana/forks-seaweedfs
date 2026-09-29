@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
-	"github.com/valyala/bytebufferpool"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -401,10 +400,7 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 		}
 
 		// upload data
-		uploadResult, err = uploader.upload_content(ctx, func(w io.Writer) (err error) {
-			_, err = w.Write(encryptedData)
-			return
-		}, len(encryptedData), &UploadOption{
+		uploadResult, err = uploader.upload_content(ctx, encryptedData, len(encryptedData), &UploadOption{
 			UploadUrl:         option.UploadUrl,
 			Filename:          "",
 			Cipher:            false,
@@ -428,10 +424,7 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 		}
 	} else {
 		// upload data
-		uploadResult, err = uploader.upload_content(ctx, func(w io.Writer) (err error) {
-			_, err = w.Write(data)
-			return
-		}, len(data), &UploadOption{
+		uploadResult, err = uploader.upload_content(ctx, data, len(data), &UploadOption{
 			UploadUrl:         option.UploadUrl,
 			Filename:          option.Filename,
 			Cipher:            false,
@@ -454,18 +447,25 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 	return uploadResult, err
 }
 
-func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction func(w io.Writer) error, originalDataSize int, option *UploadOption) (*UploadResult, error) {
-	var body_writer *multipart.Writer
-	var reqReader *bytes.Reader
-	var buf *bytebufferpool.ByteBuffer
-	if option.BytesBuffer == nil {
-		buf = GetBuffer()
-		defer PutBuffer(buf)
-		body_writer = multipart.NewWriter(buf)
-	} else {
-		option.BytesBuffer.Reset()
-		body_writer = multipart.NewWriter(option.BytesBuffer)
-	}
+// upload_content POSTs payload as the single part of a multipart/form-data
+// body. The body is streamed as preamble + payload + trailer, where preamble
+// and trailer are the few hundred bytes the multipart writer emits around the
+// part; the payload itself is never copied. A multipart part writer passes its
+// bytes through unchanged, so the wire body is identical to writing the
+// payload through the writer. The request carries an exact Content-Length:
+// a volume server reserves its 256 MiB per-request ceiling for a body of
+// unknown length.
+//
+// Buffering the whole body here gave a replicating primary one full copy of
+// every needle per replica, on top of the needle it had already parsed, while
+// transfer admission charged the needle once. On 2026-09-29 07:21-07:46 that
+// is how four DAS volume servers reached a 4.3 GiB heap and were OOMKilled at
+// their 5 GiB limit with 3 GiB of uploads and 1 GiB of downloads admitted.
+//
+// option.BytesBuffer no longer holds the body; it is left untouched.
+func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, originalDataSize int, option *UploadOption) (*UploadResult, error) {
+	var framing bytes.Buffer
+	body_writer := multipart.NewWriter(&framing)
 	h := make(textproto.MIMEHeader)
 	// Use mime.FormatMediaType for RFC 6266 compliant Content-Disposition,
 	// properly handling non-ASCII characters and special characters
@@ -484,30 +484,38 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 		h.Set("Content-MD5", option.Md5)
 	}
 
-	file_writer, cp_err := body_writer.CreatePart(h)
-	if cp_err != nil {
+	if _, cp_err := body_writer.CreatePart(h); cp_err != nil {
 		glog.V(0).InfolnCtx(ctx, "error creating form file", cp_err.Error())
 		return nil, cp_err
 	}
-	if err := fillBufferFunction(file_writer); err != nil {
-		glog.V(0).InfolnCtx(ctx, "error copying data", err)
-		return nil, err
-	}
+	// Everything written so far is the preamble; Close appends only the
+	// closing boundary, which follows the payload on the wire.
+	preambleLen := framing.Len()
 	content_type := body_writer.FormDataContentType()
 	if err := body_writer.Close(); err != nil {
 		glog.V(0).InfolnCtx(ctx, "error closing body", err)
 		return nil, err
 	}
-	if option.BytesBuffer == nil {
-		reqReader = bytes.NewReader(buf.Bytes())
-	} else {
-		reqReader = bytes.NewReader(option.BytesBuffer.Bytes())
+	// A transport may keep reading a request body after Do returns: when the
+	// server answers before consuming the body, RoundTrip returns while the
+	// write goroutine is still sending it. The body reads the caller's payload,
+	// which the caller owns again once this returns, so every body is detached
+	// before returning; a detached body fails further reads instead of touching
+	// the payload. framing is owned by this call, so it needs no such care.
+	preamble := framing.Bytes()[:preambleLen]
+	trailer := framing.Bytes()[preambleLen:]
+	bodies := &detachableBodies{}
+	defer bodies.detach()
+	newBody := func() io.ReadCloser {
+		return bodies.add(io.MultiReader(bytes.NewReader(preamble), bytes.NewReader(payload), bytes.NewReader(trailer)))
 	}
-	req, postErr := http.NewRequestWithContext(ctx, http.MethodPost, option.UploadUrl, reqReader)
+	req, postErr := http.NewRequestWithContext(ctx, http.MethodPost, option.UploadUrl, newBody())
 	if postErr != nil {
 		glog.V(1).InfofCtx(ctx, "create upload request %s: %v", option.UploadUrl, postErr)
 		return nil, fmt.Errorf("create upload request %s: %v", option.UploadUrl, postErr)
 	}
+	req.ContentLength = int64(len(preamble) + len(payload) + len(trailer))
+	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
 	req.Header.Set("Content-Type", content_type)
 	for k, v := range option.PairMap {
 		req.Header.Set(k, v)
@@ -590,3 +598,43 @@ func getEtag(r *http.Response) (etag string) {
 	}
 	return
 }
+
+// errBodyDetached is returned by a request body read after the upload that
+// created it has returned.
+var errBodyDetached = errors.New("upload body read after the upload returned")
+
+// detachableBodies hands out request bodies over a caller-owned payload and
+// cuts all of them off at once. Reads hold the mutex, so once detach has
+// taken it no read is in progress and none can reach the payload again. This
+// does not depend on the transport closing the body, which it may do late or,
+// for some HTTPClient implementations, never.
+type detachableBodies struct {
+	mu       sync.Mutex
+	detached bool
+}
+
+func (d *detachableBodies) add(r io.Reader) io.ReadCloser {
+	return &detachableBody{owner: d, r: r}
+}
+
+func (d *detachableBodies) detach() {
+	d.mu.Lock()
+	d.detached = true
+	d.mu.Unlock()
+}
+
+type detachableBody struct {
+	owner *detachableBodies
+	r     io.Reader
+}
+
+func (b *detachableBody) Read(p []byte) (int, error) {
+	b.owner.mu.Lock()
+	defer b.owner.mu.Unlock()
+	if b.owner.detached {
+		return 0, errBodyDetached
+	}
+	return b.r.Read(p)
+}
+
+func (b *detachableBody) Close() error { return nil }

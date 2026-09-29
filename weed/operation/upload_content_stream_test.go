@@ -3,10 +3,12 @@ package operation
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/textproto"
 	"path/filepath"
 	"runtime"
@@ -289,4 +291,76 @@ func TestReplicationUploadsInFlightHoldNoPayloadCopies(t *testing.T) {
 		t.Fatalf("%d in-flight replica uploads of %d bytes hold %d heap bytes; they must reference the needle, not copy it", inFlight, size, held)
 	}
 	t.Logf("%d in-flight replica uploads hold %d heap bytes", inFlight, held)
+}
+
+// TestUploadPayloadIsTheCallersAfterReturn: a server that answers before
+// reading the request body leaves the transport's write goroutine reading it
+// after Do returns. Once UploadData returns, the caller may overwrite its
+// payload; run with -race.
+func TestUploadPayloadIsTheCallersAfterReturn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"rejected before reading the body"}`)
+	}))
+	defer server.Close()
+	uploader := newUploader(server.Client())
+
+	for i := 0; i < 8; i++ {
+		payload := replicationPayload(8 << 20)
+		_, err := uploader.UploadData(context.Background(), payload, &UploadOption{
+			UploadUrl:     server.URL + "/3,01637037d6?type=replicate",
+			Filename:      "chunk",
+			IsReplication: true,
+			MaxAttempts:   1,
+		})
+		if err == nil {
+			t.Fatal("want the server's error")
+		}
+		for j := range payload {
+			payload[j] = 0xff
+		}
+	}
+}
+
+// bodyKeepingClient answers without reading the request body and keeps it,
+// plus a body from GetBody, the way a transport's write goroutine can.
+type bodyKeepingClient struct {
+	bodies []io.ReadCloser
+}
+
+func (c *bodyKeepingClient) Do(req *http.Request) (*http.Response, error) {
+	c.bodies = append(c.bodies, req.Body)
+	retry, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	c.bodies = append(c.bodies, retry)
+	return &http.Response{
+		StatusCode: http.StatusCreated,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"name":"n","size":1}`)),
+	}, nil
+}
+
+func TestUploadBodiesFailReadsAfterReturn(t *testing.T) {
+	client := &bodyKeepingClient{}
+	_, err := newUploader(client).UploadData(context.Background(), replicationPayload(1<<20), &UploadOption{
+		UploadUrl:     "http://volume-b:8080/3,01637037d6?type=replicate",
+		Filename:      "chunk",
+		IsReplication: true,
+		MaxAttempts:   1,
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if len(client.bodies) != 2 {
+		t.Fatalf("kept %d bodies, want 2", len(client.bodies))
+	}
+	for i, body := range client.bodies {
+		n, err := body.Read(make([]byte, 64))
+		if n != 0 || !errors.Is(err, errBodyDetached) {
+			t.Fatalf("body %d read after return: n=%d err=%v, want 0 and errBodyDetached", i, n, err)
+		}
+	}
 }

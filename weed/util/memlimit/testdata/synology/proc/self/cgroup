@@ -1,0 +1,9 @@
+9:devices:/seaweedfs.slice
+8:blkio:/seaweedfs.slice
+7:cpuset:/vendor
+6:cpuacct:/seaweedfs.slice
+5:cpu:/seaweedfs.slice
+4:freezer:/
+3:memory:/seaweedfs.slice
+2:name=vendormonitor:/seaweedfs.slice/pkgctl-seaweedfs.service
+1:name=systemd:/seaweedfs.slice/pkgctl-seaweedfs.service

@@ -293,19 +293,20 @@ func runVolume(cmd *Command, args []string) bool {
 }
 
 // applyMemoryLimits sizes the Go memory limit and the transfer admission
-// budgets from the container's cgroup memory limit (see weed/util/memlimit),
-// so a deployment sets only resources.limits.memory. An explicit GOMEMLIMIT
-// and explicit admission flags are kept. Budgets are applied in whole MiB.
-func (v VolumeServerOptions) applyMemoryLimits(cgroupRoot string) {
-	limit, hasLimit, err := memlimit.CgroupMemoryLimit(cgroupRoot)
+// budgets from the memory available to the process (weed/util/memlimit: the
+// cgroup limit on its cgroup or any ancestor, capped at physical RAM), so a
+// deployment sets only its container or slice memory limit. An explicit
+// GOMEMLIMIT and explicit admission flags are kept. Budgets are applied in
+// whole MiB. root is "/" in production.
+func (v VolumeServerOptions) applyMemoryLimits(root string) {
+	avail, err := memlimit.AvailableMemory(root)
 	if err != nil {
-		glog.Warningf("memory limits: %v; treating the container as unlimited", err)
-		hasLimit = false
+		glog.Warningf("memory limits: %v; available memory unknown", err)
+		avail = memlimit.Available{}
 	}
 	_, envSet := os.LookupEnv("GOMEMLIMIT")
 	plan := memlimit.PlanVolumeMemory(memlimit.VolumeMemoryInput{
-		CgroupLimit:    limit,
-		HasCgroupLimit: hasLimit,
+		AvailableBytes: avail.Bytes,
 		EnvGOMEMLIMIT:  envSet,
 		RuntimeLimit:   debug.SetMemoryLimit(-1),
 		UploadMB:       *v.concurrentUploadLimitMB,
@@ -316,8 +317,8 @@ func (v VolumeServerOptions) applyMemoryLimits(cgroupRoot string) {
 	}
 	*v.concurrentUploadLimitMB = int(plan.UploadLimitBytes >> 20)
 	*v.concurrentDownloadLimitMB = int(plan.DownloadLimitBytes >> 20)
-	glog.V(0).Infof("memory limits: cgroup limit %d (present %v), GOMEMLIMIT env %v, Go memory limit %d (set %v), upload admission %d MiB (auto %v), download admission %d MiB (auto %v)",
-		limit, hasLimit, envSet, plan.GoMemLimit, plan.SetGoMemLimit,
+	glog.V(0).Infof("memory limits: available %d (cgroup %q limit %d, physical %d), GOMEMLIMIT env %v, Go memory limit %d (set %v), upload admission %d MiB (auto %v), download admission %d MiB (auto %v)",
+		avail.Bytes, avail.CgroupDir, avail.CgroupLimit, avail.PhysicalBytes, envSet, plan.GoMemLimit, plan.SetGoMemLimit,
 		*v.concurrentUploadLimitMB, plan.AutoUpload, *v.concurrentDownloadLimitMB, plan.AutoDownload)
 }
 

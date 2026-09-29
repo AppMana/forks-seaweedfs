@@ -1,29 +1,17 @@
-// Package memlimit derives a process's memory settings from the memory limit
-// of the container it runs in, the way the JVM sizes its heap from the cgroup:
-// set only resources.limits.memory and the Go memory limit and the volume
-// server's transfer admission budgets follow from it.
+// Package memlimit derives a process's memory settings from the memory
+// available to it, determined the way the JVM does (the cgroup limit that
+// applies to the process, capped at physical RAM): set only the container or
+// slice memory limit and the Go memory limit and the volume server's transfer
+// admission budgets follow from it.
 //
 // Go does not do this by itself: it reads the cgroup CPU quota for GOMAXPROCS
 // but never the memory limit, so without this a container's GOMEMLIMIT and
 // admission flags have to be kept consistent with its limit by hand.
 package memlimit
 
-import (
-	"errors"
-	"fmt"
-	"io/fs"
-	"math"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-)
+import "math"
 
 const (
-	// cgroup v2 unified hierarchy, as mounted inside a container.
-	cgroupV2MemoryMax = "sys/fs/cgroup/memory.max"
-	// cgroup v1 memory controller, as mounted inside a container.
-	cgroupV1MemoryLimit = "sys/fs/cgroup/memory/memory.limit_in_bytes"
 	// cgroup v1 reports "no limit" as the largest page-aligned int64,
 	// 9223372036854771712; anything this large is not a real limit.
 	cgroupV1Unlimited = int64(1) << 62
@@ -50,46 +38,12 @@ const (
 	AutoMB = -1
 )
 
-// CgroupMemoryLimit returns the memory limit of the cgroup visible under
-// root ("/" in production). ok is false when no limit applies: cgroup v2
-// "max", the cgroup v1 unlimited sentinel, or no cgroup memory files at all.
-func CgroupMemoryLimit(root string) (limit int64, ok bool, err error) {
-	if raw, readErr := os.ReadFile(filepath.Join(root, cgroupV2MemoryMax)); readErr == nil {
-		value := strings.TrimSpace(string(raw))
-		if value == "max" {
-			return 0, false, nil
-		}
-		limit, err = strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return 0, false, fmt.Errorf("parse %s %q: %w", cgroupV2MemoryMax, value, err)
-		}
-		return limit, true, nil
-	} else if !errors.Is(readErr, fs.ErrNotExist) {
-		return 0, false, fmt.Errorf("read %s: %w", cgroupV2MemoryMax, readErr)
-	}
-
-	raw, readErr := os.ReadFile(filepath.Join(root, cgroupV1MemoryLimit))
-	if errors.Is(readErr, fs.ErrNotExist) {
-		return 0, false, nil
-	}
-	if readErr != nil {
-		return 0, false, fmt.Errorf("read %s: %w", cgroupV1MemoryLimit, readErr)
-	}
-	value := strings.TrimSpace(string(raw))
-	limit, err = strconv.ParseInt(value, 10, 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("parse %s %q: %w", cgroupV1MemoryLimit, value, err)
-	}
-	if limit >= cgroupV1Unlimited {
-		return 0, false, nil
-	}
-	return limit, true, nil
-}
-
 // VolumeMemoryInput is everything PlanVolumeMemory depends on.
 type VolumeMemoryInput struct {
-	CgroupLimit    int64
-	HasCgroupLimit bool
+	// AvailableBytes is the memory the process may use (see AvailableMemory):
+	// the effective cgroup limit capped at physical RAM, or physical RAM.
+	// 0 means unknown.
+	AvailableBytes int64
 	// EnvGOMEMLIMIT reports that GOMEMLIMIT is set in the environment; an
 	// operator's explicit value is never overridden.
 	EnvGOMEMLIMIT bool
@@ -123,8 +77,9 @@ type VolumeMemoryPlan struct {
 // PlanVolumeMemory derives the Go memory limit and the transfer admission
 // budgets.
 //
-// Go limit: an explicit GOMEMLIMIT wins; otherwise, when the container has a
-// memory limit, GoMemLimitRatio of it; otherwise none.
+// Go limit: an explicit GOMEMLIMIT wins; otherwise GoMemLimitRatio of the
+// available memory, which is the effective cgroup limit capped at physical RAM,
+// or physical RAM on an unconstrained host; none only when neither is known.
 //
 // Admission (for flags left at AutoMB): admitted bytes are request bodies held
 // on the Go heap next to the base heap, so together they must fit the Go
@@ -138,13 +93,14 @@ type VolumeMemoryPlan struct {
 //
 // The 3:1 split keeps the ratio of the previously audited 3072 MB upload /
 // 1024 MB download limits. The goLimit/4 floor keeps a small container
-// serving when its base heap estimate does not fit. Without any memory limit
-// the budgets stay 0 (unlimited), which is upstream's default. For a 5 GiB
-// container this gives a 4 GiB Go limit and 2112 MiB upload / 704 MiB download.
+// serving when its base heap estimate does not fit. When the available memory
+// is unknown the budgets stay 0 (unlimited), which is upstream's default. For
+// 5 GiB available this gives a 4 GiB Go limit and 2112 MiB upload / 704 MiB
+// download.
 func PlanVolumeMemory(in VolumeMemoryInput) VolumeMemoryPlan {
 	plan := VolumeMemoryPlan{GoMemLimit: in.RuntimeLimit}
-	if !in.EnvGOMEMLIMIT && in.HasCgroupLimit && in.CgroupLimit > 0 {
-		plan.GoMemLimit = int64(float64(in.CgroupLimit) * GoMemLimitRatio)
+	if !in.EnvGOMEMLIMIT && in.AvailableBytes > 0 {
+		plan.GoMemLimit = int64(float64(in.AvailableBytes) * GoMemLimitRatio)
 		plan.SetGoMemLimit = true
 	}
 

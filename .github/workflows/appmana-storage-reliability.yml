@@ -25,9 +25,9 @@ on:
         default: false
   push:
     branches: [master, main, 'merge/**']
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
   pull_request:
-    paths: ['weed/**', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
 
 permissions:
   contents: read
@@ -252,10 +252,23 @@ jobs:
         run: |
           # Both worktrees resolve ../forks-go-fuse to the pinned checkout.
           git worktree add --detach "$GITHUB_WORKSPACE/seaweed-baseline" "$BASELINE_SHA"
-          (cd "$GITHUB_WORKSPACE/seaweed-baseline" && go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$BASELINE_SHA" -o "$RUNNER_TEMP/weed-baseline" ./weed)
-          go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
+          (cd "$GITHUB_WORKSPACE/seaweed-baseline" && CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$BASELINE_SHA" -o "$RUNNER_TEMP/weed-baseline" ./weed)
+          CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
           "$RUNNER_TEMP/weed-baseline" version
           "$RUNNER_TEMP/weed-candidate" version
+      - name: Packaged volume entrypoint and automatic memory
+        run: |
+          set -euo pipefail
+          # Package the same executable used below; do not compile another one.
+          context=$(mktemp -d "$RUNNER_TEMP/server-image-context.XXXXXXXX")
+          cp docker/Dockerfile.local "$context/Dockerfile"
+          cp docker/entrypoint.sh docker/filer.toml "$context/"
+          cp "$RUNNER_TEMP/weed-candidate" "$context/weed"
+          docker build --iidfile "$context/image-id" "$context"
+          python3 test/storage_lab/run_image.py \
+            --image-id "$(cat "$context/image-id")" \
+            --weed-sha256 "$(sha256sum "$RUNNER_TEMP/weed-candidate" | cut -d' ' -f1)" \
+            --results-root "$RUNNER_TEMP/server-image-results"
       - name: Build isolated lab tests
         run: |
           go test -c -tags "$STORAGE_BUILD_TAGS" -race -o "$RUNNER_TEMP/storage.test" ./weed/storage
@@ -302,6 +315,7 @@ jobs:
             /tmp/seaweedfs-lab-results-*/
             /tmp/seaweedfs-fs-results-*/
             ${{ runner.temp }}/storage-mutant-logs/
+            ${{ runner.temp }}/server-image-results/
           if-no-files-found: warn
           retention-days: 14
 

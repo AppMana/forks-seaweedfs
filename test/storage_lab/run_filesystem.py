@@ -17,6 +17,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('filesystem', choices=('xfs', 'btrfs'))
     parser.add_argument('--tests', required=True, type=lab.artifact)
+    parser.add_argument('--results-root', type=Path,
+                        help='existing directory for retained results; independent of disposable /tmp staging')
     parser.add_argument('--enospc', action='store_true',
                         help='run the destructive-to-image disk-full preservation test')
     args = parser.parse_args()
@@ -34,7 +36,7 @@ def main():
     if usage.free < 4 * 1024**3:
         parser.error('less than 4 GiB host headroom')
 
-    results = Path(tempfile.mkdtemp(prefix='seaweedfs-fs-results-'))
+    results = Path(tempfile.mkdtemp(prefix='seaweedfs-fs-results-', dir=args.results_root))
     unit = 'seaweedfs-fs-lab-' + uuid.uuid4().hex
     mode = 'enospc' if args.enospc else 'normal'
     image_size = 2 * 1024**3 if args.enospc else 8 * 1024**3
@@ -52,7 +54,8 @@ def main():
     manifest.write_text(json.dumps(report, indent=2) + '\n')
     print('Results:', results, flush=True)
     try:
-        with tempfile.TemporaryDirectory(prefix='seaweedfs-fs-lab-') as work:
+        # filesystem_helper.sh deliberately accepts only /tmp/seaweedfs-fs-lab-*.
+        with tempfile.TemporaryDirectory(prefix='seaweedfs-fs-lab-', dir='/tmp') as work:
             os.chmod(work, 0o755)
             image = Path(work) / 'disk.img'
             with image.open('wb') as stream:

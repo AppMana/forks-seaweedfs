@@ -3,7 +3,9 @@ package volume_server_grpc_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"testing"
@@ -29,13 +31,29 @@ func TestVolumeBinaryUpgradeVacuumRollback(t *testing.T) {
 	if baseline == candidate {
 		t.Fatal("migration gate requires distinct baseline and candidate paths")
 	}
+	// Exercise both sides of Append's 64 KiB single/split-write boundary.
+	// Incompressible bytes keep transport/storage compression from turning a
+	// large-record migration into another small-record test.
+	for _, size := range []int{32 << 10, (64 << 10) - 1, 64 << 10, (64 << 10) + 1, 1 << 20} {
+		t.Run(fmt.Sprintf("payload-%d", size), func(t *testing.T) {
+			testVolumeBinaryUpgradeVacuumRollback(t, baseline, candidate, size)
+		})
+	}
+}
+
+func testVolumeBinaryUpgradeVacuumRollback(t *testing.T, baseline, candidate string, size int) {
+	t.Helper()
 	c := framework.StartSingleVolumeCluster(t, matrix.P1())
 	conn, client := framework.DialVolumeServer(t, c.VolumeGRPCAddress())
 	defer conn.Close()
 	const vid = uint32(139)
 	framework.AllocateVolume(t, client, vid, "")
 	fid := framework.NewFileID(vid, 1234, 0xabcdef12)
-	payload := bytes.Repeat([]byte("upgrade-rollback-payload"), 1024)
+	payload := make([]byte, size)
+	updated := make([]byte, size)
+	random := rand.New(rand.NewSource(139))
+	_, _ = random.Read(payload)
+	_, _ = random.Read(updated)
 	write := func(value []byte) {
 		t.Helper()
 		resp := framework.UploadBytes(t, framework.NewHTTPClient(), c.VolumeAdminURL(), fid+"?fsync=true", value)
@@ -55,7 +73,6 @@ func TestVolumeBinaryUpgradeVacuumRollback(t *testing.T) {
 	write(payload)
 	c.RestartVolumeServerWithBinary(candidate)
 	read(payload)
-	updated := bytes.Repeat([]byte("candidate-overwrite"), 2048)
 	write(updated)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

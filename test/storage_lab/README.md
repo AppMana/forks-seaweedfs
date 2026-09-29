@@ -83,18 +83,25 @@ or option to disable isolation. No automatic privileged fallback to host tests.
 From the fork root, with its pinned sibling go-fuse checkout present:
 
 ```sh
-LAB_BUILD=$(mktemp -d /tmp/seaweedfs-lab-build.XXXXXXXX)
+# Choose an existing persistent artifact directory, not a temporary build root.
+: "${SEAWEEDFS_LAB_ARTIFACTS:?set an absolute persistent artifact directory}"
+LAB_BUILD=$(mktemp -d "$SEAWEEDFS_LAB_ARTIFACTS/seaweedfs-lab-build.XXXXXXXX")
 go test -c -tags 5BytesOffset -race -o "$LAB_BUILD/storage.test" ./weed/storage
 go test -c -tags 5BytesOffset -o "$LAB_BUILD/grpc.test" ./test/volume_server/grpc
 go test -c -tags 5BytesOffset -o "$LAB_BUILD/http.test" ./test/volume_server/http
 go build -tags 5BytesOffset -o "$LAB_BUILD/weed" ./weed
-python3 test/storage_lab/run.py storage --tests "$LAB_BUILD/storage.test"
+python3 test/storage_lab/run.py storage --tests "$LAB_BUILD/storage.test" --results-root "$LAB_BUILD"
 python3 test/storage_lab/run.py migration --tests "$LAB_BUILD/grpc.test" \
-  --candidate "$LAB_BUILD/weed" --baseline "$BASELINE_BINARY"
+  --candidate "$LAB_BUILD/weed" --baseline "$BASELINE_BINARY" --results-root "$LAB_BUILD"
 python3 test/storage_lab/run.py admission --tests "$LAB_BUILD/http.test" \
-  --candidate "$LAB_BUILD/weed"
+  --candidate "$LAB_BUILD/weed" --results-root "$LAB_BUILD"
 python3 -m unittest discover -s test/storage_lab -v
 ```
+
+Both `run.py` and `run_filesystem.py` accept `--results-root` for retained
+manifests and logs. Disposable sandbox staging remains under `/tmp` regardless
+of `TMPDIR`; it contains only copied test inputs (and disposable filesystem
+images), not the source checkout or retained evidence, and is cleaned up.
 
 `BASELINE_BINARY` must be an explicitly built, known deployed-compatible
 5BytesOffset executable. Use the README's Actions baseline/go-fuse variables;

@@ -9,13 +9,22 @@ import (
 )
 
 func writeNeedleV2(n *Needle, offset uint64, bytesBuffer *bytes.Buffer) (size Size, actualSize int64, err error) {
-	return writeNeedleCommon(n, offset, bytesBuffer, Version2, func(n *Needle, header []byte, bytesBuffer *bytes.Buffer, padding int) {
+	size, actualSize, _, err = writeNeedleV2Framing(n, offset, bytesBuffer, true)
+	return
+}
+
+func writeNeedleV2Framing(n *Needle, offset uint64, bytesBuffer *bytes.Buffer, withData bool) (size Size, actualSize int64, dataAt int, err error) {
+	return writeNeedleCommon(n, offset, bytesBuffer, Version2, withData, func(n *Needle, header []byte, bytesBuffer *bytes.Buffer, padding int) {
 		util.Uint32toBytes(header[0:NeedleChecksumSize], uint32(n.Checksum))
 		bytesBuffer.Write(header[0 : NeedleChecksumSize+padding])
 	})
 }
 
-func writeNeedleCommon(n *Needle, offset uint64, bytesBuffer *bytes.Buffer, version Version, writeFooter func(n *Needle, header []byte, bytesBuffer *bytes.Buffer, padding int)) (size Size, actualSize int64, err error) {
+// writeNeedleCommon encodes the v2/v3 record into bytesBuffer. With withData
+// false it leaves out n.Data and returns in dataAt the buffer position where
+// the payload belongs, so the caller can write the payload from n.Data
+// without copying it; with withData true dataAt is where it was written.
+func writeNeedleCommon(n *Needle, offset uint64, bytesBuffer *bytes.Buffer, version Version, withData bool, writeFooter func(n *Needle, header []byte, bytesBuffer *bytes.Buffer, padding int)) (size Size, actualSize int64, dataAt int, err error) {
 	bytesBuffer.Reset()
 	header := make([]byte, NeedleHeaderSize+TimestampSize)
 	CookieToBytes(header[0:CookieSize], n.Cookie)
@@ -48,10 +57,14 @@ func writeNeedleCommon(n *Needle, offset uint64, bytesBuffer *bytes.Buffer, vers
 	}
 	SizeToBytes(header[CookieSize+NeedleIdSize:CookieSize+NeedleIdSize+SizeSize], n.Size)
 	bytesBuffer.Write(header[0:NeedleHeaderSize])
+	dataAt = bytesBuffer.Len()
 	if n.DataSize > 0 {
 		util.Uint32toBytes(header[0:4], n.DataSize)
 		bytesBuffer.Write(header[0:4])
-		bytesBuffer.Write(n.Data)
+		dataAt = bytesBuffer.Len()
+		if withData {
+			bytesBuffer.Write(n.Data)
+		}
 		util.Uint8toBytes(header[0:1], n.Flags)
 		bytesBuffer.Write(header[0:1])
 		if n.HasName() {
@@ -82,5 +95,5 @@ func writeNeedleCommon(n *Needle, offset uint64, bytesBuffer *bytes.Buffer, vers
 	writeFooter(n, header, bytesBuffer, int(padding))
 	size = Size(n.DataSize)
 	actualSize = GetActualSize(n.Size, version)
-	return size, actualSize, nil
+	return size, actualSize, dataAt, nil
 }

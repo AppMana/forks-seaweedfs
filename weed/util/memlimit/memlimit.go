@@ -128,7 +128,9 @@ type VolumeMemoryPlan struct {
 //
 // Admission (for flags left at AutoMB): admitted bytes are request bodies held
 // on the Go heap next to the base heap, so together they must fit the Go
-// limit:
+// limit. Each admitted body is held once: the needle parsed from the request
+// is appended to the .dat file and sent to every replica from that same
+// buffer, without a per-write or per-replica copy:
 //
 //	budget   = max(goLimit - VolumeBaseHeapBytes, goLimit / 4)
 //	upload   = budget * 3 / 4

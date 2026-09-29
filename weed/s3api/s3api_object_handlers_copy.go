@@ -1697,7 +1697,7 @@ func (s3a *S3ApiServer) prepareChunkCopy(sourceFileId, dstPath string, expectedD
 // uploadChunkData uploads chunk data to the destination using common upload logic
 // isCompressed indicates if the data is already compressed and should not be compressed again
 func (s3a *S3ApiServer) uploadChunkData(chunkData []byte, assignResult *filer_pb.AssignVolumeResponse, isCompressed bool) error {
-	uploadOption := newChunkUploadOption(chunkData, assignResult, isCompressed)
+	uploadOption := newChunkUploadOption(assignResult, isCompressed)
 	uploader, err := operation.NewUploader()
 	if err != nil {
 		return fmt.Errorf("create uploader: %w", err)
@@ -1710,21 +1710,12 @@ func (s3a *S3ApiServer) uploadChunkData(chunkData []byte, assignResult *filer_pb
 	return nil
 }
 
-// multipartFramingOverhead reserves space for the multipart wrapper
-// upload_content writes around chunkData (boundary + Content-Disposition +
-// optional Content-Type/Content-Encoding/Content-MD5 headers + trailing
-// boundary). Real-world overhead is a few hundred bytes; rounding to 1 KiB
-// avoids a single grow on the buffer we hand to the multipart writer.
-const multipartFramingOverhead = 1024
-
 // newChunkUploadOption builds the operation.UploadOption used by every
-// chunk-copy upload. It always sets BytesBuffer to a fresh, per-call buffer
-// so upload_content does not fall back to the package-global
-// valyala/bytebufferpool — that pool retains every high-water buffer for the
-// process's lifetime, and under concurrent UploadPartCopy load it hoarded
-// one chunk-sized buffer per concurrent upload (see #6541). The per-call
-// buffer is GC'd as soon as the upload returns.
-func newChunkUploadOption(chunkData []byte, assignResult *filer_pb.AssignVolumeResponse, isCompressed bool) *operation.UploadOption {
+// chunk-copy upload. It sets no BytesBuffer: upload_content streams the
+// payload (multipart framing around the caller's slice) and neither copies
+// it into a buffer nor falls back to a byte pool, so a chunk-sized buffer
+// here would be allocated for every copied chunk and never used.
+func newChunkUploadOption(assignResult *filer_pb.AssignVolumeResponse, isCompressed bool) *operation.UploadOption {
 	dstUrl := fmt.Sprintf("http://%s/%s", assignResult.Location.Url, assignResult.FileId)
 	if assignResult.Fsync {
 		dstUrl += "?fsync=true"
@@ -1736,7 +1727,6 @@ func newChunkUploadOption(chunkData []byte, assignResult *filer_pb.AssignVolumeR
 		MimeType:          "",
 		PairMap:           nil,
 		Jwt:               security.EncodedJwt(assignResult.Auth),
-		BytesBuffer:       bytes.NewBuffer(make([]byte, 0, len(chunkData)+multipartFramingOverhead)),
 	}
 }
 

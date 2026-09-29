@@ -18,6 +18,50 @@ spec.loader.exec_module(lab)
 
 
 class IsolationContract(unittest.TestCase):
+    def test_memory_and_record_write_regressions_run_in_race_gate(self):
+        workflow = (Path(__file__).resolve().parents[2] /
+                    '.github/workflows/appmana-storage-reliability.yml').read_text()
+        gate = workflow.split('- name: Race-tested production offset format\n', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn('-race', gate)
+        for package in ('./weed/util/memlimit', './weed/command',
+                        './weed/storage/needle', './weed/operation'):
+            self.assertIn(package, gate.split())
+
+    def test_durable_results_do_not_relocate_privileged_staging(self):
+        fs_spec = importlib.util.spec_from_file_location(
+            'filesystem_lab', Path(__file__).with_name('run_filesystem.py'))
+        filesystem = importlib.util.module_from_spec(fs_spec)
+        fs_spec.loader.exec_module(filesystem)
+        for module, arguments, boundary in [
+                (lab, ['storage'], 'PASS: sandbox boundary probe'),
+                (filesystem, ['xfs'], 'PASS: native filesystem boundary probe')]:
+            with self.subTest(runner=module.__name__), tempfile.TemporaryDirectory() as retained:
+                def execute(cmd, log, **kwargs):
+                    # TMPDIR may point inside an inaccessible home directory.
+                    # Namespace staging must still use the helper's /tmp contract.
+                    staged = [Path(arg) for arg in cmd if
+                              arg.startswith('/tmp/seaweedfs-')]
+                    self.assertTrue(staged, cmd)
+                    self.assertTrue(all(path.parent.parent == Path('/tmp')
+                                        for path in staged))
+                    log.write((boundary + '\n' + '\n'.join(
+                        '--- PASS: ' + name + ' (0.01s)'
+                        for name in lab.REQUIRED_TESTS['storage']) + '\nPASS\n').encode())
+                    return 0
+
+                runner_lab = lab if module is lab else filesystem.lab
+                with mock.patch.object(sys, 'argv', ['runner'] + arguments + [
+                        '--tests', sys.executable, '--results-root', retained]), \
+                        mock.patch.object(tempfile, 'tempdir', retained), \
+                        mock.patch.object(runner_lab, 'require_bwrap_features'), \
+                        mock.patch.object(runner_lab, 'run_bounded', side_effect=execute), \
+                        mock.patch.object(subprocess, 'run'), \
+                        mock.patch('shutil.which', return_value='/usr/bin/tool'):
+                    self.assertEqual(module.main(), 0)
+                manifests = list(Path(retained).glob('*/manifest.json'))
+                self.assertEqual(len(manifests), 1)
+                self.assertTrue((manifests[0].parent / 'test.log').is_file())
+
     def test_bwrap_requires_bounded_tmpfs_features(self):
         for help_text, accepted in [('--size BYTES\n--perms OCTAL\n--remount-ro DEST', True),
                                     ('--tmpfs DEST\n--remount-ro DEST', False),

@@ -37,6 +37,7 @@ class WindowsMSVCWorkflowTest(unittest.TestCase):
         pairs = [
             ('SEAWEEDFS_WINDOWS_MSVC_ISO', 'SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256'),
             ('SEAWEEDFS_WINFSP_MSI', 'WINFSP_MSI_SHA256'),
+            ('SEAWEEDFS_WINDOWS_CONFORMANCE_EXE', 'WINFSP_TESTS_EXE_SHA256'),
             ('SEAWEEDFS_GIT_INSTALLER', 'GIT_INSTALLER_SHA256'),
             ('SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC', 'GIT_LFS_SHA256'),
         ]
@@ -50,7 +51,8 @@ class WindowsMSVCWorkflowTest(unittest.TestCase):
             def run(values):
                 return subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
                                       env=values, capture_output=True, text=True)
-            self.assertEqual(run(env).returncode, 0)
+            accepted = run(env)
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
             for path, checksum in pairs:
                 for key, value in [(path, ''), (path, fixture.name),
                                    (path, str(fixture) + '.missing'),

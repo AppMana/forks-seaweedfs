@@ -204,6 +204,8 @@ def main():
     parser.add_argument('--tests', required=True, type=artifact)
     parser.add_argument('--candidate', type=artifact)
     parser.add_argument('--baseline', type=artifact)
+    parser.add_argument('--results-root', type=Path,
+                        help='existing directory for retained results; independent of disposable /tmp staging')
     args = parser.parse_args()
     if os.getuid() == 0:
         parser.error('invoke as a normal user; the runner uses narrowly scoped sudo')
@@ -219,7 +221,7 @@ def main():
         if digest(args.baseline) == digest(args.candidate):
             parser.error('baseline and candidate have identical contents')
         artifacts['baseline'] = args.baseline
-    results = Path(tempfile.mkdtemp(prefix='seaweedfs-lab-results-'))
+    results = Path(tempfile.mkdtemp(prefix='seaweedfs-lab-results-', dir=args.results_root))
     # bwrap drops capabilities before resolving binds; private source parents
     # may be inaccessible in its user namespace. Stage only selected binaries,
     # never chmod a caller's directory or expose a whole source/credential tree.
@@ -236,7 +238,9 @@ def main():
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(f'Results: {results}', flush=True)
     try:
-        with tempfile.TemporaryDirectory(prefix='seaweedfs-lab-artifacts-') as staging:
+        # User namespaces cannot traverse private home directories, even when
+        # their staged children are readable. Do not inherit TMPDIR here.
+        with tempfile.TemporaryDirectory(prefix='seaweedfs-lab-artifacts-', dir='/tmp') as staging:
             os.chmod(staging, 0o755)
             staged = {}
             for name, source in artifacts.items():

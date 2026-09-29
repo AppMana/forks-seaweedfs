@@ -6,6 +6,7 @@ import (
 	"net/http"
 	httppprof "net/http/pprof"
 	"os"
+	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	"github.com/seaweedfs/seaweedfs/weed/util/httpdown"
+	"github.com/seaweedfs/seaweedfs/weed/util/memlimit"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
@@ -217,8 +219,8 @@ func init() {
 	v.maintenanceMBPerSecond = cmdVolume.Flag.Int("maintenanceMBps", 0, "limit maintenance (replication / balance) IO rate in MB/s. Unset is 0, no limitation.")
 	v.fileSizeLimitMB = cmdVolume.Flag.Int("fileSizeLimitMB", 256, "limit file size to avoid out of memory")
 	v.ldbTimeout = cmdVolume.Flag.Int64("index.leveldbTimeout", 0, "alive time for leveldb (default to 0). If leveldb of volume is not accessed in ldbTimeout hours, it will be off loaded to reduce opened files and memory consumption.")
-	v.concurrentUploadLimitMB = cmdVolume.Flag.Int("concurrentUploadLimitMB", 0, "limit total concurrent upload size, 0 means unlimited")
-	v.concurrentDownloadLimitMB = cmdVolume.Flag.Int("concurrentDownloadLimitMB", 0, "limit total concurrent download size, 0 means unlimited")
+	v.concurrentUploadLimitMB = cmdVolume.Flag.Int("concurrentUploadLimitMB", memlimit.AutoMB, "limit total concurrent upload size, -1 derives it from the container memory limit, 0 means unlimited")
+	v.concurrentDownloadLimitMB = cmdVolume.Flag.Int("concurrentDownloadLimitMB", memlimit.AutoMB, "limit total concurrent download size, -1 derives it from the container memory limit, 0 means unlimited")
 	v.pprof = cmdVolume.Flag.Bool("pprof", false, "enable pprof http handlers. precludes -memprofile and -cpuprofile")
 	v.metricsHttpPort = cmdVolume.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	v.metricsHttpIp = cmdVolume.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
@@ -281,11 +283,42 @@ func runVolume(cmd *Command, args []string) bool {
 		*v.mastersString = *v.mserverString
 	}
 
+	v.applyMemoryLimits("/")
+
 	minFreeSpaces := util.MustParseMinFreeSpace(*minFreeSpace, *minFreeSpacePercent)
 	v.masters = pb.ServerAddresses(*v.mastersString).ToAddresses()
 	v.startVolumeServer(*volumeFolders, *maxVolumeCounts, *volumeWhiteListOption, minFreeSpaces)
 
 	return true
+}
+
+// applyMemoryLimits sizes the Go memory limit and the transfer admission
+// budgets from the container's cgroup memory limit (see weed/util/memlimit),
+// so a deployment sets only resources.limits.memory. An explicit GOMEMLIMIT
+// and explicit admission flags are kept. Budgets are applied in whole MiB.
+func (v VolumeServerOptions) applyMemoryLimits(cgroupRoot string) {
+	limit, hasLimit, err := memlimit.CgroupMemoryLimit(cgroupRoot)
+	if err != nil {
+		glog.Warningf("memory limits: %v; treating the container as unlimited", err)
+		hasLimit = false
+	}
+	_, envSet := os.LookupEnv("GOMEMLIMIT")
+	plan := memlimit.PlanVolumeMemory(memlimit.VolumeMemoryInput{
+		CgroupLimit:    limit,
+		HasCgroupLimit: hasLimit,
+		EnvGOMEMLIMIT:  envSet,
+		RuntimeLimit:   debug.SetMemoryLimit(-1),
+		UploadMB:       *v.concurrentUploadLimitMB,
+		DownloadMB:     *v.concurrentDownloadLimitMB,
+	})
+	if plan.SetGoMemLimit {
+		debug.SetMemoryLimit(plan.GoMemLimit)
+	}
+	*v.concurrentUploadLimitMB = int(plan.UploadLimitBytes >> 20)
+	*v.concurrentDownloadLimitMB = int(plan.DownloadLimitBytes >> 20)
+	glog.V(0).Infof("memory limits: cgroup limit %d (present %v), GOMEMLIMIT env %v, Go memory limit %d (set %v), upload admission %d MiB (auto %v), download admission %d MiB (auto %v)",
+		limit, hasLimit, envSet, plan.GoMemLimit, plan.SetGoMemLimit,
+		*v.concurrentUploadLimitMB, plan.AutoUpload, *v.concurrentDownloadLimitMB, plan.AutoDownload)
 }
 
 func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, volumeWhiteListOption string, minFreeSpaces []util.MinFreeSpace) {

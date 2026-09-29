@@ -11,6 +11,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
 )
 
+// smallRecordPayloadLimit is the payload size below which Append copies the
+// payload into the record buffer and writes the record with a single WriteAt.
+const smallRecordPayloadLimit = 64 * 1024
+
 func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset uint64, size Size, actualSize int64, err error) {
 	end, _, e := w.GetStat()
 	if e != nil {
@@ -32,10 +36,27 @@ func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset u
 		buffer_pool.SyncPoolPutBuffer(bytesBuffer)
 	}()
 
-	// The pooled buffer holds only the record's header and footer; the payload
-	// is written straight from n.Data. Copying n.Data into the buffer made
-	// every append, on the primary and on each replica, hold a second copy of
-	// the needle, and sync.Pool kept the grown buffer until two collections.
+	// A small record is built whole in the pooled buffer and written with one
+	// WriteAt: copying under smallRecordPayloadLimit bytes costs about what the
+	// two extra write syscalls of the split path would, and bounds what a
+	// pooled buffer retains.
+	if len(n.Data) < smallRecordPayloadLimit {
+		size, actualSize, err = writeNeedleByVersion(version, n, offset, bytesBuffer)
+		if err != nil {
+			return
+		}
+		_, err = w.WriteAt(bytesBuffer.Bytes(), int64(offset))
+		if err != nil {
+			err = fmt.Errorf("failed to write %d bytes to %s at offset %d: %w", actualSize, w.Name(), offset, err)
+		}
+		return offset, size, actualSize, err
+	}
+
+	// For larger payloads the pooled buffer holds only the record's header and
+	// footer, and the payload is written straight from n.Data. Copying n.Data
+	// into the buffer made every append, on the primary and on each replica,
+	// hold a second copy of the needle, and sync.Pool kept the grown buffer
+	// until two collections.
 	size, actualSize, dataAt, err := writeNeedleFramingByVersion(version, n, offset, bytesBuffer)
 	if err != nil {
 		return

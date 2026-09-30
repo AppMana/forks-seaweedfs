@@ -228,6 +228,18 @@ func run(cfg config) (runErr error) {
 	}
 
 	initialOverwrites := 24
+	// Prepare durable controls before the workload, never fsync during the
+	// observed vacuum-copy window. These settings exist only in owned VMs.
+	if cfg.scenario == "power-loss" || cfg.scenario == "all" {
+		if err := h.execOK("volume1", "python3", "-c", prepareVolatileWitness); err != nil {
+			return err
+		}
+	}
+	if cfg.scenario == "vacuum-power-loss" || cfg.scenario == "all" {
+		if err := h.execOK("volume2", "python3", "-c", prepareVolatileWitness); err != nil {
+			return err
+		}
+	}
 	if cfg.scenario == "vacuum-power-loss" {
 		initialOverwrites = 4
 	}
@@ -535,6 +547,9 @@ func (h *harness) powerLoss(fid, victim string) error {
 	if err := h.verify(fid, sequence); err != nil {
 		return fmt.Errorf("pre-cut replica convergence: %w", err)
 	}
+	if err := h.execOK(victim, "python3", "-c", dirtyVolatileWitness); err != nil {
+		return err
+	}
 	if err := h.lab.Node(victim).Crash(h.ctx); err != nil {
 		return err
 	}
@@ -545,6 +560,9 @@ func (h *harness) powerLoss(fid, victim string) error {
 		return err
 	}
 	if err := h.provisionVolume(victim, h.candidate, false); err != nil {
+		return err
+	}
+	if err := h.verifyVolatileLoss(victim); err != nil {
 		return err
 	}
 	if err := h.waitReplicas(fid); err != nil {
@@ -628,7 +646,7 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	ref := &labv1.NodeRef{SessionId: h.lab.ID(), Node: victim}
 	result, err := h.lab.RunTimeline(h.ctx,
 		&labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{
-			Exec:        &labv1.ExecRequest{Node: ref, Argv: []string{"sh", "-ec", "find /mnt/volume -name '*.cpd' -type f | grep -q ."}, TimeoutMillis: 5000},
+			Exec:        &labv1.ExecRequest{Node: ref, Argv: []string{"python3", "-c", "import glob\nassert glob.glob('/mnt/volume/*.cpd'), 'waiting for vacuum copy'\n" + dirtyVolatileWitness}, TimeoutMillis: 5000},
 			RetryMillis: 100, TimeoutMillis: 90000,
 		}}},
 		&labv1.TimelineAction{Action: &labv1.TimelineAction_Lifecycle{Lifecycle: &labv1.LifecycleRequest{Node: ref, Action: labv1.LifecycleAction_CRASH}}},
@@ -643,6 +661,9 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 		return err
 	}
 	if err := h.provisionVolume(victim, h.candidate, false); err != nil {
+		return err
+	}
+	if err := h.verifyVolatileLoss(victim); err != nil {
 		return err
 	}
 	if err := h.waitReplicas(fid); err != nil {

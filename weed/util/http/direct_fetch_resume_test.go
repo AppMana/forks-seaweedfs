@@ -3,6 +3,8 @@ package http
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -119,5 +121,68 @@ func TestContentRangeStart(t *testing.T) {
 		if got != c.want || ok != c.ok {
 			t.Errorf("contentRangeStart(%q) = %d, %v; want %d, %v", c.in, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+// A mismatched partial response is not a whole-object fallback. Consuming it
+// at offset zero poisons the prefix, which a later successful retry conceals.
+func TestRetriedFetchChunkDataRejectsWrongPartialRange(t *testing.T) {
+	payload := []byte("abcdef")
+	first, _ := chunkServer(t, payload, 2, false)
+	wrong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 3-5/6")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[3:])
+	}))
+	t.Cleanup(wrong.Close)
+	last := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(payload))
+	}))
+	t.Cleanup(last.Close)
+	buf := make([]byte, len(payload))
+	n, err := RetriedFetchChunkData(context.Background(), buf,
+		[]string{first.URL, wrong.URL, last.URL}, nil, false, true, 0, "range-repro", nil)
+	if err != nil || n != len(payload) || !bytes.Equal(buf, payload) {
+		t.Fatalf("retry must preserve the verified prefix: n=%d err=%v got=%q want=%q", n, err, buf, payload)
+	}
+}
+
+func TestDirectResumeRejectsInvalidPartialBeforeWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name, header string
+		from         int
+	}{
+		{"wrong offset", "bytes 3-5/6", 2},
+		{"malformed range", "bytes 2-not-a-range", 2},
+		{"wrong total", "bytes 2-5/7", 2},
+		{"unsolicited suffix", "bytes 3-5/6", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Range", tc.header)
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("XXXXXX"))
+			}))
+			defer srv.Close()
+			buf := []byte("ab????")
+			n, retry, err := readUrlDirectToBufferFrom(context.Background(), srv.URL, "", buf, tc.from)
+			if err == nil || !retry || n != tc.from || string(buf) != "ab????" {
+				t.Fatalf("invalid range consumed: n=%d retry=%v err=%v bytes=%q", n, retry, err, buf)
+			}
+		})
+	}
+}
+
+func TestDirectResumePreservesVerifiedShortSubrange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 2-3/6")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("cd"))
+	}))
+	defer srv.Close()
+	buf := []byte("ab????")
+	n, retry, err := readUrlDirectToBufferFrom(context.Background(), srv.URL, "", buf, 2)
+	if n != 4 || !retry || !errors.Is(err, io.ErrUnexpectedEOF) || string(buf) != "abcd??" {
+		t.Fatalf("verified subrange lost: n=%d retry=%v err=%v bytes=%q", n, retry, err, buf)
 	}
 }

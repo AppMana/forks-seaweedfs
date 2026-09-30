@@ -149,8 +149,9 @@ def main():
         # Volume startup fetches the master's configuration before listening.
         # Keep its real master on loopback in this same isolated container.
         docker('exec', name, 'mkdir', '/tmp/master')
-        docker('exec', '--detach', name, '/usr/bin/weed', 'master',
-               '-mdir=/tmp/master', '-ip=127.0.0.1', '-volumeSizeLimitMB=32')
+        docker('exec', '--detach', name, '/bin/sh', '-c',
+               'exec /usr/bin/weed master -mdir=/tmp/master -ip=127.0.0.1 '
+               '-volumeSizeLimitMB=32 >/tmp/master.log 2>&1')
         deadline = time.monotonic() + 45
         while True:
             health = docker('exec', name, 'curl', '-fsS', '--max-time', '2',
@@ -175,6 +176,8 @@ def main():
     finally:
         if created:
             try:
+                (out / 'master.log').write_text(
+                    docker('exec', name, 'cat', '/tmp/master.log', check=False).stdout)
                 (out / 'volume.log').write_text(docker('logs', name).stdout)
                 docker('stop', '--time=5', name)
                 (out / 'container.json').write_text(docker('inspect', name).stdout)

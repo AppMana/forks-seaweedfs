@@ -215,14 +215,37 @@ func (t *Topology) batchVacuumVolumeCleanup(grpcDialOption grpc.DialOption, vl *
 }
 
 func (t *Topology) Vacuum(grpcDialOption grpc.DialOption, garbageThreshold float64, maxParallelVacuumPerServer int, volumeId uint32, collection string, preallocate int64, automatic bool) {
+	_ = t.VacuumWithContext(context.Background(), grpcDialOption, garbageThreshold, maxParallelVacuumPerServer, volumeId, collection, preallocate, automatic)
+}
 
-	// if there is vacuum going on, return immediately
-	swapped := atomic.CompareAndSwapInt64(&t.vacuumLockCounter, 0, 1)
-	if !swapped {
-		glog.V(0).Infof("Vacuum is already running")
-		return
+// VacuumWithContext waits for ownership for explicit requests. Only automatic
+// sweeps may coalesce with an existing sweep, which may target another collection.
+// Cancellation bounds the ownership wait; it does not interrupt an in-progress
+// replica compact/commit sequence, whose existing safety protocol is unchanged.
+func (t *Topology) VacuumWithContext(ctx context.Context, grpcDialOption grpc.DialOption, garbageThreshold float64, maxParallelVacuumPerServer int, volumeId uint32, collection string, preallocate int64, automatic bool) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if atomic.CompareAndSwapInt64(&t.vacuumLockCounter, 0, 1) {
+			break
+		}
+		if automatic {
+			glog.V(0).Infof("Vacuum is already running")
+			return nil
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	defer atomic.StoreInt64(&t.vacuumLockCounter, 0)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// now only one vacuum process going on
 
@@ -260,6 +283,7 @@ func (t *Topology) Vacuum(grpcDialOption grpc.DialOption, garbageThreshold float
 			break
 		}
 	}
+	return nil
 }
 
 func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeLayout *VolumeLayout, c *Collection, garbageThreshold float64, maxParallelVacuumPerServer int, preallocate int64, automatic bool) {

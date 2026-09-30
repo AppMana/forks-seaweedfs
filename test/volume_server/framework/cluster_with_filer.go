@@ -25,6 +25,20 @@ func StartSingleVolumeClusterWithFiler(t testing.TB, profile matrix.Profile) *Cl
 	t.Helper()
 
 	baseCluster := StartSingleVolumeCluster(t, profile)
+	return StartFilerForCluster(t, baseCluster, "")
+}
+
+// StartFilerForCluster starts a fresh filer process against an existing data
+// plane. Explicit configuration supports external-store restore tests without
+// changing the master or volume data. Stop the previous filer before replacing
+// its configuration.
+func StartFilerForCluster(t testing.TB, baseCluster *Cluster, config string) *ClusterWithFiler {
+	t.Helper()
+	if config != "" {
+		if err := os.WriteFile(filepath.Join(baseCluster.configDir, "filer.toml"), []byte(config), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	ports, err := testutil.AllocatePorts(2)
 	if err != nil {
@@ -36,10 +50,12 @@ func StartSingleVolumeClusterWithFiler(t testing.TB, profile matrix.Profile) *Cl
 		t.Fatalf("create filer data dir: %v", mkErr)
 	}
 
-	logFile, err := os.Create(filepath.Join(baseCluster.logsDir, "filer.log"))
+	logName := fmt.Sprintf("filer-%d.log", ports[0])
+	logFile, err := os.Create(filepath.Join(baseCluster.logsDir, logName))
 	if err != nil {
 		t.Fatalf("create filer log file: %v", err)
 	}
+	defer logFile.Close()
 
 	filerPort := ports[0]
 	filerGrpcPort := ports[1]
@@ -62,21 +78,25 @@ func StartSingleVolumeClusterWithFiler(t testing.TB, profile matrix.Profile) *Cl
 	}
 
 	if err = baseCluster.waitForTCP(net.JoinHostPort("127.0.0.1", strconv.Itoa(filerGrpcPort))); err != nil {
-		filerLogTail := baseCluster.tailLog("filer.log")
+		filerLogTail := baseCluster.tailLog(logName)
 		stopProcess(filerCmd)
 		t.Fatalf("wait for filer grpc readiness: %v\nfiler log tail:\n%s", err, filerLogTail)
 	}
 
-	t.Cleanup(func() {
-		stopProcess(filerCmd)
-	})
-
-	return &ClusterWithFiler{
+	c := &ClusterWithFiler{
 		Cluster:       baseCluster,
 		filerCmd:      filerCmd,
 		filerPort:     filerPort,
 		filerGrpcPort: filerGrpcPort,
 	}
+	t.Cleanup(c.StopFiler)
+	return c
+}
+
+// StopFiler leaves the master, volume bytes and external store untouched.
+func (c *ClusterWithFiler) StopFiler() {
+	stopProcess(c.filerCmd)
+	c.filerCmd = nil
 }
 
 func (c *ClusterWithFiler) FilerAddress() string {

@@ -53,6 +53,7 @@ for repetition in 1 2 3; do
       SEAWEEDFS_WINDOWS_WEED="$binary" SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$basic" \
       SEAWEEDFS_WINDOWS_WINFSP_DLL="$dll" \
       go test . -run '^TestWindowsMountLab$' -count=1 -v -timeout=30m) 2>&1 | tee "$log"
+    python3 hack/appmana/compare-windows-access.py --validate-only "$log"
     args+=("--$label" "$log")
   done
 done

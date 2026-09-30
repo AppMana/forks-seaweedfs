@@ -199,6 +199,7 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	entry, err := s3a.resolveCopySourceEntry(srcBucket, srcObject, srcVersionId, srcVersioningState)
+	sourceIsPrefixObject := entry != nil && entry.IsPrefixObject()
 	entry = prefixObjectSource(entry)
 	if errCode := classifyCopySourceError(entry, err); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
@@ -376,6 +377,12 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 			skipHeader = true
 		}
 
+		// Membership of a shared chunk list belongs to the source entry; a
+		// destination sharing the chunks gets its own marker below.
+		if k == filer.SharedChunksExtKey || k == filer.SharedChunksLinkSourceExtKey {
+			skipHeader = true
+		}
+
 		// Filter conflicting headers for cross-encryption or encrypted→unencrypted copies
 		// This applies to both inline files (no chunks) and chunked files - fixes GitHub #7562
 		if !skipHeader {
@@ -403,6 +410,34 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	// so REPLACE doesn't leak source values through the merge. Mirrors the
 	// self-copy path's routedMetadataReplace.
 	dstEntry.Extended = mergeCopyMetadata(dstEntry.Extended, processedMetadata)
+
+	// copyChunkBytes gives dstEntry a copy of the source's data.
+	copyChunkBytes := func() s3err.ErrorCode {
+		// Use unified copy strategy approach
+		dstChunks, dstMetadata, copyErr := s3a.executeUnifiedCopyStrategy(entry, r, srcBucket, dstBucket, srcObject, dstObject, replacesSource)
+		if copyErr != nil {
+			glog.Errorf("CopyObjectHandler unified copy error: %v", copyErr)
+			// Map errors to appropriate S3 errors
+			return s3a.mapCopyErrorToS3Error(copyErr)
+		}
+
+		// re-fold a large copied chunk list, mirroring the PutObject path
+		dstEntry.Chunks = s3a.manifestizeChunks(fmt.Sprintf("%s/%s", s3a.bucketDir(dstBucket), dstObject), dstBucket, 0, dstChunks)
+
+		// Apply destination-specific metadata (e.g., SSE-C IV and headers)
+		if dstMetadata != nil {
+			for k, v := range dstMetadata {
+				dstEntry.Extended[k] = v
+			}
+			glog.V(2).Infof("Applied %d destination metadata entries for copy: %s", len(dstMetadata), r.URL.Path)
+		}
+
+		if dstEntry.Attributes != nil && len(dstEntry.Attributes.Md5) == 0 && canReuseSourceMd5 {
+			dstEntry.Attributes.Md5 = append([]byte(nil), sourceMd5...)
+		}
+		return s3err.ErrNone
+	}
+	var sharedSource *sharedCopySource
 
 	// For zero-size files or files without chunks, handle inline content
 	// This includes encrypted inline files that need decryption/re-encryption
@@ -440,45 +475,52 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 			}
 		}
 	} else {
-		// Use unified copy strategy approach
-		dstChunks, dstMetadata, copyErr := s3a.executeUnifiedCopyStrategy(entry, r, srcBucket, dstBucket, srcObject, dstObject, replacesSource)
-		if copyErr != nil {
-			glog.Errorf("CopyObjectHandler unified copy error: %v", copyErr)
-			// Map errors to appropriate S3 errors
-			errCode := s3a.mapCopyErrorToS3Error(copyErr)
+		if !sourceIsPrefixObject && s3a.canShareCopyChunks(entry, r, srcBucket, srcObject, srcVersionId, srcVersioningState, dstBucket, dstObject, dstVersioningState) {
+			if sharedSource, err = s3a.markSharedCopySource(srcBucket, srcObject, entry); err != nil {
+				glog.V(1).Infof("CopyObjectHandler: copying the bytes of %s/%s: %v", srcBucket, srcObject, err)
+				sharedSource = nil
+			}
+		}
+		if sharedSource != nil {
+			sharedSource.link(dstEntry)
+			if dstEntry.Attributes != nil && len(dstEntry.Attributes.Md5) == 0 && canReuseSourceMd5 {
+				dstEntry.Attributes.Md5 = append([]byte(nil), sourceMd5...)
+			}
+		} else if errCode := copyChunkBytes(); errCode != s3err.ErrNone {
 			s3err.WriteErrorResponse(w, r, errCode)
 			return
-		}
-
-		// re-fold a large copied chunk list, mirroring the PutObject path
-		dstEntry.Chunks = s3a.manifestizeChunks(fmt.Sprintf("%s/%s", s3a.bucketDir(dstBucket), dstObject), dstBucket, 0, dstChunks)
-
-		// Apply destination-specific metadata (e.g., SSE-C IV and headers)
-		if dstMetadata != nil {
-			for k, v := range dstMetadata {
-				dstEntry.Extended[k] = v
-			}
-			glog.V(2).Infof("Applied %d destination metadata entries for copy: %s", len(dstMetadata), r.URL.Path)
-		}
-
-		if dstEntry.Attributes != nil && len(dstEntry.Attributes.Md5) == 0 && canReuseSourceMd5 {
-			dstEntry.Attributes.Md5 = append([]byte(nil), sourceMd5...)
 		}
 	}
 
 	var dstVersionId string
 	var etag string
 
-	finalizeCode := s3a.withObjectWriteLock(dstBucket, dstObject, func() s3err.ErrorCode {
-		return s3a.checkConditionalHeaders(r, dstBucket, dstObject)
-	}, func() s3err.ErrorCode {
-		var finalizeErr error
-		dstVersionId, etag, finalizeErr = s3a.finalizeCopyDestination(dstBucket, dstObject, dstVersioningState, dstEntry)
-		if finalizeErr != nil {
-			return filerErrorToS3Error(finalizeErr)
+	finalize := func() s3err.ErrorCode {
+		return s3a.withObjectWriteLock(dstBucket, dstObject, func() s3err.ErrorCode {
+			return s3a.checkConditionalHeaders(r, dstBucket, dstObject)
+		}, func() s3err.ErrorCode {
+			var finalizeErr error
+			dstVersionId, etag, finalizeErr = s3a.finalizeCopyDestination(dstBucket, dstObject, dstVersioningState, dstEntry)
+			if finalizeErr != nil {
+				if sharedSource != nil && isSharedCopyRefused(finalizeErr) {
+					return errSharedCopyRefused
+				}
+				return filerErrorToS3Error(finalizeErr)
+			}
+			return s3err.ErrNone
+		})
+	}
+	finalizeCode := finalize()
+	if finalizeCode == errSharedCopyRefused {
+		// the source changed between its marking and the link: copy the bytes
+		glog.V(1).Infof("CopyObjectHandler: %s/%s changed while linking, copying its bytes", srcBucket, srcObject)
+		sharedSource = nil
+		filer.StripSharedChunksRef(dstEntry.Extended)
+		finalizeCode = copyChunkBytes()
+		if finalizeCode == s3err.ErrNone {
+			finalizeCode = finalize()
 		}
-		return s3err.ErrNone
-	})
+	}
 	if finalizeCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, finalizeCode)
 		return
@@ -501,9 +543,9 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 
 // copyReplacesSourceEntry reports whether a copy writes back to the very entry it
 // read, which is what lets a strategy hand the source's chunk fids to the
-// destination instead of copying the data. Nothing refcounts a plain shared chunk
-// list, so a second live entry on the same chunks loses its data as soon as either
-// side is deleted. A versioned destination writes a new version file, a suspended
+// destination instead of copying the data. A chunk list is only reference-counted
+// when a copy links it (ShareCopyChunks, s3api_object_copy_shared.go); a second
+// live entry on unlinked chunks loses its data as soon as either side is deleted. A versioned destination writes a new version file, a suspended
 // one writes the null version next to a .versions/ entry that stays live, and a
 // source pinned to a versionId reads a version file that outlives the copy — those
 // all need the chunks copied for real, as does any copy to a different key.

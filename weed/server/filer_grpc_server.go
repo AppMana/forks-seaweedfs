@@ -194,6 +194,10 @@ func (fs *FilerServer) lookupFileId(ctx context.Context, fileId string) (targetU
 func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntryRequest) (resp *filer_pb.CreateEntryResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "CreateEntry %v/%v", req.Directory, req.Entry.Name)
+	if req.IsFromOtherCluster && req.Entry != nil {
+		// the replica wrote chunks of its own; it shares nothing here
+		filer.StripSharedChunksRef(req.Entry.Extended)
+	}
 	if len(req.Entry.HardLinkId) > 0 {
 		glog.V(4).InfofCtx(ctx, "CreateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
 	}
@@ -449,6 +453,9 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 		if m.Entry == nil {
 			return fmt.Errorf("PUT requires an entry")
 		}
+		if fromOtherCluster {
+			filer.StripSharedChunksRef(m.Entry.Extended)
+		}
 		newEntry := filer.FromPbEntry(m.Directory, m.Entry)
 		so, err := fs.applyStorageDefaultsToEntry(ctx, newEntry)
 		if err != nil {
@@ -492,6 +499,9 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 			newEntry.Extended[k] = v
 		}
 		for k, v := range m.SetExtended {
+			if fromOtherCluster && (k == filer.SharedChunksExtKey || k == filer.SharedChunksLinkSourceExtKey) {
+				continue
+			}
 			newEntry.Extended[k] = v
 		}
 		for _, k := range m.DeleteExtended {
@@ -659,6 +669,9 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	if len(req.Entry.HardLinkId) > 0 {
 		glog.V(4).InfofCtx(ctx, "UpdateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
 	}
+	if req.IsFromOtherCluster {
+		filer.StripSharedChunksRef(req.Entry.Extended)
+	}
 
 	fullpath := util.Join(req.Directory, req.Entry.Name)
 
@@ -706,6 +719,10 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
 	resp := &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
 	if err = fs.filer.UpdateEntry(ctx, entry, newEntry); err == nil {
+		if len(garbage) > 0 && fs.filer.SharedChunksHeld(ctx, entry, newEntry) {
+			// the replaced chunks are still shared with other entries
+			garbage = nil
+		}
 		fs.filer.DeleteChunksNotRecursive(garbage)
 
 		fs.filer.NotifyUpdateEvent(ctx, entry, newEntry, true, req.IsFromOtherCluster, req.Signatures)

@@ -620,6 +620,10 @@ func (f *Filer) DeleteChunksNotRecursive(chunks []*filer_pb.FileChunk) {
 }
 
 func (f *Filer) deleteChunksIfNotNew(ctx context.Context, oldEntry, newEntry *Entry) {
+	if oldEntry != nil && f.SharedChunksHeld(ctx, oldEntry, newEntry) {
+		// the replaced entry shares its chunk list with entries still alive
+		return
+	}
 	var oldChunks, newChunks []*filer_pb.FileChunk
 	if oldEntry != nil {
 		oldChunks = oldEntry.GetChunks()

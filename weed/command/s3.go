@@ -66,6 +66,7 @@ type S3Options struct {
 	metricsHttpIp             *string
 	allowDeleteBucketNotEmpty *bool
 	surfaceEmptyDirectories   *bool
+	shareCopyChunks           *bool
 	autoCreateBucket          *bool
 	auditLogConfig            *string
 	localFilerSocket          *string
@@ -118,6 +119,7 @@ func init() {
 	s3StandaloneOptions.metricsHttpIp = cmdS3.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	cmdS3.Flag.Bool("allowEmptyFolder", true, "deprecated, ignored. Empty folder cleanup is now automatic.")
 	s3StandaloneOptions.allowDeleteBucketNotEmpty = cmdS3.Flag.Bool("allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	s3StandaloneOptions.shareCopyChunks = cmdS3.Flag.Bool("shareCopyChunks", false, shareCopyChunksUsage)
 	s3StandaloneOptions.surfaceEmptyDirectories = cmdS3.Flag.Bool("surfaceEmptyDirectories", false, "list a real but empty directory as a zero-byte <dir>/ marker when the prefix ends in '/'. Off by default: real S3 returns no keys for an emptied prefix, and the synthesised key has an empty basename, which breaks clients that walk trees with trailing-slash prefixes (e.g. docker/distribution's upload purger). Enable for hadoop-aws/Spark getFileStatus probes")
 	s3StandaloneOptions.autoCreateBucket = cmdS3.Flag.Bool("autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	s3StandaloneOptions.localFilerSocket = cmdS3.Flag.String("localFilerSocket", "", "local filer socket path")
@@ -370,6 +372,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		GrpcDialOption:            grpcDialOption,
 		AllowDeleteBucketNotEmpty: *s3opt.allowDeleteBucketNotEmpty,
 		SurfaceEmptyDirectories:   surfaceEmptyDirectoriesValue(s3opt.surfaceEmptyDirectories),
+		ShareCopyChunks:           s3opt.shareCopyChunks != nil && *s3opt.shareCopyChunks,
 		AutoCreateBucket:          *s3opt.autoCreateBucket,
 		LocalFilerSocket:          localFilerSocket,
 		DataCenter:                *s3opt.dataCenter,
@@ -734,6 +737,8 @@ func s3ConfigReloadInterval(v *time.Duration) time.Duration {
 	}
 	return *v
 }
+
+const shareCopyChunksUsage = "let a whole-object CopyObject within an unversioned bucket share the source's chunks instead of copying the bytes. Requires every filer to use one shared filer store"
 
 // surfaceEmptyDirectoriesValue reads the opt-in flag, tolerating a nil pointer
 // for callers that build S3ApiServerOption without going through the s3 command

@@ -188,7 +188,10 @@ func (store *LevelDB2Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 		lastFileStart, _ = genDirectoryKeyPrefix(dirPath, startFileName, store.dbCount)
 	}
 
-	iter := store.dbs[partitionId].NewIterator(&leveldb_util.Range{Start: lastFileStart}, nil)
+	// The limit stops the iterator at the end of the directory: without it, a
+	// directory with no live entry left is followed by a scan over every
+	// deleted key after it, up to the next live one anywhere in the partition.
+	iter := store.dbs[partitionId].NewIterator(&leveldb_util.Range{Start: lastFileStart, Limit: leveldb_util.BytesPrefix(directoryPrefix).Limit}, nil)
 	for iter.Next() {
 		key := iter.Key()
 		if !bytes.HasPrefix(key, directoryPrefix) {

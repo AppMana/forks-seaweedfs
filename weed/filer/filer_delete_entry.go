@@ -96,6 +96,8 @@ func (f *Filer) DeleteEntryMetaAndData(ctx context.Context, p util.FullPath, isR
 	if shouldDeleteChunks && !isDeleteCollection {
 		if len(entry.HardLinkId) != 0 && entry.HardLinkCounter > 1 {
 			// if the file is a hard link and there are other hard links, do not delete the chunks
+		} else if f.SharedChunksHeld(ctx, entry, nil) {
+			// other entries still share this chunk list
 		} else {
 			f.DeleteChunks(ctx, p, entry.GetChunks())
 		}
@@ -122,6 +124,10 @@ func (f *Filer) doBatchDeleteFolderMetaAndData(ctx context.Context, entry *Entry
 
 	//collect all the chunks of this layer and delete them together at the end
 	var chunksToDelete []*filer_pb.FileChunk
+	// children whose chunks may be shared (members, and anything under the
+	// buckets directory a copy may have marked since it was listed): freed
+	// after the bulk delete below, only when no reference is left
+	var sharedChildren []*Entry
 	lastFileName := ""
 	includeLastFile := false
 	listedChildren := !isDeletingBucket || !f.Store.CanDropWholeBucket()
@@ -159,6 +165,8 @@ func (f *Filer) doBatchDeleteFolderMetaAndData(ctx context.Context, entry *Entry
 					if len(sub.HardLinkId) != 0 {
 						// hard link chunk data are deleted separately
 						err = onHardLinkIdsFn([]HardLinkId{sub.HardLinkId})
+					} else if _, mayBeShared := f.sharedChunksGroupFor(sub); mayBeShared {
+						sharedChildren = append(sharedChildren, sub)
 					} else {
 						if shouldDeleteChunks {
 							chunksToDelete = append(chunksToDelete, sub.GetChunks()...)
@@ -188,6 +196,17 @@ func (f *Filer) doBatchDeleteFolderMetaAndData(ctx context.Context, entry *Entry
 
 	f.NotifyUpdateEvent(ctx, entry, nil, shouldDeleteChunks, isFromOtherCluster, signatures)
 	f.DeleteChunks(ctx, entry.FullPath, chunksToDelete)
+
+	// the bulk delete bypassed the store's per-entry bookkeeping; the members
+	// are gone now, so their references can go too
+	for _, sub := range sharedChildren {
+		if _, member := entrySharedChunksRef(sub); !member && !shouldDeleteChunks {
+			continue // nothing to free and no reference of its own to drop
+		}
+		if !f.SharedChunksHeld(ctx, sub, nil) && shouldDeleteChunks {
+			f.DeleteChunks(ctx, sub.FullPath, sub.GetChunks())
+		}
+	}
 
 	return nil
 }

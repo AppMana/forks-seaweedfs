@@ -523,14 +523,28 @@ func ReadUrlAsReaderCloser(fileUrl string, jwt string, rangeHeader string) (*htt
 	return r, reader, nil
 }
 
+// maxResponseDrain bounds how much of an unread response body CloseResponse
+// reads to keep the connection reusable. A body that ends within it is
+// drained; a longer one is closed unread, which drops the connection and tells
+// the server to stop sending instead of streaming the rest of a chunk nobody
+// wants.
+const maxResponseDrain = 64 * 1024
+
+// CloseResponse releases resp. A short remainder is drained so the keep-alive
+// connection goes back to the pool; a long one is abandoned. Draining without
+// a bound made every failed or abandoned chunk read (a failed copy, a
+// cancelled GET) pull the rest of the chunk from the volume server first,
+// adding load to a server that was usually slow already.
 func CloseResponse(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
 	reader := &CountingReader{reader: resp.Body}
-	io.Copy(io.Discard, reader)
+	io.CopyN(io.Discard, reader, maxResponseDrain+1)
 	resp.Body.Close()
-	if reader.BytesRead > 0 {
+	if reader.BytesRead > maxResponseDrain {
+		glog.V(1).Infof("response closed with more than %d bytes unread", maxResponseDrain)
+	} else if reader.BytesRead > 0 {
 		glog.V(1).Infof("response leftover %d bytes", reader.BytesRead)
 	}
 }
@@ -718,7 +732,11 @@ func retriedFetchChunkDataDirect(ctx context.Context, buffer []byte, urlStrings 
 			default:
 			}
 
-			n, shouldRetry, err = readUrlDirectToBuffer(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), jwt, buffer)
+			// Resume after the bytes an earlier attempt already delivered: this
+			// path serves only unencrypted, uncompressed whole chunks, whose
+			// replicas are byte-identical, so a retry asks for the remainder
+			// instead of the whole chunk again.
+			n, shouldRetry, err = readUrlDirectToBufferFrom(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), jwt, buffer, n)
 			if err == nil {
 				if failed && refreshUrls != nil {
 					refreshUrls()
@@ -754,48 +772,86 @@ func retriedFetchChunkDataDirect(ctx context.Context, buffer []byte, urlStrings 
 	return n, err
 }
 
-// readUrlDirectToBuffer reads HTTP response directly into the provided buffer,
-// avoiding intermediate buffer allocations and copies.
-func readUrlDirectToBuffer(ctx context.Context, fileUrl, jwt string, buffer []byte) (n int, retryable bool, err error) {
+// contentRangeStart returns the first byte position of a "bytes start-end/size"
+// Content-Range header.
+func contentRangeStart(contentRange string) (int, bool) {
+	start, _, _, ok := parseContentRange(contentRange)
+	return start, ok
+}
+
+func parseContentRange(header string) (start, end, total int, ok bool) {
+	var trailing string
+	n, _ := fmt.Sscanf(header, "bytes %d-%d/%d%s", &start, &end, &total, &trailing)
+	ok = n == 3 && start >= 0 && end >= start && total > end
+	return
+}
+
+// readUrlDirectToBufferFrom fills buffer[from:] with the object's bytes from
+// offset from on, and returns how many leading bytes of buffer are valid. For
+// from > 0 it sends a Range request and accepts only a 206 whose range starts
+// at from; a server that answers 200 with the whole object instead is read
+// from the start, so the result is correct either way.
+func readUrlDirectToBufferFrom(ctx context.Context, fileUrl, jwt string, buffer []byte, from int) (n int, retryable bool, err error) {
+	if from < 0 || from >= len(buffer) {
+		from = 0
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileUrl, nil)
 	if err != nil {
-		return 0, false, err
+		return from, false, err
 	}
 	maybeAddAuth(req, jwt)
 	request_id.InjectToRequest(ctx, req)
+	if from > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, len(buffer)-1))
+	}
 
 	r, err := GetGlobalHttpClient().Do(req)
 	if err != nil {
 		if ctx.Err() == nil {
 			recordUnreachable(req.URL.Host)
 		}
-		return 0, true, err
+		return from, true, err
 	}
 	recordReachable(req.URL.Host)
 	defer CloseResponse(r)
 
 	if r.StatusCode >= 400 {
 		if r.StatusCode == http.StatusNotFound {
-			return 0, true, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrNotFound)
+			return from, true, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrNotFound)
 		}
 		if r.StatusCode == http.StatusTooManyRequests {
-			return 0, false, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrTooManyRequests)
+			return from, false, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrTooManyRequests)
 		}
 		retryable = r.StatusCode >= 499
-		return 0, retryable, fmt.Errorf("%s: %s", fileUrl, r.Status)
+		return from, retryable, fmt.Errorf("%s: %s", fileUrl, r.Status)
+	}
+	readUntil := len(buffer)
+	switch r.StatusCode {
+	case http.StatusOK:
+		// Only a whole-object response may replace the existing prefix.
+		from = 0
+	case http.StatusPartialContent:
+		start, end, total, ok := parseContentRange(r.Header.Get("Content-Range"))
+		if !ok || start != from || total != len(buffer) ||
+			(r.ContentLength >= 0 && r.ContentLength != int64(end-start+1)) {
+			return from, true, fmt.Errorf("%s: invalid partial response %q for offset %d and size %d", fileUrl, r.Header.Get("Content-Range"), from, len(buffer))
+		}
+		readUntil = end + 1
+	default:
+		return from, true, fmt.Errorf("%s: unexpected chunk response %s", fileUrl, r.Status)
 	}
 
 	// Read directly into the buffer without intermediate copying
 	// This is significantly faster for large chunks (16MB+)
-	var totalRead int
-	for totalRead < len(buffer) {
+	totalRead := from
+	for totalRead < readUntil {
 		select {
 		case <-ctx.Done():
 			return totalRead, false, ctx.Err()
 		default:
 		}
 
-		m, readErr := r.Body.Read(buffer[totalRead:])
+		m, readErr := r.Body.Read(buffer[totalRead:readUntil])
 		totalRead += m
 		if readErr != nil {
 			if readErr == io.EOF {
@@ -810,5 +866,8 @@ func readUrlDirectToBuffer(ctx context.Context, fileUrl, jwt string, buffer []by
 		}
 	}
 
+	if totalRead < len(buffer) {
+		return totalRead, true, io.ErrUnexpectedEOF
+	}
 	return totalRead, false, nil
 }

@@ -700,6 +700,50 @@ func TestSharedChunksCopyWithEveryStoreWriteFailing(t *testing.T) {
 	}
 }
 
+// A remote store can commit a write and lose its acknowledgement. If the
+// subsequent read also fails, cleanup must not assume the entry is absent.
+type uncertainSharedWriteStore struct {
+	filer.FilerStore
+	target    util.FullPath
+	committed bool
+}
+
+func (s *uncertainSharedWriteStore) InsertEntry(ctx context.Context, e *filer.Entry) error {
+	if err := s.FilerStore.InsertEntry(ctx, e); err != nil {
+		return err
+	}
+	if e.FullPath == s.target {
+		s.committed = true
+		return errInjected
+	}
+	return nil
+}
+
+func (s *uncertainSharedWriteStore) FindEntry(ctx context.Context, p util.FullPath) (*filer.Entry, error) {
+	if s.committed && p == s.target {
+		return nil, errInjected
+	}
+	return s.FilerStore.FindEntry(ctx, p)
+}
+
+func TestSharedChunksUncertainWriteKeepsCommittedDestination(t *testing.T) {
+	_, raw := newSharedStore(t)
+	store := &uncertainSharedWriteStore{FilerStore: raw, target: "/buckets/bkt/dst"}
+	f := newSharedFiler(t, store)
+	chunks := newChunks(2)
+	putObject(t, f, "/buckets/bkt/src", chunks, nil)
+	if _, err := link(f, "/buckets/bkt/src", string(store.target), 0); err == nil {
+		t.Fatal("expected lost write acknowledgement")
+	}
+	store.committed = false // store connectivity recovers
+	destination, err := f.FindEntry(testCtx(), store.target)
+	if err != nil {
+		t.Fatalf("committed destination must still exist: %v", err)
+	}
+	deleteObject(t, f, "/buckets/bkt/src")
+	assertNoneDeleted(t, drainDeleted(f), fids(destination.GetChunks()), "ambiguous destination write committed")
+}
+
 func TestSharedChunksDeleteWithEveryStoreWriteFailing(t *testing.T) {
 	for n := 1; n <= 6; n++ {
 		t.Run(fmt.Sprintf("fail-write-%d", n), func(t *testing.T) {

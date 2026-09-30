@@ -256,7 +256,7 @@ jobs:
           CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
           "$RUNNER_TEMP/weed-baseline" version
           "$RUNNER_TEMP/weed-candidate" version
-      - name: Packaged volume entrypoint and automatic memory
+      - name: Packaged volume memory and S3 payload preservation
         run: |
           set -euo pipefail
           # Package the same executable used below; do not compile another one.
@@ -265,10 +265,12 @@ jobs:
           cp docker/entrypoint.sh docker/filer.toml "$context/"
           cp "$RUNNER_TEMP/weed-candidate" "$context/weed"
           docker build --iidfile "$context/image-id" "$context"
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/s3-copying.test" ./test/s3/copying
           python3 test/storage_lab/run_image.py \
             --image-id "$(cat "$context/image-id")" \
             --weed-sha256 "$(sha256sum "$RUNNER_TEMP/weed-candidate" | cut -d' ' -f1)" \
-            --results-root "$RUNNER_TEMP/server-image-results"
+            --results-root "$RUNNER_TEMP/server-image-results" \
+            --s3-suite "$RUNNER_TEMP/s3-copying.test"
       - name: Build isolated lab tests
         run: |
           go test -c -tags "$STORAGE_BUILD_TAGS" -race -o "$RUNNER_TEMP/storage.test" ./weed/storage

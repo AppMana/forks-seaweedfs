@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Qualify an existing local image; never build, pull, publish, or mount host data."""
+"""Qualify an existing local image; only an optional read-only test binary is mounted."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -10,9 +11,52 @@ import time
 import uuid
 
 
-def docker(*args, check=True):
+def docker(*args, check=True, timeout=30):
     return subprocess.run(['docker', *args], check=check, text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+
+
+S3_TESTS = ('TestBasicPutGet', 'TestBasicLargeObject', 'TestObjectCopySameBucket',
+            'TestObjectCopyDiffBucket', 'TestMultipartCopySmall',
+            'TestMultipartCopyWithoutRange', 'TestMultipartCompleteAndAbortPreservesObject')
+
+
+def check_s3_results(log):
+    passed = set(re.findall(r'^--- PASS: (\w+) ', log, re.MULTILINE))
+    if set(S3_TESTS) - passed or re.search(r'--- (?:SKIP|FAIL):', log):
+        raise RuntimeError('S3 suite did not pass its complete required inventory')
+    if not re.search(r'^PASS$', log, re.MULTILINE):
+        raise RuntimeError('S3 suite did not report terminal PASS')
+
+
+def run_s3(name, suite, out):
+    docker('exec', name, 'mkdir', '/tmp/filer')
+    docker('exec', '--detach', '--workdir=/tmp/filer', name, '/bin/sh', '-c',
+           'exec /usr/bin/weed filer -ip=127.0.0.1 -master=127.0.0.1:9333 '
+           '>/tmp/filer.log 2>&1')
+    docker('exec', '--detach', name, '/bin/sh', '-c',
+           'exec /usr/bin/weed s3 -ip.bind=127.0.0.1 -filer=127.0.0.1:8888 '
+           '>/tmp/s3.log 2>&1')
+    try:
+        deadline = time.monotonic() + 45
+        while docker('exec', name, 'curl', '-fsS', '--max-time', '2',
+                     'http://127.0.0.1:8333/', check=False).returncode:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('isolated S3 endpoint did not become ready')
+            time.sleep(1)
+        result = docker('exec', '-e', 'S3_ENDPOINT=http://127.0.0.1:8333',
+                        '-e', 'MASTER_ENDPOINT=http://127.0.0.1:9333',
+                        name, '/s3-copying.test', '-test.v', '-test.count=1',
+                        '-test.timeout=5m', '-test.run=^(' + '|'.join(S3_TESTS) + ')$',
+                        check=False, timeout=320)
+        (out / 's3-tests.log').write_text(result.stdout)
+        if result.returncode:
+            raise RuntimeError('S3 suite failed; see s3-tests.log')
+        check_s3_results(result.stdout)
+    finally:
+        for service in ('filer', 's3'):
+            log = docker('exec', name, 'cat', '/tmp/' + service + '.log', check=False)
+            (out / (service + '.log')).write_text(log.stdout)
 
 
 def check_memory(log):
@@ -31,6 +75,8 @@ def main():
     parser.add_argument('--image-id', required=True)
     parser.add_argument('--weed-sha256', required=True)
     parser.add_argument('--results-root', required=True, type=Path)
+    parser.add_argument('--s3-suite', type=Path,
+                        help='optional static Go test binary from test/s3/copying')
     args = parser.parse_args()
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', args.image_id):
         parser.error('--image-id must be a local immutable sha256 image ID')
@@ -41,6 +87,11 @@ def main():
     name = 'seaweedfs-image-check-' + uuid.uuid4().hex
     manifest = dict(status='failed', image_id=args.image_id,
                     weed_sha256=args.weed_sha256, scope='volume entrypoint and automatic memory')
+    if args.s3_suite:
+        args.s3_suite = args.s3_suite.resolve(strict=True)
+        manifest.update(scope='volume memory and isolated S3 payload/copy checks',
+                        s3_suite_sha256=hashlib.sha256(args.s3_suite.read_bytes()).hexdigest(),
+                        s3_required_tests=list(S3_TESTS))
     created = False
     try:
         info = json.loads(docker('image', 'inspect', args.image_id).stdout)[0]
@@ -49,12 +100,16 @@ def main():
         if any(e.startswith('GOMEMLIMIT=') for e in info['Config'].get('Env', [])):
             raise RuntimeError('image contains a GOMEMLIMIT override')
         (out / 'image.json').write_text(json.dumps(info, indent=2) + '\n')
-        docker('create', '--pull=never', '--name', name, '--network=none',
+        test_mount = []
+        if args.s3_suite:
+            test_mount = ['--mount', 'type=bind,src=' + str(args.s3_suite) +
+                          ',dst=/s3-copying.test,readonly']
+        docker('create', *test_mount, '--pull=never', '--name', name, '--network=none',
                '--read-only', '--user=1000:1000', '--cap-drop=ALL',
                '--security-opt=no-new-privileges', '--memory=5g', '--memory-swap=5g',
                '--cpus=1', '--pids-limit=128', '--log-opt=max-size=8m', '--log-opt=max-file=1',
-               '--tmpfs=/data:rw,uid=1000,gid=1000,size=64m',
-               '--tmpfs=/tmp:rw,mode=1777,size=32m', args.image_id,
+               '--tmpfs=/data:rw,uid=1000,gid=1000,size=512m',
+               '--tmpfs=/tmp:rw,mode=1777,size=128m', args.image_id,
                'volume', '-ip=127.0.0.1', '-mserver=127.0.0.1:9333')
         created = True
         docker('start', name)
@@ -79,6 +134,8 @@ def main():
             raise RuntimeError('packaged executable hash mismatch')
         (out / 'version.txt').write_text(docker('exec', name, '/usr/bin/weed', 'version').stdout)
         check_memory(docker('logs', name).stdout)
+        if args.s3_suite:
+            run_s3(name, args.s3_suite, out)
         manifest['status'] = 'passed'
     except Exception as exc:
         manifest['error'] = str(exc)

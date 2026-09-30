@@ -1476,6 +1476,36 @@ broader XFS/Btrfs fault and migration tests remain outstanding. Never power-cut 
 Restore drills use copied backups, new cluster identities, and blocked production
 networking. An etcd snapshot alone does not contain volume payloads.
 
+## Existing server image and S3 payload qualification
+
+`run_image.py` accepts an immutable **local** image ID and expected packaged
+`weed` digest; it never builds, pulls or publishes an image. The existing
+storage reliability workflow packages its already-built candidate and runs
+this gate. To repeat it without rebuilding the application:
+
+```sh
+CGO_ENABLED=0 go test -c -o "$LAB_BUILD/s3-copying.test" ./test/s3/copying
+python3 test/storage_lab/run_image.py \
+  --image-id "$SERVER_IMAGE_ID" --weed-sha256 "$WEED_SHA256" \
+  --results-root "$LAB_RESULTS" --s3-suite "$LAB_BUILD/s3-copying.test"
+```
+
+The read-only, nonroot container has no network interface beyond loopback,
+published ports, production credentials or writable host mounts. Its master,
+volume, filer and S3 processes communicate on loopback. Only the static test
+executable is bind-mounted, read-only. Data and temporary files use bounded
+512 MiB and 128 MiB tmpfs mounts; the container has a 5 GiB memory limit. Cleanup
+removes only its randomly named container and retains logs, image identity,
+test executable hash and the required test inventory under `--results-root`.
+
+The optional S3 suite reuses `test/s3/copying`: actual GET payload comparisons,
+same/cross-bucket copy, multipart copy, 40 MiB multipart completion and readback,
+and aborting a replacement without changing the committed object. Missing tests,
+skips, test failures or a missing terminal PASS reject qualification. This is
+protocol/payload and image-entrypoint coverage, not disk power-loss, external
+metadata-store restore, a production Harbor workload or Windows qualification.
+Omitting `--s3-suite` runs only the volume startup/automatic-memory gate.
+
 ## Native Linux filesystem runner
 
 `run_filesystem.py` runs the storage suite on a new sparse 8 GiB image formatted

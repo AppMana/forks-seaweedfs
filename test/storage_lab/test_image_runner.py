@@ -9,6 +9,15 @@ from run_image import check_memory
 
 
 class ImageMemoryContract(unittest.TestCase):
+    def test_s3_inventory_rejects_missing_skipped_failed_and_nonterminal_results(self):
+        good = ''.join('--- PASS: ' + name + ' (0.1s)\n' for name in run_image.S3_TESTS) + 'PASS\n'
+        run_image.check_s3_results(good)
+        for bad in ('PASS\n', good.replace(run_image.S3_TESTS[0], 'WrongTest'),
+                    good + '--- SKIP: Child (0.1s)\n', good + '--- FAIL: Child (0.1s)\n',
+                    good.removesuffix('PASS\n')):
+            with self.subTest(log=bad), self.assertRaises(RuntimeError):
+                run_image.check_s3_results(bad)
+
     def test_exact_cgroup_plan_and_negative_controls(self):
         good = ('memory limits: available 5368709120 (cgroup "/sys/fs/cgroup" '
                 'limit 5368709120, physical 68719476736), GOMEMLIMIT env false, '
@@ -60,4 +69,5 @@ class ImageMemoryContract(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[2] /
                     '.github/workflows/appmana-storage-reliability.yml').read_text()
         self.assertIn('python3 test/storage_lab/run_image.py', workflow)
+        self.assertIn('--s3-suite "$RUNNER_TEMP/s3-copying.test"', workflow)
         self.assertIn('${{ runner.temp }}/server-image-results/', workflow)

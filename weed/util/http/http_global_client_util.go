@@ -775,11 +775,15 @@ func retriedFetchChunkDataDirect(ctx context.Context, buffer []byte, urlStrings 
 // contentRangeStart returns the first byte position of a "bytes start-end/size"
 // Content-Range header.
 func contentRangeStart(contentRange string) (int, bool) {
-	var start int
-	if _, err := fmt.Sscanf(contentRange, "bytes %d-", &start); err != nil {
-		return 0, false
-	}
-	return start, true
+	start, _, _, ok := parseContentRange(contentRange)
+	return start, ok
+}
+
+func parseContentRange(header string) (start, end, total int, ok bool) {
+	var trailing string
+	n, _ := fmt.Sscanf(header, "bytes %d-%d/%d%s", &start, &end, &total, &trailing)
+	ok = n == 3 && start >= 0 && end >= start && total > end
+	return
 }
 
 // readUrlDirectToBufferFrom fills buffer[from:] with the object's bytes from
@@ -821,24 +825,33 @@ func readUrlDirectToBufferFrom(ctx context.Context, fileUrl, jwt string, buffer 
 		retryable = r.StatusCode >= 499
 		return from, retryable, fmt.Errorf("%s: %s", fileUrl, r.Status)
 	}
-	if from > 0 {
-		if start, ok := contentRangeStart(r.Header.Get("Content-Range")); r.StatusCode != http.StatusPartialContent || !ok || start != from {
-			// Not the remainder we asked for: take the object from the start.
-			from = 0
+	readUntil := len(buffer)
+	switch r.StatusCode {
+	case http.StatusOK:
+		// Only a whole-object response may replace the existing prefix.
+		from = 0
+	case http.StatusPartialContent:
+		start, end, total, ok := parseContentRange(r.Header.Get("Content-Range"))
+		if !ok || start != from || total != len(buffer) ||
+			(r.ContentLength >= 0 && r.ContentLength != int64(end-start+1)) {
+			return from, true, fmt.Errorf("%s: invalid partial response %q for offset %d and size %d", fileUrl, r.Header.Get("Content-Range"), from, len(buffer))
 		}
+		readUntil = end + 1
+	default:
+		return from, true, fmt.Errorf("%s: unexpected chunk response %s", fileUrl, r.Status)
 	}
 
 	// Read directly into the buffer without intermediate copying
 	// This is significantly faster for large chunks (16MB+)
 	totalRead := from
-	for totalRead < len(buffer) {
+	for totalRead < readUntil {
 		select {
 		case <-ctx.Done():
 			return totalRead, false, ctx.Err()
 		default:
 		}
 
-		m, readErr := r.Body.Read(buffer[totalRead:])
+		m, readErr := r.Body.Read(buffer[totalRead:readUntil])
 		totalRead += m
 		if readErr != nil {
 			if readErr == io.EOF {
@@ -853,5 +866,8 @@ func readUrlDirectToBufferFrom(ctx context.Context, fileUrl, jwt string, buffer 
 		}
 	}
 
+	if totalRead < len(buffer) {
+		return totalRead, true, io.ErrUnexpectedEOF
+	}
 	return totalRead, false, nil
 }

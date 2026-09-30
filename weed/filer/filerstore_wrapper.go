@@ -176,6 +176,12 @@ func (fsw *FilerStoreWrapper) abandonWrittenSharedChunksRef(ctx context.Context,
 		if storedRef, member := entrySharedChunksRef(stored); member && storedRef == ref {
 			return
 		}
+	} else if !isNotFound(err) {
+		// A failed write may have committed before its acknowledgement was
+		// lost. Without a reliable read, dropping its reference could free
+		// chunks still used by that entry. Keep the reference on uncertainty.
+		glog.WarningfCtx(ctx, "verify failed shared chunks write %s: %v; keeping reference %s", entry.FullPath, err, ref)
+		return
 	}
 	abandonSharedChunksRef(ctx, fsw, ref, entry.FullPath)
 }

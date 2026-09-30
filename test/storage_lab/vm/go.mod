@@ -3,8 +3,9 @@ module github.com/seaweedfs/seaweedfs/test/storage_lab/vm
 go 1.26.3
 
 require (
-	github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260923233400-56e537c59dcb
+	github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260929031752-816233a73e22
 	github.com/srl-labs/containerlab v0.79.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
@@ -198,7 +199,6 @@ require (
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect

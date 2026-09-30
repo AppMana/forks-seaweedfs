@@ -147,11 +147,68 @@ func (fsw *FilerStoreWrapper) InsertEntry(ctx context.Context, entry *Entry) err
 			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
 	}
 
-	if err := fsw.handleUpdateToHardLinks(ctx, entry); err != nil {
+	existing, err := fsw.handleUpdateToHardLinks(ctx, entry)
+	if err != nil {
+		return err
+	}
+	carrySharedChunksMembership(existing, entry)
+	sharedRef, wroteRef, err := prepareSharedChunksWrite(ctx, fsw, entry)
+	if err != nil {
 		return err
 	}
 
-	return actualStore.InsertEntry(ctx, entry)
+	if err := actualStore.InsertEntry(ctx, entry); err != nil {
+		fsw.abandonWrittenSharedChunksRef(ctx, sharedRef, wroteRef, entry)
+		return err
+	}
+	fsw.releaseReplacedSharedChunksRef(ctx, existing, entry)
+	return nil
+}
+
+// abandonWrittenSharedChunksRef drops the reference prepareSharedChunksWrite
+// wrote for an entry whose store write then failed, unless an existing entry at
+// the same path already carried that reference.
+func (fsw *FilerStoreWrapper) abandonWrittenSharedChunksRef(ctx context.Context, ref SharedChunksRef, wrote bool, entry *Entry) {
+	if !wrote {
+		return
+	}
+	if stored, err := fsw.getActualStore(entry.FullPath).FindEntry(ctx, entry.FullPath); err == nil {
+		if storedRef, member := entrySharedChunksRef(stored); member && storedRef == ref {
+			return
+		}
+	} else if !isNotFound(err) {
+		// A failed write may have committed before its acknowledgement was
+		// lost. Without a reliable read, dropping its reference could free
+		// chunks still used by that entry. Keep the reference on uncertainty.
+		glog.WarningfCtx(ctx, "verify failed shared chunks write %s: %v; keeping reference %s", entry.FullPath, err, ref)
+		return
+	}
+	abandonSharedChunksRef(ctx, fsw, ref, entry.FullPath)
+}
+
+// releaseReplacedSharedChunksRef drops the reference of the entry a write just
+// replaced when the new entry no longer carries it. The replaced chunks are the
+// caller's to free, after SharedChunksStillReferenced.
+func (fsw *FilerStoreWrapper) releaseReplacedSharedChunksRef(ctx context.Context, replaced, entry *Entry) {
+	ref, left := sharedChunksLeft(replaced, entry)
+	if !left {
+		return
+	}
+	if err := releaseSharedChunksRef(ctx, fsw, ref, replaced.FullPath); err != nil {
+		glog.WarningfCtx(ctx, "release shared chunks reference %s of %s: %v (leaked)", ref, replaced.FullPath, err)
+	}
+}
+
+// releaseDeletedSharedChunksRef drops the reference of an entry the store just
+// deleted.
+func (fsw *FilerStoreWrapper) releaseDeletedSharedChunksRef(ctx context.Context, deleted *Entry) {
+	ref, member := entrySharedChunksRef(deleted)
+	if !member {
+		return
+	}
+	if err := releaseSharedChunksRef(ctx, fsw, ref, deleted.FullPath); err != nil {
+		glog.WarningfCtx(ctx, "release shared chunks reference %s of %s: %v (leaked)", ref, deleted.FullPath, err)
+	}
 }
 
 // InsertEntryKnownAbsent skips the pre-insert FindEntry path when the caller has
@@ -179,7 +236,15 @@ func (fsw *FilerStoreWrapper) InsertEntryKnownAbsent(ctx context.Context, entry 
 		}
 	}
 
-	return actualStore.InsertEntry(ctx, entry)
+	sharedRef, wroteRef, err := prepareSharedChunksWrite(ctx, fsw, entry)
+	if err != nil {
+		return err
+	}
+	if err := actualStore.InsertEntry(ctx, entry); err != nil {
+		fsw.abandonWrittenSharedChunksRef(ctx, sharedRef, wroteRef, entry)
+		return err
+	}
+	return nil
 }
 
 func (fsw *FilerStoreWrapper) UpdateEntry(ctx context.Context, entry *Entry) error {
@@ -202,11 +267,22 @@ func (fsw *FilerStoreWrapper) UpdateEntry(ctx context.Context, entry *Entry) err
 			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
 	}
 
-	if err := fsw.handleUpdateToHardLinks(ctx, entry); err != nil {
+	existing, err := fsw.handleUpdateToHardLinks(ctx, entry)
+	if err != nil {
+		return err
+	}
+	carrySharedChunksMembership(existing, entry)
+	sharedRef, wroteRef, err := prepareSharedChunksWrite(ctx, fsw, entry)
+	if err != nil {
 		return err
 	}
 
-	return actualStore.UpdateEntry(ctx, entry)
+	if err := actualStore.UpdateEntry(ctx, entry); err != nil {
+		fsw.abandonWrittenSharedChunksRef(ctx, sharedRef, wroteRef, entry)
+		return err
+	}
+	fsw.releaseReplacedSharedChunksRef(ctx, existing, entry)
+	return nil
 }
 
 func normalizeEntryMimeForStore(entry *Entry) {
@@ -272,7 +348,11 @@ func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath)
 		}
 	}
 
-	return actualStore.DeleteEntry(ctx, fp)
+	if err := actualStore.DeleteEntry(ctx, fp); err != nil {
+		return err
+	}
+	fsw.releaseDeletedSharedChunksRef(ctx, existingEntry)
+	return nil
 }
 
 func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry *Entry) (err error) {
@@ -302,7 +382,11 @@ func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry 
 		}
 	}
 
-	return actualStore.DeleteEntry(ctx, existingEntry.FullPath)
+	if err := actualStore.DeleteEntry(ctx, existingEntry.FullPath); err != nil {
+		return err
+	}
+	fsw.releaseDeletedSharedChunksRef(ctx, existingEntry)
+	return nil
 }
 
 func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.FullPath) (err error) {

@@ -49,7 +49,7 @@ func (s3a *S3ApiServer) executeUnifiedCopyStrategy(entry *filer_pb.Entry, r *htt
 	// Execute strategy
 	switch strategy {
 	case CopyStrategyDirect:
-		chunks, err := s3a.copyChunks(entry, dstPath)
+		chunks, err := s3a.copyChunks(r.Context(), entry, dstPath)
 		return chunks, nil, err
 
 	case CopyStrategyKeyRotation:

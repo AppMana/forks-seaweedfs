@@ -315,27 +315,31 @@ func TestWindowsBasicAccessDenial(t *testing.T) {
 // Retain individual samples for matched-build lab comparisons. No absolute
 // wall-clock threshold: guest scheduling differs across hosts. Each timed path
 // validates data, so a failed/short read cannot masquerade as a speedup.
+// Use QPC, not time.Now: the latter rounded an entire 4096-read sample to
+// zero on the Windows Server 2022 VM. Keep timer calls outside the read loop.
 func TestWindowsAccessPerformance(t *testing.T) {
+	clock, frequency := windowsPerformanceCounter(t)
 	name := filepath.Join(testRoot(t), "access-perf.bin")
 	payload := bytes.Repeat([]byte("access-performance"), 256)
 	if err := writeAndSync(name, payload); err != nil {
 		t.Fatal(err)
 	}
 	for sample := 0; sample < 5; sample++ {
-		start := time.Now()
+		start := clock()
 		for i := 0; i < 256; i++ {
 			got, err := os.ReadFile(name)
 			if err != nil || !bytes.Equal(got, payload) {
 				t.Fatalf("open/read: %v", err)
 			}
 		}
-		t.Logf("ACCESS_PERF sample=%d operation=open_read_close iterations=256 ns_per_op=%d", sample, time.Since(start).Nanoseconds()/256)
+		elapsed := performanceCounterNanoseconds(clock()-start, frequency)
+		t.Logf("ACCESS_PERF sample=%d operation=open_read_close iterations=256 ns_per_op=%d", sample, elapsed/256)
 		f, err := os.Open(name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		buf := make([]byte, len(payload))
-		start = time.Now()
+		start = clock()
 		for i := 0; i < 4096; i++ {
 			n, err := f.ReadAt(buf, 0)
 			if err != nil || n != len(buf) || !bytes.Equal(buf, payload) {
@@ -343,9 +347,58 @@ func TestWindowsAccessPerformance(t *testing.T) {
 				t.Fatalf("handle read: %d %v", n, err)
 			}
 		}
-		t.Logf("ACCESS_PERF sample=%d operation=handle_read iterations=4096 ns_per_op=%d", sample, time.Since(start).Nanoseconds()/4096)
+		elapsed = performanceCounterNanoseconds(clock()-start, frequency)
+		t.Logf("ACCESS_PERF sample=%d operation=handle_read iterations=4096 ns_per_op=%d", sample, elapsed/4096)
 		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func windowsPerformanceCounter(t *testing.T) (func() int64, int64) {
+	t.Helper()
+	dll := windows.NewLazySystemDLL("kernel32.dll")
+	counter := dll.NewProc("QueryPerformanceCounter")
+	frequencyProc := dll.NewProc("QueryPerformanceFrequency")
+	if err := counter.Find(); err != nil {
+		t.Fatal(err)
+	}
+	var frequency int64
+	if ok, _, err := frequencyProc.Call(uintptr(unsafe.Pointer(&frequency))); ok == 0 || frequency <= 0 {
+		t.Fatalf("QueryPerformanceFrequency: frequency=%d error=%v", frequency, err)
+	}
+	t.Logf("ACCESS_PERF_CLOCK source=QueryPerformanceCounter frequency=%d", frequency)
+	return func() int64 {
+		var ticks int64
+		if ok, _, err := counter.Call(uintptr(unsafe.Pointer(&ticks))); ok == 0 {
+			t.Fatalf("QueryPerformanceCounter: %v", err)
+		}
+		return ticks
+	}, frequency
+}
+
+func performanceCounterNanoseconds(ticks, frequency int64) int64 {
+	// Convert the interval, not the absolute boot counter. Floating point
+	// avoids overflowing ticks*1e9 while retaining nanosecond precision for
+	// these short, bounded samples.
+	return int64(float64(ticks) * 1e9 / float64(frequency))
+}
+
+func TestWindowsPerformanceCounter(t *testing.T) {
+	if got := performanceCounterNanoseconds(12345, 10000000); got != 1234500 {
+		t.Fatalf("counter conversion = %d, want 1234500 ns", got)
+	}
+	clock, frequency := windowsPerformanceCounter(t)
+	start := clock()
+	previous := start
+	for i := 0; i < 1000; i++ {
+		now := clock()
+		if now < previous {
+			t.Fatal("performance counter moved backwards")
+		}
+		previous = now
+	}
+	if performanceCounterNanoseconds(previous-start, frequency) <= 0 {
+		t.Fatal("performance counter did not advance")
 	}
 }

@@ -67,7 +67,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         }
         $label = "native persistence $Phase"
     } elseif ($PerformanceOnly) {
-        $names = @('TestWindowsAccessPerformance')
+        $names = @('TestWindowsPerformanceCounter', 'TestWindowsAccessPerformance')
         $label = 'native access performance'
     } elseif ($MetadataOnly) {
         $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase', 'TestWindowsAttributesRoundTrip', 'TestWindowsCreationTimeStable', 'TestWindowsUnicodeComponentLimits', 'TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity', 'TestWindowsSymlinkTargets', 'TestWindowsAccessPerformance')

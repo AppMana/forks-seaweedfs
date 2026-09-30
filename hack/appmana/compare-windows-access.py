@@ -47,10 +47,19 @@ def load_runs(paths):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", action="append", required=True)
-    parser.add_argument("--candidate", action="append", required=True)
+    parser.add_argument("--baseline", action="append")
+    parser.add_argument("--candidate", action="append")
+    parser.add_argument("--validate-only", metavar="LOG",
+                        help="reject invalid samples before scheduling another VM")
     parser.add_argument("--max-regression-percent", type=float, default=15)
     args = parser.parse_args()
+    if args.validate_only:
+        if args.baseline or args.candidate:
+            parser.error("--validate-only cannot be combined with a comparison")
+        load_runs([args.validate_only])
+        return 0
+    if not args.baseline or not args.candidate:
+        parser.error("comparison requires --baseline and --candidate")
     if not 0 <= args.max_regression_percent <= 100:
         parser.error("regression percent must be between 0 and 100")
     baseline, candidate = load_runs(args.baseline), load_runs(args.candidate)

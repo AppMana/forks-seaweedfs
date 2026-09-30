@@ -44,17 +44,31 @@ func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions bool) *WinFspHost {
 		if inode, found := wfs.inodeToPath.GetInode(event.Path); found {
 			adapter.readAhead.Invalidate(inode)
 		}
-		if event.Entry == nil || event.Entry.IsDirectory {
+		action := winFspAppliedEventAction(event)
+		if action == winFspAppliedNone {
 			return
+		}
+		notifyAction := uint32(NotifyTruncate | NotifyUtime)
+		switch action {
+		case winFspAppliedCreate:
+			notifyAction = NotifyCreate
+		case winFspAppliedMkdir:
+			notifyAction = NotifyMkdir
+		case winFspAppliedUnlink:
+			notifyAction = NotifyUnlink
+		case winFspAppliedRmdir:
+			notifyAction = NotifyRmdir
 		}
 		root := strings.TrimRight(wfs.option.FilerMountRootPath, "/")
 		path := string(event.Path)
 		if !strings.HasPrefix(path, root+"/") {
 			return
 		}
-		// The earlier subscription notification can race handle refresh.
-		// Re-notify only after our read-ahead generation and WFS entry advance.
-		if !host.Notify(strings.TrimPrefix(path, root), NotifyTruncate|NotifyUtime) {
+		// The earlier subscription notification can race cache/handle refresh.
+		// Re-notify every changed namespace path after userspace has advanced,
+		// including vacated names, so a re-entrant lookup cannot retain the
+		// old positive entry indefinitely with kernel data caching enabled.
+		if !host.Notify(strings.TrimPrefix(path, root), notifyAction) {
 			glog.V(4).Infof("winfsp post-refresh notify rejected for %s", path)
 		}
 	})

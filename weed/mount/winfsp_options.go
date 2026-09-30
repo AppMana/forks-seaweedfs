@@ -3,7 +3,39 @@ package mount
 import (
 	"fmt"
 	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 )
+
+type winFspAppliedAction uint8
+
+const (
+	winFspAppliedNone winFspAppliedAction = iota
+	winFspAppliedContent
+	winFspAppliedCreate
+	winFspAppliedMkdir
+	winFspAppliedUnlink
+	winFspAppliedRmdir
+)
+
+func winFspAppliedEventAction(event meta_cache.EntryInvalidation) winFspAppliedAction {
+	if event.Entry == nil {
+		if !event.Deleted && event.RenamedTo == "" {
+			return winFspAppliedNone
+		}
+		if event.WasDirectory {
+			return winFspAppliedRmdir
+		}
+		return winFspAppliedUnlink
+	}
+	if event.Entry.IsDirectory {
+		return winFspAppliedMkdir
+	}
+	if event.PreviousEntry == nil {
+		return winFspAppliedCreate
+	}
+	return winFspAppliedContent
+}
 
 // WinFsp enables the Windows data cache only for an infinite file-info
 // timeout. KeepFileCache must remain absent: the FUSE layer then flushes and

@@ -3,7 +3,33 @@ package mount
 import (
 	"reflect"
 	"testing"
+
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
+
+func TestWinFspAppliedNamespaceInvalidations(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		event meta_cache.EntryInvalidation
+		want  winFspAppliedAction
+	}{
+		{"deleted file", meta_cache.EntryInvalidation{Deleted: true}, winFspAppliedUnlink},
+		{"deleted directory", meta_cache.EntryInvalidation{Deleted: true, WasDirectory: true}, winFspAppliedRmdir},
+		{"renamed source", meta_cache.EntryInvalidation{RenamedTo: "/new"}, winFspAppliedUnlink},
+		{"renamed directory", meta_cache.EntryInvalidation{RenamedTo: "/new", WasDirectory: true}, winFspAppliedRmdir},
+		{"created or renamed destination", meta_cache.EntryInvalidation{Entry: &filer_pb.Entry{Name: "new"}}, winFspAppliedCreate},
+		{"created directory", meta_cache.EntryInvalidation{Entry: &filer_pb.Entry{Name: "new", IsDirectory: true}}, winFspAppliedMkdir},
+		{"content update", meta_cache.EntryInvalidation{PreviousEntry: &filer_pb.Entry{Name: "file"}, Entry: &filer_pb.Entry{Name: "file"}}, winFspAppliedContent},
+		{"empty invalidation", meta_cache.EntryInvalidation{}, winFspAppliedNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := winFspAppliedEventAction(tc.event); got != tc.want {
+				t.Fatalf("post-apply invalidation = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestWinFspCacheOptions(t *testing.T) {
 	want := []string{

@@ -9,6 +9,19 @@ from run_image import check_memory
 
 
 class ImageMemoryContract(unittest.TestCase):
+    def test_soak_requires_exact_duration_multiple_cycles_and_complete_test(self):
+        good = ('SOAK_COMPLETE duration_seconds=86400 cycles=2000\n'
+                '--- PASS: TestS3QualificationSoak (86401s)\nPASS\n')
+        run_image.check_soak_results(good, 86400)
+        for bad in ('PASS\n', good.replace('86400', '30'),
+                    good.replace('cycles=2000', 'cycles=1'),
+                    good.replace('cycles=2000', 'cycles=0'),
+                    good.replace('TestS3QualificationSoak', 'WrongTest'),
+                    good.replace('--- PASS:', '--- SKIP:'),
+                    good.removesuffix('PASS\n')):
+            with self.subTest(log=bad), self.assertRaises(RuntimeError):
+                run_image.check_soak_results(bad, 86400)
+
     def test_s3_inventory_rejects_missing_skipped_failed_and_nonterminal_results(self):
         good = ''.join('--- PASS: ' + name + ' (0.1s)\n' for name in run_image.S3_TESTS) + 'PASS\n'
         run_image.check_s3_results(good)
@@ -70,4 +83,6 @@ class ImageMemoryContract(unittest.TestCase):
                     '.github/workflows/appmana-storage-reliability.yml').read_text()
         self.assertIn('python3 test/storage_lab/run_image.py', workflow)
         self.assertIn('--s3-suite "$RUNNER_TEMP/s3-copying.test"', workflow)
+        self.assertIn('--soak-seconds 30', workflow)
+        self.assertEqual(workflow.count("'test/s3/copying/**'"), 2)
         self.assertIn('${{ runner.temp }}/server-image-results/', workflow)

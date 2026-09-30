@@ -21,15 +21,30 @@ S3_TESTS = ('TestBasicPutGet', 'TestBasicLargeObject', 'TestObjectCopySameBucket
             'TestMultipartCopyWithoutRange', 'TestMultipartCompleteAndAbortPreservesObject')
 
 
-def check_s3_results(log):
+def check_s3_results(log, required=S3_TESTS):
     passed = set(re.findall(r'^--- PASS: (\w+) ', log, re.MULTILINE))
-    if set(S3_TESTS) - passed or re.search(r'--- (?:SKIP|FAIL):', log):
+    if set(required) - passed or re.search(r'--- (?:SKIP|FAIL):', log):
         raise RuntimeError('S3 suite did not pass its complete required inventory')
     if not re.search(r'^PASS$', log, re.MULTILINE):
         raise RuntimeError('S3 suite did not report terminal PASS')
 
 
-def run_s3(name, suite, out):
+def check_soak_results(log, seconds):
+    check_s3_results(log, ('TestS3QualificationSoak',))
+    if not re.search(r'^SOAK_COMPLETE duration_seconds=' + str(seconds) +
+                     r' cycles=(?:[2-9]|[1-9][0-9]+)$', log, re.MULTILINE):
+        raise RuntimeError('soak completion/duration inventory missing')
+
+
+def docker_logged(path, *args, timeout):
+    # Persist progress as it happens, including if the controller is interrupted.
+    with path.open('w') as log:
+        result = subprocess.run(['docker', *args], stdout=log,
+                                stderr=subprocess.STDOUT, timeout=timeout)
+    return subprocess.CompletedProcess(result.args, result.returncode, path.read_text())
+
+
+def run_s3(name, suite, out, soak_seconds=0):
     docker('exec', name, 'mkdir', '/tmp/filer')
     docker('exec', '--detach', '--workdir=/tmp/filer', name, '/bin/sh', '-c',
            'exec /usr/bin/weed filer -ip=127.0.0.1 -master=127.0.0.1:9333 '
@@ -53,6 +68,18 @@ def run_s3(name, suite, out):
         if result.returncode:
             raise RuntimeError('S3 suite failed; see s3-tests.log')
         check_s3_results(result.stdout)
+        if soak_seconds:
+            result = docker_logged(out / 'soak-tests.log', 'exec', '-e', 'S3_ENDPOINT=http://127.0.0.1:8333',
+                            '-e', 'MASTER_ENDPOINT=http://127.0.0.1:9333',
+                            '-e', 'SEAWEEDFS_ISOLATED_IMAGE=1',
+                            '-e', 'SEAWEEDFS_SOAK_SECONDS=' + str(soak_seconds),
+                            name, '/s3-copying.test', '-test.v', '-test.count=1',
+                            '-test.timeout=' + str(soak_seconds + 600) + 's',
+                            '-test.run=^TestS3QualificationSoak$',
+                            timeout=soak_seconds + 620)
+            if result.returncode:
+                raise RuntimeError('soak failed; see soak-tests.log')
+            check_soak_results(result.stdout, soak_seconds)
     finally:
         for service in ('filer', 's3'):
             log = docker('exec', name, 'cat', '/tmp/' + service + '.log', check=False)
@@ -77,7 +104,11 @@ def main():
     parser.add_argument('--results-root', required=True, type=Path)
     parser.add_argument('--s3-suite', type=Path,
                         help='optional static Go test binary from test/s3/copying')
+    parser.add_argument('--soak-seconds', type=int, default=0,
+                        help='intensive fixed-live-data S3/vacuum lane, up to 86400 seconds')
     args = parser.parse_args()
+    if not 0 <= args.soak_seconds <= 86400 or (args.soak_seconds and not args.s3_suite):
+        parser.error('--soak-seconds requires --s3-suite and must be 0..86400')
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', args.image_id):
         parser.error('--image-id must be a local immutable sha256 image ID')
     if not re.fullmatch(r'[0-9a-f]{64}', args.weed_sha256):
@@ -87,12 +118,14 @@ def main():
     name = 'seaweedfs-image-check-' + uuid.uuid4().hex
     manifest = dict(status='failed', image_id=args.image_id,
                     weed_sha256=args.weed_sha256, scope='volume entrypoint and automatic memory')
+    manifest['soak_seconds'] = args.soak_seconds
     if args.s3_suite:
         args.s3_suite = args.s3_suite.resolve(strict=True)
         manifest.update(scope='volume memory and isolated S3 payload/copy checks',
                         s3_suite_sha256=hashlib.sha256(args.s3_suite.read_bytes()).hexdigest(),
                         s3_required_tests=list(S3_TESTS))
     created = False
+    print('Starting qualification; retained progress: ' + str(out), flush=True)
     try:
         info = json.loads(docker('image', 'inspect', args.image_id).stdout)[0]
         if info['Id'] != args.image_id:
@@ -135,7 +168,7 @@ def main():
         (out / 'version.txt').write_text(docker('exec', name, '/usr/bin/weed', 'version').stdout)
         check_memory(docker('logs', name).stdout)
         if args.s3_suite:
-            run_s3(name, args.s3_suite, out)
+            run_s3(name, args.s3_suite, out, args.soak_seconds)
         manifest['status'] = 'passed'
     except Exception as exc:
         manifest['error'] = str(exc)

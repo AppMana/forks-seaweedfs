@@ -98,6 +98,9 @@ try {
     foreach ($script:BasicPermissions in @($false, $true)) {
         $script:failures = 0
         $null = Start-Mount $root $root $root 'policy-contract'
+        if ($script:capturedMountArgs -contains '-volumeLabel=SmokeTest') {
+            throw 'Shared mount command uses fork-only volumeLabel flag unsupported by vanilla baseline'
+        }
         if (($script:capturedMountArgs -contains '-winfspBasicPermissions') -ne $script:BasicPermissions) {
             throw 'Mount permission switch does not match policy'
         }

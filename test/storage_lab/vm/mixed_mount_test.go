@@ -52,12 +52,31 @@ func TestMixedOSMountLab(t *testing.T) {
 		"linux-workload":   os.Getenv("SEAWEEDFS_MIXED_LINUX_WORKLOAD"),
 		"windows-workload": os.Getenv("SEAWEEDFS_MIXED_WINDOWS_WORKLOAD"),
 		"winfsp.msi":       os.Getenv("SEAWEEDFS_WINFSP_MSI"),
-		"winfsp-x64.dll":   os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL"),
 	}
-	inputs["winfsp-x64.dll.manifest.txt"] = inputs["winfsp-x64.dll"] + ".manifest.txt"
-	inputs["winfsp-x64.dll.source.patch"] = inputs["winfsp-x64.dll"] + ".source.patch"
+	nativePackage := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_NATIVE_PACKAGE")
+	if nativePackage == "" {
+		inputs["winfsp-x64.dll"] = os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
+		inputs["winfsp-x64.dll.manifest.txt"] = inputs["winfsp-x64.dll"] + ".manifest.txt"
+		inputs["winfsp-x64.dll.source.patch"] = inputs["winfsp-x64.dll"] + ".source.patch"
+	} else if os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL") != "" {
+		t.Fatal("native package selects a matched DLL; unset SEAWEEDFS_WINDOWS_WINFSP_DLL")
+	}
 	artifacts := map[string][]byte{}
 	var provenance strings.Builder
+	if nativePackage != "" {
+		native, err := nativeWinFspInputs(nativePackage, os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_FORK"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for target, data := range native {
+			name := strings.TrimPrefix(target, `C:\lab\`)
+			if name == target {
+				t.Fatalf("unexpected native artifact target %s", target)
+			}
+			artifacts[name] = data
+			fmt.Fprintf(&provenance, "native_artifact=%s sha256=%s\n", target, sha(data))
+		}
+	}
 	traceLinux := os.Getenv("SEAWEEDFS_MIXED_TRACE") == "1"
 	fmt.Fprintf(&provenance, "linux_fuse_trace=%t\n", traceLinux)
 	for name, path := range inputs {
@@ -71,8 +90,10 @@ func TestMixedOSMountLab(t *testing.T) {
 		artifacts[name] = b
 		fmt.Fprintf(&provenance, "%s %s sha256=%s\n", name, path, sha(b))
 	}
-	if err := validateWinFspLabManifest(artifacts["winfsp-x64.dll.manifest.txt"], artifacts["winfsp-x64.dll"], artifacts["winfsp-x64.dll.source.patch"]); err != nil {
-		t.Fatal(err)
+	if nativePackage == "" {
+		if err := validateWinFspLabManifest(artifacts["winfsp-x64.dll.manifest.txt"], artifacts["winfsp-x64.dll"], artifacts["winfsp-x64.dll.source.patch"]); err != nil {
+			t.Fatal(err)
+		}
 	}
 	linuxImage, windowsImage := os.Getenv("LABCONTAINERS_VM_IMAGE"), os.Getenv("LABCONTAINERS_WINDOWS_IMAGE")
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
@@ -193,6 +214,9 @@ New-NetIPAddress -InterfaceIndex $nic[0].ifIndex -IPAddress 192.0.2.11 -PrefixLe
 $p=Start-Process msiexec.exe -ArgumentList '/i','C:\lab\winfsp.msi','/qn','/norestart','INSTALLLEVEL=1000' -Wait -PassThru;
 if($p.ExitCode -notin @(0,3010)){throw "installer exit $($p.ExitCode)"}; if(-not(Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)){throw 'WinFsp service absent'};
 Write-Output SETUP_COMPLETE`))
+	if nativePackage != "" {
+		installNativeWinFsp(t, ctx, lab, lab.Node("windows"), results)
+	}
 	// Offline Windows images can interpret the virtual RTC as local time.
 	// Mount subscriptions start at the client's time.Now(), so a future clock
 	// silently excludes current filer events. Set only this fresh guest's clock,

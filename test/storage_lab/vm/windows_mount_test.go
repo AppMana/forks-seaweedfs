@@ -97,6 +97,10 @@ func TestWindowsMountLab(t *testing.T) {
 	}
 	labDLL := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
 	nativePackage := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_NATIVE_PACKAGE")
+	stockDriverSHA := os.Getenv("SEAWEEDFS_WINDOWS_STOCK_DRIVER_SHA256")
+	if stockDriverSHA != "" && nativePackage == "" {
+		t.Fatal("stock driver override requires a verified native DLL package")
+	}
 	if nativePackage != "" && labDLL != "" {
 		t.Fatal("native package selects a matched DLL; unset SEAWEEDFS_WINDOWS_WINFSP_DLL")
 	}
@@ -145,8 +149,15 @@ func TestWindowsMountLab(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if stockDriverSHA != "" {
+			artifacts, err = stockWinFspArtifacts(artifacts, stockDriverSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	var provenance strings.Builder
+	fmt.Fprintf(&provenance, "stock_driver_sha256=%q\n", stockDriverSHA)
 	fmt.Fprintf(&provenance, "mount_manager_from_fsd=%q\n", registrationMode)
 	fmt.Fprintf(&provenance, "mount_manager_check_cleanup=%q\n", cleanupMode)
 	fmt.Fprintf(&provenance, "mount_manager_guid_junction=%q\n", guidJunction)
@@ -298,8 +309,29 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 	if err := validateWindowsCommandOutput(r.GetExitCode(), string(r.GetStdout()), setupMarker); err != nil {
 		t.Fatal(err)
 	}
-	if nativePackage != "" {
+	if nativePackage != "" && stockDriverSHA == "" {
 		installNativeWinFsp(t, ctx, lab, n, resultDir)
+	}
+	if stockDriverSHA != "" {
+		// Run even on a workload failure, before the existing VM cleanup.
+		// This attests the actually loaded driver, not merely an MSI filename.
+		defer func() {
+			verifyCtx, stop := context.WithTimeout(context.Background(), time.Minute)
+			defer stop()
+			result, err := n.ExecWithTimeout(verifyCtx, 45*time.Second, ps, "-NoProfile", "-Command", stockWinFspVerification(stockDriverSHA))
+			output := string(result.GetStdout()) + string(result.GetStderr())
+			if writeErr := os.WriteFile(filepath.Join(resultDir, "stock-driver.log"), []byte(output), 0600); writeErr != nil {
+				t.Error(writeErr)
+			}
+			t.Log(output)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if err := validateWindowsCommandOutput(result.GetExitCode(), output, "STOCK_DRIVER_READY:"+stockDriverSHA); err != nil {
+				t.Error(err)
+			}
+		}()
 	}
 	if isolateMountManager {
 		nativeMarker := "NATIVE_COMPLETE:" + filepath.Base(resultDir)

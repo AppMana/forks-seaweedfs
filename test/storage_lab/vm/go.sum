@@ -29,8 +29,8 @@ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFI
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
 github.com/antlr4-go/antlr/v4 v4.13.0 h1:lxCg3LAv+EUK6t1i0y1V6/SLeUi0eKEKdhQAlS8TVTI=
 github.com/antlr4-go/antlr/v4 v4.13.0/go.mod h1:pfChB/xh/Unjila75QW7+VU4TSnWnnk9UTnmpPaOR2g=
-github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260929031752-816233a73e22 h1:jL/uixJdxdDsTb8qa3J29FcuQxe3tfcLy/smcV49EFE=
-github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260929031752-816233a73e22/go.mod h1:t8wYsITQR0SWsj4m8Lj6GZqnu3Ph0K+ihHWPZAhZhNo=
+github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260930171753-f9df7146a738 h1:TYPAm3yVuR1WU09sr1OIbpYPhVwOOE4agcm49b44wMI=
+github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260930171753-f9df7146a738/go.mod h1:t8wYsITQR0SWsj4m8Lj6GZqnu3Ph0K+ihHWPZAhZhNo=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 h1:0CwZNZbxp69SHPdPJAN/hZIm0C4OItdklCFmMRWYpio=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5/go.mod h1:wHh0iHkYZB8zMSxRWpUBQtwG5a7fFgvEO+odwuTv2gs=
 github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 h1:DklsrG3dyBCFEj5IhUbnKptjxatkF07cF2ak3yi77so=

@@ -3,7 +3,7 @@ module github.com/seaweedfs/seaweedfs/test/storage_lab/vm
 go 1.26.3
 
 require (
-	github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260929031752-816233a73e22
+	github.com/appmana/labcontainers v0.2.0-alpha.2.0.20260930171753-f9df7146a738
 	github.com/srl-labs/containerlab v0.79.0
 	golang.org/x/sys v0.47.0
 )

@@ -299,8 +299,7 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
         '-filer=127.0.0.1:8888',
         "-dir=$mnt",
         "-cacheDir=$cacheDir",
-        '-cacheCapacityMB=512',
-        '-volumeLabel=SmokeTest'
+        '-cacheCapacityMB=512'
     )
     if ($Trace) { $mountArgs += '-winfspOptions=debug' }
     if ($WinFspOptions) { $mountArgs += "-winfspOptions=$WinFspOptions" }

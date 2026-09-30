@@ -53,6 +53,13 @@ func validateWindowsScenarioEvidence(scenario, output string) error {
 		required = []string{"PASS: native metadata regressions completes without skips"}
 	case "AccessPerformance":
 		required = []string{"PASS: native access performance completes without skips", "--- PASS: TestWindowsAccessPerformance "}
+	case "CacheLifecycle":
+		for _, marker := range []string{"PASS: native cached delete lifecycle completes without skips", "--- PASS: TestCachedDeleteRecreate ", "--- PASS: TestDeleteOnClose "} {
+			if strings.Count(output, marker) != 2 {
+				return fmt.Errorf("CacheLifecycle requires both NTFS control and mounted evidence: %s", marker)
+			}
+		}
+		required = []string{"PASS: native access performance completes without skips", "--- PASS: TestWindowsAccessPerformance "}
 	case "Conformance":
 		required = []string{"PASS: upstream conformance including known failures"}
 	case "All":
@@ -72,11 +79,15 @@ func validateWindowsScenarioEvidence(scenario, output string) error {
 
 func TestWindowsScenarioEvidence(t *testing.T) {
 	const perf = "--- PASS: TestWindowsAccessPerformance (5.33s)\r\nPASS: native access performance completes without skips\r\n"
+	const lifecycle = "--- PASS: TestCachedDeleteRecreate (1.0s)\n--- PASS: TestDeleteOnClose (0.1s)\nPASS: native cached delete lifecycle completes without skips\n"
 	for _, tc := range []struct {
 		name, scenario, output string
 		valid                  bool
 	}{
 		{"real performance marker", "AccessPerformance", perf, true},
+		{"cache control and mount", "CacheLifecycle", lifecycle + lifecycle + perf, true},
+		{"cache missing control or mount", "CacheLifecycle", lifecycle + perf, false},
+		{"cache missing performance", "CacheLifecycle", lifecycle + lifecycle, false},
 		{"empty performance", "AccessPerformance", "", false},
 		{"wrong Git marker", "AccessPerformance", "PASS: git init iteration 20 leaves no stale config.lock", false},
 		{"missing native PASS", "AccessPerformance", "PASS: native access performance completes without skips", false},

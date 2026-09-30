@@ -25,9 +25,9 @@ on:
         default: false
   push:
     branches: [master, main, 'merge/**']
-    paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/s3/copying/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
   pull_request:
-    paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
+    paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/s3/copying/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
 
 permissions:
   contents: read
@@ -270,7 +270,8 @@ jobs:
             --image-id "$(cat "$context/image-id")" \
             --weed-sha256 "$(sha256sum "$RUNNER_TEMP/weed-candidate" | cut -d' ' -f1)" \
             --results-root "$RUNNER_TEMP/server-image-results" \
-            --s3-suite "$RUNNER_TEMP/s3-copying.test"
+            --s3-suite "$RUNNER_TEMP/s3-copying.test" \
+            --soak-seconds 30
       - name: Build isolated lab tests
         run: |
           go test -c -tags "$STORAGE_BUILD_TAGS" -race -o "$RUNNER_TEMP/storage.test" ./weed/storage

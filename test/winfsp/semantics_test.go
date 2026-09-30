@@ -557,6 +557,41 @@ func TestDeleteOnClose(t *testing.T) {
 	}
 }
 
+// Warm Windows' data cache before deleting, then immediately reclaim the same
+// name. No retries or sleeps: a successful delete must not leave a deferred
+// namespace collision. Check each generation's bytes to catch stale pages too.
+func TestCachedDeleteRecreate(t *testing.T) {
+	dir := testRoot(t)
+	name := filepath.Join(dir, "cached-recreate.bin")
+	for generation := 0; generation < 64; generation++ {
+		want := bytes.Repeat([]byte{byte(generation + 1)}, 64*1024)
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatalf("generation %d exclusive create after delete: %v", generation, err)
+		}
+		if n, err := f.Write(want); err != nil || n != len(want) {
+			f.Close()
+			t.Fatalf("generation %d write: n=%d err=%v", generation, n, err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for read := 0; read < 2; read++ {
+			got, err := os.ReadFile(name)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("generation %d warm read %d: n=%d err=%v", generation, read, len(got), err)
+			}
+		}
+		if err := os.Remove(name); err != nil {
+			t.Fatalf("generation %d delete: %v", generation, err)
+		}
+	}
+}
+
 func describeFileInfo(fi os.FileInfo) string {
 	if fi == nil {
 		return "<nil>"

@@ -130,6 +130,11 @@ try {
             $selected.Contains('TestWindowsPermissionsPersistenceRepeatVerify') -ne $script:BasicPermissions) {
             throw 'verify phase lost real mounted repeatability coverage'
         }
+        Invoke-NativeMountedSuite $root -CacheLifecycleOnly
+        $selected = @($script:capturedNativeArgs | Where-Object { $_ -like '-test.run=*' })[0]
+        if ($selected -ne '-test.run=^(TestCachedDeleteRecreate|TestDeleteOnClose)$' -or $script:failures -ne 0) {
+            throw 'Cache lifecycle selection lost the focused immediate-recreate regressions'
+        }
     }
     $script:BasicPermissions = $false
     Invoke-NativeMountedSuite $root -MetadataOnly -FilerEndpoint '192.0.2.10:8888' -FilerRootPrefix '/buckets/pvc-test/qualification-token/native' -LegacyPermissionUID 0 -LegacyPermissionGID 0 -LegacyPermissionMode 504

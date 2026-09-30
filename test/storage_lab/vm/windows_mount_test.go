@@ -47,7 +47,7 @@ func TestWindowsMountLab(t *testing.T) {
 	scenarios := []string{"GitAtomicRenamePrimed", "GitLfsTempMetadata"}
 	if scenario := os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_SCENARIO"); scenario != "" {
 		switch scenario {
-		case "All", "NativeMetadata", "AccessPerformance", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
+		case "All", "NativeMetadata", "AccessPerformance", "CacheLifecycle", "Conformance", "GitAtomicRenamePrimed", "GitLfsTempMetadata", "MountManagerDirectoryLifecycle", "MountManagerProcessCrash", "MountManagerRegistrationRollback":
 			scenarios = []string{scenario}
 		default:
 			t.Fatal("unknown SEAWEEDFS_WINDOWS_MOUNT_SCENARIO; see test/storage_lab/README.md")

@@ -24,7 +24,7 @@ param(
     [switch]$BasicPermissions,
     [ValidateRange(0, 4)][int]$Verbosity = 0,
     [ValidateRange(0, 900)][int]$DiagnosticHoldSeconds = 0,
-    [ValidateSet('All', 'NativeMetadata', 'AccessPerformance', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
+    [ValidateSet('All', 'NativeMetadata', 'AccessPerformance', 'CacheLifecycle', 'Conformance', 'NamespaceCoherence', 'GitAtomicRename', 'GitAtomicRenamePrimed', 'GitLfsTempMetadata')][string]$TestCase = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,7 +56,7 @@ function Assert-WinFspModule([int]$TargetProcessId, [string]$ExpectedPath) {
 # Enumerate the actual executable: adding a mounted test must automatically add
 # coverage. Only tests with their own isolated-VM driver and the separate
 # remount phases are excluded here; the lab runner executes those separately.
-function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly, [switch]$PerformanceOnly,
+function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$MetadataOnly, [switch]$PerformanceOnly, [switch]$CacheLifecycleOnly,
     [string]$FilerEndpoint = '127.0.0.1:8888', [string]$FilerRootPrefix = '/',
     [uint32]$LegacyPermissionUID = 544, [uint32]$LegacyPermissionGID = 18, [uint32]$LegacyPermissionMode = 376) {
     if (-not $WinFspTestExe) { throw 'native mounted suite requires WinFspTestExe' }
@@ -66,6 +66,9 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
             $names += @('TestWindowsAttributesPersistenceRepeatVerify', 'TestWindowsPermissionsPersistenceRepeatVerify')
         }
         $label = "native persistence $Phase"
+    } elseif ($CacheLifecycleOnly) {
+        $names = @('TestCachedDeleteRecreate', 'TestDeleteOnClose')
+        $label = 'native cached delete lifecycle'
     } elseif ($PerformanceOnly) {
         $names = @('TestWindowsPerformanceCounter', 'TestWindowsAccessPerformance')
         $label = 'native access performance'
@@ -91,7 +94,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         if ($MetadataOnly) { $names += 'TestWindowsLegacyPermissionCompatibility' }
         Write-Host 'PERMISSION_POLICY: legacy (permissive compatibility; not access-denial qualification)'
     }
-    if (-not $Phase -and -not $PerformanceOnly) {
+    if (-not $Phase -and -not $PerformanceOnly -and -not $CacheLifecycleOnly) {
         $required = if ($BasicPermissions) { @('TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity') } else { @('TestWindowsLegacyPermissionCompatibility') }
         foreach ($name in $required) {
             if ($names -notcontains $name) { throw "Native executable lacks required permission policy test $name" }
@@ -460,6 +463,18 @@ try {
             Write-Host "DIAGNOSTIC_HOLD: mounted lab available for $DiagnosticHoldSeconds seconds; test status unchanged"
             Start-Sleep -Seconds $DiagnosticHoldSeconds
         }
+        Stop-Mount $mount $mnt
+        if ($failures -gt 0) { exit 1 }
+        exit 0
+    }
+
+    if ($TestCase -eq 'CacheLifecycle') {
+        $controlRoot = Join-Path $WorkRoot 'ntfs-cache-control'
+        New-Item -ItemType Directory -Path $controlRoot | Out-Null
+        Invoke-NativeMountedSuite $controlRoot -CacheLifecycleOnly
+        if ($failures -gt 0) { throw 'NTFS cached delete control failed' }
+        Invoke-NativeMountedSuite $mnt -CacheLifecycleOnly
+        if ($failures -eq 0) { Invoke-NativeMountedSuite $mnt -PerformanceOnly }
         Stop-Mount $mount $mnt
         if ($failures -gt 0) { exit 1 }
         exit 0

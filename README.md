@@ -173,6 +173,17 @@ knob: never open existing large-disk indexes with a four-byte-offset binary.
 The older Windows workflow separately configures `GO_FUSE_BRANCH` and
 `WINFSP_MSI_URL`; review those when changing the dependency or Windows runtime.
 
+The hosted reliability job also restores a fresh external-etcd snapshot using
+the candidate binary. `SEAWEEDFS_ETCD_TEST_IMAGE` can override its digest-pinned
+Linux amd64 etcd 3.5.21 image; update the pin when the deployed metadata-store
+version changes. It verifies chunk references, file bytes, a new cluster identity,
+absence of post-snapshot writes, and new writes after recovery with the original
+services stopped. This does not qualify power-loss durability or TLS/auth setup.
+Run locally with `WEED_BINARY=/absolute/path/to/weed` and
+`ETCD_RESTORE_RESULTS=/existing/persistent/directory` using
+`bash test/storage_lab/run_etcd_restore.sh`. Docker supplies only the pinned
+etcd tools; test services use fresh local directories and loopback endpoints.
+
 ### Running locally
 
 Keep `../forks-go-fuse` checked out at the tested dependency pin. Build baseline

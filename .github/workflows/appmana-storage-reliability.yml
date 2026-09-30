@@ -272,6 +272,19 @@ jobs:
             --results-root "$RUNNER_TEMP/server-image-results" \
             --s3-suite "$RUNNER_TEMP/s3-copying.test" \
             --soak-seconds 30
+      - name: External etcd snapshot restore preserves chunks and file bytes
+        env:
+          WEED_BINARY: ${{ runner.temp }}/weed-candidate
+          ETCD_RESTORE_RESULTS: ${{ runner.temp }}
+          SEAWEEDFS_ETCD_TEST_IMAGE: ${{ vars.SEAWEEDFS_ETCD_TEST_IMAGE || 'registry.k8s.io/etcd@sha256:21d2177d708b53ac0fbd1c073c334d58f913eb75da293ff086610e61af03630a' }}
+        run: bash test/storage_lab/run_etcd_restore.sh
+      - name: Retain external-store recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-etcd-restore
+          path: ${{ runner.temp }}/etcd-restore.*/
+          if-no-files-found: ignore
       - name: Build isolated lab tests
         run: |
           go test -c -tags "$STORAGE_BUILD_TAGS" -race -o "$RUNNER_TEMP/storage.test" ./weed/storage

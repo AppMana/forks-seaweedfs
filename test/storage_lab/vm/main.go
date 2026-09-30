@@ -228,18 +228,6 @@ func run(cfg config) (runErr error) {
 	}
 
 	initialOverwrites := 24
-	// Prepare durable controls before the workload, never fsync during the
-	// observed vacuum-copy window. These settings exist only in owned VMs.
-	if cfg.scenario == "power-loss" || cfg.scenario == "all" {
-		if err := h.execOK("volume1", "python3", "-c", prepareVolatileWitness); err != nil {
-			return err
-		}
-	}
-	if cfg.scenario == "vacuum-power-loss" || cfg.scenario == "all" {
-		if err := h.execOK("volume2", "python3", "-c", prepareVolatileWitness); err != nil {
-			return err
-		}
-	}
 	if cfg.scenario == "vacuum-power-loss" {
 		initialOverwrites = 4
 	}
@@ -540,6 +528,11 @@ func (h *harness) concurrentVacuum(fid string) error {
 }
 
 func (h *harness) powerLoss(fid, victim string) error {
+	// Prepare before the acknowledged write under test, after any migration
+	// reboots (which reset guest writeback settings in the combined scenario).
+	if err := h.execOK(victim, "python3", "-c", prepareVolatileWitness); err != nil {
+		return err
+	}
 	sequence := 1001
 	if err := h.execOK(controller, "python3", "/opt/workload.py", "write", fid, addresses[victim], strconv.Itoa(sequence)); err != nil {
 		return err
@@ -607,6 +600,10 @@ func (h *harness) gracefulStopVolume(name string) error {
 }
 
 func (h *harness) vacuumPowerLoss(fid, victim string) error {
+	// Never fsync the witness during the observed compaction window.
+	if err := h.execOK(victim, "python3", "-c", prepareVolatileWitness); err != nil {
+		return err
+	}
 	// A larger overwrite history makes the copy phase observable without adding
 	// a test-only hook to SeaweedFS core code. If no .cpd is observed, fail rather
 	// than pretending a power cut happened during vacuum.

@@ -78,23 +78,6 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		// A fixed FileSecurity DACL or umask=000 would hide restrictions.
 		// This opt-in mode is basic access control, not arbitrary ACL storage.
 		"-o", fmt.Sprintf("volname=%s", volumeLabel),
-		// FileInfoTimeout=-1 would engage the NT cache manager for file
-		// DATA (40-90x on warm/small reads, measured), but it also
-		// DEFERS the FUSE unlink past DeleteFile() return for files
-		// whose data the cache holds: a delete-then-recreate of the
-		// same name (pwsh7 Move-Item -Force, compilers, any replace
-		// pattern) then races a real "file exists" collision ~50% of
-		// the time (verified: at the failure instant the backend still
-		// has the file, so this is deferred delete, not stale cache;
-		// FspFileSystemNotify does not help). Default to the safe
-		// finite timeout; read-mostly volumes can opt into -1 via
-		// -winfspOptions=FileInfoTimeout=-1 (SEAWEEDFS_WINFSP_OPTIONS
-		// on the CSI DaemonSet).
-		"-o", "FileInfoTimeout=1000",
-		// Directory listings: bounded staleness, mirrors the Linux
-		// mount's entryValidSec (milliseconds).
-		"-o", "DirInfoTimeout=2000",
-		"-o", "VolumeInfoTimeout=5000",
 		"-o", "FileSystemName=seaweedfs",
 		// Filer symlink targets use POSIX paths. Interpret /target inside
 		// this mounted volume, never against the Windows host's root.
@@ -102,6 +85,7 @@ func (h *WinFspHost) Mount(dir string, volumeLabel string, extraOptions []string
 		// refuses to resolve them. A later norellinks explicitly opts out.
 		"-o", "rellinks",
 	}
+	options = append(options, winFspCacheOptions()...)
 	if !h.basicPermissions {
 		// Preserve existing shared-volume behavior on upgrades. Old metadata
 		// may have restrictive modes previously hidden by these overrides;

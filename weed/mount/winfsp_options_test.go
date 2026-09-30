@@ -1,6 +1,27 @@
 package mount
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
+
+func TestWinFspCacheOptions(t *testing.T) {
+	want := []string{
+		"-o", "FileInfoTimeout=-1",
+		"-o", "DirInfoTimeout=2000",
+		"-o", "VolumeInfoTimeout=5000",
+		"-o", "EaTimeout=1000",
+	}
+	if got := winFspCacheOptions(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("cache options = %v, want %v (without KeepFileCache)", got, want)
+	}
+	// A caller appending explicit per-volume overrides must not mutate defaults.
+	options := winFspCacheOptions()
+	options[1] = "FileInfoTimeout=1000"
+	if !reflect.DeepEqual(winFspCacheOptions(), want) {
+		t.Fatal("per-mount override mutated shared defaults")
+	}
+}
 
 func TestWinFspBasicOptionsRejectPermissionOverrides(t *testing.T) {
 	for _, option := range []string{

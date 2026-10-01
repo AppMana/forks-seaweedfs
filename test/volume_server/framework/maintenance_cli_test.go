@@ -3,6 +3,7 @@ package framework
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -18,6 +19,42 @@ func TestMaintenanceCLIExitStatus(t *testing.T) {
 		t.Skip("starts isolated master and volume binaries")
 	}
 	c := StartSingleVolumeCluster(t, matrix.P1())
+	checkMaintenanceCLIExitStatus(t, func(ctx context.Context) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, c.weedBinary, "-config_dir="+c.configDir, "shell", "-master="+c.MasterAddress())
+		cmd.Dir = c.baseDir
+		return cmd
+	})
+}
+
+// Opt-in image qualification uses a network-disabled container: master and
+// CLI share only its loopback, with no production routes or mounted credentials.
+func TestMaintenanceCLIImage(t *testing.T) {
+	image := os.Getenv("WEED_MAINTENANCE_IMAGE")
+	if testing.Short() || image == "" {
+		t.Skip("set WEED_MAINTENANCE_IMAGE to an already built local image")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "run", "--pull=never", "--rm", "-d", "--network=none", "--read-only",
+		"--tmpfs", "/data", "--tmpfs", "/tmp", image, "master", "-ip=127.0.0.1", "-mdir=/data").CombinedOutput()
+	if err != nil {
+		t.Fatalf("start isolated image: %v: %s", err, out)
+	}
+	id := strings.TrimSpace(string(out))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "docker", "stop", "--time=5", id).CombinedOutput(); err != nil {
+			t.Errorf("clean isolated image: %v: %s", err, out)
+		}
+	})
+	checkMaintenanceCLIExitStatus(t, func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "docker", "exec", "-i", id, "/usr/bin/weed", "shell", "-master=127.0.0.1:9333")
+	})
+}
+
+func checkMaintenanceCLIExitStatus(t *testing.T, command func(context.Context) *exec.Cmd) {
+	t.Helper()
 	for _, tc := range []struct {
 		name, input, wantOutput string
 		wantExit                int
@@ -33,8 +70,7 @@ func TestMaintenanceCLIExitStatus(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, c.weedBinary, "-config_dir="+c.configDir, "shell", "-master="+c.MasterAddress())
-			cmd.Dir = c.baseDir
+			cmd := command(ctx)
 			cmd.Stdin = strings.NewReader(tc.input)
 			out, err := cmd.CombinedOutput()
 			if ctx.Err() != nil {

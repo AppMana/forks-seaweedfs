@@ -34,6 +34,10 @@ func TestConcurrentWriteCrossesOffsetBoundary(t *testing.T) {
 	if err := v.DataBackend.Truncate(64 << 30); err != nil {
 		t.Fatal(err)
 	}
+	// End the sparse fixture with an indexed record, not an unexplained
+	// unindexed tail. The later concurrent write still moves from above
+	// 64 GiB to the small compacted file and exercises all offset bytes.
+	write(2, 32)
 	if err := v.CompactByIndex(nil); err != nil {
 		t.Fatal(err)
 	}

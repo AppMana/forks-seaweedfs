@@ -58,6 +58,56 @@ type CompactOptions struct {
 	version     needle.Version
 }
 
+// validateCompactSource requires dataFileAccessLock: the data and index must
+// describe the same append boundary. An index-only copy must never silently
+// discard an unindexed tail, even when an operator explicitly vacuums a
+// read-only volume. Read-only alone is not an error (full volumes need vacuum).
+func (v *Volume) validateCompactSource() error {
+	if v.DataBackend == nil || v.nm == nil {
+		return fmt.Errorf("volume %d: compact source is not open", v.Id)
+	}
+	if err := v.nm.Sync(); err != nil {
+		return fmt.Errorf("volume %d: compact source index sync: %w", v.Id, err)
+	}
+	f, size, err := v.openIndex()
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := verifyIndexFileIntegrity(f); err != nil {
+		return err
+	}
+	datSize, _, err := v.DataBackend.GetStat()
+	if err != nil {
+		return err
+	}
+	expectedEnd := int64(v.SuperBlock.BlockSize())
+	if size > 0 {
+		pos, err := findDatTailEntryOffset(v, f, size)
+		if err != nil {
+			return err
+		}
+		if pos >= 0 {
+			entry, err := readIndexEntryAtOffset(f, pos)
+			if err != nil {
+				return err
+			}
+			_, offset, size := idx2.IdxFileEntry(entry)
+			expectedEnd = needleDiskEnd(offset, size, v.Version())
+		}
+	}
+	if datSize != expectedEnd {
+		return fmt.Errorf("volume %d: refusing vacuum: data size %d differs from indexed end %d; preserve source for repair", v.Id, datSize, expectedEnd)
+	}
+	return nil
+}
+
+func (v *Volume) checkCompactSource() error {
+	v.dataFileAccessLock.RLock()
+	defer v.dataFileAccessLock.RUnlock()
+	return v.validateCompactSource()
+}
+
 // compact a volume based on deletions in .dat files
 func (v *Volume) CompactByVolumeData(opts *CompactOptions) error {
 	if opts == nil {
@@ -80,6 +130,9 @@ func (v *Volume) CompactByVolumeData(opts *CompactOptions) error {
 	defer v.isCompactionInProgress.Store(false)
 
 	v.compactCopyFailed.Store(true)
+	if err := v.checkCompactSource(); err != nil {
+		return err
+	}
 	v.lastCompactIndexOffset = v.IndexFileSize()
 	v.lastCompactRevision = v.SuperBlock.CompactionRevision
 	glog.V(3).Infof("creating copies for volume %d ,last offset %d...", v.Id, v.lastCompactIndexOffset)
@@ -125,6 +178,9 @@ func (v *Volume) CompactByIndex(opts *CompactOptions) error {
 	defer v.isCompactionInProgress.Store(false)
 
 	v.compactCopyFailed.Store(true)
+	if err := v.checkCompactSource(); err != nil {
+		return err
+	}
 	v.lastCompactIndexOffset = v.IndexFileSize()
 	v.lastCompactRevision = v.SuperBlock.CompactionRevision
 	glog.V(3).Infof("creating copies for volume %d ...", v.Id)
@@ -170,6 +226,9 @@ func (v *Volume) CommitCompact() error {
 
 	if v.compactCopyFailed.Load() {
 		return fmt.Errorf("volume %d compact commit aborted: preceding copy failed", v.Id)
+	}
+	if err := v.validateCompactSource(); err != nil {
+		return err
 	}
 	// A failed copy is not a decided commit. Check before closing the live
 	// backend or publishing a marker that restart would roll forward.

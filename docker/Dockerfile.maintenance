@@ -2,10 +2,13 @@
 # maintenance binary. Context must contain the CGO-disabled 5BytesOffset weed.
 # Override the base explicitly when qualifying a new runtime distribution.
 ARG BASE_IMAGE=ghcr.io/appmana/seaweedfs@sha256:00ce517c006fa3fbd6be89ca3515fdcb17270ccf66cd6cdcc0c17fbd045aec7e
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS runtime
 ARG SOURCE_COMMIT
 LABEL org.opencontainers.image.revision=${SOURCE_COMMIT}
 COPY --chmod=755 weed /usr/bin/weed
+# --target runtime retains the qualified server entrypoint and defaults for
+# master/server rollouts. The default target below is maintenance-only.
+FROM runtime AS maintenance
 # Avoid the general-purpose entrypoint shell adapter: preserve piped stdin and
 # accept the maintenance command's flags without rewriting them.
 ENTRYPOINT ["/usr/bin/weed"]

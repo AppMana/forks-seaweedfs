@@ -35,6 +35,26 @@ func TestExternalEtcdSnapshotRestore(t *testing.T) {
 		}
 	}
 	c := StartSingleVolumeCluster(t, matrix.P1())
+	baseline := os.Getenv("WEED_FILER_UPGRADE_BASELINE")
+	if baseline != "" {
+		for _, input := range []struct{ path, pin string }{
+			{baseline, os.Getenv("WEED_FILER_UPGRADE_BASELINE_SHA256")},
+			{c.weedBinary, os.Getenv("WEED_FILER_UPGRADE_CANDIDATE_SHA256")},
+		} {
+			data, err := os.ReadFile(input.path)
+			if err != nil || fmt.Sprintf("%x", sha256.Sum256(data)) != input.pin {
+				t.Fatalf("binary hash mismatch: %s: %v", input.path, err)
+			}
+			version, err := exec.Command(input.path, "version").CombinedOutput()
+			if err != nil {
+				t.Fatalf("version: %v: %s", err, version)
+			}
+			t.Logf("pinned filer binary %s SHA256=%s version=%s", input.path, input.pin, version)
+		}
+		if os.Getenv("WEED_FILER_UPGRADE_BASELINE_SHA256") == os.Getenv("WEED_FILER_UPGRADE_CANDIDATE_SHA256") {
+			t.Fatal("identical binaries cannot qualify a filer upgrade")
+		}
+	}
 	run := func(args ...string) []byte {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -97,8 +117,9 @@ func TestExternalEtcdSnapshotRestore(t *testing.T) {
 		}
 		return status[0].Status.Header.ClusterID
 	}
+	filerBinary := c.weedBinary
 	filerFor := func(s *store) *ClusterWithFiler {
-		return StartFilerForCluster(t, c, fmt.Sprintf("[etcd]\nenabled = true\nservers = %q\nkey_prefix = \"restore-qualification/\"\ntimeout = \"3s\"\n", s.client))
+		return startFilerBinaryForCluster(t, c, fmt.Sprintf("[etcd]\nenabled = true\nservers = %q\nkey_prefix = \"restore-qualification/\"\ntimeout = \"3s\"\n", s.client), filerBinary)
 	}
 	client := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	t.Cleanup(client.CloseIdleConnections)
@@ -148,6 +169,9 @@ func TestExternalEtcdSnapshotRestore(t *testing.T) {
 	original := newStore("original")
 	start(original)
 	originalID := identity(original)
+	if baseline != "" {
+		filerBinary = baseline
+	}
 	f := filerFor(original)
 	payload := bytes.Repeat([]byte("external-etcd-restore-payload\x00"), 65536)
 	upload(f, "intact.bin", payload)
@@ -160,6 +184,28 @@ func TestExternalEtcdSnapshotRestore(t *testing.T) {
 	}
 	if err := json.Unmarshal(metadata, &entry); err != nil || len(entry.Chunks) == 0 {
 		t.Fatalf("must reference real volume chunks: %v %s", err, metadata)
+	}
+	if baseline != "" {
+		old := f
+		filerBinary = c.weedBinary
+		f = filerFor(original)
+		if got := get(f, "/restore/intact.bin", 200); !bytes.Equal(got, payload) {
+			t.Fatal("candidate cannot read baseline payload")
+		}
+		if got := get(f, "/restore/intact.bin?metadata=true", 200); !bytes.Equal(got, metadata) {
+			t.Fatal("candidate changed baseline chunk metadata")
+		}
+		// Both versions stay alive against the same fresh etcd store. Read
+		// newly created names to avoid claiming cache-invalidation coverage.
+		for _, pair := range [][2]*ClusterWithFiler{{old, f}, {f, old}} {
+			name := fmt.Sprintf("mixed-%d.bin", pair[0].filerPort)
+			upload(pair[0], name, payload)
+			if got := get(pair[1], "/restore/"+name, 200); !bytes.Equal(got, payload) {
+				t.Fatal("mixed-version filer payload mismatch")
+			}
+		}
+		old.StopFiler()
+		t.Log("FILER_MIXED_VERSION_COMPLETE baseline data and bidirectional new writes verified")
 	}
 	snapshot := filepath.Join(c.baseDir, "snapshot.db")
 	run("--endpoints="+original.client, "snapshot", "save", snapshot)

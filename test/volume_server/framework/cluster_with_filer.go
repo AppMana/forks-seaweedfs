@@ -34,6 +34,11 @@ func StartSingleVolumeClusterWithFiler(t testing.TB, profile matrix.Profile) *Cl
 // its configuration.
 func StartFilerForCluster(t testing.TB, baseCluster *Cluster, config string) *ClusterWithFiler {
 	t.Helper()
+	return startFilerBinaryForCluster(t, baseCluster, config, baseCluster.weedBinary)
+}
+
+func startFilerBinaryForCluster(t testing.TB, baseCluster *Cluster, config, binary string) *ClusterWithFiler {
+	t.Helper()
 	if config != "" {
 		if err := os.WriteFile(filepath.Join(baseCluster.configDir, "filer.toml"), []byte(config), 0600); err != nil {
 			t.Fatal(err)
@@ -45,7 +50,7 @@ func StartFilerForCluster(t testing.TB, baseCluster *Cluster, config string) *Cl
 		t.Fatalf("allocate filer ports: %v", err)
 	}
 
-	filerDataDir := filepath.Join(baseCluster.baseDir, "filer")
+	filerDataDir := filepath.Join(baseCluster.baseDir, fmt.Sprintf("filer-%d", ports[0]))
 	if mkErr := os.MkdirAll(filerDataDir, 0o755); mkErr != nil {
 		t.Fatalf("create filer data dir: %v", mkErr)
 	}
@@ -69,7 +74,7 @@ func StartFilerForCluster(t testing.TB, baseCluster *Cluster, config string) *Cl
 		"-defaultStoreDir=" + filerDataDir,
 	}
 
-	filerCmd := exec.Command(baseCluster.weedBinary, args...)
+	filerCmd := exec.Command(binary, args...)
 	filerCmd.Dir = baseCluster.baseDir
 	filerCmd.Stdout = logFile
 	filerCmd.Stderr = logFile

@@ -1476,6 +1476,22 @@ broader XFS/Btrfs fault and migration tests remain outstanding. Never power-cut 
 Restore drills use copied backups, new cluster identities, and blocked production
 networking. An etcd snapshot alone does not contain volume payloads.
 
+`run_etcd_restore.sh` runs the existing real-process external-etcd restore
+test with fresh loopback stores. Set `WEED_BINARY` to the absolute candidate
+binary and `ETCD_RESTORE_RESULTS` to an existing persistent artifact directory.
+For a mixed-version filer migration gate, also set
+`WEED_FILER_UPGRADE_BASELINE` to the previous binary and provide both
+`WEED_FILER_UPGRADE_BASELINE_SHA256` and
+`WEED_FILER_UPGRADE_CANDIDATE_SHA256`. Identical binaries and mismatched hashes
+are rejected. The test creates data through the old filer, verifies candidate
+readback and unchanged chunk metadata, and verifies bidirectional new-file
+writes while both versions share the same disposable etcd store. It then stops
+the old filer and performs the snapshot/restore checks with the candidate.
+Each filer has a separate local working store. This tests metadata and payload
+compatibility, not cache invalidation of already-open files, production data,
+multi-member etcd failover, or VM power loss. Both completion markers are
+required when the mixed-version mode is enabled.
+
 ## Existing server image and S3 payload qualification
 
 `run_image.py` accepts an immutable **local** image ID and expected packaged

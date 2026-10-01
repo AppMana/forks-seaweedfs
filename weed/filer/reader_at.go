@@ -392,6 +392,11 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 			return fetchChunkRange(ctx, buffer, c.readerCache.lookupFileIdFn, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset),
 				refreshUrls(ctx, c.readerCache.cacheInvalidator, c.readerCache.lookupFileIdFn, chunkView.FileId))
 		}
+		// A promoted random read is not a stream position: pinning it would
+		// drop the chunk as soon as the next random read moved the pin, and
+		// every revisit would download it again.
+		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+		return c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 	}
 
 	// Sequential reads and random chunks promoted after reuse go through the

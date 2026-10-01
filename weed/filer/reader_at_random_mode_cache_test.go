@@ -117,7 +117,7 @@ func TestRandomModeStillCachesWholeChunk(t *testing.T) {
 	readerAt := &ChunkReadAt{
 		chunkViews:    chunkViews,
 		fileSize:      int64(chunkSize),
-		readerCache:   NewReaderCache(3, alwaysMissChunkCache{}, lookupFn, nil),
+		readerCache:   NewReaderCache(3, alwaysMissChunkCache{}, lookupFn, nil).KeepUntilEvicted(),
 		readerPattern: NewReaderPattern(),
 		ctx:           ctx,
 	}

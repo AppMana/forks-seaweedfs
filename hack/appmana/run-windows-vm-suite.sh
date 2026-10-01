@@ -20,6 +20,8 @@ printf 'Retained Windows suite evidence: %s\n' "$suite_results"
 export SEAWEEDFS_WINDOWS_LIVE=1 SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE=1
 export SEAWEEDFS_WINDOWS_MOUNT_LIVE=1 SEAWEEDFS_MIXED_LIVE=1
 export SEAWEEDFS_WINDOWS_MOUNT_REPEATS=5
+# Qualify both policies explicitly below, independent of the caller's shell.
+export SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=0
 unset SEAWEEDFS_WINDOWS_MOUNT_SCENARIO SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD
 unset SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION
 # The declared workload uses immutable Windows mappings. The mixed suite still
@@ -45,10 +47,17 @@ for registration in '' 1; do
 done
 unset SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP
 export SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1
-for scenario in All Conformance; do
-  export SEAWEEDFS_WINDOWS_MOUNT_SCENARIO="$scenario"
-  run "$scenario" '^TestWindowsMountLab$'
+export SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=All
+for policy in 0 1; do
+  export SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$policy"
+  run "All-basic-permissions-$policy" '^TestWindowsMountLab$'
 done
+# Upstream backup/restore tests require restrictive permissions. Legacy
+# Everyone:FullAccess behavior is checked by the separate All policy-0 lane.
+export SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1
+export SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=Conformance
+run Conformance '^TestWindowsMountLab$'
+export SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=0
 unset SEAWEEDFS_WINDOWS_MOUNT_SCENARIO
 run mixed '^TestMixedOSMountLab$'
 exit "$failed"

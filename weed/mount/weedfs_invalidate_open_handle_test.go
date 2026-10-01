@@ -1564,6 +1564,18 @@ func TestForeignDeleteMarksHandleDeleted(t *testing.T) {
 	if !fh.isDeleted {
 		t.Fatal("handle not marked deleted after a foreign delete; a flush would recreate the unlinked name")
 	}
+	if _, found := wfs.inodeToPath.GetInode(util.FullPath("/dir/file")); found {
+		t.Error("deleted name still resolves to the open inode; Windows path Getattr can return the unlinked handle")
+	}
+	var out fuse.AttrOut
+	in := &fuse.GetAttrIn{}
+	in.NodeId = inode
+	if status := wfs.GetAttr(nil, in, &out); status != fuse.OK {
+		t.Fatalf("open descriptor must survive remote unlink: %v", status)
+	}
+	if out.Nlink != 0 {
+		t.Errorf("unlinked descriptor nlink = %d, want 0", out.Nlink)
+	}
 }
 
 // A no-event acknowledgment (log fence only) must version the cache entry, so

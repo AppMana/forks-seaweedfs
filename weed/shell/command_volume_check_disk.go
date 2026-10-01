@@ -170,6 +170,7 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 // checkWritableVolumes fixes volume replicas which are not read-only.
 func (vcd *volumeCheckDisk) checkWritableVolumes(volumeReplicas map[uint32][]*VolumeReplica) error {
 	vcd.write("Pass #1 (writable volumes)")
+	var errs []error
 
 	for _, replicas := range volumeReplicas {
 		// filter readonly replica
@@ -190,7 +191,11 @@ func (vcd *volumeCheckDisk) checkWritableVolumes(volumeReplicas map[uint32][]*Vo
 			shouldSkip, err := vcd.shouldSkipVolume(a, b)
 			if err != nil {
 				vcd.write("error checking if volume %d should be skipped: %v", a.info.Id, err)
-				// Continue with sync despite error to be safe
+				errs = append(errs, fmt.Errorf("checking volume %d on %s and %s: %w", a.info.Id, a.location.dataNode.Id, b.location.dataNode.Id, err))
+				// Do not repair a pair whose preflight failed. Keep checking
+				// other pairs, but fail the command rather than reporting clean.
+				writableReplicas = append(writableReplicas[:1], writableReplicas[2:]...)
+				continue
 			} else if shouldSkip {
 				// always choose the larger volume to be the source
 				writableReplicas = append(writableReplicas[:1], writableReplicas[2:]...)
@@ -200,6 +205,7 @@ func (vcd *volumeCheckDisk) checkWritableVolumes(volumeReplicas map[uint32][]*Vo
 			modified, err := vcd.syncTwoReplicas(a, b, true)
 			if err != nil {
 				vcd.write("failed to sync volumes %d on %s and %s: %v", a.info.Id, a.location.dataNode.Id, b.location.dataNode.Id, err)
+				errs = append(errs, fmt.Errorf("sync volume %d on %s and %s: %w", a.info.Id, a.location.dataNode.Id, b.location.dataNode.Id, err))
 			} else {
 				if modified {
 					vcd.write("synced %s and %s for volume %d", a.location.dataNode.Id, b.location.dataNode.Id, a.info.Id)
@@ -215,7 +221,7 @@ func (vcd *volumeCheckDisk) checkWritableVolumes(volumeReplicas map[uint32][]*Vo
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // makeVolumeWritable flags a volume as writable, by volume ID.

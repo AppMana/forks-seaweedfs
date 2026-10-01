@@ -488,9 +488,11 @@ func (iam *IdentityAccessManagement) markStaticIdentitiesFromSource(config *iam_
 
 var iamReloadRetryInterval = 5 * time.Second
 
+const iamReloadCoalesceInterval = 10 * time.Millisecond
+
 // scheduleReload queues a coalesced full configuration reload that retries
 // until it succeeds. Safe to call for every IAM config change event: bursts
-// collapse into a single reload via the buffered reloadCh.
+// collapse into a single reload within a bounded batching window.
 func (iam *IdentityAccessManagement) scheduleReload(reason string) {
 	glog.V(1).Infof("IAM change detected in %s, scheduling reload", reason)
 	select {
@@ -505,6 +507,23 @@ func (iam *IdentityAccessManagement) reloadRetryLoop() {
 		case <-iam.stopChan:
 			return
 		case <-iam.reloadCh:
+		}
+		// A buffered signal alone cannot coalesce events when a fast store
+		// finishes a reload between notifications. Use a fixed window, not a
+		// sliding debounce: continuous changes must not starve credential
+		// revocations. Only the background worker waits, never request handlers.
+		timer := time.NewTimer(iamReloadCoalesceInterval)
+		select {
+		case <-iam.stopChan:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		// This snapshot will include changes signaled during the window.
+		// Leave signals arriving during the load queued for another snapshot.
+		select {
+		case <-iam.reloadCh:
+		default:
 		}
 		for {
 			err := iam.LoadS3ApiConfigurationFromCredentialManager()

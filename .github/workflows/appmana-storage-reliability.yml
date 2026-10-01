@@ -263,7 +263,7 @@ jobs:
           VOLUME_SERVER_IT_KEEP_LOGS: '1'
         run: >-
           go test -tags "$STORAGE_BUILD_TAGS" -count=1 -v -timeout="$STORAGE_PROCESS_TEST_TIMEOUT"
-          ./test/volume_server/framework -run '^TestMissingNeedleRepairRPC$'
+          ./test/volume_server/framework -run '^Test(MissingNeedleRepairRPC|MaintenanceReferencedNeedleRepair)$'
       - name: Packaged volume memory and S3 payload preservation
         run: |
           set -euo pipefail

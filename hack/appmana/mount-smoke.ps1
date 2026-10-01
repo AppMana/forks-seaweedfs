@@ -217,7 +217,13 @@ function Invoke-GitLfsTempMetadataTest([string]$mnt) {
         if ($statusExitCode -ne 0) { break }
         $modifiedPaths = @($statusOutputLines | Where-Object { "$_" -match '^ M asset-\d+\.lfs$' })
         Assert ($modifiedPaths.Count -eq 32) "Git LFS status iteration $iteration reports all 32 modified assets"
-        if ($modifiedPaths.Count -ne 32) { break }
+        if ($modifiedPaths.Count -ne 32) {
+            # Preserve the failing command's output before any subsequent Git
+            # invocation can refresh metadata or hide the original observation.
+            Write-Host "GIT STATUS COUNT UTC=$([DateTime]::UtcNow.ToString('O')) matched=$($modifiedPaths.Count) repo=$gitRepo"
+            Write-Host (ConvertTo-Json -InputObject @($statusOutputLines | ForEach-Object { "$_" }) -Compress)
+            break
+        }
     }
 }
 

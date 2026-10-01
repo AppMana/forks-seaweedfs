@@ -34,6 +34,19 @@ func TestWindowsAdapterLab(t *testing.T) {
 	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_TEST"), []string{"TestWindowsFlagsEncoding", "TestCheckNamePlatformUnits", "TestAttrToStatWindowsArchiveFlags", "TestWinfspGetpathReportsVolumeRelativeCanonicalName", "TestWinfspGetpathResolvesCaseThroughRealMetadataCache", "TestWinfspGetpathPreservesExactHardLinkAlias", "TestAttrToStatMapsEveryField", "TestAttrToStatSynthesizesBirthTimeFromCtime", "TestAttrToStatDefaultsZeroBlksize", "TestAttrToStatOverwritesReusedBuffer", "TestWinfspFSFullPath", "TestWinfspFSFullPathDoesNotDoubleSlashAtRoot", "TestInodeFromFhRejectsSentinel"})
 }
 
+func TestWindowsRemoteDeleteLab(t *testing.T) {
+	if os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE") != "1" {
+		t.Skip("set SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE=1")
+	}
+	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_MOUNT_UNIT_TEST"), []string{
+		"TestForeignDeleteMarksHandleDeleted",
+		"TestForeignRenameDoesNotMarkHandleDeleted",
+		"TestRemoteDeletePathPreservesReplacementAndOtherLinks",
+		"TestGetAttrOnUnlinkedOpenFile",
+		"TestSetAttrOnUnlinkedOpenFile",
+	})
+}
+
 // Share the isolated Windows VM, staging and strict inventory checks with the
 // storage suite; the assertions remain in the original application packages.
 func runWindowsUnitLab(t *testing.T, executable string, names []string) {

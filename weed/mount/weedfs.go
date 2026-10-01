@@ -1146,6 +1146,9 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		if invalidation.Deleted {
 			fh.isDeleted = true
 			fh.deleteEpoch++
+			// A descriptor survives unlink, but a pathname must not resolve
+			// back to that descriptor (notably WinFsp's path-based Getattr).
+			wfs.inodeToPath.RemovePathForInode(filePath, inode)
 		}
 		if !fh.dirtyMetadata {
 			fh.dirtyPages.Destroy()

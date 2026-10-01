@@ -533,6 +533,20 @@ func (i *InodeToPath) RemovePath(path util.FullPath, onStillReferenced func(inod
 	}
 }
 
+// RemovePathForInode detaches a remotely deleted name without removing a
+// replacement that acquired the name while the invalidation was pending.
+// Keep the inode itself alive for existing descriptors and kernel references.
+func (i *InodeToPath) RemovePathForInode(path util.FullPath, inode uint64) {
+	i.Lock()
+	defer i.Unlock()
+	if current, found := i.path2inode[path]; !found || current != inode {
+		return
+	}
+	delete(i.path2inode, path)
+	i.dropDirPath(inode)
+	i.removePathFromInode2Path(inode, path)
+}
+
 func (i *InodeToPath) removePathFromInode2Path(inode uint64, path util.FullPath) {
 	ie, found := i.inode2path[inode]
 	if !found {

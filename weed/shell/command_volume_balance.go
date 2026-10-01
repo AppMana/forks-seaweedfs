@@ -158,7 +158,10 @@ func (c *commandVolumeBalance) Do(args []string, commandEnv *CommandEnv, writer 
 		return fmt.Errorf("use \"ALL\", \"ACTIVE\" or \"FULL\"")
 	})
 	if err = balanceCommand.Parse(args); err != nil {
-		return nil
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
 	}
 	handleDeprecatedForceFlag(writer, balanceCommand, applyBalancingAlias, applyBalancing)
 	c.applyBalancing = *applyBalancing

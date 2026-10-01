@@ -1372,16 +1372,22 @@ func copyChunksConcurrently(ctx context.Context, count int, copyOne func(ctx con
 		})
 	}
 
-	// Wait for all operations to complete and check for errors
+	// Cancellation requests that workers stop; it does not join them. Drain
+	// every result before returning so failed requests cannot leave sibling
+	// HTTP copies or their cleanup running after this operation has returned.
+	var resultErr error
 	for i := 0; i < count; i++ {
-		if err := <-errChan; err != nil {
-			firstErrMu.Lock()
-			defer firstErrMu.Unlock()
-			if firstErr != nil {
-				return nil, firstErr
-			}
-			return nil, err
+		if err := <-errChan; err != nil && resultErr == nil {
+			resultErr = err
 		}
+	}
+	if resultErr != nil {
+		firstErrMu.Lock()
+		defer firstErrMu.Unlock()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		return nil, resultErr
 	}
 
 	return dstChunks, nil

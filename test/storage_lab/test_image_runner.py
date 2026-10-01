@@ -9,6 +9,19 @@ from run_image import check_memory
 
 
 class ImageMemoryContract(unittest.TestCase):
+    def test_mixed_filer_uses_explicit_binary_and_disables_shared_copy(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                run_image, 'docker') as execute:
+            execute.return_value = subprocess.CompletedProcess([], 0,
+                ''.join('--- PASS: ' + name + ' (0.1s)\n'
+                        for name in run_image.S3_TESTS) + 'PASS\n')
+            run_image.run_s3('owned-lab', None, Path(root),
+                             filer_binary='/baseline-weed')
+        calls = [call.args for call in execute.call_args_list]
+        self.assertTrue(any('exec /baseline-weed filer ' in str(c) for c in calls))
+        self.assertTrue(any('exec /usr/bin/weed s3 ' in str(c) and
+                            '-shareCopyChunks=false' in str(c) for c in calls))
+
     def test_soak_requires_exact_duration_multiple_cycles_and_complete_test(self):
         good = ('SOAK_COMPLETE duration_seconds=86400 cycles=2000\n'
                 '--- PASS: TestS3QualificationSoak (86401s)\nPASS\n')

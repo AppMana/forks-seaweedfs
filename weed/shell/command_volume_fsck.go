@@ -65,6 +65,10 @@ type commandVolumeFsck struct {
 	verifyNeedle              *bool
 	filerSigningKey           string
 	unresolvedManifestEntries atomic.Int64
+	// Missing-reference scans may encounter chunks outside the bucket's
+	// collection. Keep their real locations before filtering the topology;
+	// lazily inspect those referenced volumes instead of calling them absent.
+	outsideCollection map[uint32]map[string]VInfo
 	// readNeedleMeta returns a needle's append time as the volume server
 	// reads it at the copied index offset; tests replace it.
 	readNeedleMeta func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) (appendAtNs uint64, err error)
@@ -203,6 +207,20 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	}
 
 	c.scopedFilerPath = c.resolveScopedFilerPath(dataNodeVolumeIdToVInfo)
+	c.outsideCollection = make(map[uint32]map[string]VInfo)
+	if *c.findMissingChunksInFiler && *c.collection != "" {
+		for node, volumes := range dataNodeVolumeIdToVInfo {
+			for vid, info := range volumes {
+				if info.collection == *c.collection {
+					continue
+				}
+				if c.outsideCollection[vid] == nil {
+					c.outsideCollection[vid] = make(map[string]VInfo)
+				}
+				c.outsideCollection[vid][node] = info
+			}
+		}
+	}
 	if *c.verbose && c.scopedFilerPath != "/" {
 		fmt.Fprintf(c.writer, "scoping filer walk to %s\n", c.scopedFilerPath)
 	}
@@ -370,6 +388,26 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 			buffer := make([]byte, readbufferSize)
 			for item := range outputChan {
 				i := item.(*Item)
+				if *c.findMissingChunksInFiler && files[i.vid] == nil &&
+					(len(c.volumeIds) == 0 || c.volumeIds[i.vid]) && len(c.outsideCollection[i.vid]) > 0 {
+					// The bucket can legitimately reference a shared/default
+					// collection. A filter exclusion is not a missing volume,
+					// especially when purgeAbsent would delete the intact file.
+					for node, info := range c.outsideCollection[i.vid] {
+						if *c.skipEcVolumes && info.isEcVolume {
+							return fmt.Errorf("referenced volume %d excluded by -skipEcVolumes; scan incomplete", i.vid)
+						}
+						if err := c.collectOneVolumeFileIds(node, i.vid, info); err != nil {
+							return fmt.Errorf("collect referenced cross-collection volume %d on %s: %w", i.vid, node, err)
+						}
+						dataNodeVolumeIdToVInfo[node][i.vid] = info
+					}
+					f, err := os.OpenFile(getFilerFileIdFile(c.tempFolder, i.vid), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+					if err != nil {
+						return fmt.Errorf("create cross-collection reference file for volume %d: %w", i.vid, err)
+					}
+					files[i.vid] = f
+				}
 				if f, ok := files[i.vid]; ok {
 					util.Uint64toBytes(buffer, i.fileKey)
 					util.Uint32toBytes(buffer[8:], i.cookie)

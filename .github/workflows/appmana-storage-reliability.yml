@@ -256,6 +256,14 @@ jobs:
           CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
           "$RUNNER_TEMP/weed-baseline" version
           "$RUNNER_TEMP/weed-candidate" version
+      - name: Absent-only repair rejects old servers and preserves data across restart
+        env:
+          WEED_BINARY: ${{ runner.temp }}/weed-candidate
+          WEED_REPAIR_BASELINE: ${{ runner.temp }}/weed-baseline
+          VOLUME_SERVER_IT_KEEP_LOGS: '1'
+        run: >-
+          go test -tags "$STORAGE_BUILD_TAGS" -count=1 -v -timeout="$STORAGE_PROCESS_TEST_TIMEOUT"
+          ./test/volume_server/framework -run '^TestMissingNeedleRepairRPC$'
       - name: Packaged volume memory and S3 payload preservation
         run: |
           set -euo pipefail

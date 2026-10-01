@@ -2643,6 +2643,16 @@ impl VolumeServer for VolumeGrpcService {
         }))
     }
 
+    async fn write_needle_blob_if_absent(
+        &self,
+        request: Request<volume_server_pb::WriteNeedleBlobRequest>,
+    ) -> Result<Response<volume_server_pb::WriteNeedleBlobResponse>, Status> {
+        self.check_grpc_admin_auth(&request)?;
+        // Do not substitute the overwrite-capable replication writer. Until
+        // Rust has an atomic, durable absent-only primitive, fail closed.
+        Err(Status::unimplemented("absent-only repair is not supported"))
+    }
+
     async fn write_needle_blob(
         &self,
         request: Request<volume_server_pb::WriteNeedleBlobRequest>,
@@ -7648,6 +7658,22 @@ mod tests {
         }
 
         (split_disk_grpc_service(store), tmp)
+    }
+
+    #[tokio::test]
+    async fn absent_only_repair_fails_closed_without_rust_primitive() {
+        let service = split_disk_grpc_service(Store::new(NeedleMapKind::InMemory));
+        let result = service
+            .write_needle_blob_if_absent(Request::new(
+                volume_server_pb::WriteNeedleBlobRequest {
+                    volume_id: 41,
+                    needle_id: 17,
+                    size: 0,
+                    needle_blob: Vec::new(),
+                },
+            ))
+            .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 
     /// Wrap a hand-built two-location `Store` in the full

@@ -12,6 +12,7 @@ func TestMaintenanceCommandsRejectMalformedArguments(t *testing.T) {
 		badValue string
 	}{
 		{"volume.check.disk", (&commandVolumeCheckDisk{}).Do, "-volumeId=not-a-number"},
+		{"volume.fsck", (&commandVolumeFsck{}).Do, "-cutoffTimeAgo=not-a-duration"},
 		{"volume.vacuum", (&commandVacuum{}).Do, "-garbageThreshold=not-a-number"},
 		{"volume.deleteEmpty", (&commandVolumeDeleteEmpty{}).Do, "-quietFor=not-a-duration"},
 		{"volume.balance", (&commandVolumeBalance{}).Do, "-volumeBy=INVALID"},

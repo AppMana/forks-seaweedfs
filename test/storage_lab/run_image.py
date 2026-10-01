@@ -20,6 +20,18 @@ S3_TESTS = ('TestBasicPutGet', 'TestBasicLargeObject', 'TestObjectCopySameBucket
             'TestObjectCopyDiffBucket', 'TestMultipartCopySmall',
             'TestMultipartCopyWithoutRange', 'TestMultipartCompleteAndAbortPreservesObject')
 
+S3_EXTENDED_TESTS = S3_TESTS + (
+    'TestBasicBucketOperations', 'TestObjectCopyCannedAcl', 'TestObjectCopyRetainingMetadata',
+    'TestMultipartCopySpecialNames', 'TestMultipartCopyMultipleSizes',
+    'TestCopyObjectIfMatchGood', 'TestCopyObjectIfNoneMatchFailed',
+    'TestCopyObjectIfMatchFailed', 'TestCopyObjectIfNoneMatchGood',
+    'TestRenameObject', 'TestRenameObjectOverwritesDestination', 'TestRenameObjectIfNoneMatch',
+    'TestRenameObjectSourceIfMatch', 'TestRenameObjectOntoDirectory',
+    'TestRenameObjectDirectorySource', 'TestRenameObjectMissingSource',
+    'TestRenameObjectQualifiedSource', 'TestRenameObjectSourceShadowingTheBucketName',
+    'TestRenameObjectSourceShadowedByADirectory', 'TestRenameObjectCrossBucket',
+    'TestRenameObjectVersionedBucket')
+
 
 def check_s3_results(log, required=S3_TESTS):
     passed = set(re.findall(r'^--- PASS: (\w+) ', log, re.MULTILINE))
@@ -44,7 +56,7 @@ def docker_logged(path, *args, timeout):
     return subprocess.CompletedProcess(result.args, result.returncode, path.read_text())
 
 
-def run_s3(name, suite, out, soak_seconds=0, filer_binary='/usr/bin/weed'):
+def run_s3(name, suite, out, soak_seconds=0, filer_binary='/usr/bin/weed', required=S3_TESTS):
     if filer_binary not in ('/usr/bin/weed', '/baseline-weed'):
         raise ValueError('unexpected filer binary path')
     docker('exec', name, 'mkdir', '/tmp/filer')
@@ -52,24 +64,31 @@ def run_s3(name, suite, out, soak_seconds=0, filer_binary='/usr/bin/weed'):
            'exec ' + filer_binary + ' filer -ip=127.0.0.1 -master=127.0.0.1:9333 '
            '>/tmp/filer.log 2>&1')
     docker('exec', '--detach', name, '/bin/sh', '-c',
-           'exec /usr/bin/weed s3 -ip.bind=127.0.0.1 -filer=127.0.0.1:8888 -shareCopyChunks=false '
+           'exec /usr/bin/weed s3 -ip.bind=127.0.0.1 -filer=127.0.0.1:8888 '
+           '-config=/s3-test-identities.json -shareCopyChunks=false '
            '>/tmp/s3.log 2>&1')
     try:
         deadline = time.monotonic() + 45
-        while docker('exec', name, 'curl', '-fsS', '--max-time', '2',
-                     'http://127.0.0.1:8333/', check=False).returncode:
+        while True:
+            health = docker('exec', name, 'curl', '-sS', '-o', '/dev/null',
+                            '-w', '%{http_code}', '--max-time', '2',
+                            'http://127.0.0.1:8333/', check=False)
+            # Anonymous ListBuckets may be denied with IAM enabled. Signed
+            # operations and their assertions are exercised by the Go suite.
+            if health.returncode == 0 and health.stdout.strip() in ('200', '403'):
+                break
             if time.monotonic() >= deadline:
                 raise RuntimeError('isolated S3 endpoint did not become ready')
             time.sleep(1)
         result = docker('exec', '-e', 'S3_ENDPOINT=http://127.0.0.1:8333',
                         '-e', 'MASTER_ENDPOINT=http://127.0.0.1:9333',
                         name, '/s3-copying.test', '-test.v', '-test.count=1',
-                        '-test.timeout=5m', '-test.run=^(' + '|'.join(S3_TESTS) + ')$',
+                        '-test.timeout=5m', '-test.run=^(' + '|'.join(required) + ')$',
                         check=False, timeout=320)
         (out / 's3-tests.log').write_text(result.stdout)
         if result.returncode:
             raise RuntimeError('S3 suite failed; see s3-tests.log')
-        check_s3_results(result.stdout)
+        check_s3_results(result.stdout, required)
         if soak_seconds:
             result = docker_logged(out / 'soak-tests.log', 'exec', '-e', 'S3_ENDPOINT=http://127.0.0.1:8333',
                             '-e', 'MASTER_ENDPOINT=http://127.0.0.1:9333',
@@ -109,9 +128,14 @@ def main():
     parser.add_argument('--baseline-filer', type=Path,
                         help='optional old filer binary for mixed-version S3 qualification')
     parser.add_argument('--baseline-filer-sha256')
+    parser.add_argument('--s3-extended', action='store_true',
+                        help='require all non-soak tests from test/s3/copying')
     parser.add_argument('--soak-seconds', type=int, default=0,
                         help='intensive fixed-live-data S3/vacuum lane, up to 86400 seconds')
     args = parser.parse_args()
+    if args.s3_extended and not args.s3_suite:
+        parser.error('--s3-extended requires --s3-suite')
+    required = S3_EXTENDED_TESTS if args.s3_extended else S3_TESTS
     if bool(args.baseline_filer) != bool(args.baseline_filer_sha256):
         parser.error('--baseline-filer and --baseline-filer-sha256 must be paired')
     if args.baseline_filer:
@@ -138,7 +162,7 @@ def main():
         args.s3_suite = args.s3_suite.resolve(strict=True)
         manifest.update(scope='volume memory and isolated S3 payload/copy checks',
                         s3_suite_sha256=hashlib.sha256(args.s3_suite.read_bytes()).hexdigest(),
-                        s3_required_tests=list(S3_TESTS))
+                        s3_required_tests=list(required))
     created = False
     print('Starting qualification; retained progress: ' + str(out), flush=True)
     try:
@@ -152,6 +176,10 @@ def main():
         if args.s3_suite:
             test_mount = ['--mount', 'type=bind,src=' + str(args.s3_suite) +
                           ',dst=/s3-copying.test,readonly']
+            identities = Path(__file__).resolve().parents[2] / 'docker/compose/s3.json'
+            manifest['s3_identities_sha256'] = hashlib.sha256(identities.read_bytes()).hexdigest()
+            test_mount += ['--mount', 'type=bind,src=' + str(identities) +
+                           ',dst=/s3-test-identities.json,readonly']
         if args.baseline_filer:
             test_mount += ['--mount', 'type=bind,src=' + str(args.baseline_filer) +
                            ',dst=/baseline-weed,readonly']
@@ -194,7 +222,8 @@ def main():
                 (out / 'baseline-filer-version.txt').write_text(
                     docker('exec', name, '/baseline-weed', 'version').stdout)
             run_s3(name, args.s3_suite, out, args.soak_seconds,
-                   filer_binary='/baseline-weed' if args.baseline_filer else '/usr/bin/weed')
+                   filer_binary='/baseline-weed' if args.baseline_filer else '/usr/bin/weed',
+                   required=required)
         manifest['status'] = 'passed'
     except Exception as exc:
         manifest['error'] = str(exc)

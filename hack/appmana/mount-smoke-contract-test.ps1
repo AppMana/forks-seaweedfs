@@ -105,6 +105,9 @@ try {
             throw 'Mount permission switch does not match policy'
         }
         Invoke-NativeMountedSuite $root -MetadataOnly
+        if (-not (@($script:capturedNativeArgs | Where-Object { $_ -like '-test.run=*' })[0].Contains('TestDirectoryEnumerationSizeAfterClose'))) {
+            throw 'Metadata suite omitted the directory-size/Git LFS regression'
+        }
         if (($script:capturedNativeArgs -contains '-check-basic-permissions') -ne $script:BasicPermissions -or
             ($script:capturedNativeArgs -contains '-check-legacy-permissions') -eq $script:BasicPermissions -or
             $script:capturedNativeArgs -notcontains '-filer=127.0.0.1:8888') {

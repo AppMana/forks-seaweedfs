@@ -29,6 +29,11 @@ type ReaderCache struct {
 	downloaders map[string]*SingleChunkCacher
 	limit       int
 	budget      *ReaderCacheBudget
+	// keepUntilEvicted retains completed chunk buffers after their readers
+	// finish or leave, until slot or budget eviction picks them. A mount
+	// file's sections share one cache across concurrent and revisiting reads
+	// (mmap page faults), so dropping a chunk on leave re-downloads it.
+	keepUntilEvicted bool
 }
 
 type SingleChunkCacher struct {
@@ -65,6 +70,13 @@ func NewReaderCache(limit int, chunkCache chunk_cache.ChunkCache, lookupFileIdFn
 		fetchChunkDataFn: util_http.RetriedFetchChunkData,
 		downloaders:      make(map[string]*SingleChunkCacher),
 	}
+}
+
+// KeepUntilEvicted makes the cache retain chunk buffers that were fully read
+// or left by every stream until slot or budget eviction removes them.
+func (rc *ReaderCache) KeepUntilEvicted() *ReaderCache {
+	rc.keepUntilEvicted = true
+	return rc
 }
 
 // MaybeCache prefetches up to 'count' chunks ahead in parallel.
@@ -325,6 +337,9 @@ func (rc *ReaderCache) removeUnpinned(downloader *SingleChunkCacher) (removed bo
 // at the same time either wins (the cacher stays and that reader's detach
 // retries the removal) or misses the map and refetches.
 func (rc *ReaderCache) removeConsumed(downloader *SingleChunkCacher) {
+	if rc.keepUntilEvicted {
+		return
+	}
 	rc.Lock()
 	removed := rc.downloaders[downloader.chunkFileId] == downloader &&
 		atomic.LoadInt32(&downloader.readers) == 0 &&

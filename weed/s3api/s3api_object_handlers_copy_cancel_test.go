@@ -24,6 +24,49 @@ func TestCopyChunksConcurrentlyReturnsChunksInOrder(t *testing.T) {
 	}
 }
 
+func TestCopyChunksConcurrentlyWaitsForCancelledSiblingCleanup(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	boom := errors.New("copy failed")
+	go func() {
+		_, err := copyChunksConcurrently(context.Background(), 2, func(ctx context.Context, i int) (*filer_pb.FileChunk, error) {
+			if i == 0 {
+				<-started
+				return nil, boom
+			}
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			<-release // Model cleanup of an in-flight HTTP copy.
+			return nil, ctx.Err()
+		})
+		done <- err
+	}()
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("sibling was not cancelled")
+	}
+	select {
+	case err := <-done:
+		close(release)
+		t.Fatalf("copy returned before cancelled sibling finished cleanup: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, boom) {
+			t.Fatalf("lost original error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("copy failed to return after sibling cleanup")
+	}
+}
+
 // One failed chunk loses the whole copy, so the chunk copies still running
 // must be cancelled and the ones not started must not run at all.
 func TestCopyChunksConcurrentlyCancelsSiblingsOnFirstError(t *testing.T) {

@@ -60,6 +60,8 @@ func checkMaintenanceCLIExitStatus(t *testing.T, command func(context.Context) *
 		wantExit                int
 	}{
 		{"check-invalid", "volume.check.disk -not-a-real-flag\n", "flag provided but not defined", 1},
+		{"fsck-invalid", "volume.fsck -not-a-real-flag\n", "flag provided but not defined", 1},
+		{"fsck-invalid-cutoff", "volume.fsck -cutoffTimeAgo=invalid\n", "invalid", 1},
 		{"vacuum-invalid", "volume.vacuum -garbageThreshold=invalid\n", "invalid", 1},
 		{"delete-empty-invalid", "volume.deleteEmpty -quietFor=invalid\n", "invalid", 1},
 		{"balance-invalid", "volume.balance -not-a-real-flag\n", "flag provided but not defined", 1},

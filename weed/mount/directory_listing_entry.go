@@ -7,7 +7,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// directoryListingEntry selects the metadata passed to adapter enumeration.
+// directoryListingEntry selects metadata for adapter enumeration, not file IO.
 func (wfs *WFS) directoryListingEntry(dir util.FullPath, inode uint64, entry *filer.Entry) *filer.Entry {
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 		// Match GetAttr's lock order: local writes and background chunk
@@ -15,9 +15,19 @@ func (wfs *WFS) directoryListingEntry(dir util.FullPath, inode uint64, entry *fi
 		lock := wfs.fhLockTable.AcquireLock("directoryListingEntry", fh.fh, util.SharedLock)
 		fh.entry.RLock()
 		if fh.entry.Entry != nil {
-			// Conversion retains protobuf slices/maps; clone before releasing
-			// the locks so later writes cannot race the enumeration callback.
-			entry = filer.FromPbEntry(string(dir), proto.Clone(fh.entry.Entry).(*filer_pb.Entry))
+			// Readdir consumes stat attributes, link count and Windows flags,
+			// not chunk records or inline content. Compute size under the lock
+			// (including unflushed chunks and remote size), then clone only the
+			// enumeration metadata. Copying all chunks allocates proportional
+			// to file fragmentation for every directory enumeration.
+			current := fh.entry.Entry
+			metadata := &filer_pb.Entry{
+				Name: current.Name, IsDirectory: current.IsDirectory,
+				Attributes: current.Attributes, Extended: current.Extended,
+				HardLinkId: current.HardLinkId, HardLinkCounter: current.HardLinkCounter,
+			}
+			entry = filer.FromPbEntry(string(dir), proto.Clone(metadata).(*filer_pb.Entry))
+			entry.FileSize = filer.FileSize(current)
 		}
 		fh.entry.RUnlock()
 		wfs.fhLockTable.ReleaseLock(fh.fh, lock)

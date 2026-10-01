@@ -42,7 +42,10 @@ func (c *commandVacuum) Do(args []string, commandEnv *CommandEnv, writer io.Writ
 	collection := volumeVacuumCommand.String("collection", "", "vacuum this collection")
 	volumeIds := volumeVacuumCommand.String("volumeId", "", "comma-separated list of volume IDs")
 	if err = volumeVacuumCommand.Parse(args); err != nil {
-		return nil
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
 	}
 
 	if err = commandEnv.confirmIsLocked(args); err != nil {

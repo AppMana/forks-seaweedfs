@@ -467,6 +467,11 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
+	return v.doWriteNeedleBlob(needleId, needleBlob, size)
+}
+
+// Caller holds dataFileAccessLock through validation, append and index update.
+func (v *Volume) doWriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size) error {
 
 	// nm.Put on a read-only volume fails only after the blob is appended to .dat.
 	if v.IsReadOnly() {

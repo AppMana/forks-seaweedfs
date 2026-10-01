@@ -63,9 +63,69 @@ func TestVolumeLoadPreservesPartialUnindexedTail(t *testing.T) {
 			v.Close()
 			t.Fatal("partial unindexed tail must prevent writes and deletes")
 		}
+		if err := v.CompactByIndex(nil); err == nil {
+			v.Close()
+			t.Fatal("index vacuum accepted a partial unindexed tail; commit would discard it")
+		}
+		if err := v.CompactByVolumeData(nil); err == nil {
+			v.Close()
+			t.Fatal("data vacuum accepted a partial unindexed tail")
+		}
 		v.Close()
 		if !bytes.Equal(read(datPath), wantDat) || !bytes.Equal(read(idxPath), wantIndex) {
 			t.Fatal("restart changed the original data or index")
 		}
+	}
+}
+
+func TestCompactCommitPreservesNewUnindexedTail(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	if _, _, _, err := v.writeNeedle2(newRandomNeedle(1), true, false, false); err != nil {
+		t.Fatal(err)
+	}
+	// A benignly read-only source is still eligible: do not blanket-ban it.
+	v.noWriteOrDelete = true
+	if err := v.CompactByIndex(nil); err != nil {
+		t.Fatalf("healthy read-only copy: %v", err)
+	}
+	if err := v.CommitCompact(); err != nil {
+		t.Fatalf("healthy read-only commit: %v", err)
+	}
+	if err := v.CompactByIndex(nil); err != nil {
+		t.Fatalf("second copy: %v", err)
+	}
+	datPath, idxPath := v.FileName(".dat"), v.FileName(".idx")
+	datSize, _, err := v.DataBackend.GetStat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.DataBackend.WriteAt([]byte("interrupted append after compact copy"), datSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.DataBackend.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	read := func(path string) []byte {
+		t.Helper()
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	wantDat, wantIdx := read(datPath), read(idxPath)
+	if err := v.CommitCompact(); err == nil {
+		t.Fatal("commit accepted a new unindexed tail")
+	}
+	if !bytes.Equal(read(datPath), wantDat) || !bytes.Equal(read(idxPath), wantIdx) {
+		t.Fatal("failed commit changed original files")
+	}
+	if _, err := os.Stat(v.FileName(".cpc")); !os.IsNotExist(err) {
+		t.Fatalf("failed commit published a recovery marker: %v", err)
 	}
 }

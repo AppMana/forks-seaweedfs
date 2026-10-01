@@ -695,6 +695,7 @@ func (a *winfspFS) Readdir(path string,
 	listErr := a.wfs.listDirectoryForAdapter(context.Background(), dirPath, func(entry *filer.Entry) (bool, error) {
 		childPath := dirPath.Child(entry.Name())
 		childIno := a.wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, false)
+		entry = a.wfs.directoryListingEntry(dirPath, childIno, entry)
 		attr = fuse.Attr{}
 		a.wfs.setAttrByFilerEntry(&attr, childIno, entry)
 		stat = cgofuse.Stat_t{}

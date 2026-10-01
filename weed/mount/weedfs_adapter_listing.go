@@ -3,7 +3,6 @@ package mount
 import (
 	"context"
 	"errors"
-	"math"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
@@ -17,8 +16,35 @@ import (
 func (wfs *WFS) listDirectoryForAdapter(ctx context.Context, dir util.FullPath, each filer.ListEachEntryFunc) error {
 	err := wfs.ensureDirectoryVisited(dir)
 	if err == nil {
-		_, err = wfs.metaCache.ListDirectoryEntries(ctx, dir, "", false, math.MaxInt64, each)
-		return err
+		// The cache holds its read lock while visiting entries. Adapter
+		// callbacks may read local file handles; Flush holds those handles
+		// while updating the cache. Invoke callbacks outside the cache lock
+		// to avoid that inversion, retaining only one bounded page.
+		const pageSize = 128
+		start := ""
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			entries := make([]*filer.Entry, 0, pageSize)
+			last, err := wfs.metaCache.ListDirectoryEntries(ctx, dir, start, false, pageSize, func(entry *filer.Entry) (bool, error) {
+				entries = append(entries, entry)
+				return true, nil
+			})
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				more, err := each(entry)
+				if err != nil || !more {
+					return err
+				}
+			}
+			if last == "" || last == start {
+				return nil
+			}
+			start = last
+		}
 	}
 	var tooLarge *meta_cache.DirectoryTooLargeError
 	if !errors.As(err, &tooLarge) {

@@ -84,6 +84,8 @@ func (c *commandVolumeCheckDisk) Help() string {
 	  -volumeId: check only a specific volume ID (0 for all)
 	  -apply: actually apply the fixes (default is simulation mode)
 	  -fixReadOnly: also check and repair read-only volumes using uni-directional sync
+	    Without -apply, all-read-only replica sets are compared without changing their state.
+	    With -apply, repair requires a writable source; otherwise the command fails.
 	  -syncDeleted: sync deletion records during repair
 	  -nonRepairThreshold: maximum fraction of missing keys allowed for repair (default 0.3)
 	  -resurrectMissingNeedles: copy needles absent on one replica back from the other, e.g. after replication failures.
@@ -286,7 +288,26 @@ func (vcd *volumeCheckDisk) checkReadOnlyVolumes(volumeReplicas map[uint32][]*Vo
 			continue
 		}
 		if len(rwReplicas) == 0 {
-			vcd.write("got %d read-only replicas for volume %d and no writable replicas to fix from", len(roReplicas), vid)
+			if vcd.applyChanges {
+				vcd.ewg.AddErrorf("got %d read-only replicas for volume %d and no writable replicas to fix from", len(roReplicas), vid)
+				continue
+			}
+			if len(roReplicas) < 2 {
+				vcd.write("volume %d has only one read-only replica; no replica pair to compare", vid)
+				continue
+			}
+			// Report-only comparison does not require a writable authority.
+			// Never mark these replicas writable or choose one as a repair
+			// source: both sides may hold unique intact data.
+			for _, target := range roReplicas[1:] {
+				vcd.ewg.Add(func() error {
+					_, err := vcd.syncTwoReplicas(roReplicas[0], target, true)
+					if err != nil {
+						return fmt.Errorf("compare read-only volume %d: %w", vid, err)
+					}
+					return nil
+				})
+			}
 			continue
 		}
 

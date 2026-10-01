@@ -249,6 +249,10 @@ Encrypted, manifest, multi-chunk, inline, TTL and files over 64 MiB are refused.
 `TestMaintenanceReferencedNeedleRepair` exercises this CLI on disposable real
 servers, including wrong-hash refusal, dry-run, intact target-only data, repeat
 refusal, and restart retention; it runs alongside the RPC compatibility test.
+The same CI step also runs the existing CLI exit-status, cross-collection fsck,
+live-volume retention, balance preservation, and read-only/scheduler fixtures.
+These are real-process tests in `test/volume_server/framework`, not covered by
+running only the sibling `grpc` and `http` packages.
 
 ## Deployment-specific operations
 

@@ -9,18 +9,49 @@ from run_image import check_memory
 
 
 class ImageMemoryContract(unittest.TestCase):
+    def test_baseline_hash_mismatch_never_creates_container(self):
+        with tempfile.TemporaryDirectory() as root:
+            baseline = Path(root) / 'weed'
+            baseline.write_bytes(b'not-the-approved-binary')
+            with mock.patch.object(run_image, 'docker') as execute, mock.patch(
+                    'sys.argv', ['run_image', '--image-id', 'sha256:' + 'a' * 64,
+                                 '--weed-sha256', 'b' * 64, '--results-root', root,
+                                 '--s3-suite', str(baseline), '--baseline-filer', str(baseline),
+                                 '--baseline-filer-sha256', 'c' * 64]):
+                with self.assertRaises(SystemExit) as raised:
+                    run_image.main()
+                self.assertEqual(raised.exception.code, 2)
+                execute.assert_not_called()
+
+    def test_extended_inventory_covers_every_non_soak_copying_test(self):
+        import re
+        source_dir = Path(__file__).resolve().parents[1] / 's3/copying'
+        discovered = set()
+        for path in source_dir.glob('*_test.go'):
+            discovered.update(re.findall(r'^func (Test\w+)\(t \*testing.T\)',
+                                         path.read_text(), re.MULTILINE))
+        discovered.remove('TestS3QualificationSoak')
+        self.assertEqual(set(run_image.S3_EXTENDED_TESTS), discovered)
+        with self.assertRaises(RuntimeError):
+            run_image.check_s3_results(''.join('--- PASS: ' + name + ' (0.1s)\n'
+                for name in run_image.S3_TESTS) + 'PASS\n', run_image.S3_EXTENDED_TESTS)
+
     def test_mixed_filer_uses_explicit_binary_and_disables_shared_copy(self):
         with tempfile.TemporaryDirectory() as root, mock.patch.object(
                 run_image, 'docker') as execute:
-            execute.return_value = subprocess.CompletedProcess([], 0,
-                ''.join('--- PASS: ' + name + ' (0.1s)\n'
-                        for name in run_image.S3_TESTS) + 'PASS\n')
+            def response(*args, **kwargs):
+                output = '403' if 'curl' in args else ''.join(
+                    '--- PASS: ' + name + ' (0.1s)\n'
+                    for name in run_image.S3_TESTS) + 'PASS\n'
+                return subprocess.CompletedProcess(args, 0, output)
+            execute.side_effect = response
             run_image.run_s3('owned-lab', None, Path(root),
                              filer_binary='/baseline-weed')
         calls = [call.args for call in execute.call_args_list]
         self.assertTrue(any('exec /baseline-weed filer ' in str(c) for c in calls))
         self.assertTrue(any('exec /usr/bin/weed s3 ' in str(c) and
                             '-shareCopyChunks=false' in str(c) for c in calls))
+        self.assertTrue(any('-config=/s3-test-identities.json' in str(c) for c in calls))
 
     def test_soak_requires_exact_duration_multiple_cycles_and_complete_test(self):
         good = ('SOAK_COMPLETE duration_seconds=86400 cycles=2000\n'

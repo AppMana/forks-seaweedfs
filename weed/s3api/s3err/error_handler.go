@@ -123,14 +123,15 @@ func setCommonHeaders(w http.ResponseWriter, r *http.Request) {
 
 func WriteResponse(w http.ResponseWriter, r *http.Request, statusCode int, response []byte, mType mimeType) {
 	setCommonHeaders(w, r)
-	if response != nil {
+	bodyAllowed := statusCode >= 200 && statusCode != http.StatusNoContent && statusCode != http.StatusNotModified
+	if response != nil && bodyAllowed {
 		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
 	}
 	if mType != mimeNone {
 		w.Header().Set("Content-Type", string(mType))
 	}
 	w.WriteHeader(statusCode)
-	if response != nil {
+	if response != nil && bodyAllowed && r.Method != http.MethodHead {
 		glog.V(4).Infof("status %d %s: %s", statusCode, mType, string(response))
 		_, err := w.Write(response)
 		if err != nil {

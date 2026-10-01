@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/gorilla/mux"
@@ -48,19 +47,16 @@ func TestHeadBucketSeparatesLookupFailureFromMissingBucket(t *testing.T) {
 		name     string
 		filer    *fakeLookupFiler
 		wantCode int
-		wantBody string
 	}{
 		{
 			name:     "transient lookup failure",
 			filer:    &fakeLookupFiler{lookupErr: status.Error(codes.Internal, "filer store unavailable")},
 			wantCode: http.StatusInternalServerError,
-			wantBody: "<Code>InternalError</Code>",
 		},
 		{
 			name:     "missing bucket",
 			filer:    &fakeLookupFiler{},
 			wantCode: http.StatusNotFound,
-			wantBody: "<Code>NoSuchBucket</Code>",
 		},
 		{
 			name:     "existing bucket",
@@ -80,8 +76,11 @@ func TestHeadBucketSeparatesLookupFailureFromMissingBucket(t *testing.T) {
 			if rr.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d: %s", rr.Code, tc.wantCode, rr.Body.String())
 			}
-			if tc.wantBody != "" && !strings.Contains(rr.Body.String(), tc.wantBody) {
-				t.Fatalf("body = %s, want %s", rr.Body.String(), tc.wantBody)
+			// HEAD distinguishes these failures by status, never an XML body.
+			// A real net/http server suppresses bodies that ResponseRecorder
+			// previously allowed this test to observe.
+			if rr.Body.Len() != 0 {
+				t.Fatalf("HEAD returned a body: %s", rr.Body.String())
 			}
 		})
 	}

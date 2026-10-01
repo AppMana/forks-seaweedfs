@@ -74,6 +74,7 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         $label = 'native access performance'
     } elseif ($MetadataOnly) {
         $names = @('TestDefaultFileAttributesArchive', 'TestDirectoryChangeNotificationPreservesCase', 'TestWindowsAttributesRoundTrip', 'TestWindowsCreationTimeStable', 'TestWindowsUnicodeComponentLimits', 'TestWindowsBasicAccessDenial', 'TestWindowsCreateSecurity', 'TestWindowsSymlinkTargets', 'TestWindowsAccessPerformance')
+        $names += 'TestDirectoryEnumerationSizeAfterClose'
         $label = 'native metadata regressions'
     } else {
         $listing = @(& $WinFspTestExe '-test.list=^Test' 2>&1)

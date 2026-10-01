@@ -17,7 +17,7 @@ func TestWindowsStorageLab(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_WINDOWS_LIVE") != "1" {
 		t.Skip("set SEAWEEDFS_WINDOWS_LIVE=1")
 	}
-	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_STORAGE_TEST"), []string{"TestWriteNeedle2FsyncsInlineWhileStopping", "TestWriteNeedle2FsyncsIndexBeforeAcknowledging", "TestWriteNeedle2RejectsFailedIndexFsync", "TestWriteNeedle2TruncatesWhenInlineFsyncFails", "TestWriteNeedle2DropsIndexOfUnflushedNewNeedle", "TestStoreWriteVolumeNeedleStaysDurableWhileStopping", "TestReconcileRollForwardMarkerOnly", "TestReconcileRollForwardPartialRename", "TestReconcileRollBackNoMarker", "TestApplyCompactSwapMissingTempFilesPreservesLive", "TestLevelDbReplaysDurableIndexDespiteNewerLog", "TestLevelDbReplayPreservesRepeatedKeyOrder", "TestLevelDbReplaySparseKeysAcrossBatches"})
+	runWindowsUnitLab(t, os.Getenv("SEAWEEDFS_WINDOWS_STORAGE_TEST"), []string{"TestVolumeLoadPreservesPartialUnindexedTail", "TestCompactCommitPreservesNewUnindexedTail", "TestWriteNeedle2FsyncsInlineWhileStopping", "TestWriteNeedle2FsyncsIndexBeforeAcknowledging", "TestWriteNeedle2RejectsFailedIndexFsync", "TestWriteNeedle2TruncatesWhenInlineFsyncFails", "TestWriteNeedle2DropsIndexOfUnflushedNewNeedle", "TestStoreWriteVolumeNeedleStaysDurableWhileStopping", "TestReconcileRollForwardMarkerOnly", "TestReconcileRollForwardPartialRename", "TestReconcileRollBackNoMarker", "TestApplyCompactSwapMissingTempFilesPreservesLive", "TestLevelDbReplaysDurableIndexDespiteNewerLog", "TestLevelDbReplayPreservesRepeatedKeyOrder", "TestLevelDbReplaySparseKeysAcrossBatches"})
 }
 
 func TestWindowsMountXAttrLab(t *testing.T) {

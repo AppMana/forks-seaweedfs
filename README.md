@@ -236,6 +236,20 @@ arbitrary differences: the caller must establish a current filer reference.
 It refuses existing index entries, including tombstones, and never falls back
 to the overwrite-capable `WriteNeedleBlob` RPC on an older server.
 
+`volume.repair.needle` is the explicit, dry-run-by-default caller for an
+immutable, single-chunk filer file. Supply `-path`, `-fid` (including cookie),
+`-sha256` (uncompressed payload), `-source`, and `-target`; only `-apply` writes.
+Hold the shell admin lock and quiesce application changes to that file: the
+admin lock does not stop filer writes or garbage collection. The command checks
+the current reference, source CRC/identity/payload hash, target index absence,
+and matching volume format/collection. It rechecks the reference before writing
+and verifies the target record and reference afterward. An uncertain result
+never triggers overwrite, deletion, or automatic rollback. Reinspect before retry.
+Encrypted, manifest, multi-chunk, inline, TTL and files over 64 MiB are refused.
+`TestMaintenanceReferencedNeedleRepair` exercises this CLI on disposable real
+servers, including wrong-hash refusal, dry-run, intact target-only data, repeat
+refusal, and restart retention; it runs alongside the RPC compatibility test.
+
 ## Deployment-specific operations
 
 Cluster hardware, GitOps settings, capacity accounting, release gates, and

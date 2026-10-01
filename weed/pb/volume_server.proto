@@ -79,6 +79,11 @@ service VolumeServer {
     }
     rpc WriteNeedleBlob (WriteNeedleBlobRequest) returns (WriteNeedleBlobResponse) {
     }
+    // Explicit admin repair: refuse existing entries, including tombstones.
+    // A distinct method makes old servers fail closed with UNIMPLEMENTED.
+    // The caller must independently verify a current filer reference.
+    rpc WriteNeedleBlobIfAbsent (WriteNeedleBlobRequest) returns (WriteNeedleBlobResponse) {
+    }
     rpc ReadAllNeedles (ReadAllNeedlesRequest) returns (stream ReadAllNeedlesResponse) {
     }
 

@@ -218,6 +218,24 @@ bounded `.dat` size for a fixed live dataset, on memory and LevelDB indexes.
 SIGKILL is **not power loss**: host page-cache survival does not prove durable
 acknowledgements.
 
+The same workflow runs `TestMissingNeedleRepairRPC` with `WEED_BINARY` set to
+the candidate and `WEED_REPAIR_BASELINE` set to the pinned baseline executable.
+It requires that baseline to predate `WriteNeedleBlobIfAbsent`: the old server
+must return `Unimplemented`, never silently accept an unsafe fallback. Keep
+that compatibility case when promoting the baseline. The test repairs an absent
+record, refuses a repeat, and verifies repaired and unrelated intact payloads
+after a process restart. Run it locally with matching offset build tags:
+
+```sh
+WEED_BINARY=/absolute/path/weed-candidate WEED_REPAIR_BASELINE=/absolute/path/weed-baseline \
+  go test -tags 5BytesOffset -count=1 -v -timeout=3m ./test/volume_server/framework -run '^TestMissingNeedleRepairRPC$'
+```
+
+This RPC is only an absent-record storage primitive, not authorization to repair
+arbitrary differences: the caller must establish a current filer reference.
+It refuses existing index entries, including tombstones, and never falls back
+to the overwrite-capable `WriteNeedleBlob` RPC on an older server.
+
 ## Deployment-specific operations
 
 Cluster hardware, GitOps settings, capacity accounting, release gates, and

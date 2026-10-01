@@ -298,6 +298,9 @@ func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeL
 	// limiter for each volume server
 	limiter := make(map[NodeId]int)
 	var limiterLock sync.Mutex
+	// Coalesce worker completions without blocking workers. A buffered wakeup
+	// also covers completion between the quota check and the scheduler wait.
+	quotaReturned := make(chan struct{}, 1)
 	for _, locationList := range todoVolumeMap {
 		for _, dn := range locationList.list {
 			if _, ok := limiter[dn.Id()]; !ok {
@@ -345,6 +348,10 @@ func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeL
 					limiter[dn.Id()]++
 					limiterLock.Unlock()
 				}
+				select {
+				case quotaReturned <- struct{}{}:
+				default:
+				}
 			})
 			if automatic && t.IsVacuumDisabled() {
 				break
@@ -354,7 +361,7 @@ func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeL
 			break
 		}
 		if len(todoVolumeMap) == len(pendingVolumeMap) {
-			time.Sleep(10 * time.Second)
+			<-quotaReturned
 		}
 		todoVolumeMap = pendingVolumeMap
 	}

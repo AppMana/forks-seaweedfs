@@ -64,6 +64,14 @@ func TestMaintenanceReferencedNeedleRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The requested source record must not be the last index row: production
+	// CopyFile responses batch many records, unlike a single-record fixture.
+	sourceOther := NewFileID(uint32(parsed.VolumeId), uint64(parsed.Key)+2000, 789)
+	response = UploadBytes(t, client, source.VolumeAdminURL(), sourceOther, bytes.Repeat([]byte("unrelated source record"), 128))
+	ReadAllAndClose(t, response)
+	if response.StatusCode != 201 {
+		t.Fatalf("source index suffix seed: %d", response.StatusCode)
+	}
 	conn, tc := DialVolumeServer(t, target.VolumeGRPCAddress())
 	defer conn.Close()
 	AllocateVolume(t, tc, uint32(parsed.VolumeId), "repair")

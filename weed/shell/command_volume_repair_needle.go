@@ -136,7 +136,7 @@ func repairIndex(ctx context.Context, c volume_server_pb.VolumeServerClient, fid
 		for len(pending) >= row {
 			if types.BytesToNeedleId(pending[:types.NeedleIdSize]) == fid.Key {
 				offset = types.BytesToOffset(pending[types.NeedleIdSize:])
-				size = types.BytesToSize(pending[types.NeedleIdSize+types.OffsetSize:])
+				size = types.BytesToSize(pending[types.NeedleIdSize+types.OffsetSize : row])
 				found = true
 			}
 			pending = pending[row:]

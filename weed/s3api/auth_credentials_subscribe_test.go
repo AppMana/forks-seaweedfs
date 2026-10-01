@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/credential"
@@ -14,6 +15,46 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 )
+
+func TestIamReloadCoalescesScheduledBurst(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s3a := newTestS3ApiServerWithMemoryIAM(t, []*iam_pb.Identity{{Name: "anonymous"}})
+		defer s3a.iam.Shutdown()
+		counter := &countingStore{CredentialStore: s3a.iam.credentialManager.Store}
+		s3a.iam.credentialManager.Store = counter
+		for i := 0; i < 50; i++ {
+			s3a.iam.scheduleReload("burst")
+			time.Sleep(100 * time.Microsecond)
+		}
+		if loads := atomic.LoadInt64(&counter.loads); loads != 0 {
+			t.Fatalf("reloaded %d times before the coalescing window elapsed", loads)
+		}
+		time.Sleep(5 * time.Millisecond)
+		synctest.Wait()
+		if loads := atomic.LoadInt64(&counter.loads); loads != 1 {
+			t.Fatalf("burst performed %d loads, want 1", loads)
+		}
+		if err := s3a.iam.credentialManager.CreateUser(context.Background(), &iam_pb.Identity{Name: "later"}); err != nil {
+			t.Fatal(err)
+		}
+		s3a.iam.scheduleReload("later event")
+		time.Sleep(10 * time.Millisecond)
+		synctest.Wait()
+		if !hasIdentity(s3a.iam, "later") || atomic.LoadInt64(&counter.loads) != 2 {
+			t.Fatal("later event was lost or reloaded more than once")
+		}
+		// Notifications never become quiet here. A sliding debounce would
+		// postpone every snapshot, including credential revocations.
+		for i := 0; i < 50; i++ {
+			s3a.iam.scheduleReload("continuous changes")
+			time.Sleep(time.Millisecond)
+		}
+		synctest.Wait()
+		if loads := atomic.LoadInt64(&counter.loads); loads < 6 || loads > 7 {
+			t.Fatalf("continuous changes starved or bypassed batching: %d loads", loads)
+		}
+	})
+}
 
 func TestOnIamConfigChangeLegacyIdentityDeletionReloadsConfiguration(t *testing.T) {
 	s3a := newTestS3ApiServerWithMemoryIAM(t, []*iam_pb.Identity{

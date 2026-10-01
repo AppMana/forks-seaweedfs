@@ -330,6 +330,7 @@ jobs:
           # Admission must exercise the candidate, not the initial baseline.
           WEED_VOLUME_BINARY="$WEED_CANDIDATE_BINARY" go test -tags "$STORAGE_BUILD_TAGS" -count=1 -timeout="$STORAGE_PROCESS_TEST_TIMEOUT" ./test/volume_server/http -run '^TestUploadLimitTimeoutIncludesReplication$'
           go test -tags "$STORAGE_BUILD_TAGS" -count=1 -timeout="$STORAGE_PROCESS_TEST_TIMEOUT" ./test/volume_server/grpc -run '^TestVolumeBinaryUpgradeVacuumRollback$'
+          WEED_VOLUME_BINARY="$WEED_CANDIDATE_BINARY" go test -tags "$STORAGE_BUILD_TAGS" -count=1 -timeout="$STORAGE_PROCESS_TEST_TIMEOUT" ./test/volume_server/grpc -run '^TestVacuumRPCPreservesUnindexedTail$'
       - uses: actions/upload-artifact@v7
         if: always()
         with:

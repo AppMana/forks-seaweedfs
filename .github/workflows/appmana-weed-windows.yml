@@ -39,6 +39,9 @@ jobs:
       - name: Verify PowerShell contract exit status under the Actions wrapper
         working-directory: forks-seaweedfs
         run: python3 -m unittest discover -s hack/appmana -p 'test_smoke_contract_exit.py' -v
+      - name: Verify real-VM campaign schedules both permission policies
+        working-directory: forks-seaweedfs
+        run: python3 -m unittest discover -s hack/appmana -p 'test_windows_suite_policy.py' -v
       - name: Cross-compile gate (windows/amd64, large disk)
         working-directory: forks-seaweedfs
         run: |

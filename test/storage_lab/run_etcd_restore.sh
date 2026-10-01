@@ -27,4 +27,7 @@ export VOLUME_SERVER_IT_KEEP_LOGS=1 TMPDIR="$run_dir"
 go test -tags="${STORAGE_BUILD_TAGS:-5BytesOffset}" -count=1 -v -timeout=4m \
   ./test/volume_server/framework -run '^TestExternalEtcdSnapshotRestore$' 2>&1 | tee "$run_dir/test.log"
 grep -q 'ETCD_RESTORE_COMPLETE' "$run_dir/test.log"
+if [[ -n "${WEED_FILER_UPGRADE_BASELINE:-}" ]]; then
+  grep -q 'FILER_MIXED_VERSION_COMPLETE' "$run_dir/test.log"
+fi
 printf 'Restore evidence: %s\n' "$run_dir"

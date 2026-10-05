@@ -1,0 +1,120 @@
+name: AppMana large-disk server images
+
+on:
+  push:
+    branches: ['merge/upstream-4.47']
+    paths:
+      - 'weed/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'docker/Dockerfile.local'
+      - 'docker/entrypoint.sh'
+      - 'docker/filer.toml'
+      - '.github/workflows/appmana-server-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/appmana/seaweedfs
+  GO_FUSE_REF: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
+jobs:
+  build:
+    if: github.repository == 'AppMana/forks-seaweedfs'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: forks-seaweedfs
+      - name: Require reviewed dependency pin
+        shell: bash
+        run: |
+          [[ "$GO_FUSE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'Set SEAWEEDFS_RELIABILITY_GO_FUSE_REF to a full reviewed SHA' >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: AppMana/forks-go-fuse
+          ref: ${{ env.GO_FUSE_REF }}
+          path: forks-go-fuse
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: forks-seaweedfs/go.mod
+          cache-dependency-path: forks-seaweedfs/go.sum
+      - name: Test and build native large-disk server
+        working-directory: forks-seaweedfs
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          test "$(git -C ../forks-go-fuse rev-parse HEAD)" = "$GO_FUSE_REF"
+          go test -short -count=1 -timeout=10m -tags 5BytesOffset ./weed/storage ./weed/topology
+          go build -trimpath -tags 5BytesOffset -ldflags "-s -w -X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$GITHUB_SHA" -o docker/weed ./weed
+          ./docker/weed version
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package and verify native binary
+        working-directory: forks-seaweedfs
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:sha-${GITHUB_SHA}_large_disk-linux-$ARCH"
+          docker build --platform "linux/$ARCH" -f docker/Dockerfile.local \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "io.appmana.go-fuse.revision=$GO_FUSE_REF" \
+            --label 'io.appmana.seaweedfs.offset-format=5BytesOffset' \
+            -t "$tag" docker
+          docker run --rm --network none --entrypoint /usr/bin/weed "$tag" version | tee version.txt
+          grep -F "$GITHUB_SHA" version.txt
+          docker push "$tag"
+          mkdir -p digests
+          docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
+            | jq -er '.digest' > "digests/$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-digest-${{ matrix.arch }}
+          path: forks-seaweedfs/digests/
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: server-digest-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish and check exact two-platform candidate
+        run: |
+          set -euo pipefail
+          amd64="$(cat digests/amd64)"
+          arm64="$(cat digests/arm64)"
+          [[ "$amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          tag="$IMAGE:sha-${GITHUB_SHA}_large_disk"
+          docker buildx imagetools create -t "$tag" "$IMAGE@$amd64" "$IMAGE@$arm64"
+          docker buildx imagetools inspect --raw "$tag" | jq -e \
+            '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          docker buildx imagetools inspect "$tag"
+          echo "Candidate only: $tag; storage migration and VM qualification are separate gates." >> "$GITHUB_STEP_SUMMARY"

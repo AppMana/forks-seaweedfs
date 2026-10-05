@@ -47,6 +47,9 @@ jobs:
   # amd64 and arm64 without QEMU, turning a 5-hour emulated cargo build into
   # ~15 minutes of native compilation.
   build-rust-binaries:
+    # This inherited publisher targets upstream registries. Fork releases use
+    # appmana-server-images.yml and must never write the upstream namespace.
+    if: github.repository == 'seaweedfs/seaweedfs'
     runs-on: ubuntu-22.04
     strategy:
       matrix:

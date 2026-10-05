@@ -1,263 +1,45 @@
-# forks-seaweedfs — SeaweedFS with Windows mount support
+# AppMana SeaweedFS
 
-AppMana fork of [seaweedfs/seaweedfs](https://github.com/seaweedfs/seaweedfs),
-originally branched from **4.23**, now carrying the AppMana **4.40** integration
-and storage reliability fixes. The **4.47 upgrade is being qualified, not yet
-approved for deployment**. Besides Windows mounts, this fork changes allocation,
-compaction/recovery, admission control, S3 behavior, and CSI-facing semantics.
+SeaweedFS 4.47 with Windows mounts and fixes for allocation, vacuum/recovery,
+memory use, S3 streaming and shared-mount coherence.
 
-```
-weed mount -filer=<filer:port> -dir=C:\mnt\seaweedfs
-```
+## Install and use
 
-- The mount is served through [WinFsp](https://winfsp.dev/) via
-  [cgofuse](https://github.com/winfsp/cgofuse) in its no-cgo mode, so
-  `CGO_ENABLED=0 GOOS=windows` cross-compiles from Linux. WinFsp must be
-  installed on the host (the mount preflights for it).
-- The adapter (`weed/mount/winfsp_*_windows.go`) layers cgofuse's path-based
-  API over the existing inode-based mount filesystem, so the battle-tested
-  read/write/rename pipelines are reused, not reimplemented. Includes
-  per-handle sequential read-ahead.
-- `WEED_WINFSP_VOLUME_PREFIX=\seaweedfs` switches to a WinFsp *network* file
-  system (UNC path). This is required when containers consume the mount:
-  Windows HCS refuses to bind local WinFsp volumes into containers
-  ([winfsp#498](https://github.com/winfsp/winfsp/issues/498)).
-- `-winfspOptions=k=v,...` passes raw WinFsp options. `FileInfoTimeout=-1`
-  enables kernel data caching (large speedup for small reads) but is only
-  safe on read-mostly volumes; see `WINDOWS_PORT.md` for why.
+| Package | Use |
+| --- | --- |
+| [ghcr.io/appmana/seaweedfs](https://github.com/orgs/AppMana/packages?repo_name=forks-seaweedfs) | Master, filer, volume and S3 services |
+| [CSI packages](https://github.com/AppMana/forks-seaweedfs-csi-driver) | Linux and Windows Kubernetes mounts |
+| [Synology package](https://github.com/AppMana/spk-seaweedfs) | DSM installation and service management |
 
-## Large volumes
+Select a published server image in your role workloads or Helm values, and
+deploy CSI for client mounts. Stock k0s works without a storage-specific fork.
 
-Production releases of this fork must use the **large-disk** variant
-(`-tags 5BytesOffset`), matching the upstream `*_large_disk` releases: 5-byte
-needle offsets raise the per-volume size limit (8TB volume files) for big-disk
-deployments. Build:
+**Windows CSI installs bundled WinFsp automatically.** No separate installation
+is needed for that deployment. DLL-only packages retain the signed stock kernel
+driver; they do not include fixes that require a driver replacement.
+Standalone weed.exe is a developer binary, not a dependency installer.
 
-```
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags 5BytesOffset -o weed.exe ./weed
-```
+Use matching **large-disk** builds across upgrades and rollbacks: their index
+format differs from normal upstream builds. Set container memory limits and
+leave explicit Go-memory/upload/download admission overrides unset to use
+automatic sizing. Vacuum needs temporary disk space and refuses corrupt live
+records rather than silently discarding them.
 
-`go.mod` replaces `github.com/seaweedfs/go-fuse/v2` with a sibling checkout of
-[AppMana/forks-go-fuse](https://github.com/AppMana/forks-go-fuse) (a
-compile-only Windows port of the fuse package) — clone it next to this repo
-as `../forks-go-fuse` before building.
+See [Windows behavior](WINDOWS_PORT.md) for caching and permission limitations.
 
-`WINDOWS_PORT.md` documents every file changed relative to upstream, the
-behavior notes (case sensitivity, xattrs, locking), and the caching
-investigation. CI cross-compiles, runs native Windows tests, executes a real
-WinFsp mount smoke test, and benchmarks every build.
+## Compatibility
 
-Used by [AppMana/forks-seaweedfs-csi-driver](https://github.com/AppMana/forks-seaweedfs-csi-driver)
-to serve SeaweedFS persistent volumes to Windows Kubernetes nodes.
+Results apply to the linked build and scope, not every historical test run.
 
-## Reliability CI: configuration and updating the baseline
+| Scope | Result |
+| --- | --- |
+| Linux mount/filer/S3 and native Windows smoke gates | [tested](https://github.com/AppMana/forks-seaweedfs/actions/runs/36923202188) |
+| Full storage reliability gate: isolation contract failure | [fails](https://github.com/AppMana/forks-seaweedfs/actions/runs/36923202055) |
+| Same build: mixed-OS, MSVC and power-loss qualification | unknown |
+| New Linux amd64/arm64 server publication | unknown — first successful build required |
+| Linux arm64 storage workloads | unknown |
+| Synology 4.47-15 public availability | unknown — release remains draft |
 
-For safe local reproduction, see the [isolated storage lab](test/storage_lab/README.md).
-It reuses existing tests with bounded resources and no production network or
-writable host mounts. Linux, native Windows, and Synology SPK qualification are
-separate gates; passing the Linux lab does not qualify the other packages.
-
-Native WinFsp compilation is also an opt-in VM gate:
-`TestWindowsWinFspMSVCBuildLab`. Its offline compiler ISO path/hash, pinned
-toolchain/source versions, media layout, and invocation are documented in the
-[existing lab instructions](test/storage_lab/README.md). It builds and retains
-matched baseline/candidate DLLs; compilation alone does not qualify deployment.
-That qualification job also runs `TestMixedOSMountLab`: concurrent native
-Windows WinFsp and Linux FUSE clients against one isolated Linux filer. It uses
-the exact compiled candidate DLL and additionally requires the configured,
-preloaded Linux VM image. The existing lab README documents local invocation,
-coverage, and limitations; its fast corruption-oracle tests run in Linux CI.
-
-Passing local tests does not authorize promotion; deployment requirements and
-current operational facts belong in the existing AppMana `docs/seaweedfs.md`
-runbook, not a second document in this source repository.
-
-The candidate also backports upstream #11411, including its unchanged
-five-byte-offset regression test; plain 4.47 does not contain that fix.
-Index-based vacuum refuses unreadable or wrong-identity live records rather
-than dropping them. This is a safety policy, not a tuning option: bad indexes
-require diagnosis/repair before reclamation, even if that leaves disk usage high.
-
-The [storage reliability workflow](.github/workflows/appmana-storage-reliability.yml)
-runs on `merge/**`, `master`, `main`, pull requests, and manual dispatch. It
-uses the existing storage tests and `test/volume_server` process harness. It
-does **not** publish images, reclaim production data, or deploy anything.
-
-Configure these **Actions repository variables**, not secrets, under Settings →
-Secrets and variables → Actions → Variables:
-
-| Variable | Purpose | Update rule |
-| --- | --- | --- |
-| `SEAWEEDFS_RELIABILITY_BASELINE_REF` | Full 40-character commit SHA for the source compatibility baseline | Change deliberately when the baseline is promoted; keep the previous deployed release in the upgrade/rollback matrix. Do not use `HEAD~1`, a branch, or `latest`. |
-| `SEAWEEDFS_RELIABILITY_GO_FUSE_REF` | Full commit SHA for `AppMana/forks-go-fuse`, required by the local `go.mod` replacement | Change only alongside a reviewed and tested dependency upgrade. Both test builds use this pinned sibling. |
-| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | Full commit SHA for `AppMana/labcontainers` used to build `labd` and its Go SDK | Must include explicit crashes, peer bridge restoration and `ExecWithTimeout` (introduced in local commit `6f89daa3da9f6739270ab6e36c1cbbd101c5ae12`). Publish and qualify the commit before selecting it in Actions. Never point this at a moving branch. |
-| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE` | Qualified Ubuntu VM image reference including `@sha256:<64 hex>` | Build from the pinned source, publish and preload it on the dedicated runner, and update only after its live KVM smoke test passes. Mutable tags are rejected. |
-| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Windows VM image including `@sha256:<64 hex>` | Preload the licensed image on the same dedicated runner. Run the native Windows core regressions and Labcontainers NTFS crash test before promotion. |
-| `SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256` | Absolute runner-local WinFsp MSI path and SHA-256 | Preload the reviewed installer. The VM gate verifies its hash before staging it offline. |
-| `SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_PATH` / `SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_SHA256` | Absolute runner-local upstream `winfsp-tests-x64.exe` path and SHA-256 | Required by native MSVC qualification. Preload the reviewed conformance executable; update path and hash together. The VM runs all listed cases, including optional and known-failure cases, with basic permissions enabled. No download occurs inside the VM. |
-| `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH` / `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256` | Absolute runner-local Git for Windows installer path and SHA-256 | Preload the reviewed installer including Git LFS; update path and digest together after qualification. Missing/mismatched installers fail the VM gate. |
-| `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH` / `SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` | Optional absolute runner-local standalone Windows `git-lfs.exe` path and SHA-256 | Set both to test an explicit client independently of the Git installer bundle; a partial pair or hash mismatch fails the gate. Leave both unset to test bundled LFS. Update deliberately after client qualification, never download `latest` during a regression run. |
-| `SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED` | Set to `1` to run native WinFsp build/qualification on applicable trusted pushes | Otherwise use manual dispatch input `windows_msvc_build`. Never runs for pull requests. Requires the dedicated isolated KVM runner; an omitted job is not a qualification pass. |
-| `SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH` / `SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256` | Absolute runner-local offline compiler ISO and its SHA-256 | Generate with `bash hack/appmana/prepare-winfsp-msvc-media.sh`, preload on the dedicated runner, and update both variables together. Review the pinned source, image-layer, Git and compiler/SDK versions in the existing lab instructions when replacing the payload. |
-
-The native MSVC qualification job additionally **requires** both explicit Git LFS
-variables above (bundled LFS is not its default). It uploads the exact baseline
-and candidate DLLs with manifests, patches, compiler logs/binlogs and runtime
-evidence, then tests the candidate app-locally with the pinned signed WinFsp MSI.
-The rebuilt-DLL job runs both legacy sharing and opt-in basic permission suites.
-`weed mount -winfspBasicPermissions` selects basic stored-mode enforcement;
-it requires the qualified rebuilt WinFsp DLL, not merely the stock MSI.
-Leave it off for existing shared volumes until their metadata is audited.
-The local VM equivalent is `SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1` (default `0`).
-Basic mode rejects raw identity/DACL/permission overrides in `-winfspOptions`.
-Windows mounts interpret absolute POSIX symlink targets within the mounted
-volume (`rellinks`); `-winfspOptions=norellinks` restores rejection of these
-targets. This does not make Windows drive paths portable to Linux. Prefer
-relative symlinks for shared workloads. Creating an absolute Windows target
-through a directory-junction mount remains unqualified; enabling `rellinks`
-does not bypass WinFsp's cross-volume target check.
-It does not replace the installed driver, sign/publish a release, or deploy.
-No repository variables are changed by the build itself.
-
-The initial baseline is `9ec822e2d634abc36eb2a113d0ddb4a844970873` (the audited
-4.40 fork source), and the initial Go-FUSE pin is
-`1bdeec4d57d1e9ee85d4938f36f2ed876dd7bd5e`. These are historical setup values,
-**not duplicate workflow defaults**. The source baseline is newer than some
-currently deployed role images; passing it does not replace testing each
-deployed version before rollout.
-
-```sh
-gh variable set SEAWEEDFS_RELIABILITY_BASELINE_REF --repo AppMana/forks-seaweedfs --body "$BASELINE_SHA"
-gh variable set SEAWEEDFS_RELIABILITY_GO_FUSE_REF --repo AppMana/forks-seaweedfs --body "$GO_FUSE_SHA"
-gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_SHA"
-gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE --repo AppMana/forks-seaweedfs --body "$LABCONTAINERS_VM_IMAGE_AT_DIGEST"
-gh variable set SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE --repo AppMana/forks-seaweedfs --body "$WINDOWS_IMAGE_AT_DIGEST"
-gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_WINFSP_MSI_PATH"
-gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_MSI_SHA256"
-gh variable set SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_WINFSP_TESTS_EXE_PATH"
-gh variable set SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_SHA256 --repo AppMana/forks-seaweedfs --body "$WINFSP_TESTS_EXE_SHA256"
-gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_INSTALLER_PATH"
-gh variable set SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_INSTALLER_SHA256"
-# Optional for the stock-MSI gate, mandatory for MSVC qualification.
-gh variable set SEAWEEDFS_RELIABILITY_GIT_LFS_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_GIT_LFS_PATH"
-gh variable set SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 --repo AppMana/forks-seaweedfs --body "$GIT_LFS_SHA256"
-# Native MSVC qualification: preload the helper-generated ISO on the runner.
-gh variable set SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH --repo AppMana/forks-seaweedfs --body "$RUNNER_MSVC_ISO_PATH"
-gh variable set SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256 --repo AppMana/forks-seaweedfs --body "$MSVC_ISO_SHA256"
-# Enable only after runner provisioning and a successful manual qualification.
-gh variable set SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED --repo AppMana/forks-seaweedfs --body 1
-gh variable list --repo AppMana/forks-seaweedfs
-```
-
-Manual dispatch accepts `baseline_ref` to override the baseline for one run.
-The candidate is derived dynamically from the checked-out workflow commit;
-Go comes from `go.mod`. Missing/invalid pins and identical baseline/candidate
-commits fail explicitly. The job summary records both resolved commits and
-the dependency pin, and the binaries embed their source commits. A manual
-override does not update the repository variable.
-
-The intensive `vm-fault-gates` job runs only on a dedicated self-hosted runner
-labelled `linux`, `x64`, `kvm`, and `seaweedfs-lab`. It requires `/dev/kvm`,
-Docker, Containerlab 0.79.0, and the digest-pinned VM image, but no production
-routes or credentials. Four fresh isolated labs test replicated concurrent
-vacuum, acknowledged-write power loss, graceful baseline/candidate/rollback
-migration, and power loss after observing the vacuum `.cpd` copy.
-Both self-hosted VM jobs are restricted to pushes and deliberate manual runs;
-pull requests run hosted checks only. Review the selected ref before manually
-dispatching: the selected code can control Docker/KVM on the dedicated runner.
-
-Workflow-level variables `STORAGE_BUILD_TAGS`, `STORAGE_UNIT_TEST_TIMEOUT`, and
-`STORAGE_PROCESS_TEST_TIMEOUT` define the build format and test deadlines in
-one place. `5BytesOffset` is a storage-format requirement, **not** a tuning
-knob: never open existing large-disk indexes with a four-byte-offset binary.
-The older Windows workflow separately configures `GO_FUSE_BRANCH` and
-`WINFSP_MSI_URL`; review those when changing the dependency or Windows runtime.
-
-The hosted reliability job also restores a fresh external-etcd snapshot using
-the candidate binary. `SEAWEEDFS_ETCD_TEST_IMAGE` can override its digest-pinned
-Linux amd64 etcd 3.5.21 image; update the pin when the deployed metadata-store
-version changes. It verifies chunk references, file bytes, a new cluster identity,
-absence of post-snapshot writes, and new writes after recovery with the original
-services stopped. This does not qualify power-loss durability or TLS/auth setup.
-Run locally with `WEED_BINARY=/absolute/path/to/weed` and
-`ETCD_RESTORE_RESULTS=/existing/persistent/directory` using
-`bash test/storage_lab/run_etcd_restore.sh`. Docker supplies only the pinned
-etcd tools; test services use fresh local directories and loopback endpoints.
-
-### Running locally
-
-Keep `../forks-go-fuse` checked out at the tested dependency pin. Build baseline
-and candidate from separate source worktrees with the same offset format:
-
-```sh
-go test -short -tags 5BytesOffset -race -count=1 -timeout=5m ./weed/storage ./weed/topology ./weed/shell ./weed/server
-go build -tags 5BytesOffset -o /absolute/test-bin/weed-candidate ./weed
-
-WEED_BINARY=/absolute/test-bin/weed-candidate \
-WEED_VOLUME_BINARY=/absolute/test-bin/weed-baseline \
-WEED_CANDIDATE_BINARY=/absolute/test-bin/weed-candidate \
-VOLUME_SERVER_IT_KEEP_LOGS=1 \
-go test -tags 5BytesOffset -count=1 -timeout=5m ./test/volume_server/grpc -run '^TestVolumeBinaryUpgradeVacuumRollback$'
-```
-
-`WEED_BINARY` selects the master/default binary; `WEED_VOLUME_BINARY` selects
-the initial volume-server binary; `WEED_CANDIDATE_BINARY` selects its upgrade.
-Use absolute executable paths. Without explicit baseline/candidate paths the
-migration test **skips**, so a generic suite pass is not migration evidence.
-The harness otherwise builds a fresh binary matching the test's offset format,
-uses loopback ports and temporary volumes, and retains failed-test logs.
-`VOLUME_SERVER_IT_KEEP_LOGS=1` also retains successful runs under
-`/tmp/seaweedfs_volume_server_it_*/`. Clean up only a verified test directory
-after reviewing it; never point test cleanup at production storage.
-
-The migration test checks payloads through baseline → candidate → vacuum with
-a concurrent write → baseline rollback → candidate process-crash recovery.
-Sparse-file tests cover relocation at 32, 128, and 200 GiB without physically
-allocating those sizes. Repeated overwrite/delete/vacuum/restart tests require
-bounded `.dat` size for a fixed live dataset, on memory and LevelDB indexes.
-SIGKILL is **not power loss**: host page-cache survival does not prove durable
-acknowledgements.
-
-The same workflow runs `TestMissingNeedleRepairRPC` with `WEED_BINARY` set to
-the candidate and `WEED_REPAIR_BASELINE` set to the pinned baseline executable.
-It requires that baseline to predate `WriteNeedleBlobIfAbsent`: the old server
-must return `Unimplemented`, never silently accept an unsafe fallback. Keep
-that compatibility case when promoting the baseline. The test repairs an absent
-record, refuses a repeat, and verifies repaired and unrelated intact payloads
-after a process restart. Run it locally with matching offset build tags:
-
-```sh
-WEED_BINARY=/absolute/path/weed-candidate WEED_REPAIR_BASELINE=/absolute/path/weed-baseline \
-  go test -tags 5BytesOffset -count=1 -v -timeout=3m ./test/volume_server/framework -run '^TestMissingNeedleRepairRPC$'
-```
-
-This RPC is only an absent-record storage primitive, not authorization to repair
-arbitrary differences: the caller must establish a current filer reference.
-It refuses existing index entries, including tombstones, and never falls back
-to the overwrite-capable `WriteNeedleBlob` RPC on an older server.
-
-`volume.repair.needle` is the explicit, dry-run-by-default caller for an
-immutable, single-chunk filer file. Supply `-path`, `-fid` (including cookie),
-`-sha256` (uncompressed payload), `-source`, and `-target`; only `-apply` writes.
-Hold the shell admin lock and quiesce application changes to that file: the
-admin lock does not stop filer writes or garbage collection. The command checks
-the current reference, source CRC/identity/payload hash, target index absence,
-and matching volume format/collection. It rechecks the reference before writing
-and verifies the target record and reference afterward. An uncertain result
-never triggers overwrite, deletion, or automatic rollback. Reinspect before retry.
-Encrypted, manifest, multi-chunk, inline, TTL and files over 64 MiB are refused.
-`TestMaintenanceReferencedNeedleRepair` exercises this CLI on disposable real
-servers, including wrong-hash refusal, dry-run, intact target-only data, repeat
-refusal, and restart retention; it runs alongside the RPC compatibility test.
-The same CI step also runs the existing CLI exit-status, cross-collection fsck,
-live-volume retention, balance preservation, and read-only/scheduler fixtures.
-These are real-process tests in `test/volume_server/framework`, not covered by
-running only the sibling `grpc` and `http` packages.
-
-## Deployment-specific operations
-
-Cluster hardware, GitOps settings, capacity accounting, release gates, and
-reclamation procedures are maintained in AppMana's existing
-`docs/seaweedfs.md` runbook, not duplicated in this source tree.
-
-Upstream README: https://github.com/seaweedfs/seaweedfs
+[Storage lab and configuration](test/storage_lab/README.md) ·
+[Server builds](.github/workflows/appmana-server-images.yml) ·
+[Upstream](https://github.com/seaweedfs/seaweedfs)

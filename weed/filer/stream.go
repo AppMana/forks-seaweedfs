@@ -384,7 +384,11 @@ var _ = io.Closer(&ChunkStreamReader{})
 
 func doNewChunkStreamReader(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk) *ChunkStreamReader {
 
-	chunkViews := ViewFromChunks(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
+	chunkViews, err := viewFromChunksOrErr(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
+	if err != nil {
+		// An empty view would read as an empty file; fail every read instead.
+		return &ChunkStreamReader{lookupFileId: lookupFileIdFn, sourceErr: err}
+	}
 
 	var totalSize int64
 	for x := chunkViews.Front(); x != nil; x = x.Next {
@@ -483,6 +487,9 @@ func insideChunk(offset int64, chunk *ChunkView) bool {
 }
 
 func (c *ChunkStreamReader) prepareBufferFor(offset int64) (err error) {
+	if c.chunkView == nil && c.sourceErr != nil {
+		return c.sourceErr
+	}
 	// stay in the same chunk
 	if c.bufferOffset <= offset && offset < c.bufferOffset+int64(len(c.buffer)) {
 		return nil

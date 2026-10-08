@@ -14,6 +14,8 @@ import (
 
 /** Create a symbolic link */
 func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target string, name string, out *fuse.EntryOut) (code fuse.Status) {
+	wfs.holdKernelLock(header.NodeId)
+	defer wfs.releaseKernelLock(header.NodeId)
 
 	if wfs.IsOverQuotaWithUncommitted() {
 		return fuse.Status(syscall.ENOSPC)

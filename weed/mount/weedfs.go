@@ -727,6 +727,10 @@ const expiredDirRebuildCooldown = 30 * time.Second
 func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion, fuse.Status) {
 	dir, _ := fullpath.DirAndName()
 	dirPath := util.FullPath(dir)
+	// The kernel holds the parent's lock until this lookup is answered: one
+	// deadline covers the rebuild and the filer lookup below.
+	ctx, cancel := filerReplyContext(context.Background())
+	defer cancel()
 
 	// The kernel can serve a directory listing from its page cache past
 	// cacheMetaTtlSec, so ReadDir never runs and EnsureVisited is not called.
@@ -739,7 +743,12 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion,
 		if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
 			wfs.waitForPendingAsyncFlush(inode)
 		}
-		if err := wfs.ensureDirectoryVisited(dirPath); err != nil {
+		// The rebuild only warms the cache: if the filer is slow, stop waiting
+		// for it (it finishes on its own goroutine) and look the name up
+		// directly below.
+		if _, err := awaitFilerReply(ctx, "rebuild "+string(dirPath), func() (struct{}, error) {
+			return struct{}{}, wfs.ensureDirectoryVisited(dirPath)
+		}); err != nil && !errors.Is(err, errFilerTimeout) {
 			// Record the attempt so the cooldown suppresses repeated rebuilds
 			// while the listing keeps failing; once it elapses a later lookup
 			// retries. Oversized dirs are already marked read-through.
@@ -791,21 +800,30 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion,
 
 	// Directory not cached - fetch directly from filer without caching the entire directory.
 	glog.V(4).Infof("lookupEntry fetching from filer %s", fullpath)
+	lookupDir, lookupName := fullpath.DirAndName()
+	// WithFilerClient retries for longer than the deadline; await it instead.
+	resp, err := awaitFilerReply(ctx, "lookup "+string(fullpath), func() (*filer_pb.LookupDirectoryEntryResponse, error) {
+		var resp *filer_pb.LookupDirectoryEntryResponse
+		err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+			var lookupErr error
+			resp, lookupErr = filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
+				Directory: lookupDir,
+				Name:      lookupName,
+			})
+			return lookupErr
+		})
+		return resp, err
+	})
 	var entry *filer_pb.Entry
 	var lookupVersion entryVersion
-	lookupDir, lookupName := fullpath.DirAndName()
-	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		resp, lookupErr := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
-			Directory: lookupDir,
-			Name:      lookupName,
-		})
-		if lookupErr != nil {
-			return lookupErr
-		}
+	if err == nil {
 		entry = resp.Entry
 		lookupVersion = entryVersion{tsNs: resp.LogTsNs, signature: resp.LogSignature}
-		return nil
-	})
+	}
+	if errors.Is(err, errFilerTimeout) {
+		glog.Warningf("lookupEntry %s: %v", fullpath, err)
+		return nil, entryVersion{}, fuse.EIO
+	}
 	if err != nil {
 		if err == filer_pb.ErrNotFound {
 			// The entry may exist in the local store from a deferred create

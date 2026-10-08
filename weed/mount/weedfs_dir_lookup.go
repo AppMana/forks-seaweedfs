@@ -13,6 +13,8 @@ import (
 // name) pair.
 
 func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) (code fuse.Status) {
+	wfs.holdKernelLock(header.NodeId)
+	defer wfs.releaseKernelLock(header.NodeId)
 
 	var s fuse.Status
 	if name, s = checkName(name); s != fuse.OK {

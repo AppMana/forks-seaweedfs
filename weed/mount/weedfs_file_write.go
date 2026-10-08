@@ -37,6 +37,8 @@ import (
  * @param fi file information
  */
 func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (written uint32, code fuse.Status) {
+	wfs.holdKernelLock(in.NodeId)
+	defer wfs.releaseKernelLock(in.NodeId)
 
 	// Check quota including uncommitted writes for real-time enforcement
 	if wfs.IsOverQuotaWithUncommitted() {

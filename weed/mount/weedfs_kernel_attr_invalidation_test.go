@@ -3,6 +3,7 @@ package mount
 import (
 	"bytes"
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,7 @@ func TestKernelAttributeNotificationPreservesDirtyWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfs.metaCache.WaitForEntryInvalidations()
+	wfs.waitForKernelNotifications()
 	got := make([]byte, len(want))
 	stop := fh.dirtyPages.ReadDirtyDataAt(got, 100, 0)
 	if stop != int64(100+len(want)) || !bytes.Equal(got, want) || fh.GetEntry().Attributes.FileSize != uint64(100+len(want)) {
@@ -64,6 +66,7 @@ func TestForeignSameMtimeContentChangeInvalidatesKernelData(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfs.metaCache.WaitForEntryInvalidations()
+	wfs.waitForKernelNotifications()
 	for _, call := range notifier.calls {
 		if call.inode == inode && call.offset == 0 && call.length <= 0 {
 			return
@@ -89,12 +92,16 @@ func TestEntryListenerSeesRefreshedOpenHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfs.metaCache.WaitForEntryInvalidations()
+	wfs.waitForKernelNotifications()
 	if !called {
 		t.Fatal("listener not called")
 	}
 }
 
+// Notifications arrive from the invalidation worker and from the kernel
+// notification sender; read the slices only after both have been waited for.
 type recordingInodeNotifier struct {
+	mu            sync.Mutex
 	entryCalls    []entryNotification
 	onEntryNotify func(uint64, string)
 	calls         []inodeNotification
@@ -102,7 +109,9 @@ type recordingInodeNotifier struct {
 }
 
 func (n *recordingInodeNotifier) EntryNotify(parent uint64, name string) fuse.Status {
+	n.mu.Lock()
 	n.entryCalls = append(n.entryCalls, entryNotification{parent, name})
+	n.mu.Unlock()
 	if n.onEntryNotify != nil {
 		n.onEntryNotify(parent, name)
 	}
@@ -110,7 +119,9 @@ func (n *recordingInodeNotifier) EntryNotify(parent uint64, name string) fuse.St
 }
 
 func (n *recordingInodeNotifier) InodeNotify(inode uint64, offset, length int64) fuse.Status {
+	n.mu.Lock()
 	n.calls = append(n.calls, inodeNotification{inode, offset, length})
+	n.mu.Unlock()
 	if n.onNotify != nil {
 		n.onNotify()
 	}
@@ -158,6 +169,8 @@ func TestForeignUpdateInvalidatesKernelFileAttributes(t *testing.T) {
 				t.Fatal(err)
 			}
 			wfs.metaCache.WaitForEntryInvalidations()
+			wfs.waitForKernelNotifications()
+	wfs.waitForKernelNotifications()
 			found := false
 			for _, call := range notifier.calls {
 				if call.inode == inode {
@@ -187,6 +200,7 @@ func TestSelfUpdateDoesNotInvalidateKernelFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfs.metaCache.WaitForEntryInvalidations()
+	wfs.waitForKernelNotifications()
 	for _, call := range notifier.calls {
 		if call.inode == inode {
 			t.Fatalf("self echo invalidated file: %+v", call)

@@ -112,4 +112,3 @@ func runApplyFailureChild() {
 		os.Stdout.WriteString("no store failure observed\n")
 	}
 }
-

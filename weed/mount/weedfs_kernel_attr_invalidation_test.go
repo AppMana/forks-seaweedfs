@@ -170,7 +170,7 @@ func TestForeignUpdateInvalidatesKernelFileAttributes(t *testing.T) {
 			}
 			wfs.metaCache.WaitForEntryInvalidations()
 			wfs.waitForKernelNotifications()
-	wfs.waitForKernelNotifications()
+			wfs.waitForKernelNotifications()
 			found := false
 			for _, call := range notifier.calls {
 				if call.inode == inode {

@@ -84,7 +84,8 @@ func TestFuseReverseInvalidationLab(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(15+8*iterations)*time.Minute)
+	lifetime := time.Duration(15+8*iterations) * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), lifetime)
 	defer cancel()
 	topology, err := clab.Source(&core.Config{Name: "seaweedfs-notify", Topology: &types.Topology{
 		Nodes: map[string]*types.NodeDefinition{
@@ -103,7 +104,7 @@ func TestFuseReverseInvalidationLab(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: topology, Nodes: map[string]*labv1.NodeExtension{"linux": {Control: "qga"}}, ArtifactDirectory: results}, 10*time.Minute)
+	lab, err := c.Start(ctx, &labv1.LabSpec{Topology: topology, Nodes: map[string]*labv1.NodeExtension{"linux": {Control: "qga"}}, ArtifactDirectory: results}, lifetime)
 	if err != nil {
 		t.Fatal(err)
 	}

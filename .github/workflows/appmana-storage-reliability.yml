@@ -111,6 +111,10 @@ jobs:
             seaweedfs/go.sum
             labcontainers/go.sum
       - name: Build and verify matched native DLL artifacts
+        env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
           sdk_pin=$(sed -n 's/.*github.com\/appmana\/labcontainers .*-[^-]*-\([0-9a-f]*\)$/\1/p' test/storage_lab/vm/go.mod)
@@ -129,6 +133,9 @@ jobs:
           printf 'Native WinFsp source/patch/toolchain manifests and binaries: `%s`\n' "${results[0]}" >> "$GITHUB_STEP_SUMMARY"
       - name: Qualify the exact compiled candidate
         env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
           SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'
           SEAWEEDFS_WINDOWS_MOUNT_REPEATS: '5'
           SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/msvc-winfsp.test.exe
@@ -158,6 +165,9 @@ jobs:
           printf 'Rebuilt DLL qualified with explicit legacy compatibility and basic permission enforcement inventories.\n' >> "$GITHUB_STEP_SUMMARY"
       - name: Mixed Windows and Linux mounted clients
         env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
           SEAWEEDFS_MIXED_LIVE: '1'
           SEAWEEDFS_LINUX_WEED: ${{ runner.temp }}/mixed-weed-linux
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/msvc-weed.exe
@@ -240,6 +250,10 @@ jobs:
       - name: Lab isolation command contracts
         run: python3 -m unittest discover -s test/storage_lab -v
       - name: Mixed workload oracle and corruption negative controls
+        env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
         run: cd test/storage_lab/vm && GOWORK=off go test -race -count=1 ./mixed_workload
       - name: Negative controls prove regressions turn red
         env:
@@ -413,6 +427,10 @@ jobs:
           go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$RUNNER_TEMP/weed-candidate-vm" ./weed
           printf 'VM baseline: `%s`\n\nVM candidate: `%s`\n\nLabcontainers: `%s`\n\nVM image: `%s`\n' "$baseline_sha" "$candidate_sha" "$LABCONTAINERS_REF" "$LABCONTAINERS_VM_IMAGE" >> "$GITHUB_STEP_SUMMARY"
       - name: Unit-test the Labcontainers VM harness
+        env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
         run: |
           sdk_pin=$(sed -n 's/.*github.com\/appmana\/labcontainers .*-[^-]*-\([0-9a-f]*\)$/\1/p' test/storage_lab/vm/go.mod)
           test "${LABCONTAINERS_REF:0:12}" = "$sdk_pin"
@@ -425,6 +443,9 @@ jobs:
           GOWORK="$vm_work/go.work" go test ./test/storage_lab/vm/...
       - name: Compare interval and index startup performance with vanilla upstream
         env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
           SEAWEEDFS_INTERVAL_PERFORMANCE_LIVE: '1'
           LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
           SEAWEEDFS_PERFORMANCE_BASELINE: ${{ runner.temp }}/interval-baseline.test
@@ -453,6 +474,9 @@ jobs:
           SEAWEEDFS_INDEX_PERFORMANCE_LIVE=1 GOWORK="$perf_work/go.work" go test ./test/storage_lab/vm -run '^TestIndexRecoveryPerformanceLab$' -count=1 -v -timeout=20m
       - name: Run isolated four-VM durability gates
         env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
           LABCONTAINERS_SOURCE: ${{ github.workspace }}/labcontainers
           LABCONTAINERS_REF: ${{ env.LABCONTAINERS_REF }}
         run: |
@@ -468,6 +492,9 @@ jobs:
           done
       - name: Native Windows core storage regressions
         env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
           SEAWEEDFS_WINDOWS_LIVE: '1'
           SEAWEEDFS_WINDOWS_STORAGE_TEST: ${{ runner.temp }}/windows-storage.test.exe
           SEAWEEDFS_WINDOWS_MOUNT_UNIT_LIVE: '1'
@@ -487,6 +514,9 @@ jobs:
           go test ./test/storage_lab/vm -run '^TestWindows(MountXAttr|Adapter)Lab$' -count=1 -v -timeout=35m
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
           SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'
           SEAWEEDFS_WINDOWS_MOUNT_REPEATS: '5'
           SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY: '1'

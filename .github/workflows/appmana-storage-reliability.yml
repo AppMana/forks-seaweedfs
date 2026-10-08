@@ -375,6 +375,16 @@ jobs:
         with:
           fetch-depth: 0
           path: seaweedfs
+      - name: Load the pinned Linux lab images into the runner's image store
+        # The runner's Docker image store persists per node; a digest that is
+        # already present is not fetched again.
+        run: |
+          [[ "$LABCONTAINERS_VM_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]
+          docker image inspect "$LABCONTAINERS_VM_IMAGE" >/dev/null 2>&1 || docker pull "$LABCONTAINERS_VM_IMAGE"
+          # Topology peers use alpine:3.20 with pull policy Never.
+          peer=alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+          docker image inspect "$peer" >/dev/null 2>&1 || docker pull "$peer"
+          docker tag "$peer" alpine:3.20
       - name: Validate immutable VM-lab inputs
         run: |
           for name in BASELINE_REF GO_FUSE_REF LABCONTAINERS_REF; do

@@ -210,12 +210,12 @@ type WFS struct {
 
 	// entryChanged is notified of every applied metadata event, for a front
 	// end that has to push invalidations to its own client.
-	entryChangeMu   sync.RWMutex
-	entryChanged    func(meta_cache.EntryInvalidation)
+	entryChangeMu sync.RWMutex
+	entryChanged  func(meta_cache.EntryInvalidation)
 
 	// kernelNotify holds back reverse invalidations that wait on a kernel lock
 	// while a request whose caller holds that lock is being served.
-	kernelNotify kernelNotifyGate
+	kernelNotify    kernelNotifyGate
 	asyncFlushClose sync.Once
 
 	// asyncFlushCh is a bounded work queue for background flush operations.

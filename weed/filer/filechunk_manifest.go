@@ -195,6 +195,7 @@ func (r *chunkManifestResolver) resolve(chunks []*filer_pb.FileChunk, startOffse
 
 	slots := make([]resolveSlot, len(chunks))
 	var reads sync.WaitGroup
+	manifestReads := 0
 	for i, chunk := range chunks {
 		if max(chunk.Offset, startOffset) >= min(chunk.Offset+int64(chunk.Size), stopOffset) {
 			continue
@@ -205,6 +206,7 @@ func (r *chunkManifestResolver) resolve(chunks []*filer_pb.FileChunk, startOffse
 			continue
 		}
 
+		manifestReads++
 		reads.Add(1)
 		if !r.submit(chunkManifestResolveJob{
 			chunk:       chunk,
@@ -224,8 +226,13 @@ func (r *chunkManifestResolver) resolve(chunks []*filer_pb.FileChunk, startOffse
 		}
 	}
 	reads.Wait()
-	if err := r.parentCtx.Err(); err != nil {
-		return dataChunks, nil, err
+	// Only manifest reads depend on the context. A level of plain chunks
+	// resolves to itself, so a caller cancelled meanwhile (a mount whose
+	// stream closed during CreateEntry) still gets its chunks.
+	if manifestReads > 0 {
+		if err := r.parentCtx.Err(); err != nil {
+			return dataChunks, nil, err
+		}
 	}
 
 	// Recurse only after this level's reads release their worker slots. A

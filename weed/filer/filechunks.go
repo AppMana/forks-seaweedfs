@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -65,7 +66,13 @@ func ETagChunks(chunks []*filer_pb.FileChunk) (etag string) {
 
 func CompactFileChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk) (compacted, garbage []*filer_pb.FileChunk) {
 
-	visibles, _ := NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
+	visibles, err := NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
+	if err != nil {
+		// Unresolved, nothing is known to be covered. Callers delete what is
+		// returned as garbage, so keep every chunk.
+		glog.V(1).InfofCtx(ctx, "CompactFileChunks: keeping all %d chunks: %v", len(chunks), err)
+		return chunks, nil
+	}
 
 	compacted, garbage = SeparateGarbageChunks(visibles, chunks)
 

@@ -20,6 +20,9 @@ concurrency:
 jobs:
   render:
     name: Regenerate star history chart
+    # Upstream's chart of upstream's stars: a fork's token is refused the
+    # stargazer API (403), and the job would push commits to the fork's branch.
+    if: github.repository == 'seaweedfs/seaweedfs'
     runs-on: ubuntu-latest
 
     steps:

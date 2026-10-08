@@ -65,7 +65,11 @@ func LoadOrCreateChunkCacheVolume(fileName string, preallocate int64) (*ChunkCac
 		v.lastModTime = modTime
 		v.fileSize = fileSize
 	} else {
-		if v.DataBackend, err = backend.CreateVolumeFile(v.fileName+".dat", preallocate, 0); err != nil {
+		// preallocate is the volume's size limit, not a reservation: a mount
+		// creates its whole cache at mount time, and reserving it took every
+		// mount's full -cacheCapacityMB of the node's disk before anything was
+		// cached. Disk is used as chunks are written; sizeLimit still bounds it.
+		if v.DataBackend, err = backend.CreateVolumeFile(v.fileName+".dat", 0, 0); err != nil {
 			return nil, fmt.Errorf("cannot create cache file %s.dat: %v", v.fileName, err)
 		}
 		v.lastModTime = time.Now()

@@ -56,7 +56,7 @@ print('--- PASS: TestWindowsMountLab (2.00s)')
             command.write_text('''#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ['CALLS'], 'a') as output:
-    output.write(json.dumps({'cwd': os.getcwd(), 'gowork': os.getenv('GOWORK'), 'args': sys.argv[1:], 'scenario': os.getenv('SEAWEEDFS_WINDOWS_MOUNT_SCENARIO', ''), 'registration': os.getenv('SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD', ''), 'cleanup': os.getenv('SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP', '')}) + '\\n')
+    output.write(json.dumps({'cwd': os.getcwd(), 'gowork': os.getenv('GOWORK'), 'args': sys.argv[1:], 'scenario': os.getenv('SEAWEEDFS_WINDOWS_MOUNT_SCENARIO', ''), 'registration': os.getenv('SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD', ''), 'cleanup': os.getenv('SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP', ''), 'basic': os.getenv('SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS', '')}) + '\\n')
 sys.exit(1 if os.getenv('SEAWEEDFS_WINDOWS_MOUNT_SCENARIO') == 'Conformance' else 0)
 ''')
             command.chmod(0o755)
@@ -74,8 +74,11 @@ SEAWEEDFS_MIXED_LINUX_WORKLOAD SEAWEEDFS_MIXED_WINDOWS_WORKLOAD'''.split()
                                     env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
-            self.assertEqual(len(calls), 11)
-            self.assertEqual([call['scenario'] for call in calls[-3:]], ['All', 'Conformance', ''])
+            # storage, git-lfs, 2x3 mount-manager lanes, All under both
+            # permission policies, Conformance, mixed.
+            self.assertEqual(len(calls), 12)
+            self.assertEqual([(call['scenario'], call['basic']) for call in calls[-4:]],
+                             [('All', '0'), ('All', '1'), ('Conformance', '1'), ('', '0')])
             self.assertIn('^TestMixedOSMountLab$', calls[-1]['args'])
             for mode in ['', '1']:
                 for scenario in ['MountManagerDirectoryLifecycle', 'MountManagerProcessCrash', 'MountManagerRegistrationRollback']:

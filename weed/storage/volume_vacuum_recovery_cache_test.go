@@ -20,15 +20,24 @@ func TestReconcileAfterBothRenamesInvalidatesOldLevelDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { v.Close() }()
+	// Index replay starts at the cache's watermark, which advances every
+	// watermarkBatchSize entries. Cross it, then delete the first needle: the
+	// compacted .idx holds exactly watermarkBatchSize entries, every one at a
+	// shifted offset, so replay rewrites none of them and only invalidating
+	// the cache stops it pointing every needle at its pre-compaction offset.
+	last := uint64(watermarkBatchSize + 1)
 	var want []byte
-	for _, value := range []byte{1, 2} {
-		n := newEmptyNeedle(1)
-		n.Data = bytes.Repeat([]byte{value}, 4096)
+	for id := uint64(1); id <= last; id++ {
+		n := newEmptyNeedle(id)
+		n.Data = bytes.Repeat([]byte{byte(id)}, 64)
 		n.Checksum = needle.NewCRC(n.Data)
 		if _, _, _, err := v.writeNeedle2(n, true, true, false); err != nil {
 			t.Fatal(err)
 		}
 		want = n.Data
+	}
+	if _, err := v.deleteNeedle2(newEmptyNeedle(1)); err != nil {
+		t.Fatal(err)
 	}
 	if err := v.CompactByIndex(nil); err != nil {
 		t.Fatal(err)
@@ -60,7 +69,7 @@ func TestReconcileAfterBothRenamesInvalidatesOldLevelDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := newEmptyNeedle(1)
+	got := newEmptyNeedle(last)
 	if _, err := v.readNeedle(got, nil, nil); err != nil || !bytes.Equal(got.Data, want) {
 		t.Fatalf("recovered volume reused stale cache: read=%v, payload bytes=%d", err, len(got.Data))
 	}

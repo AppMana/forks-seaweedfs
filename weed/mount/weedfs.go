@@ -341,6 +341,11 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 			return wfs.inodeToPath.IsChildrenCached(path)
 		}, wfs.onEntryInvalidation, nil)
 	wfs.metaCache.SetPinnedChildFn(wfs.isLocalOnlyEntry)
+	// A subscribed change the local metadata store cannot record (a full
+	// cache disk) leaves the cache behind the filer. Stop answering from it:
+	// every directory reads through to the filer until it is listed again,
+	// and the in-memory flags this needs cannot fail the way the store did.
+	wfs.metaCache.SetApplyFailureHandler(wfs.onMetadataApplyFailure)
 	grace.OnInterrupt(func() {
 		// grace calls os.Exit(0) after all hooks, so WaitForAsyncFlush
 		// after server.Serve() would never execute.  Drain here first.
@@ -491,6 +496,11 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		return make([]byte, option.ChunkSizeLimit)
 	}
 	return wfs
+}
+
+func (wfs *WFS) onMetadataApplyFailure(resp *filer_pb.SubscribeMetadataResponse, err error) {
+	glog.Errorf("metadata cache could not apply a change under %s, reading every directory through the filer: %v", resp.Directory, err)
+	wfs.inodeToPath.InvalidateAllChildrenCache()
 }
 
 func (wfs *WFS) StartBackgroundTasks() error {

@@ -39,6 +39,8 @@ import (
  * @param fi file information
  */
 func (wfs *WFS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buff []byte) (fuse.ReadResult, fuse.Status) {
+	wfs.holdKernelLock(in.NodeId)
+	defer wfs.releaseKernelLock(in.NodeId)
 	fh := wfs.GetHandle(FileHandleId(in.Fh))
 	if fh == nil {
 		return nil, fuse.ENOENT

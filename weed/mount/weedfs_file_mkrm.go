@@ -27,6 +27,8 @@ import (
  * will be called instead.
  */
 func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, out *fuse.CreateOut) (code fuse.Status) {
+	wfs.holdKernelLock(in.NodeId)
+	defer wfs.releaseKernelLock(in.NodeId)
 	var s fuse.Status
 	if name, s = checkName(name); s != fuse.OK {
 		return s
@@ -146,6 +148,8 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
  * regular files that will be called instead.
  */
 func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out *fuse.EntryOut) (code fuse.Status) {
+	wfs.holdKernelLock(in.NodeId)
+	defer wfs.releaseKernelLock(in.NodeId)
 
 	var s fuse.Status
 	if name, s = checkName(name); s != fuse.OK {
@@ -174,6 +178,8 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 
 /** Remove a file */
 func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) (code fuse.Status) {
+	wfs.holdKernelLock(header.NodeId)
+	defer wfs.releaseKernelLock(header.NodeId)
 
 	// Sanitize before it reaches DeleteEntryRequest.Name; see sanitizeFuseName.
 	name = sanitizeFuseName(name)

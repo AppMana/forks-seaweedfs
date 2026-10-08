@@ -27,6 +27,8 @@ When creating a link:
 
 /** Create a hard link to a file */
 func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *fuse.EntryOut) (code fuse.Status) {
+	wfs.holdKernelLock(in.NodeId)
+	defer wfs.releaseKernelLock(in.NodeId)
 	if wfs.IsOverQuotaWithUncommitted() {
 		return fuse.Status(syscall.ENOSPC)
 	}

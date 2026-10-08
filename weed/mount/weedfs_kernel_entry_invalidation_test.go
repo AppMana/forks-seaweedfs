@@ -32,6 +32,7 @@ func TestForeignRenameExpiresBothKernelNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfs.metaCache.WaitForEntryInvalidations()
+	wfs.waitForKernelNotifications()
 	if path, status := wfs.inodeToPath.GetPath(inode); status != fuse.OK || path != "/dir/new" {
 		t.Fatalf("rename did not update userspace path: %s, %v", path, status)
 	}
@@ -68,6 +69,7 @@ func TestKernelEntryNotificationOnlyForForeignNamespaceChanges(t *testing.T) {
 			wfs.fuseServer = notifier
 			tc.event.Path = "/dir/file"
 			wfs.onEntryInvalidation(tc.event)
+			wfs.waitForKernelNotifications()
 			if got := len(notifier.entryCalls) > 0; got != tc.want {
 				t.Fatalf("entry invalidated=%v want=%v", got, tc.want)
 			}
@@ -110,6 +112,7 @@ func TestCrossDirectoryRenameNotifiesAfterOpenHandleMoves(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfs.metaCache.WaitForEntryInvalidations()
+	wfs.waitForKernelNotifications()
 	want := []entryNotification{{sourceParent, "old"}, {destParent, "new"}}
 	if len(notifier.entryCalls) != len(want) {
 		t.Fatalf("notifications=%v want=%v", notifier.entryCalls, want)

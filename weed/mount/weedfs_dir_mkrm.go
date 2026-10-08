@@ -22,6 +22,8 @@ import (
  * correct directory type bits use  mode|S_IFDIR
  * */
 func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out *fuse.EntryOut) (code fuse.Status) {
+	wfs.holdKernelLock(in.NodeId)
+	defer wfs.releaseKernelLock(in.NodeId)
 
 	if wfs.IsOverQuotaWithUncommitted() {
 		return fuse.Status(syscall.ENOSPC)
@@ -143,6 +145,8 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 
 /** Remove a directory */
 func (wfs *WFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) (code fuse.Status) {
+	wfs.holdKernelLock(header.NodeId)
+	defer wfs.releaseKernelLock(header.NodeId)
 
 	if name == "." {
 		return fuse.Status(syscall.EINVAL)

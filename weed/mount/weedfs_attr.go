@@ -16,6 +16,8 @@ import (
 )
 
 func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
+	wfs.holdKernelLock(input.NodeId)
+	defer wfs.releaseKernelLock(input.NodeId)
 	glog.V(4).Infof("GetAttr %v", input.NodeId)
 	if input.NodeId == 1 {
 		wfs.setRootAttr(out)
@@ -59,6 +61,8 @@ func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 }
 
 func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
+	wfs.holdKernelLock(input.NodeId)
+	defer wfs.releaseKernelLock(input.NodeId)
 
 	// Check quota including uncommitted writes for real-time enforcement
 	if wfs.IsOverQuotaWithUncommitted() {

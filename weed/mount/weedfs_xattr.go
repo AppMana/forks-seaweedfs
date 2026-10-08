@@ -21,6 +21,8 @@ const (
 // number of bytes. If the buffer is too small, return ERANGE,
 // with the required buffer size.
 func (wfs *WFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string, dest []byte) (size uint32, code fuse.Status) {
+	wfs.holdKernelLock(header.NodeId)
+	defer wfs.releaseKernelLock(header.NodeId)
 
 	if wfs.option.DisableXAttr {
 		return 0, fuse.Status(syscall.ENOTSUP)
@@ -76,6 +78,8 @@ func (wfs *WFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr str
 //	       Perform a pure replace operation, which fails if the named
 //	       attribute does not already exist.
 func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
+	wfs.holdKernelLock(input.NodeId)
+	defer wfs.releaseKernelLock(input.NodeId)
 
 	if wfs.option.DisableXAttr {
 		return fuse.Status(syscall.ENOTSUP)
@@ -189,6 +193,8 @@ func (wfs *WFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []
 
 // RemoveXAttr removes an extended attribute.
 func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string) fuse.Status {
+	wfs.holdKernelLock(header.NodeId)
+	defer wfs.releaseKernelLock(header.NodeId)
 
 	if wfs.option.DisableXAttr {
 		return fuse.Status(syscall.ENOTSUP)

@@ -176,10 +176,14 @@ func (wfs *WFS) FsyncDir(cancel <-chan struct{}, input *fuse.FsyncIn) (code fuse
  * '1'.
  */
 func (wfs *WFS) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) (code fuse.Status) {
+	wfs.holdKernelLock(input.NodeId)
+	defer wfs.releaseKernelLock(input.NodeId)
 	return wfs.doReadDirectory(input, fuseDirEntryList{out}, false)
 }
 
 func (wfs *WFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) (code fuse.Status) {
+	wfs.holdKernelLock(input.NodeId)
+	defer wfs.releaseKernelLock(input.NodeId)
 	return wfs.doReadDirectory(input, fuseDirEntryList{out}, true)
 }
 

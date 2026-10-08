@@ -212,6 +212,10 @@ type WFS struct {
 	// end that has to push invalidations to its own client.
 	entryChangeMu   sync.RWMutex
 	entryChanged    func(meta_cache.EntryInvalidation)
+
+	// kernelNotify holds back reverse invalidations that wait on a kernel lock
+	// while a request whose caller holds that lock is being served.
+	kernelNotify kernelNotifyGate
 	asyncFlushClose sync.Once
 
 	// asyncFlushCh is a bounded work queue for background flush operations.
@@ -977,9 +981,10 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 
 // Directory page-cache invalidation does not expire a cached name lookup.
 // Remote namespace changes must expire both positive and negative dentries;
-// rename events supply separate source and destination invalidations. Run on
-// the invalidation worker after moving paths and releasing handle locks, since
-// EntryNotify may cause the kernel to re-enter filesystem operations.
+// rename events supply separate source and destination invalidations. Queued
+// from the invalidation worker after moving paths and releasing handle locks,
+// and sent through kernelNotify: the kernel takes the directory's lock for it,
+// which a local request in that directory can be holding while it waits on us.
 func (wfs *WFS) invalidateKernelEntry(invalidation meta_cache.EntryInvalidation) {
 	server := wfs.fuseServer
 	if server == nil || invalidation.PreviousEntry != nil {
@@ -998,9 +1003,7 @@ func (wfs *WFS) invalidateKernelEntry(invalidation meta_cache.EntryInvalidation)
 	if !found {
 		return
 	}
-	if status := server.EntryNotify(parent, name); status != fuse.OK && status != fuse.ENOENT && status != fuse.ENOSYS {
-		glog.V(4).Infof("invalidate kernel name %s: %v", invalidation.Path, status)
-	}
+	wfs.submitKernelNotification(kernelNotification{kind: expireEntryName, inode: parent, name: name})
 }
 
 // Run only from the metadata invalidation worker, after refreshing the handle
@@ -1020,16 +1023,18 @@ func (wfs *WFS) invalidateKernelFileAttributes(invalidation meta_cache.EntryInva
 	if !found {
 		return
 	}
-	offset := int64(-1)
 	if invalidation.PreviousEntry != nil && !sameEntryContent(invalidation.PreviousEntry, invalidation.Entry) {
 		// Expire clean cached pages and mappings, not only attributes: mtime
 		// can be unchanged. The kernel invalidates through its normal page
-		// cache machinery; this is not a truncate or dirty-page discard.
-		// This worker holds no FUSE request or file-handle lock.
-		offset = 0
+		// cache machinery; this is not a truncate or dirty-page discard. It
+		// locks each page, and a read in flight holds its pages locked until
+		// we answer, so this goes through kernelNotify.
 		wfs.invalidateOpenMtimeCache(inode)
+		wfs.submitKernelNotification(kernelNotification{kind: expireFileData, inode: inode})
+		return
 	}
-	if status := server.InodeNotify(inode, offset, 0); status != fuse.OK && status != fuse.ENOENT && status != fuse.ENOSYS {
+	// Attributes only: no page or inode lock is taken.
+	if status := server.InodeNotify(inode, -1, 0); status != fuse.OK && status != fuse.ENOENT && status != fuse.ENOSYS {
 		glog.V(4).Infof("invalidate kernel attributes of %s: %v", invalidation.Path, status)
 	}
 }

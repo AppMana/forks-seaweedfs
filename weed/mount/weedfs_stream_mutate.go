@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -159,8 +160,30 @@ func (m *streamMutateMux) DeleteEntry(ctx context.Context, req *filer_pb.DeleteE
 // response events until is_last=true. The callback is invoked for each
 // intermediate rename event (same as the current StreamRenameEntry recv loop).
 func (m *streamMutateMux) Rename(ctx context.Context, req *filer_pb.StreamRenameEntryRequest, onEvent func(*filer_pb.StreamRenameEntryResponse) error) error {
-	gen, err := m.ensureStream()
+	// A directory rename can run long but keeps sending events: give up only
+	// once the filer has been quiet for filerReplyTimeout. Giving up stops
+	// waiting; the rename is not cancelled on the filer.
+	parent := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var quiet atomic.Bool
+	idle := time.AfterFunc(filerReplyTimeout, func() {
+		quiet.Store(true)
+		cancel()
+	})
+	defer idle.Stop()
+	done := func() error {
+		if quiet.Load() && parent.Err() == nil {
+			return fmt.Errorf("rename %s/%s: %w after %v without progress", req.OldDirectory, req.OldName, errFilerTimeout, filerReplyTimeout)
+		}
+		return ctx.Err()
+	}
+
+	gen, err := m.ensureStream(ctx)
 	if err != nil {
+		if quiet.Load() {
+			return done()
+		}
 		return fmt.Errorf("%w: %v", ErrStreamTransport, err)
 	}
 
@@ -180,7 +203,7 @@ func (m *streamMutateMux) Rename(ctx context.Context, req *filer_pb.StreamRename
 	select {
 	case m.sendCh <- sendReq:
 	case <-ctx.Done():
-		return ctx.Err()
+		return done()
 	}
 	select {
 	case err := <-sendReq.errCh:
@@ -188,7 +211,7 @@ func (m *streamMutateMux) Rename(ctx context.Context, req *filer_pb.StreamRename
 			return fmt.Errorf("rename send: %w: %v", ErrStreamTransport, err)
 		}
 	case <-ctx.Done():
-		return ctx.Err()
+		return done()
 	}
 
 	// Collect rename events until is_last=true.
@@ -198,6 +221,10 @@ func (m *streamMutateMux) Rename(ctx context.Context, req *filer_pb.StreamRename
 			if !ok {
 				return fmt.Errorf("rename recv: %w: stream closed", ErrStreamTransport)
 			}
+			if !idle.Stop() {
+				return done()
+			}
+			idle.Reset(filerReplyTimeout)
 			if r, ok := resp.Response.(*filer_pb.StreamMutateEntryResponse_RenameResponse); ok {
 				if r.RenameResponse != nil && r.RenameResponse.EventNotification != nil {
 					if err := onEvent(r.RenameResponse); err != nil {
@@ -215,14 +242,18 @@ func (m *streamMutateMux) Rename(ctx context.Context, req *filer_pb.StreamRename
 				return nil
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return done()
 		}
 	}
 }
 
 // doUnary sends a single-response request and waits for the reply.
 func (m *streamMutateMux) doUnary(ctx context.Context, req *filer_pb.StreamMutateEntryRequest) (*filer_pb.StreamMutateEntryResponse, error) {
-	gen, err := m.ensureStream()
+	// Stops waiting, never cancels the mutation on the filer: see
+	// awaitFilerReply.
+	ctx, cancel := filerReplyContext(ctx)
+	defer cancel()
+	gen, err := m.ensureStream(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrStreamTransport, err)
 	}
@@ -275,7 +306,7 @@ func (m *streamMutateMux) doUnary(ctx context.Context, req *filer_pb.StreamMutat
 
 // ensureStream opens the bidi stream if not already open. It returns the
 // stream generation so callers can tag outgoing requests.
-func (m *streamMutateMux) ensureStream() (uint64, error) {
+func (m *streamMutateMux) ensureStream(ctx context.Context) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -310,7 +341,7 @@ func (m *streamMutateMux) ensureStream() (uint64, error) {
 	}
 
 	var stream filer_pb.SeaweedFiler_StreamMutateEntryClient
-	err := m.openStream(&stream)
+	err := m.openStream(ctx, &stream)
 	if err != nil {
 		if s, ok := status.FromError(err); ok && s.Code() == codes.Unimplemented {
 			m.disabled = true
@@ -330,7 +361,7 @@ func (m *streamMutateMux) ensureStream() (uint64, error) {
 	return gen, nil
 }
 
-func (m *streamMutateMux) openStream(out *filer_pb.SeaweedFiler_StreamMutateEntryClient) error {
+func (m *streamMutateMux) openStream(waitCtx context.Context, out *filer_pb.SeaweedFiler_StreamMutateEntryClient) error {
 	i := atomic.LoadInt32(&m.wfs.option.filerIndex)
 	n := int32(len(m.wfs.option.FilerAddresses))
 	var lastErr error
@@ -349,6 +380,13 @@ func (m *streamMutateMux) openStream(out *filer_pb.SeaweedFiler_StreamMutateEntr
 			continue
 		}
 
+		// Opening a stream on a connection still dialing waits without any
+		// deadline (a filer behind dropped SYNs held renames indefinitely).
+		if err := waitConnReady(waitCtx, grpcConn); err != nil {
+			grpcConn.Close()
+			lastErr = fmt.Errorf("stream dial %s: %v", filerGrpcAddress, err)
+			continue
+		}
 		client := filer_pb.NewSeaweedFilerClient(grpcConn)
 		streamCtx, cancel := context.WithCancel(ctx)
 		stream, err := client.StreamMutateEntry(streamCtx)

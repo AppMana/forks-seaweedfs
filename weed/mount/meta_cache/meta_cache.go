@@ -64,6 +64,16 @@ type MetaCache struct {
 	// the apply loop (flushMetadataToFiler -> applyLocalMetadataEvent), so inline
 	// invalidation deadlocks the mount.
 	invalidateWorker *util.AsyncBatchWorker[EntryInvalidation]
+
+	// applyFailed, when set, takes a subscribed event the local store could
+	// not apply instead of the subscription treating it as fatal.
+	applyFailed func(resp *filer_pb.SubscribeMetadataResponse, err error)
+}
+
+// SetApplyFailureHandler installs fn for subscribed events the local store
+// fails to apply (a full or failing cache disk). Set before subscribing.
+func (mc *MetaCache) SetApplyFailureHandler(fn func(resp *filer_pb.SubscribeMetadataResponse, err error)) {
+	mc.applyFailed = fn
 }
 
 var errMetaCacheClosed = errors.New("metadata cache is shut down")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
@@ -15,36 +16,53 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// doRename tries the streaming mux first, falling back to unary on transport errors.
+// doRename tries the streaming mux first, falling back to unary on transport
+// errors. Both stop waiting once the filer goes quiet (filerReplyTimeout)
+// without cancelling the rename there; events arriving after that are not
+// applied, since the kernel was already told the rename failed and the
+// metadata subscription carries the filer's outcome.
 func (wfs *WFS) doRename(ctx context.Context, request *filer_pb.StreamRenameEntryRequest, oldPath, newPath util.FullPath) error {
+	var abandoned atomic.Bool
+	apply := func(resp *filer_pb.StreamRenameEntryResponse) error {
+		if abandoned.Load() {
+			return nil
+		}
+		return wfs.handleRenameResponse(ctx, resp)
+	}
 	if wfs.streamMutate != nil && wfs.streamMutate.IsAvailable() {
-		err := wfs.streamMutate.Rename(ctx, request, func(resp *filer_pb.StreamRenameEntryResponse) error {
-			return wfs.handleRenameResponse(ctx, resp)
-		})
+		err := wfs.streamMutate.Rename(ctx, request, apply)
 		if err == nil || !errors.Is(err, ErrStreamTransport) {
 			return err // success or application error
 		}
 		glog.V(1).Infof("Rename %s => %s: stream failed, falling back to unary: %v", oldPath, newPath, err)
 	}
-	return wfs.WithFilerClient(true, func(client filer_pb.SeaweedFilerClient) error {
-		stream, streamErr := client.StreamRenameEntry(ctx, request)
-		if streamErr != nil {
-			return fmt.Errorf("dir AtomicRenameEntry %s => %s : %v", oldPath, newPath, streamErr)
-		}
-		for {
-			resp, recvErr := stream.Recv()
-			if recvErr != nil {
-				if recvErr == io.EOF {
-					break
+	waitCtx, cancel := filerReplyContext(ctx)
+	defer cancel()
+	_, err := awaitFilerReply(waitCtx, "rename", func() (struct{}, error) {
+		return struct{}{}, wfs.WithFilerClient(true, func(client filer_pb.SeaweedFilerClient) error {
+			stream, streamErr := client.StreamRenameEntry(context.Background(), request)
+			if streamErr != nil {
+				return fmt.Errorf("dir AtomicRenameEntry %s => %s : %v", oldPath, newPath, streamErr)
+			}
+			for {
+				resp, recvErr := stream.Recv()
+				if recvErr != nil {
+					if recvErr == io.EOF {
+						break
+					}
+					return fmt.Errorf("dir Rename %s => %s receive: %v", oldPath, newPath, recvErr)
 				}
-				return fmt.Errorf("dir Rename %s => %s receive: %v", oldPath, newPath, recvErr)
+				if err := apply(resp); err != nil {
+					return err
+				}
 			}
-			if err := wfs.handleRenameResponse(ctx, resp); err != nil {
-				return err
-			}
-		}
-		return nil
+			return nil
+		})
 	})
+	if errors.Is(err, errFilerTimeout) {
+		abandoned.Store(true)
+	}
+	return err
 }
 
 /** Rename a file

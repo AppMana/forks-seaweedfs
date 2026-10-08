@@ -2,6 +2,7 @@ package meta_cache
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 
@@ -61,7 +62,14 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 				}
 			}
 		}
-		return mc.ApplyMetadataResponse(context.Background(), resp, SubscriberMetadataResponseApplyOptions)
+		err := mc.ApplyMetadataResponse(context.Background(), resp, SubscriberMetadataResponseApplyOptions)
+		if err != nil && mc.applyFailed != nil && !errors.Is(err, errMetaCacheClosed) {
+			// The filer still holds the change; only this cache missed it.
+			// Let the mount stop trusting the cache rather than exit.
+			mc.applyFailed(resp, err)
+			return nil
+		}
+		return err
 	}
 
 	prefix := dir

@@ -2,6 +2,7 @@ package chunk_cache
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"slices"
 
@@ -46,9 +47,20 @@ func (c *OnDiskCacheLayer) setChunk(needleId types.NeedleId, data []byte) {
 	}
 
 	if c.diskCaches[0].fileSize+int64(len(data)) > c.diskCaches[0].sizeLimit {
-		t, resetErr := c.diskCaches[len(c.diskCaches)-1].Reset()
+		oldest := c.diskCaches[len(c.diskCaches)-1]
+		t, resetErr := oldest.Reset()
 		if resetErr != nil {
-			glog.Errorf("failed to reset cache file %s", c.diskCaches[len(c.diskCaches)-1].fileName)
+			// The cache directory may have been removed underneath the
+			// mount. Recreate it and try once more; a volume that still
+			// cannot be reset is shut down and leaves the rotation.
+			glog.Errorf("failed to reset cache file %s: %v", oldest.fileName, resetErr)
+			if mkdirErr := os.MkdirAll(path.Dir(oldest.fileName), 0755); mkdirErr == nil {
+				t, resetErr = oldest.Reset()
+			}
+		}
+		if resetErr != nil {
+			glog.Errorf("dropping cache file %s from the rotation: %v", oldest.fileName, resetErr)
+			c.diskCaches = c.diskCaches[:len(c.diskCaches)-1]
 			return
 		}
 		for i := len(c.diskCaches) - 1; i > 0; i-- {

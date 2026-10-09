@@ -1221,7 +1221,7 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {
 	if wfs.option.VolumeServerAccess == "filerProxy" {
 		return func(ctx context.Context, fileId string) (targetUrls []string, err error) {
-			return []string{util_http.ProxyChunkUrl(string(wfs.getCurrentFiler().ToHttpAddress()), fileId)}, nil
+			return []string{wfs.filerProxyChunkUrl(fileId)}, nil
 		}
 	}
 	// Use the cached FilerClient for efficient lookups with singleflight and cache history
@@ -1237,6 +1237,13 @@ func (wfs *WFS) CacheInvalidator() filer.CacheInvalidator {
 		return nil
 	}
 	return wfs.filerClient
+}
+
+// filerProxyChunkUrl addresses fileId through the current filer's chunk proxy,
+// on its HTTP port. getCurrentFiler can change on failover, so callers build
+// the URL per request.
+func (wfs *WFS) filerProxyChunkUrl(fileId string) string {
+	return util_http.ProxyChunkUrl(wfs.getCurrentFiler().ToHttpAddress(), fileId)
 }
 
 func (wfs *WFS) getCurrentFiler() pb.ServerAddress {

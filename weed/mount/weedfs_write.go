@@ -3,6 +3,7 @@ package mount
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -11,6 +12,11 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
+
+// chunkUploadAttemptTimeout bounds one attempt to upload a chunk. A volume
+// server that stops reading would otherwise hold the upload, and every flush
+// waiting on it, forever.
+const chunkUploadAttemptTimeout = 60 * time.Second
 
 func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFunctionType {
 
@@ -35,6 +41,7 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			MimeType:          "",
 			PairMap:           nil,
 			WantMd5:           true,
+			AttemptTimeout:    chunkUploadAttemptTimeout,
 		}
 		if wfs.option.VolumeServerAccess == "filerProxy" {
 			// getCurrentFiler() can change on failover, so read it per attempt.

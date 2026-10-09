@@ -271,6 +271,16 @@ jobs:
           CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$CANDIDATE_SHA" -o "$RUNNER_TEMP/weed-candidate" ./weed
           "$RUNNER_TEMP/weed-baseline" version
           "$RUNNER_TEMP/weed-candidate" version
+      - name: Repair the fusermount3 setuid bit
+        uses: ./seaweedfs/.github/actions/fix-fusermount-setuid
+      - name: Mount request deadlines and bounded close
+        # fuse-integration.yml runs only for master/main; these are the hang and
+        # close() regressions for this branch.
+        env:
+          WEED_BINARY: ${{ runner.temp }}/weed-candidate
+        run: >-
+          cd test/fuse_integration && go test -count=1 -v -timeout=20m .
+          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap)$'
       - name: Maintenance CLI preservation, scoped fsck, scheduler and absent-only repair
         env:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate
@@ -482,6 +492,19 @@ jobs:
           (cd "$vanilla" && GOWORK=off CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_PERFORMANCE_BASELINE" ./weed/storage)
           GOWORK=off CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_PERFORMANCE_CANDIDATE" ./weed/storage
           SEAWEEDFS_INDEX_PERFORMANCE_LIVE=1 GOWORK="$perf_work/go.work" go test ./test/storage_lab/vm -run '^TestIndexRecoveryPerformanceLab$' -count=1 -v -timeout=20m
+      - name: Linux FUSE hang gates in a guest that panics on hung tasks
+        env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
+          LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
+          SEAWEEDFS_LINUX_WEED: ${{ runner.temp }}/weed-candidate-vm
+          SEAWEEDFS_STUCK_LAB_LIVE: '1'
+          SEAWEEDFS_NOTIFY_LAB_LIVE: '1'
+        run: |
+          fuse_work=$(mktemp -d "$RUNNER_TEMP/seaweedfs-fuse-work.XXXXXXXX")
+          (cd "$fuse_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
+          GOWORK="$fuse_work/go.work" go test ./test/storage_lab/vm -run '^(TestFuseStuckBackendLab|TestFuseReverseInvalidationLab)$' -count=1 -v -timeout=90m
       - name: Run isolated four-VM durability gates
         env:
           # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
@@ -587,6 +610,8 @@ jobs:
             ${{ runner.temp }}/seaweedfs-interval-results-*/
             /tmp/seaweedfs-index-recovery-results-*/
             ${{ runner.temp }}/seaweedfs-index-recovery-results-*/
+            ${{ runner.temp }}/seaweedfs-stuck-results-*/
+            ${{ runner.temp }}/seaweedfs-notify-results-*/
             /tmp/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
             ${{ runner.temp }}/windows-mount-test.log

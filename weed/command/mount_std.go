@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
@@ -22,6 +23,25 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
+
+// fuseRequestTimeouts returns the mount's own deadline for answering a FUSE
+// request and the timeout it negotiates with the kernel. The mount must answer
+// first: the kernel's timeout aborts the whole connection.
+func fuseRequestTimeouts(option *MountOptions) (request, kernel time.Duration, err error) {
+	if option.fuseRequestTimeout != nil {
+		request = *option.fuseRequestTimeout
+	}
+	if option.fuseKernelRequestTimeout != nil {
+		kernel = *option.fuseKernelRequestTimeout
+	}
+	if request < 0 || kernel < 0 {
+		return 0, 0, fmt.Errorf("-fuse.requestTimeout %v and -fuse.kernelRequestTimeout %v must not be negative", request, kernel)
+	}
+	if kernel > 0 && (request == 0 || request >= kernel) {
+		return 0, 0, fmt.Errorf("-fuse.requestTimeout %v must be set and below -fuse.kernelRequestTimeout %v", request, kernel)
+	}
+	return request, kernel, nil
+}
 
 func RunMount(option *MountOptions, umask os.FileMode) bool {
 	if err := configureMountMemory(option); err != nil {
@@ -36,6 +56,11 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 	readerCacheMode, err := parseReaderCacheMode(*mountOptions.readerCacheMode)
+	if err != nil {
+		fmt.Println(err.Error())
+		return false
+	}
+	requestTimeout, kernelRequestTimeout, err := fuseRequestTimeouts(option)
 	if err != nil {
 		fmt.Println(err.Error())
 		return false
@@ -197,6 +222,9 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	// Last, so an option given on the command line wins over the default
 	// this mount picked for it.
 	fuseMountOptions.Options = append(fuseMountOptions.Options, option.extraOptions...)
+
+	fuseMountOptions.RequestTimeout = requestTimeout
+	fuseMountOptions.KernelRequestTimeout = kernelRequestTimeout
 
 	if option.writebackCache != nil {
 		fuseMountOptions.EnableWriteback = *option.writebackCache

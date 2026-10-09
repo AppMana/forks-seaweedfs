@@ -11,6 +11,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -157,9 +158,18 @@ func (v *ChunkCacheVolume) dropReadCache(offset int64, length int64) {
 	}
 }
 
+// lookup finds key in the volume's index. A volume that was shut down, for
+// example by a failed Reset, has no index and holds nothing.
+func (v *ChunkCacheVolume) lookup(key types.NeedleId) (*needle_map.NeedleValue, bool) {
+	if v.nm == nil || v.DataBackend == nil {
+		return nil, false
+	}
+	return v.nm.Get(key)
+}
+
 func (v *ChunkCacheVolume) GetNeedle(key types.NeedleId) ([]byte, error) {
 
-	nv, ok := v.nm.Get(key)
+	nv, ok := v.lookup(key)
 	if !ok {
 		return nil, storage.ErrorNotFound
 	}
@@ -181,7 +191,7 @@ func (v *ChunkCacheVolume) GetNeedle(key types.NeedleId) ([]byte, error) {
 }
 
 func (v *ChunkCacheVolume) readNeedleSliceAt(data []byte, key types.NeedleId, offset uint64) (n int, err error) {
-	nv, ok := v.nm.Get(key)
+	nv, ok := v.lookup(key)
 	if !ok {
 		return 0, storage.ErrorNotFound
 	}
@@ -212,6 +222,9 @@ func (v *ChunkCacheVolume) readNeedleSliceAt(data []byte, key types.NeedleId, of
 
 func (v *ChunkCacheVolume) WriteNeedle(key types.NeedleId, data []byte) error {
 
+	if v.nm == nil || v.DataBackend == nil {
+		return fmt.Errorf("cache file %s is shut down", v.fileName)
+	}
 	offset := v.fileSize
 
 	written, err := v.DataBackend.WriteAt(data, offset)

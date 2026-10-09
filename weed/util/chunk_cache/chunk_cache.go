@@ -90,7 +90,7 @@ func (c *TieredChunkCache) IsInCache(fileId string, lockNeeded bool) (answer boo
 	// Check disk cache with volume ID and cookie validation
 	for i, diskCacheLayer := range c.diskCaches {
 		for k, v := range diskCacheLayer.diskCaches {
-			if nv, ok := v.nm.Get(fid.Key); ok {
+			if nv, ok := v.lookup(fid.Key); ok {
 				// Read cache header to check volume ID and cookie
 				headerBytes := make([]byte, cacheHeaderSize)
 				if readN, readErr := v.DataBackend.ReadAt(headerBytes, nv.Offset.ToActualOffset()); readErr == nil && readN == cacheHeaderSize {

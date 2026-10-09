@@ -20,7 +20,7 @@ import (
 // filer cannot wedge the calling process forever. It is deliberately generous:
 // a healthy CreateEntry completes in well under a second, so this only fires on
 // a genuinely stuck filer, never on a normal flush.
-const metadataFlushTimeout = 30 * time.Second
+var metadataFlushTimeout = 30 * time.Second
 
 /**
  * Flush method
@@ -78,17 +78,7 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	hasPosixLocks := wfs.hasPosixOwner(in.NodeId, in.LockOwner)
 	allowAsync := !hasPosixLocks
 
-	// Bound the flush with a deadline instead of tying it to the FUSE cancel
-	// channel. A FUSE interrupt is not a process kill: Go's async preemption
-	// (SIGURG) makes a close() under load emit an interrupt on nearly every
-	// flush (see go-fuse RawFileSystem docs), so cancelling the in-flight
-	// metadata CreateEntry on that interrupt turned healthy concurrent close()s
-	// into EIO. The deadline still keeps close() from hanging forever against an
-	// overwhelmed filer without failing benign flushes.
-	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancelFunc()
-
-	status := wfs.doFlush(ctx, fh, in.Uid, in.Gid, allowAsync)
+	status := wfs.doFlush(fh, in.Uid, in.Gid, allowAsync)
 	if in.LockOwner != 0 {
 		wfs.releasePosixOwner(in.NodeId, in.LockOwner)
 	}
@@ -121,15 +111,12 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 		return fuse.ENOENT
 	}
 
-	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancelFunc()
-
 	// Fsync is an explicit sync request — always flush synchronously
-	return wfs.doFlush(ctx, fh, in.Uid, in.Gid, false)
+	return wfs.doFlush(fh, in.Uid, in.Gid, false)
 
 }
 
-func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
+func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
 
 	// WinFsp may issue overlapping Flush/Cleanup callbacks for several
 	// Windows handles that cgofuse maps to the same FUSE file handle. The
@@ -188,6 +175,13 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		return fuse.Status(syscall.ENOSPC)
 	}
 
+	// The deadline covers the metadata commit only; the uploads above are
+	// bounded per attempt. It is not tied to the FUSE cancel channel: Go's
+	// async preemption (SIGURG) makes a close() under load emit an interrupt
+	// on nearly every flush (see go-fuse RawFileSystem docs), and cancelling
+	// CreateEntry on that interrupt turned healthy close()s into EIO.
+	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
+	defer cancelFunc()
 	if err := retryMetadataFlush(ctx, func() error {
 		return wfs.flushMetadataToFilerLocked(ctx, fh, dir, name, uid, gid)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {

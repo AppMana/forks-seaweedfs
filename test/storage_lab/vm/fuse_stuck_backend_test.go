@@ -13,8 +13,8 @@ import (
 	"time"
 
 	labv1 "github.com/appmana/labcontainers/api/v1"
-	clab "github.com/appmana/labcontainers/pkg/containerlab"
 	"github.com/appmana/labcontainers/pkg/client"
+	clab "github.com/appmana/labcontainers/pkg/containerlab"
 	"github.com/srl-labs/containerlab/core"
 	"github.com/srl-labs/containerlab/types"
 )

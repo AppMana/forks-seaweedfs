@@ -424,9 +424,11 @@ func deviceID(path string) (uint64, error) {
 	return uint64(st.Dev), nil
 }
 
-// findWeedBinary locates the weed binary.
+// findWeedBinary prefers WEED_BINARY, then the binary built in this checkout,
+// and only then PATH: an installed weed of another version would otherwise be
+// tested silently in place of the source under test.
 func findWeedBinary() string {
-	if p, err := exec.LookPath("weed"); err == nil {
+	if p := os.Getenv("WEED_BINARY"); p != "" {
 		return p
 	}
 

@@ -83,6 +83,10 @@ type MountOptions struct {
 	fuseMaxBackground       *int
 	fuseCongestionThreshold *int
 
+	// Upper bounds on how long a FUSE request may go unanswered
+	fuseRequestTimeout       *time.Duration
+	fuseKernelRequestTimeout *time.Duration
+
 	// macOS-specific FUSE options
 	novncache *bool
 
@@ -176,6 +180,9 @@ func init() {
 	mountOptions.cacheSymlink = cmdMount.Flag.Bool("cacheSymlink", false, "enable symlink caching to reduce metadata lookups")
 	mountOptions.fuseMaxBackground = cmdMount.Flag.Int("fuse.maxBackground", 128, "FUSE max_background: maximum in-flight asynchronous requests the kernel will queue. Heavy upload workloads may benefit from higher values (e.g. 2048). Equivalent to writing /sys/fs/fuse/connections/<id>/max_background. If -fuse.congestionThreshold is 0, the kernel derives it as 3/4 of this value.")
 	mountOptions.fuseCongestionThreshold = cmdMount.Flag.Int("fuse.congestionThreshold", 0, "FUSE congestion_threshold: in-flight async request count at which the kernel marks the FUSE bdi as congested and throttles new submissions. 0 means use the default (3/4 of -fuse.maxBackground). Equivalent to writing /sys/fs/fuse/connections/<id>/congestion_threshold. The kernel silently clamps this to -fuse.maxBackground when set higher.")
+
+	mountOptions.fuseRequestTimeout = cmdMount.Flag.Duration("fuse.requestTimeout", 60*time.Second, "answer a FUSE request with EIO when it is still unanswered after this long, so no process waits on the mount indefinitely; 0 disables. Must be below -fuse.kernelRequestTimeout")
+	mountOptions.fuseKernelRequestTimeout = cmdMount.Flag.Duration("fuse.kernelRequestTimeout", 90*time.Second, "ask the kernel (Linux 6.14+) to abort the mount's connection when a request stays unanswered this long, whatever the mount process is doing; whole seconds, 0 disables")
 
 	// macOS-specific FUSE options
 	mountOptions.novncache = cmdMount.Flag.Bool("sys.novncache", false, "(macOS only) disable vnode name caching to avoid stale data")

@@ -61,6 +61,7 @@ type UploadOption struct {
 	SourceUrl         string                           // optional: for logging when reading from a remote source
 	MaxAttempts       int                              // <=0 uses the default
 	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
+	AttemptTimeout    time.Duration                    // >0 bounds each upload attempt
 }
 
 type UploadResult struct {
@@ -329,7 +330,7 @@ func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, op
 			case <-time.After(time.Millisecond * time.Duration(237*(i+1))):
 			}
 		}
-		uploadResult, err = uploader.doUploadData(ctx, data, option)
+		uploadResult, err = uploader.doUploadDataAttempt(ctx, data, option)
 		if err == nil {
 			uploadResult.RetryCount = i
 			return
@@ -340,6 +341,17 @@ func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, op
 		glog.WarningfCtx(ctx, "uploading %d to %s: %v", i, option.UploadUrl, err)
 	}
 	return
+}
+
+// doUploadDataAttempt is one upload attempt, bounded by option.AttemptTimeout
+// so a volume server that stops reading cannot hold it forever.
+func (uploader *Uploader) doUploadDataAttempt(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) {
+	if option.AttemptTimeout <= 0 {
+		return uploader.doUploadData(ctx, data, option)
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, option.AttemptTimeout)
+	defer cancel()
+	return uploader.doUploadData(attemptCtx, data, option)
 }
 
 func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {

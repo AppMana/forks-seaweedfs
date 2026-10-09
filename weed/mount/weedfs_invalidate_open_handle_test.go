@@ -1321,7 +1321,7 @@ func TestFlushAckCancelsPendingCopyEventAdoption(t *testing.T) {
 
 	// A local flush lands: the ack at 3000 becomes the authoritative base.
 	fh.dirtyMetadata = true
-	if status := wfs.doFlush(context.Background(), fh, 0, 0, false); status != fuse.OK {
+	if status := wfs.doFlush(fh, 0, 0, false); status != fuse.OK {
 		t.Fatalf("doFlush status = %v, want OK", status)
 	}
 

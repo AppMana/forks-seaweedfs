@@ -168,7 +168,7 @@ func (b *MessageQueueBroker) assignAndUpload(targetFile string, data []byte) (fi
 	if b.option.VolumeServerAccess == "filerProxy" {
 		// b.currentFiler can change on failover, so read it per attempt.
 		uploadOption.GenUploadUrl = func(host, fileId string) string {
-			return util_http.ProxyChunkUrl(string(b.currentFiler), fileId)
+			return util_http.ProxyChunkUrl(b.currentFiler.ToHttpAddress(), fileId)
 		}
 	}
 

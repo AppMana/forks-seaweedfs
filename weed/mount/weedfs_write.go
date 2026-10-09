@@ -10,7 +10,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 // chunkUploadAttemptTimeout bounds one attempt to upload a chunk. A volume
@@ -44,9 +43,8 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			AttemptTimeout:    chunkUploadAttemptTimeout,
 		}
 		if wfs.option.VolumeServerAccess == "filerProxy" {
-			// getCurrentFiler() can change on failover, so read it per attempt.
 			uploadOption.GenUploadUrl = func(host, fileId string) string {
-				return util_http.ProxyChunkUrl(string(wfs.getCurrentFiler()), fileId)
+				return wfs.filerProxyChunkUrl(fileId)
 			}
 		}
 

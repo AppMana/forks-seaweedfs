@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,8 +18,11 @@ func TestUploadAttemptTimeoutBoundsAStalledVolumeServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	var heldLock sync.Mutex
 	var held []net.Conn
 	defer func() {
+		heldLock.Lock()
+		defer heldLock.Unlock()
 		for _, c := range held {
 			c.Close()
 		}
@@ -29,7 +33,9 @@ func TestUploadAttemptTimeoutBoundsAStalledVolumeServer(t *testing.T) {
 			if err != nil {
 				return
 			}
+			heldLock.Lock()
 			held = append(held, c)
+			heldLock.Unlock()
 		}
 	}()
 

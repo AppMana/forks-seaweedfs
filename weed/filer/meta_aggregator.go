@@ -722,3 +722,16 @@ func (fc filerClient) AdjustedUrl(location *filer_pb.Location) string {
 func (fc filerClient) GetDataCenter() string {
 	return ""
 }
+
+// RemotePeers lists the other filers this one follows.
+func (ma *MetaAggregator) RemotePeers() []pb.ServerAddress {
+	ma.peerChansLock.Lock()
+	defer ma.peerChansLock.Unlock()
+	var peers []pb.ServerAddress
+	for address := range ma.peerChans {
+		if address != ma.self {
+			peers = append(peers, address)
+		}
+	}
+	return peers
+}

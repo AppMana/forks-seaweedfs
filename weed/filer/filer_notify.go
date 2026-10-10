@@ -57,6 +57,9 @@ func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 	}
 
 	event := f.newMetadataEvent(oldEntry, newEntry, deleteChunks, isFromOtherCluster, signatures)
+	// Before the mutation's caller is answered, so a reader it then tells can
+	// find the change.
+	f.dirChanges.note(event.TsNs, ChangedDirectories(event)...)
 	// Clear the stamp after the buffer append below - deliberately also on
 	// append failure (see the metaLogInflight comment).
 	defer f.metaLogInflight.done(event.TsNs)

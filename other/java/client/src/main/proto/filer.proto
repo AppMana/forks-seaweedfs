@@ -69,6 +69,12 @@ service SeaweedFiler {
     rpc Ping (PingRequest) returns (PingResponse) {
     }
 
+    // The log position of the newest change to a directory's children, across
+    // every filer of the cluster: a mount that has applied the metadata stream
+    // through it holds a current listing of the directory.
+    rpc DirectoryChangePosition (DirectoryChangePositionRequest) returns (DirectoryChangePositionResponse) {
+    }
+
     rpc GetFilerConfiguration (GetFilerConfigurationRequest) returns (GetFilerConfigurationResponse) {
     }
 
@@ -620,6 +626,20 @@ message StatisticsResponse {
     // sizes counting one copy of the data, as reported by the master
     uint64 logical_total_size = 7;
     uint64 logical_used_size = 8;
+}
+
+message DirectoryChangePositionRequest {
+    string directory = 1;
+    bool local_only = 2; // this filer's own changes only; set when a filer asks its peers
+}
+message DirectoryChangePositionResponse {
+    // A log timestamp at or above every change to the directory's children:
+    // the change's own timestamp while this filer remembers it, otherwise a
+    // floor above everything it has forgotten.
+    int64 ts_ns = 1;
+    // ts_ns is a remembered change, so the metadata stream carries an event at
+    // it; a floor names no event to wait for.
+    bool remembered = 2;
 }
 
 message PingRequest {

@@ -39,6 +39,7 @@ const (
 	SeaweedFiler_DeleteCollection_FullMethodName                = "/filer_pb.SeaweedFiler/DeleteCollection"
 	SeaweedFiler_Statistics_FullMethodName                      = "/filer_pb.SeaweedFiler/Statistics"
 	SeaweedFiler_Ping_FullMethodName                            = "/filer_pb.SeaweedFiler/Ping"
+	SeaweedFiler_DirectoryChangePosition_FullMethodName         = "/filer_pb.SeaweedFiler/DirectoryChangePosition"
 	SeaweedFiler_GetFilerConfiguration_FullMethodName           = "/filer_pb.SeaweedFiler/GetFilerConfiguration"
 	SeaweedFiler_TraverseBfsMetadata_FullMethodName             = "/filer_pb.SeaweedFiler/TraverseBfsMetadata"
 	SeaweedFiler_SubscribeMetadata_FullMethodName               = "/filer_pb.SeaweedFiler/SubscribeMetadata"
@@ -80,6 +81,10 @@ type SeaweedFilerClient interface {
 	DeleteCollection(ctx context.Context, in *DeleteCollectionRequest, opts ...grpc.CallOption) (*DeleteCollectionResponse, error)
 	Statistics(ctx context.Context, in *StatisticsRequest, opts ...grpc.CallOption) (*StatisticsResponse, error)
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
+	// The log position of the newest change to a directory's children, across
+	// every filer of the cluster: a mount that has applied the metadata stream
+	// through it holds a current listing of the directory.
+	DirectoryChangePosition(ctx context.Context, in *DirectoryChangePositionRequest, opts ...grpc.CallOption) (*DirectoryChangePositionResponse, error)
 	GetFilerConfiguration(ctx context.Context, in *GetFilerConfigurationRequest, opts ...grpc.CallOption) (*GetFilerConfigurationResponse, error)
 	TraverseBfsMetadata(ctx context.Context, in *TraverseBfsMetadataRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TraverseBfsMetadataResponse], error)
 	SubscribeMetadata(ctx context.Context, in *SubscribeMetadataRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubscribeMetadataResponse], error)
@@ -331,6 +336,16 @@ func (c *seaweedFilerClient) Ping(ctx context.Context, in *PingRequest, opts ...
 	return out, nil
 }
 
+func (c *seaweedFilerClient) DirectoryChangePosition(ctx context.Context, in *DirectoryChangePositionRequest, opts ...grpc.CallOption) (*DirectoryChangePositionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DirectoryChangePositionResponse)
+	err := c.cc.Invoke(ctx, SeaweedFiler_DirectoryChangePosition_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *seaweedFilerClient) GetFilerConfiguration(ctx context.Context, in *GetFilerConfigurationRequest, opts ...grpc.CallOption) (*GetFilerConfigurationResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetFilerConfigurationResponse)
@@ -532,6 +547,10 @@ type SeaweedFilerServer interface {
 	DeleteCollection(context.Context, *DeleteCollectionRequest) (*DeleteCollectionResponse, error)
 	Statistics(context.Context, *StatisticsRequest) (*StatisticsResponse, error)
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
+	// The log position of the newest change to a directory's children, across
+	// every filer of the cluster: a mount that has applied the metadata stream
+	// through it holds a current listing of the directory.
+	DirectoryChangePosition(context.Context, *DirectoryChangePositionRequest) (*DirectoryChangePositionResponse, error)
 	GetFilerConfiguration(context.Context, *GetFilerConfigurationRequest) (*GetFilerConfigurationResponse, error)
 	TraverseBfsMetadata(*TraverseBfsMetadataRequest, grpc.ServerStreamingServer[TraverseBfsMetadataResponse]) error
 	SubscribeMetadata(*SubscribeMetadataRequest, grpc.ServerStreamingServer[SubscribeMetadataResponse]) error
@@ -621,6 +640,9 @@ func (UnimplementedSeaweedFilerServer) Statistics(context.Context, *StatisticsRe
 }
 func (UnimplementedSeaweedFilerServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
+}
+func (UnimplementedSeaweedFilerServer) DirectoryChangePosition(context.Context, *DirectoryChangePositionRequest) (*DirectoryChangePositionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DirectoryChangePosition not implemented")
 }
 func (UnimplementedSeaweedFilerServer) GetFilerConfiguration(context.Context, *GetFilerConfigurationRequest) (*GetFilerConfigurationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetFilerConfiguration not implemented")
@@ -1023,6 +1045,24 @@ func _SeaweedFiler_Ping_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SeaweedFiler_DirectoryChangePosition_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DirectoryChangePositionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SeaweedFilerServer).DirectoryChangePosition(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SeaweedFiler_DirectoryChangePosition_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SeaweedFilerServer).DirectoryChangePosition(ctx, req.(*DirectoryChangePositionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SeaweedFiler_GetFilerConfiguration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetFilerConfigurationRequest)
 	if err := dec(in); err != nil {
@@ -1346,6 +1386,10 @@ var SeaweedFiler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Ping",
 			Handler:    _SeaweedFiler_Ping_Handler,
+		},
+		{
+			MethodName: "DirectoryChangePosition",
+			Handler:    _SeaweedFiler_DirectoryChangePosition_Handler,
 		},
 		{
 			MethodName: "GetFilerConfiguration",

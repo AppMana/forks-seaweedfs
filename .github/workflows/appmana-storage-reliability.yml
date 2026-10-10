@@ -273,14 +273,14 @@ jobs:
           "$RUNNER_TEMP/weed-candidate" version
       - name: Repair the fusermount3 setuid bit
         uses: ./seaweedfs/.github/actions/fix-fusermount-setuid
-      - name: Mount request deadlines and bounded close
-        # fuse-integration.yml runs only for master/main; these are the hang and
-        # close() regressions for this branch.
+      - name: Mount request deadlines, bounded close and cross-mount visibility
+        # fuse-integration.yml runs only for master/main; these are the hang,
+        # close() and close-to-open regressions for this branch.
         env:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate
         run: >-
           cd test/fuse_integration && go test -count=1 -v -timeout=20m .
-          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap)$'
+          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility)$'
       - name: Maintenance CLI preservation, scoped fsck, scheduler and absent-only repair
         env:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate

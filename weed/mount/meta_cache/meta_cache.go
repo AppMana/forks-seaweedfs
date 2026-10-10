@@ -59,6 +59,13 @@ type MetaCache struct {
 	// whole listing. See meta_cache_sections.go.
 	dirSections map[util.FullPath]*sectionList
 
+	// dirChangesApplied is, per cached directory, the newest change to its
+	// children this cache has applied. With the listing floor it says how far
+	// the cached listing is current. See meta_cache_dir_position.go.
+	dirChangesApplied map[util.FullPath]int64
+	appliedMu         sync.Mutex
+	appliedAdvanced   chan struct{}
+
 	// Entry invalidations run on a worker, not inline on the apply loop:
 	// invalidateFunc takes the fh lock, which a flush can hold while waiting on
 	// the apply loop (flushMetadataToFiler -> applyLocalMetadataEvent), so inline
@@ -143,6 +150,7 @@ func NewMetaCache(dbFolder string, uidGidMapper *UidGidMapper, root util.FullPat
 		dedupRing:            newDedupRingBuffer(),
 		dirVersionFloors:     make(map[util.FullPath]int64),
 		dirSections:          make(map[util.FullPath]*sectionList),
+		dirChangesApplied:    make(map[util.FullPath]int64),
 		oversizedDirs:        make(map[util.FullPath]struct{}),
 	}
 	mc.invalidateWorker = util.NewAsyncBatchWorker(func(batch []EntryInvalidation) {
@@ -626,6 +634,7 @@ func (mc *MetaCache) DeleteFolderChildren(ctx context.Context, fp util.FullPath)
 	defer mc.Unlock()
 	delete(mc.dirVersionFloors, fp)
 	delete(mc.dirSections, fp)
+	delete(mc.dirChangesApplied, fp)
 	mc.deleteChildVersionRecordsLocked(ctx, fp)
 	return mc.localStore.DeleteFolderChildren(ctx, fp)
 }
@@ -866,6 +875,16 @@ type metadataResponseSideEffects struct {
 }
 
 func (mc *MetaCache) applyMetadataResponseNow(ctx context.Context, resp *filer_pb.SubscribeMetadataResponse, options MetadataResponseApplyOptions) error {
+	if err := mc.applyMetadataResponseRouted(ctx, resp, options); err != nil {
+		return err
+	}
+	// Only once the store holds the change: a listing current through it must
+	// show it. A duplicate counts too, its first delivery was applied.
+	mc.noteChangesApplied(resp)
+	return nil
+}
+
+func (mc *MetaCache) applyMetadataResponseRouted(ctx context.Context, resp *filer_pb.SubscribeMetadataResponse, options MetadataResponseApplyOptions) error {
 	if mc.shouldSkipDuplicateEvent(resp) {
 		return nil
 	}
@@ -1013,6 +1032,7 @@ func (mc *MetaCache) applyMetadataResponseLocked(ctx context.Context, resp *file
 		if isDelete || isMove {
 			delete(mc.dirVersionFloors, oldPath)
 			delete(mc.dirSections, oldPath)
+			delete(mc.dirChangesApplied, oldPath)
 			if deleteErr := mc.localStore.DeleteFolderChildren(ctx, oldPath); deleteErr != nil {
 				glog.V(2).Infof("delete descendants of %s: %v", oldPath, deleteErr)
 			}
@@ -1055,6 +1075,7 @@ func (mc *MetaCache) purgeDirectoryChildrenNow(ctx context.Context, dirPath util
 	defer mc.Unlock()
 	delete(mc.dirVersionFloors, dirPath)
 	delete(mc.dirSections, dirPath)
+	delete(mc.dirChangesApplied, dirPath)
 	mc.deleteChildVersionRecordsLocked(ctx, dirPath)
 	return mc.localStore.DeleteFolderChildren(ctx, dirPath)
 }

@@ -73,6 +73,7 @@ type Filer struct {
 	EmptyFolderCleanupDelay       time.Duration
 	persistedLogCache             *persistedLogCache
 	metaLogInflight               metaLogInflight
+	dirChanges                    directoryChanges
 }
 
 func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerHost pb.ServerAddress, filerGroup string, collection string, replication string, dataCenter string, maxFilenameLength uint32, notifyFn func()) *Filer {
@@ -92,6 +93,7 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 	if f.UniqueFilerId < 0 {
 		f.UniqueFilerId = -f.UniqueFilerId
 	}
+	f.dirChanges.reset(time.Now().UnixNano())
 
 	// ReadFromDiskFn is intentionally nil here.  SubscribeLocalMetadata already
 	// manages disk reads explicitly with shouldReadFromDisk / lastCheckedFlushTsNs

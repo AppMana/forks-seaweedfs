@@ -130,12 +130,26 @@ func (wfs *WFS) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 	}
 	dhid, _ := wfs.AcquireDirectoryHandle()
 	out.Fh = uint64(dhid)
-	// Let the kernel keep the listing in the directory's page cache, so
-	// reopening the directory does not reach the mount at all. Local mutations
-	// drop that cache in the kernel; remote ones arrive through the metadata
-	// subscription, which notifies the kernel per changed directory. A kernel
+	// Let the kernel cache the listing in the directory's page cache. A kernel
 	// too old for the flag ignores it.
-	out.OpenFlags |= fuse.FOPEN_CACHE_DIR | fuse.FOPEN_KEEP_CACHE
+	out.OpenFlags |= fuse.FOPEN_CACHE_DIR
+	dirPath, code := wfs.inodeToPath.GetPath(input.NodeId)
+	if code != fuse.OK {
+		return fuse.OK
+	}
+	// Opening a directory is where a change another mount has acknowledged
+	// must become visible. The kernel keeps the listing it holds only when no
+	// change has landed since it was read; the metadata stream's own kernel
+	// notifications run on a worker and may not have reached it yet.
+	ctx, cancelCtx := filerReplyContext(context.Background())
+	defer cancelCtx()
+	if currency := wfs.awaitDirectoryCurrent(ctx, dirPath); currency.verified {
+		if wfs.dirPositions.keepKernelListing(input.NodeId, currency.changeTsNs, wfs.metaCache.DirectoryCurrentThrough(dirPath)) {
+			out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+		}
+	} else {
+		wfs.dirPositions.dropKernelListing(input.NodeId)
+	}
 	return fuse.OK
 }
 

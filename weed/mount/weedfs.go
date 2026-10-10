@@ -216,6 +216,7 @@ type WFS struct {
 	// kernelNotify holds back reverse invalidations that wait on a kernel lock
 	// while a request whose caller holds that lock is being served.
 	kernelNotify    kernelNotifyGate
+	dirPositions    directoryPositions
 	asyncFlushClose sync.Once
 
 	// asyncFlushCh is a bounded work queue for background flush operations.
@@ -783,10 +784,25 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion,
 			// disagree; trust the filer over the local cache (the
 			// filer-ErrNotFound branch below logs the confirmed drift).
 			if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); !inodeFound {
-				glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
-				return nil, entryVersion{}, fuse.ENOENT
+				// The name may be a file another mount has just closed whose
+				// change is still on its way here. Once the listing is current
+				// its answer stands, as it does unverified while the filer
+				// cannot be asked; otherwise ask the filer below.
+				if currency := wfs.awaitDirectoryCurrent(ctx, dirPath); currency.cached && wfs.metaCache.IsNameFresh(fullpath) {
+					cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(context.Background(), fullpath)
+					if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
+						glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
+						return nil, entryVersion{}, fuse.EIO
+					}
+					if cachedEntry != nil {
+						return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
+					}
+					glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
+					return nil, entryVersion{}, fuse.ENOENT
+				}
+			} else {
+				glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
 			}
-			glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
 		}
 	}
 

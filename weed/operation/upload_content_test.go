@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
@@ -66,6 +65,7 @@ func TestShouldReassignUpload(t *testing.T) {
 		{name: "503 service unavailable", err: &uploadStatusError{StatusCode: 503, err: fmt.Errorf("busy")}, want: true},
 		{name: "400 bad request", err: &uploadStatusError{StatusCode: 400, err: fmt.Errorf("bad needle")}, want: false},
 		{name: "401 unauthorized", err: &uploadStatusError{StatusCode: 401, err: fmt.Errorf("wrong jwt")}, want: false},
+		{name: "429 upload admission full", err: &uploadStatusError{StatusCode: 429, err: fmt.Errorf("upload needs 4194557 bytes with inflight upload data 2616981613 and limit 2617245696")}, want: true},
 		{name: "assign rpc transport", err: fmt.Errorf("assign volume: transport is closing"), want: true},
 		{name: "other permanent", err: fmt.Errorf("mismatching cookie"), want: false},
 	}
@@ -95,12 +95,12 @@ func TestUploadWithRetryDataReassignsOnVolumeSizeExceeded(t *testing.T) {
 	uploader := newUploader(httpClient)
 
 	assignCalls := 0
-	fileID, uploadResult, err := uploader.uploadWithRetryData(func() (string, string, security.EncodedJwt, error) {
+	fileID, uploadResult, err := uploader.uploadWithRetryData(func() (uploadAssignment, error) {
 		assignCalls++
 		if assignCalls == 1 {
-			return "1,first", "volume-a", "", nil
+			return uploadAssignment{fileId: "1,first", host: "volume-a"}, nil
 		}
-		return "2,second", "volume-b", "", nil
+		return uploadAssignment{fileId: "2,second", host: "volume-b"}, nil
 	}, &UploadOption{Filename: "test.bin"}, []byte("abc"))
 
 	if err != nil {
@@ -143,12 +143,12 @@ func TestUploadWithRetryDataReassignsOnReplicaWriteFailure(t *testing.T) {
 	uploader := newUploader(httpClient)
 
 	assignCalls := 0
-	fileID, uploadResult, err := uploader.uploadWithRetryData(func() (string, string, security.EncodedJwt, error) {
+	fileID, uploadResult, err := uploader.uploadWithRetryData(func() (uploadAssignment, error) {
 		assignCalls++
 		if assignCalls == 1 {
-			return "1,first", "volume-a", "", nil
+			return uploadAssignment{fileId: "1,first", host: "volume-a"}, nil
 		}
-		return "2,second", "volume-b", "", nil
+		return uploadAssignment{fileId: "2,second", host: "volume-b"}, nil
 	}, &UploadOption{Filename: "test.bin"}, []byte("abc"))
 
 	if err != nil {

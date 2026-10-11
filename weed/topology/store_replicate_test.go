@@ -225,3 +225,44 @@ func TestReplicatedWriteForwardsFsyncToReplicas(t *testing.T) {
 		})
 	}
 }
+
+// A replica that accepts the forward and never answers must fail the
+// replicated write within ReplicaWriteTimeout, with an error that names the
+// replica, instead of holding the client's request until the client gives up.
+// The client can then avoid that server; on 2026-10-11 it could only blame
+// the primary.
+func TestReplicatedWriteFailsFastNamingAStalledReplica(t *testing.T) {
+	release := make(chan struct{})
+	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer replica.Close()
+	defer close(release)
+	replicaHost := strings.TrimPrefix(replica.URL, "http://")
+
+	masterFn, dialOption := startMockMasterServer(t, &mockMasterServer{
+		locations: []*master_pb.Location{{Url: replicaHost}},
+	})
+	volumeId := needle.VolumeId(1)
+	operation.InvalidateVolumeIdLocationCache(volumeId.String())
+
+	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/1,01637037d6", nil)
+	if err := r.ParseForm(); err != nil {
+		t.Fatal(err)
+	}
+	n := &needle.Needle{Id: 1, Data: make([]byte, 2<<20), Ttl: needle.EMPTY_TTL}
+	bound := ReplicaWriteTimeout(len(n.Data))
+
+	start := time.Now()
+	_, err := ReplicatedWrite(context.Background(), masterFn, dialOption, &storage.Store{}, volumeId, n, r, "")
+	took := time.Since(start)
+	if err == nil {
+		t.Fatal("replicated write to a stalled replica succeeded")
+	}
+	if took > bound+2*time.Second {
+		t.Fatalf("replicated write took %v with a stalled replica, want about %v", took, bound)
+	}
+	if !strings.Contains(err.Error(), "["+replicaHost+"]: ") {
+		t.Fatalf("error does not name the stalled replica %s: %v", replicaHost, err)
+	}
+}

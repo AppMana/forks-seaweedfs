@@ -22,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/mount/page_writer"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mount_pb"
@@ -181,7 +182,8 @@ type WFS struct {
 	peerGrpcServer        *PeerGrpcServer
 	peerAnnouncer         *PeerAnnouncer
 	peerConnPool          *PeerConnPool
-	peerDirectoryStop     chan struct{} // closed on unmount to stop the sweeper goroutine
+	stalledVolumeServers  *operation.StalledServers // servers chunk uploads recently stalled on
+	peerDirectoryStop     chan struct{}             // closed on unmount to stop the sweeper goroutine
 	FilerConf             *filer.FilerConf
 	filerClient           *wdclient.FilerClient // Cached volume location client
 	refreshMu             sync.Mutex
@@ -307,6 +309,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		attrValidSec:      1,
 		dirIdleEvict:      dirIdleEvict,
 	}
+	wfs.stalledVolumeServers = operation.NewStalledServers(stalledVolumeServerTTL)
 
 	// With writeback caching, this mount is the single writer. Increase kernel
 	// FUSE cache TTLs so the kernel doesn't re-issue Lookup/GetAttr for every

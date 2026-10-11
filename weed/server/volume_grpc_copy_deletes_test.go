@@ -65,6 +65,8 @@ func copyVolumeFrom(t *testing.T, source volume_server_pb.VolumeServerServer, ki
 	target := &VolumeServer{
 		store:          targetStore,
 		grpcDialOption: grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// The source listens on loopback, which the replica-target guard refuses.
+		AllowUntrustedRemoteEndpoints: true,
 	}
 	err := target.VolumeCopy(&volume_server_pb.VolumeCopyRequest{
 		VolumeId:       uint32(vid),

@@ -1,150 +1,173 @@
-# AppMana SeaweedFS
+# SeaweedFS fork: Windows mounts and bounded FUSE mounts
 
-SeaweedFS 4.47 with Windows mounts and fixes for allocation, vacuum/recovery,
-memory use, S3 streaming and shared-mount coherence.
+SeaweedFS 4.47 with a WinFsp `weed mount` for Windows, FUSE mounts that
+always answer the kernel, and fixes for allocation, vacuum and recovery,
+memory use, S3 copies and cross-mount coherence. Every change carries a
+regression test that fails without it.
 
-## Install and use
+## Packages
 
 | Package | Use |
 | --- | --- |
-| [ghcr.io/appmana/seaweedfs](https://github.com/orgs/AppMana/packages?repo_name=forks-seaweedfs) | Master, filer, volume and S3 services |
-| [CSI packages](https://github.com/AppMana/forks-seaweedfs-csi-driver) | Linux and Windows Kubernetes mounts |
-| [Synology package](https://github.com/AppMana/spk-seaweedfs) | DSM installation and service management |
+| [ghcr.io/appmana/seaweedfs](https://github.com/orgs/AppMana/packages?repo_name=forks-seaweedfs) | Master, filer, volume and S3 services (`sha-<commit>_large_disk`, linux/amd64 and linux/arm64) |
+| [forks-seaweedfs-csi-driver](https://github.com/AppMana/forks-seaweedfs-csi-driver) | Kubernetes CSI driver and mount images for Linux and Windows nodes, built from a pinned commit of this repo |
+| [spk-seaweedfs](https://github.com/AppMana/spk-seaweedfs) | Synology DSM package |
 
-Select a published server image in your role workloads or Helm values, and
-deploy CSI for client mounts. Stock k0s works without a storage-specific fork.
+All builds are **large-disk** (`-tags 5BytesOffset`). Their index format
+differs from normal upstream builds, so use large-disk builds across upgrades
+and rollbacks. Set container memory limits and leave the Go memory and
+upload/download admission overrides unset to get automatic sizing.
 
-**Windows CSI installs bundled WinFsp automatically.** No separate installation
-is needed for that deployment. DLL-only packages retain the signed stock kernel
-driver; they do not include fixes that require a driver replacement.
-Standalone weed.exe is a developer binary, not a dependency installer.
+Windows CSI installs WinFsp automatically. Standalone `weed.exe` is a
+developer binary and needs the WinFsp MSI on the host; see
+[Windows behavior](WINDOWS_PORT.md) for caching and permission limits.
 
-Use matching **large-disk** builds across upgrades and rollbacks: their index
-format differs from normal upstream builds. Set container memory limits and
-leave explicit Go-memory/upload/download admission overrides unset to use
-automatic sizing. Vacuum needs temporary disk space and refuses corrupt live
-records rather than silently discarding them.
+## What the fork changes
 
-See [Windows behavior](WINDOWS_PORT.md) for caching and permission limitations.
+**Mount (Linux and Windows)**
 
-## Compatibility
+- Every FUSE request is answered within `-fuse.requestTimeout`; the kernel is
+  asked to abort the connection after `-fuse.kernelRequestTimeout` if the
+  mount process itself stops answering. A stopped filer or volume server, or
+  a deleted cache directory, returns EIO instead of hanging callers.
+- Chunk uploads are bounded per attempt; the metadata commit deadline starts
+  after the data upload, so a large `close()` over a slow link no longer
+  fails after its data was stored.
+- `-writeBufferSizeMB` bounds dirty data (memory and swap), so `close()` and
+  `fsync()` drain within the request deadline.
+- Kernel invalidations that take a directory or page lock are held until no
+  request holding that lock is in flight (the notify gate), so remote changes
+  cannot deadlock local requests.
+- Files another mount has closed are visible to listings and lookups that
+  start afterwards: a cached directory confirms with the filer
+  (`DirectoryChangePosition`) that it has applied every change before serving
+  from cache.
+- Name and attribute caches expire after remote namespace and metadata
+  changes; remotely unlinked names detach from surviving open handles;
+  overwrites are ordered after observed chunk versions.
+- A metadata store that cannot apply an event degrades to read-through
+  instead of serving stale entries.
+- The on-disk read cache uses disk as chunks are cached instead of reserving
+  its whole limit at start, and recreates a cache directory removed
+  underneath it.
+- Swap and buffered-write failures are reported, never acknowledged as
+  written; deferred creates survive cache eviction and flush serially.
+- Sequential/random read detection no longer misclassifies concurrent or
+  mmap reads; `-readerCacheMode` overrides it.
 
-Results apply to the linked build and scope, not every historical test run.
+**Windows mounts (WinFsp)**: native `weed mount` through cgofuse without
+cgo; network-FS mode for container consumption; case-insensitive by default;
+kernel caching with filer-event invalidation and finite timeouts; per-handle
+read-ahead; canonical names, Unicode and NFS reparse entries; volume-relative
+symlinks; opt-in basic permissions. Details in [WINDOWS_PORT.md](WINDOWS_PORT.md).
 
-| Scope | Result |
+**Filer and S3**
+
+- Chunk lists shared between entries are reference counted: a same-bucket
+  `CopyObject` shares the source's chunks, and update, rename and uncertain
+  store writes never garbage-collect shared chunks.
+- Chunk compaction under a cancelled context no longer panics; LevelDB2
+  listings stop at the end of the directory; streaming renames are
+  acknowledged with committed metadata events.
+- S3 chunk copies cancel with the request, stream with an exact
+  `Content-Length`, and do not allocate a chunk-sized buffer per chunk.
+  Identities reload from `-s3.config` without a restart; the empty-directory
+  marker and bucket empty-folder cleanup are opt-in.
+- HTTP chunk reads resume where a failed attempt stopped, reject invalid
+  partial responses and bound how much of an unread response is drained.
+
+**Volume servers and maintenance**
+
+- `GOMEMLIMIT` and transfer admission derive from the cgroup memory limit;
+  concurrent transfer bytes are reserved atomically; multipart uploads
+  stream instead of copying the payload.
+- Durable index tails replay regardless of log mtime; partial unindexed
+  append tails survive restarts; vacuum refuses mismatched data and index
+  boundaries instead of discarding live records.
+- An absent-only repair RPC restores a missing needle from a checksum-pinned
+  replica; scoped `volume.fsck` preserves cross-collection references and
+  skips needles whose copied index went stale; maintenance commands reject
+  malformed arguments and propagate disk-check failures.
+- A volume that fails to open fails its load instead of crashing the server;
+  a master that does not know a volume does not report it under-replicated.
+
+## Mount configuration
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `-cacheCapacityMB` | 128 | On-disk read cache per mount, in three tiers (1/8, 3/8 and 1/2 of the limit). Disk is used as chunks are cached, up to the limit. `0` disables it. |
+| `-cacheDir` | system temp | Parent of the mount's cache. The mount keeps its cache and write swap in `<cacheDir>/<id>`, where `<id>` hashes the mount directory, filer, filer path and weed version: a different version starts a new directory and leaves the old one, which nothing removes. |
+| `-writeBufferSizeMB` | 0 (no cap) | Cap on the mount's dirty data, memory plus swap. Writers wait for uploads when it is full, so `close()` drains at most this much. |
+| `-fuse.requestTimeout` | 60 s | A request still unanswered after this long gets EIO and is cancelled. Must be below the kernel timeout. `0` disables. |
+| `-fuse.kernelRequestTimeout` | 90 s | Negotiated at `FUSE_INIT` on Linux 6.14+: the kernel aborts the connection if a request stays unanswered this long. Whole seconds; `0` disables. |
+| `-readerCacheMode` | `auto` | `sequential` caches whole chunks always (mmap-heavy reads such as model loading); `random` never. |
+| `-winfspOptions`, `-winfspCaseSensitive`, `-winfspBasicPermissions`, `-volumeLabel` | | Windows mounts only; see [WINDOWS_PORT.md](WINDOWS_PORT.md). |
+
+Fixed deadlines inside the mount: a filer call a FUSE request waits on gives
+up after 60 s, one chunk upload attempt after 60 s, and the metadata commit
+after a flush 30 s after the data upload finished. A listing or negative
+lookup in a cached directory waits up to 1 s for an in-flight event, and
+serves the cache after 5 s when the filer is unreachable.
+
+A mount's disk use is bounded by `cacheCapacityMB + writeBufferSizeMB` in its
+current cache directory. Size `writeBufferSizeMB` so that it drains well
+inside the request timeout at the node's uplink rate (512 MiB at 46 MB/s is
+about 11 s).
+
+## Benchmarks
+
+Measured on the change that introduced each behavior; see that commit for the
+setup.
+
+| Scenario | Result |
 | --- | --- |
-| Linux mount/filer/S3 and native Windows smoke gates | [tested](https://github.com/AppMana/forks-seaweedfs/actions/runs/37845560942) |
-| Large-disk regressions: unit/race, mutants, maintenance, packaged image, etcd restore, isolated lab, rollback | [tested](https://github.com/AppMana/forks-seaweedfs/actions/runs/37845560963) |
-| Linux amd64/arm64 server image publication | [tested](https://github.com/AppMana/forks-seaweedfs/actions/runs/37845561076) |
-| Windows Git LFS mount smoke | intermittent: `lfs install --local` cannot resolve `.git` right after `git init` in 2 of 7 runs |
-| VM fault gates (power loss, four-VM durability) | pending a self-hosted KVM runner |
-| Same build: mixed-OS, MSVC and power-loss qualification | unknown |
-| Linux arm64 storage workloads | unknown |
-| Synology 4.47-15 public availability | unknown — release remains draft |
+| 4 GiB sequential write, `-writeBufferSizeMB=512`, 1 GbE uplink | write 80.4 s, `close()` 8.8 s, 46 MB/s |
+| 256 MiB sequential write, 16 MiB/s uplink | `close()` 15.7 s uncapped; 1.35 s with `-writeBufferSizeMB=32` |
+| Missing-file `stat` in a cached directory (cross-mount freshness) | 24 µs before, about 200 µs after (one filer round trip) |
+| `opendir` + list of 200 entries | 63 to 75 µs before, 210 to 320 µs after |
+| `TestCrossMountCloseToOpenVisibility`, 40 rounds through a 100 ms proxy | 186 stale observations before, 0 after |
 
-## Operating the AppMana deployment
+## How CI builds and qualifies
 
-Several repositories ship one storage system. Change them together and roll
-out one component at a time.
+| Workflow | Trigger | Does |
+| --- | --- | --- |
+| [`appmana-server-images.yml`](.github/workflows/appmana-server-images.yml) | push to the default branch (`weed/**`, `go.mod`, docker inputs) | Tests and builds native amd64 and arm64 large-disk servers, publishes `ghcr.io/appmana/seaweedfs:sha-<commit>_large_disk` as one two-platform manifest. A candidate only: qualification is separate. |
+| [`appmana-storage-reliability.yml`](.github/workflows/appmana-storage-reliability.yml) | push to `merge/**`, pull requests, dispatch | Race-tested unit suites, real FUSE gates, maintenance, packaged-image, etcd-restore, isolated lab and rollback gates on hosted runners; VM fault, hung-task and native Windows gates on a self-hosted KVM runner. |
+| [`appmana-weed-windows.yml`](.github/workflows/appmana-weed-windows.yml) | push to `merge/**`, pull requests | Cross-compile and native `weed.exe` builds, WinFsp mount smoke, conformance and mount benchmarks. |
 
-### Branches
+Mount images are built by the CSI fork's `build-images.yml` from the commit
+its `SEAWEEDFS_COMMIT` pins. Deploy only CI-built images, by digest.
+
+Qualify a change locally the way CI does:
+
+```sh
+# unit and race
+GOWORK=off go test -short -tags 5BytesOffset -race -count=1 ./weed/mount/... ./weed/filer/... ./weed/storage/... ./weed/util/chunk_cache/...
+python3 -m unittest discover -s test/storage_lab -v
+
+# real FUSE mounts on this host; WEED_BINARY selects the binary under test
+go build -tags 5BytesOffset -o /abs/weed ./weed
+(cd test/fuse_integration && WEED_BINARY=/abs/weed go test -count=1 -v -timeout=20m . \
+  -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility)$')
+
+# disposable-VM gates (guest panics on hung tasks); needs KVM and Labcontainers
+SEAWEEDFS_STUCK_LAB_LIVE=1 SEAWEEDFS_NOTIFY_LAB_LIVE=1 SEAWEEDFS_LINUX_WEED=/abs/weed \
+LABCONTAINERS_LABD=/abs/labd LABCONTAINERS_VM_IMAGE=<pinned image> \
+GOWORK=off go test ./test/storage_lab/vm -run '^(TestFuseStuckBackendLab|TestFuseReverseInvalidationLab)$' -v -timeout 90m
+```
+
+The [storage lab README](test/storage_lab/README.md) covers the four-VM
+fault, Windows and mixed-OS scenarios and their inputs.
+
+## Branches
 
 | Branch | Role |
 | --- | --- |
-| `merge/upstream-4.47` | Integration branch and default: every fork fix lands here (merged, never rebased), and CI runs here. |
-| `release/<change>-<base>` | Ship branch: the deployed commit plus only the change being rolled out, e.g. `release/mount-notify-gate-dd2b9ef98`. It is merged back into `merge/upstream-4.47`. |
+| `merge/upstream-4.47` | Default branch and the deployed line. Every fix merges here (never rebased); server images are built from it. |
+| `merge/upstream-<next>` | Next upstream release merged into the default branch. It becomes the default once qualified; the server image workflow's branch filter moves with it. |
+| `release/<change>-<base>` | Short-lived ship branch: a deployed commit plus only the change being rolled out. It merges back into the default branch and is then deleted. |
 
-Build images from the ship branch whenever `merge/upstream-4.47` has unshipped
-changes in the same component.
+The default branch advances only by merges: fork fixes, ship branches merged
+back, and upstream releases merged in on the next `merge/upstream-*` branch.
 
-### Images and where they are pinned
-
-| Image | Built by | Pinned in appmana-cluster |
-| --- | --- | --- |
-| `ghcr.io/appmana/seaweedfs` (master, filer, volume, S3, shell jobs) | this repo, [`appmana-server-images.yml`](.github/workflows/appmana-server-images.yml), `sha-<commit>_large_disk` | `clusters/appmana-cluster-03/seaweedfs/helm-release.yaml` (master, filer: `imageOverride`), `volume-statefulsets.yaml`, `harbor-s3-gateway.yaml`, `traces-s3-gateway.yaml`, and the maintenance jobs beside them |
-| `ghcr.io/appmana/seaweedfs-mount` (CSI mount supervisor + `weed mount`) | [forks-seaweedfs-csi-driver](https://github.com/AppMana/forks-seaweedfs-csi-driver) `build-images.yml` on `merge/**` branches, `candidate-<sha>-<run>-<attempt>` | `seaweedfs/csi-driver.yaml` (DaemonSet `seaweedfs-mount`), `csi-driver-windows.yaml` |
-| `ghcr.io/appmana/seaweedfs-csi-driver` | same workflow | `csi-driver.yaml` (node plugin), `csi-controller.yaml`, `csi-driver-windows.yaml` |
-
-Every pin is a digest. The CSI fork selects this repo's source with
-`SEAWEEDFS_COMMIT` in `build-images.yml` and both Linux mount Dockerfiles;
-`test/kubernetes_lab/build_pins_test.go` requires them to agree and the weed
-build to be static (`CGO_ENABLED=0`), `5BytesOffset`, go-fuse `1bdeec4` and
-stamped (`weed version` prints the commit).
-
-### Roles in appmana-cluster
-
-- **Masters** (Raft, three ordinals) and **filers** (three ordinals, shared
-  store) come from the upstream Helm chart, `seaweedfs/helm-release.yaml`.
-- **Volume servers** are per-disk StatefulSets, `volume-statefulsets.yaml`.
-- **S3 gateways**: Harbor's registry and the trace bucket run their own
-  gateways, `harbor-s3-gateway.yaml` and `traces-s3-gateway.yaml`.
-- **Mounts**: the CSI node plugin asks the per-node `seaweedfs-mount`
-  supervisor to run one `weed mount` per volume. Both DaemonSets use
-  `OnDelete`, so a new pin replaces nothing until a node's pod is deleted.
-
-### Mount kernel notifications
-
-A remote namespace change makes the mount expire the name in the kernel
-(`EntryNotify`), and a remote content change drops cached pages
-(`InodeNotify`). Linux takes the directory's lock, or the pages' locks, for
-these, and a local request holds those locks until the mount answers it. The
-mount's notify gate (`weed/mount/kernel_notify_gate.go`) therefore guarantees:
-
-- no such notification is sent while this mount is serving a request whose
-  caller holds the lock it needs (a lookup, create, rename, unlink, listing or
-  attribute change in that directory; a read or write of that file);
-- deferred notifications are sent, once each, after the last such request is
-  answered, from a goroutine nothing else waits on;
-- a request the kernel queued but the mount has not read yet can still delay
-  a notification until that one request is answered.
-
-Filer calls a FUSE request waits on give up after 60 s (`filerReplyTimeout`)
-without cancelling the filer's work, so no request holds a kernel lock longer.
-
-### Tests
-
-```sh
-# unit and race, as CI's large-disk job runs them
-GOWORK=off go test -short -tags 5BytesOffset -race -count=1 ./weed/mount/... ./weed/filer/... ./weed/storage/...
-python3 -m unittest discover -s test/storage_lab -v
-# real FUSE mounts on this host (puts weed on PATH)
-(cd test/fuse_integration && PATH=/path/to/weed-dir:$PATH go test -race -count=1 ./...)
-# disposable-VM kernel scenarios through Labcontainers
-SEAWEEDFS_NOTIFY_LAB_LIVE=1 SEAWEEDFS_LINUX_WEED=/abs/weed \
-LABCONTAINERS_VM_IMAGE=labcontainers/vm-ubuntu:csi-f9df714 LABCONTAINERS_LABD=/abs/labd \
-GOWORK=off go test ./test/storage_lab/vm -run '^TestFuseReverseInvalidationLab$' -v -timeout 120m
-```
-
-The storage lab README covers the four-VM fault, Windows and mixed-OS
-scenarios. VM jobs need a self-hosted KVM runner.
-
-### Rollout
-
-- **Masters and filers**: set the component's `updatePartition` to the
-  highest ordinal, verify that pod, then lower it one ordinal at a time. The
-  chart renders no `updateStrategy` at partition 0, so Helm cannot remove a
-  partition it never recorded: commit partition 1 as deployed before 0, or
-  ordinal 0 keeps the old image.
-- **Volume servers**: `hacking/seaweedfs-volume-restart.py` (preview, then
-  `--apply`), one disk at a time; check index load, payload readback and
-  registration before the next.
-- **S3 gateways**: `hacking/seaweedfs-s3-probe.py` against the replaced
-  gateway (write, read back, delete).
-- **CSI mounts**: change the `seaweedfs-mount` digest, then delete the
-  supervisor pod on one node. That remounts every SeaweedFS volume on the
-  node. Verify the image digest, `weed version`, that pods' claims read, and
-  that no weed thread is in `D` (`ps -eLo stat,comm | grep weed`), then move
-  to the next node. Replace the node plugin before the supervisor when both
-  change. Nodes running training wait for a scheduled window.
-
-### When a node hangs or panics
-
-Nodes run `kernel.hung_task_panic=1`: a FUSE request stuck 120 s reboots the
-node. Kernel output reaches Loki through netconsole:
-`{job="netconsole", host="appmana-NNN"}` (filter one `collector=`), the
-journal is `{job="systemd-journal", host=...}`, and kdump leaves vmcores in
-`/var/crash` on the node.
-
-[Storage lab and configuration](test/storage_lab/README.md) ·
-[Server builds](.github/workflows/appmana-server-images.yml) ·
 [Upstream](https://github.com/seaweedfs/seaweedfs)

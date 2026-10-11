@@ -1,6 +1,6 @@
-# AppMana Windows mount port (WinFsp)
+# Windows mount port (WinFsp)
 
-Branch `appmana-4.23-large-disk-winfsp`, based on upstream tag `4.23`.
+Part of the default branch since the 4.23 port.
 Adds a WinFsp-backed `weed mount` for GOOS=windows via
 `github.com/winfsp/cgofuse` (no-cgo mode: `winfsp-x64.dll` is loaded at
 runtime, so `CGO_ENABLED=0 GOOS=windows` cross-compilation works).

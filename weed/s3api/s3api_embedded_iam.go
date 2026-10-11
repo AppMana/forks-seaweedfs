@@ -22,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/credential"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	iamlib "github.com/seaweedfs/seaweedfs/weed/iam"
+	"github.com/seaweedfs/seaweedfs/weed/iam/integration"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
@@ -195,10 +196,32 @@ func newIamErrorResponse(errCode string, errMsg string, requestID string) iamErr
 	return errorResp
 }
 
-func (e *EmbeddedIamApi) writeIamErrorResponse(w http.ResponseWriter, r *http.Request, reqID string, iamErr *iamError) {
+// iamAuthErrorCode maps an S3-side signature failure onto the IAM
+// query-protocol code IAM clients expect for the same request.
+func iamAuthErrorCode(errCode s3err.ErrorCode) string {
+	switch errCode {
+	case s3err.ErrInvalidAccessKeyID:
+		return "InvalidClientTokenId"
+	case s3err.ErrSignatureDoesNotMatch:
+		return "SignatureDoesNotMatch"
+	case s3err.ErrAccessDenied:
+		return "AccessDenied"
+	case s3err.ErrExpiredToken:
+		return "ExpiredToken"
+	case s3err.ErrRequestTimeTooSkewed:
+		return "RequestTimeTooSkewed"
+	case s3err.ErrInternalError:
+		return iam.ErrCodeServiceFailureException
+	default:
+		return "IncompleteSignature"
+	}
+}
+
+func writeIamErrorResponse(w http.ResponseWriter, r *http.Request, reqID string, iamErr *iamError) {
 	if iamErr == nil {
 		glog.Errorf("writeIamErrorResponse called with nil error")
 		internalResp := newIamErrorResponse(iam.ErrCodeServiceFailureException, "Internal server error", reqID)
+		internalResp.Error.Type = "Receiver"
 		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalResp)
 		return
 	}
@@ -209,22 +232,29 @@ func (e *EmbeddedIamApi) writeIamErrorResponse(w http.ResponseWriter, r *http.Re
 
 	errorResp := newIamErrorResponse(errCode, errMsg, reqID)
 	internalErrorResponse := newIamErrorResponse(iam.ErrCodeServiceFailureException, "Internal server error", reqID)
+	internalErrorResponse.Error.Type = "Receiver"
 
 	switch errCode {
 	case iam.ErrCodeNoSuchEntityException:
 		s3err.WriteXMLResponse(w, r, http.StatusNotFound, errorResp)
 	case iam.ErrCodeEntityAlreadyExistsException:
 		s3err.WriteXMLResponse(w, r, http.StatusConflict, errorResp)
-	case iam.ErrCodeMalformedPolicyDocumentException, iam.ErrCodeInvalidInputException, "ValidationError":
+	case iam.ErrCodeMalformedPolicyDocumentException, iam.ErrCodeInvalidInputException, "ValidationError", "IncompleteSignature", "ExpiredToken":
 		s3err.WriteXMLResponse(w, r, http.StatusBadRequest, errorResp)
-	case "AccessDenied", iam.ErrCodeLimitExceededException:
+	case "AccessDenied", "InvalidClientTokenId", "SignatureDoesNotMatch", "RequestTimeTooSkewed":
 		s3err.WriteXMLResponse(w, r, http.StatusForbidden, errorResp)
+	case iam.ErrCodeLimitExceededException:
+		s3err.WriteXMLResponse(w, r, http.StatusConflict, errorResp)
 	case iam.ErrCodeServiceFailureException:
 		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalErrorResponse)
 	case "NotImplemented":
 		s3err.WriteXMLResponse(w, r, http.StatusNotImplemented, errorResp)
+	case "InvalidAction":
+		s3err.WriteXMLResponse(w, r, http.StatusNotFound, errorResp)
 	case iam.ErrCodeDeleteConflictException:
 		s3err.WriteXMLResponse(w, r, http.StatusConflict, errorResp)
+	case iam.ErrCodeUnmodifiableEntityException:
+		s3err.WriteXMLResponse(w, r, http.StatusBadRequest, errorResp)
 	default:
 		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalErrorResponse)
 	}
@@ -325,13 +355,20 @@ func (e *EmbeddedIamApi) DeleteUser(s3cfg *iam_pb.S3ApiConfiguration, userName s
 	resp := &iamDeleteUserResponse{}
 	for i, ident := range s3cfg.Identities {
 		if userName == ident.Name {
-			// AWS IAM behavior: prevent deletion if user has service accounts
-			// This ensures explicit cleanup and prevents orphaned resources
+			// AWS IAM behavior: prevent deletion if user has dependent resources.
+			// This ensures explicit cleanup and prevents orphaned resources.
 			if len(ident.ServiceAccountIds) > 0 {
 				return resp, &iamError{
 					Code: iam.ErrCodeDeleteConflictException,
 					Error: fmt.Errorf("cannot delete user %s: user has %d service account(s). Delete service accounts first",
 						userName, len(ident.ServiceAccountIds)),
+				}
+			}
+			if len(ident.Credentials) > 0 {
+				return resp, &iamError{
+					Code: iam.ErrCodeDeleteConflictException,
+					Error: fmt.Errorf("cannot delete user %s: user has %d access key(s). Delete access keys first",
+						userName, len(ident.Credentials)),
 				}
 			}
 			s3cfg.Identities = append(s3cfg.Identities[:i], s3cfg.Identities[i+1:]...)
@@ -641,6 +678,20 @@ func (e *EmbeddedIamApi) DeletePolicy(ctx context.Context, values url.Values) (*
 					Code:  iam.ErrCodeDeleteConflictException,
 					Error: fmt.Errorf("policy %s is attached to group %s", policyName, gn),
 				}
+			}
+		}
+	}
+	// Roles attach policies by name too; see integration.RolesAttachingPolicy,
+	// including why a role only in a peer's IAM config file is not seen here.
+	if mgr := e.oidcIAMManager(); mgr != nil && mgr.GetRoleStore() != nil {
+		roles, err := integration.RolesAttachingPolicy(ctx, mgr.GetRoleStore(), policyName)
+		if err != nil {
+			return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+		}
+		if len(roles) > 0 {
+			return resp, &iamError{
+				Code:  iam.ErrCodeDeleteConflictException,
+				Error: fmt.Errorf("policy %s is attached to role %s", policyName, roles[0]),
 			}
 		}
 	}
@@ -2545,15 +2596,19 @@ func (iam *IdentityAccessManagement) AuthIamManagement(f http.HandlerFunc) http.
 		// needs to hash the body for IAM requests (service != "s3").
 		// The streamHashRequestBody function in auth_signature_v4.go preserves the body
 		// after reading it, so ParseForm() will work correctly after authentication.
+		r, reqID := request_id.Ensure(r)
 		identity, errCode := iam.AuthSignatureOnly(r)
 		if errCode != s3err.ErrNone {
-			s3err.WriteErrorResponse(w, r, errCode)
+			writeIamErrorResponse(w, r, reqID, &iamError{
+				Code:  iamAuthErrorCode(errCode),
+				Error: errors.New(s3err.GetAPIError(errCode).Description),
+			})
 			return
 		}
 
 		// Now parse form to get Action and UserName (body was preserved by auth)
 		if err := r.ParseForm(); err != nil {
-			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+			writeIamErrorResponse(w, r, reqID, &iamError{Code: "InvalidInput", Error: err})
 			return
 		}
 
@@ -2561,7 +2616,10 @@ func (iam *IdentityAccessManagement) AuthIamManagement(f http.HandlerFunc) http.
 		// from, so the authorized target and the acted-on target cannot differ.
 		action := r.Form.Get("Action")
 		if errCode := iam.AuthorizeIamAction(r, identity, action, iamTargetUserName(action, r)); errCode != s3err.ErrNone {
-			s3err.WriteErrorResponse(w, r, errCode)
+			writeIamErrorResponse(w, r, reqID, &iamError{
+				Code:  iamAuthErrorCode(errCode),
+				Error: errors.New(s3err.GetAPIError(errCode).Description),
+			})
 			return
 		}
 
@@ -2582,7 +2640,10 @@ func (e *EmbeddedIamApi) AuthIam(f http.HandlerFunc, _ Action) http.HandlerFunc 
 }
 
 // ExecuteAction executes an IAM action with the given values.
-// If skipPersist is true, the changed configuration is not saved to the persistent store.
+// If skipPersist is true, the changed S3ApiConfiguration is not saved to the
+// persistent store. OIDC provider and role actions do not change that
+// configuration: they write to the IAM manager's own stores, whichever the
+// server was configured with, and skipPersist does not apply to them.
 // reqID is set on the response; if empty, a new request ID is generated.
 func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, skipPersist bool, reqID string) (iamlib.RequestIDSetter, *iamError) {
 	if reqID == "" {
@@ -2598,7 +2659,8 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 		case "ListUsers", "ListAccessKeys", "GetUser", "GetUserPolicy", "ListUserPolicies", "ListAttachedUserPolicies", "ListPolicies", "GetPolicy", "ListPolicyVersions", "GetPolicyVersion", "ListServiceAccounts", "GetServiceAccount",
 			"GetGroup", "ListGroups", "ListAttachedGroupPolicies", "GetGroupPolicy", "ListGroupPolicies", "ListGroupsForUser",
 			"ListUserTags",
-			actionListOpenIDConnectProviders, actionGetOpenIDConnectProvider:
+			actionListOpenIDConnectProviders, actionGetOpenIDConnectProvider,
+			actionGetRole, actionListRoles, actionListAttachedRolePolicies:
 			// Allowed read-only actions
 		default:
 			return nil, &iamError{Code: s3err.GetAPIError(s3err.ErrAccessDenied).Code, Error: fmt.Errorf("IAM write operations are disabled on this server")}
@@ -2608,6 +2670,15 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 	// OIDC provider actions don't operate on S3ApiConfiguration; dispatch
 	// before the unrelated config load + reload churn.
 	if response, iamErr, ok := e.dispatchOIDCProviderAction(ctx, values); ok {
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		response.SetRequestId(reqID)
+		return response, nil
+	}
+
+	// Role actions operate on the IAM manager's role store, likewise.
+	if response, iamErr, ok := e.dispatchRoleAction(ctx, values); ok {
 		if iamErr != nil {
 			return nil, iamErr
 		}
@@ -2944,7 +3015,7 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 		}
 		changed = false
 	default:
-		return nil, &iamError{Code: s3err.GetAPIError(s3err.ErrNotImplemented).Code, Error: errors.New(s3err.GetAPIError(s3err.ErrNotImplemented).Description)}
+		return nil, &iamError{Code: "InvalidAction", Error: fmt.Errorf("The action %s is not valid for this endpoint", values.Get("Action"))}
 	}
 	if changed {
 		if !skipPersist {
@@ -2973,7 +3044,7 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 func (e *EmbeddedIamApi) DoActions(w http.ResponseWriter, r *http.Request) {
 	r, reqID := request_id.Ensure(r)
 	if err := r.ParseForm(); err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+		writeIamErrorResponse(w, r, reqID, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err})
 		return
 	}
 	values := r.PostForm
@@ -2989,7 +3060,7 @@ func (e *EmbeddedIamApi) DoActions(w http.ResponseWriter, r *http.Request) {
 
 	response, iamErr := e.ExecuteAction(r.Context(), values, false, reqID)
 	if iamErr != nil {
-		e.writeIamErrorResponse(w, r, reqID, iamErr)
+		writeIamErrorResponse(w, r, reqID, iamErr)
 		return
 	}
 

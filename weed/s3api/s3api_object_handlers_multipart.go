@@ -40,6 +40,12 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Reject before the auto-create check so a refused upload cannot leave a bucket behind
+	if errCode := ValidateRequestEncryption(r.Header); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
 	// Check if bucket exists, and create it if it doesn't (auto-create bucket)
 	if err := s3a.checkBucket(r, bucket); err == s3err.ErrNoSuchBucket {
 		// Auto-create bucket if it doesn't exist (requires Admin permission)
@@ -69,7 +75,7 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 	}
 
 	// Validate object lock headers before processing
-	if err := s3a.validateObjectLockHeaders(r, versioningEnabled); err != nil {
+	if err := s3a.validateObjectLockHeaders(r, bucket, object, versioningEnabled); err != nil {
 		glog.V(2).Infof("NewMultipartUploadHandler: object lock header validation failed for bucket %s, object %s: %v", bucket, object, err)
 		s3err.WriteErrorResponse(w, r, mapValidationErrorToS3Error(err))
 		return
@@ -328,6 +334,12 @@ func (s3a *S3ApiServer) ListObjectPartsHandler(w http.ResponseWriter, r *http.Re
 // PutObjectPartHandler - Put an object part in a multipart upload.
 func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Request) {
 	bucket, object := s3_constants.GetBucketAndObject(r)
+	if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
+		// Well-formed copy sources are claimed by the CopyObjectPart route; what
+		// is left here has no "bucket/key" form and is not a plain PutObjectPart.
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidArgument)
+		return
+	}
 	_, err := validateContentMd5(r.Header)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidDigest)
@@ -350,16 +362,8 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 
 	partIDString := r.URL.Query().Get("partNumber")
 	partID, err := strconv.Atoi(partIDString)
-	if err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
-		return
-	}
-	if partID > s3_constants.MaxS3MultipartParts {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
-		return
-	}
-	if partID < 1 {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
+	if err != nil || partID < 1 || partID > s3_constants.MaxS3MultipartParts {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidArgument)
 		return
 	}
 
@@ -440,6 +444,21 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 			if err := s3a.handleSSES3MultipartHeaders(r, uploadEntry, uploadID); err != nil {
 				glog.Errorf("Failed to setup SSE-S3 multipart headers: %v", err)
 				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				return
+			}
+		}
+	}
+
+	// Parts inherit the checksum algorithm declared at CreateMultipartUpload
+	// when the request doesn't specify one; a conflicting one is rejected.
+	if headerName := string(uploadEntry.Extended[s3_constants.ExtChecksumAlgorithm]); headerName != "" {
+		if algo, reqHeaderName, code := detectRequestedChecksumAlgorithm(r); code == s3err.ErrNone {
+			if algo == ChecksumAlgorithmNone {
+				if name := checksumAlgorithmNameFromHeaderName(headerName); name != "" {
+					r.Header.Set(s3_constants.AmzChecksumAlgorithm, name)
+				}
+			} else if reqHeaderName != headerName {
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
 				return
 			}
 		}
@@ -635,6 +654,7 @@ type CompleteMultipartUpload struct {
 type CompletedPart struct {
 	ETag       string
 	PartNumber int
+	ChecksumResult
 }
 
 // handleSSES3MultipartHeaders handles SSE-S3 multipart upload header setup to reduce nesting complexity

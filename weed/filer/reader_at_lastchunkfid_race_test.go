@@ -74,7 +74,10 @@ func newMultiChunkFixture(t *testing.T, numChunks, chunkSize int) (*ChunkReadAt,
 	ctx := context.Background()
 	lookupFn := masterClient.GetLookupFileIdFunction()
 	fileSize := int64(numChunks * chunkSize)
-	chunkViews := ViewFromChunks(ctx, lookupFn, chunks, 0, fileSize)
+	chunkViews, err := ViewFromChunks(ctx, lookupFn, chunks, 0, fileSize)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	readerAt := &ChunkReadAt{
 		chunkViews:  chunkViews,

@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    Router,
+    extract::{Request, State, connect_info::ConnectInfo},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get},
-    Router,
 };
 
 use crate::config::ReadMode;
@@ -73,8 +73,6 @@ pub struct VolumeServerState {
     pub volume_state_notify: tokio::sync::Notify,
     /// Optional batched write queue for improved throughput under load.
     pub write_queue: std::sync::OnceLock<WriteQueue>,
-    /// Registry of S3 tier backends for tiered storage operations.
-    pub s3_tier_registry: std::sync::RwLock<crate::remote_storage::s3_tier::S3TierRegistry>,
     /// Read mode: local, proxy, or redirect for non-local volumes.
     pub read_mode: ReadMode,
     /// If true, FetchAndWriteNeedle skips remote S3 endpoint validation,
@@ -116,6 +114,21 @@ pub struct VolumeServerState {
     pub cli_white_list: Vec<String>,
     /// Path to state.pb file for persisting VolumeServerState across restarts.
     pub state_file_path: String,
+    /// Volumes with an EC decode in flight. A dropped request leaves the
+    /// blocking job running; this keeps a retry from racing it on the
+    /// same volume files.
+    pub ec_decodes_in_flight:
+        std::sync::Mutex<std::collections::HashSet<crate::storage::types::VolumeId>>,
+    /// Volumes whose EC decode is in its publishing tail (journal catch-up,
+    /// .idx write, compaction). Local .ecj appenders wait on
+    /// `ec_decode_tail_notify` while their vid is listed, so no committed
+    /// delete falls between the last catch_up and the .cpd/.cpx swap —
+    /// the per-volume slice of Go's EcVolume.ecjFileAccessLock.
+    pub ec_decode_tail:
+        std::sync::Mutex<std::collections::HashSet<crate::storage::types::VolumeId>>,
+    /// Wakes .ecj appenders waiting on `ec_decode_tail` when a decode's
+    /// publishing tail ends.
+    pub ec_decode_tail_notify: tokio::sync::Notify,
 }
 
 impl VolumeServerState {
@@ -200,9 +213,7 @@ pub fn to_http_address(addr: &str) -> std::borrow::Cow<'_, str> {
         // rather than being silently rewritten. Mirrors the validation already
         // done in `to_grpc_address` for the inverse direction.
         if let (Ok(_), Ok(_)) = (http_port.parse::<u16>(), grpc_port.parse::<u16>()) {
-            return std::borrow::Cow::Owned(
-                addr[..ports_sep_index + 1 + dot_idx].to_string(),
-            );
+            return std::borrow::Cow::Owned(addr[..ports_sep_index + 1 + dot_idx].to_string());
         }
     }
     std::borrow::Cow::Borrowed(addr)
@@ -312,16 +323,15 @@ async fn admin_store_handler(state: State<Arc<VolumeServerState>>, request: Requ
             )
         }
     };
-    if method == Method::GET {
-        if let Some(response_bytes) = response
+    if method == Method::GET
+        && let Some(response_bytes) = response
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|value| *value > 0)
-        {
-            super::server_stats::record_bytes_out(response_bytes);
-        }
+    {
+        super::server_stats::record_bytes_out(response_bytes);
     }
     super::server_stats::record_request_close();
     crate::metrics::INFLIGHT_REQUESTS_GAUGE
@@ -358,16 +368,15 @@ async fn public_store_handler(state: State<Arc<VolumeServerState>>, request: Req
         }
         _ => StatusCode::OK.into_response(),
     };
-    if method == Method::GET {
-        if let Some(response_bytes) = response
+    if method == Method::GET
+        && let Some(response_bytes) = response
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|value| *value > 0)
-        {
-            super::server_stats::record_bytes_out(response_bytes);
-        }
+    {
+        super::server_stats::record_bytes_out(response_bytes);
     }
     super::server_stats::record_request_close();
     crate::metrics::INFLIGHT_REQUESTS_GAUGE
@@ -432,13 +441,13 @@ pub fn build_admin_router_with_ui(state: Arc<VolumeServerState>, ui_enabled: boo
         .route("/healthz", get(handlers::healthz_handler))
         .route("/favicon.ico", get(handlers::favicon_handler))
         .route(
-            "/seaweedfsstatic/*path",
+            "/seaweedfsstatic/{*path}",
             get(handlers::static_asset_handler),
         )
         .route("/", any(admin_store_handler))
-        .route("/:path", any(admin_store_handler))
-        .route("/:vid/:fid", any(admin_store_handler))
-        .route("/:vid/:fid/:filename", any(admin_store_handler))
+        .route("/{path}", any(admin_store_handler))
+        .route("/{vid}/{fid}", any(admin_store_handler))
+        .route("/{vid}/{fid}/{filename}", any(admin_store_handler))
         .fallback(admin_store_handler);
     if ui_enabled {
         // Note: /stats/* endpoints are commented out in Go's volume_server.go (L130-134).
@@ -455,13 +464,13 @@ pub fn build_public_router(state: Arc<VolumeServerState>) -> Router {
     Router::new()
         .route("/favicon.ico", get(handlers::favicon_handler))
         .route(
-            "/seaweedfsstatic/*path",
+            "/seaweedfsstatic/{*path}",
             get(handlers::static_asset_handler),
         )
         .route("/", any(public_store_handler))
-        .route("/:path", any(public_store_handler))
-        .route("/:vid/:fid", any(public_store_handler))
-        .route("/:vid/:fid/:filename", any(public_store_handler))
+        .route("/{path}", any(public_store_handler))
+        .route("/{vid}/{fid}", any(public_store_handler))
+        .route("/{vid}/{fid}/{filename}", any(public_store_handler))
         .fallback(public_store_handler)
         .layer(middleware::from_fn(common_headers_middleware))
         .with_state(state)
@@ -516,7 +525,10 @@ mod tests {
         // "host:abc.def"), and silently rewriting it would just hide the bug.
         assert_eq!(to_http_address("host:abc.def"), "host:abc.def");
         assert_eq!(to_http_address("host:9333.notaport"), "host:9333.notaport");
-        assert_eq!(to_http_address("host:notaport.19333"), "host:notaport.19333");
+        assert_eq!(
+            to_http_address("host:notaport.19333"),
+            "host:notaport.19333"
+        );
         // Out-of-range ports must not be silently truncated either.
         assert_eq!(to_http_address("host:99999.19333"), "host:99999.19333");
     }

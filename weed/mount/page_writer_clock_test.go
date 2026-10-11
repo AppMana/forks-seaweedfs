@@ -41,7 +41,10 @@ func TestWriteAfterFutureChunkSurvivesCompaction(t *testing.T) {
 			t.Fatalf("write: %d, %v", written, status)
 		}
 		current := &filer_pb.FileChunk{FileId: fmt.Sprintf("1,%02x00000001", i+2), Size: 4, ModifiedTsNs: r.timestamps[i]}
-		live, garbage := filer.CompactFileChunks(context.Background(), nil, []*filer_pb.FileChunk{old, current})
+		live, garbage, err := filer.CompactFileChunks(context.Background(), nil, []*filer_pb.FileChunk{old, current})
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(live) != 1 || live[0] != current || len(garbage) != 1 || garbage[0] != old {
 			t.Fatalf("acknowledged overwrite discarded: old timestamp=%d write timestamp=%d live=%v", old.ModifiedTsNs, current.ModifiedTsNs, live)
 		}

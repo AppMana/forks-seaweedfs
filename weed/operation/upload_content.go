@@ -62,6 +62,7 @@ type UploadOption struct {
 	MaxAttempts       int                              // <=0 uses the default
 	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
 	AttemptTimeout    time.Duration                    // >0 bounds each upload attempt
+	FilerJwt          security.FilerJwtProvider        // credential for proxy chunk URLs; nil → process-wide jwt.filer_signing
 }
 
 type UploadResult struct {
@@ -194,11 +195,12 @@ func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
 	}
 }
 
-func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, fsync bool, err error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
 	doUploadFunc := func() error {
 		var host string
 		var auth security.EncodedJwt
-		fileId, host, auth, err = assignFn()
+		var fsync bool
+		fileId, host, auth, fsync, err = assignFn()
 		if err != nil {
 			return err
 		}
@@ -208,12 +210,19 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 			genUrl = func(host, fileId string) string { return fmt.Sprintf("http://%s/%s", host, fileId) }
 		}
 		uploadOption.UploadUrl = genUrl(host, fileId)
+		if fsync {
+			uploadOption.UploadUrl = util_http.AppendQueryParameter(uploadOption.UploadUrl, "fsync", "true")
+		}
 		uploadOption.Jwt = auth
 		if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
 			// The request addresses the filer, which authorizes it and mints the
 			// volume credential itself. The AssignVolume token is not a filer
 			// credential and gets the caller nowhere here.
-			uploadOption.Jwt = security.EncodedJwt(util_http.JwtForFilerServer(true))
+			if uploadOption.FilerJwt != nil {
+				uploadOption.Jwt = uploadOption.FilerJwt(true)
+			} else {
+				uploadOption.Jwt = security.EncodedJwt(util_http.JwtForFilerServer(true))
+			}
 		}
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
@@ -263,7 +272,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 		uploadOption.Md5 = base64.StdEncoding.EncodeToString(digest[:])
 	}
 
-	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, err error) {
+	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, fsync bool, err error) {
 		// grpc assign volume
 		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 			assignCtx, assignCancel := context.WithTimeout(context.Background(), assignVolumeTimeout)
@@ -278,6 +287,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 			}
 
 			fileId, auth = resp.FileId, security.EncodedJwt(resp.Auth)
+			fsync = resp.Fsync
 			loc := resp.Location
 			host = filerClient.AdjustedUrl(loc)
 
@@ -420,6 +430,7 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 			MimeType:          "",
 			PairMap:           nil,
 			Jwt:               option.Jwt,
+			BytesBuffer:       option.BytesBuffer,
 		})
 		if uploadResult == nil {
 			return

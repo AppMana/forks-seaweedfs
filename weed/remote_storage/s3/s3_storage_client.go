@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -229,6 +230,25 @@ type s3RemoteStorageClient struct {
 	conn s3iface.S3API
 }
 
+const (
+	defaultUploadConcurrency = 1
+	defaultReadConcurrency   = 5
+)
+
+func (s *s3RemoteStorageClient) uploadConcurrency() int {
+	if n := int(s.conf.GetUploadConcurrency()); n > 0 {
+		return n
+	}
+	return defaultUploadConcurrency
+}
+
+func (s *s3RemoteStorageClient) downloadConcurrency() int {
+	if n := int(s.conf.GetDownloadConcurrency()); n > 0 {
+		return n
+	}
+	return defaultReadConcurrency
+}
+
 var _ = remote_storage.RemoteStorageClient(&s3RemoteStorageClient{})
 
 func (s *s3RemoteStorageClient) Traverse(remote *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) (err error) {
@@ -374,12 +394,12 @@ func (s *s3RemoteStorageClient) StatFile(loc *remote_pb.RemoteStorageLocation) (
 }
 
 func (s *s3RemoteStorageClient) ReadFile(loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (data []byte, err error) {
-	return s.ReadFileWithConcurrency(loc, offset, size, 5)
+	return s.ReadFileWithConcurrency(loc, offset, size, 0)
 }
 
 func (s *s3RemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteStorageLocation, offset int64, size int64, concurrency int) (data []byte, err error) {
 	if concurrency <= 0 {
-		concurrency = 5
+		concurrency = s.downloadConcurrency()
 	}
 	downloader := s3manager.NewDownloaderWithClient(s.conn, func(u *s3manager.Downloader) {
 		u.PartSize = int64(4 * 1024 * 1024)
@@ -395,6 +415,9 @@ func (s *s3RemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteSto
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)),
 	})
 	if err != nil {
+		if isNoSuchKey(err) {
+			return nil, remote_storage.ErrRemoteObjectNotFound
+		}
 		return nil, fmt.Errorf("failed to download file %s%s: %v", loc.Bucket, loc.Path, err)
 	}
 	// The buffer is pre-sized to size, so a short read leaves the tail
@@ -414,12 +437,19 @@ func (s *s3RemoteStorageClient) ReadFileAsStream(ctx context.Context, loc *remot
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)),
 	})
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == s3.ErrCodeNoSuchKey {
+		if isNoSuchKey(err) {
 			return nil, remote_storage.ErrRemoteObjectNotFound
 		}
 		return nil, fmt.Errorf("failed to open stream for %s%s: %v", loc.Bucket, loc.Path, err)
 	}
 	return output.Body, nil
+}
+
+// isNoSuchKey matches only a missing key: a missing bucket is also a 404 but
+// says nothing about the object.
+func isNoSuchKey(err error) bool {
+	var aerr awserr.Error
+	return errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey
 }
 
 func (s *s3RemoteStorageClient) WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
@@ -493,7 +523,7 @@ func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, 
 	// Create an uploader with the session and custom options
 	uploader := s3manager.NewUploaderWithClient(s.conn, func(u *s3manager.Uploader) {
 		u.PartSize = partSize
-		u.Concurrency = 1
+		u.Concurrency = s.uploadConcurrency()
 	})
 
 	// process tagging

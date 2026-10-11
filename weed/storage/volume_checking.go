@@ -85,21 +85,18 @@ func (v *Volume) scrubVolumeData(idxFile *os.File, idxFileSize int64) (int64, []
 		if offset.IsZero() && size.IsDeleted() {
 			return nil
 		}
+		physicalSize := types.Size(size.Raw())
 		// compute the actual size of the needle in disk, including needle header, body and alignment padding.
-		actualSize := int64(needle.GetActualSize(size, version))
-
-		// TODO: Needle.ReadData() is currently broken for deleted files, which have a types.Size < 0. Fix
-		// so deleted needles get properly scrubbed as well.
-		// TODO: idx.WalkIndexFile() returns a size -1 (and actual size of 32 bytes) for deleted needles. We
-		// want to scrub deleted needles whenever possible.
-		if size.IsDeleted() {
-			totalRead += actualSize
-			return nil
-		}
+		actualSize := int64(needle.GetActualSize(physicalSize, version))
 
 		n := needle.Needle{}
-		if err := n.ReadData(v.DataBackend, offset.ToActualOffset(), size, version); err != nil {
+		if err := n.ReadData(v.DataBackend, offset.ToActualOffset(), physicalSize, version); err != nil {
 			errs = append(errs, fmt.Errorf("failed to read needle %d on volume %d: %v", id, v.Id, err))
+		} else if n.Id != id {
+			// The data CRC does not cover the header: a damaged needle id still
+			// reads clean while every live-needle lookup on this replica keeps
+			// finding the index key here.
+			errs = append(errs, fmt.Errorf("index key %v does not match needle's Id %v on volume %d", id, n.Id, v.Id))
 		}
 
 		totalRead += actualSize
@@ -149,7 +146,7 @@ func CheckVolumeDataIntegrity(v *Volume, indexFile *os.File) (lastAppendAtNs uin
 		return 0, nil
 	}
 	// The deeper-than-tail structural check (every (offset + actual size)
-	// fits inside .dat — issue #8928) lives in volume.load(): it reads
+	// fits inside .dat) lives in volume.load(): it reads
 	// MaximumNeedleEnd from the needle map after the load walk, so we don't
 	// need a redundant linear scan of the .idx here.
 
@@ -159,7 +156,7 @@ func CheckVolumeDataIntegrity(v *Volume, indexFile *os.File) (lastAppendAtNs uin
 	// puts the highest-key needle last instead of the .dat-tail needle. Picking
 	// the last file-position entry there compares a mid-file needle's tail
 	// against the full .dat size and falsely flips the volume read-only on every
-	// load (issue #9688).
+	// load.
 	tailEntryPos, err := findDatTailEntryOffset(v, indexFile, indexSize)
 	if err != nil {
 		return 0, fmt.Errorf("CheckVolumeDataIntegrity %s: %v", indexFile.Name(), err)
@@ -218,14 +215,8 @@ func findDatTailEntryOffset(v *Volume, indexFile *os.File, indexSize int64) (int
 }
 
 // needleDiskEnd returns the byte offset just past the needle's on-disk record.
-// Deletion tombstones carry TombstoneFileSize (-1) in the .idx but are written
-// with DataSize=0, so their on-disk record is sized as 0.
 func needleDiskEnd(offset types.Offset, size types.Size, version needle.Version) int64 {
-	onDiskSize := size
-	if size.IsDeleted() {
-		onDiskSize = 0
-	}
-	return offset.ToActualOffset() + needle.GetActualSize(onDiskSize, version)
+	return offset.ToActualOffset() + needle.GetActualSize(types.Size(size.Raw()), version)
 }
 
 func doCheckAndFixVolumeData(v *Volume, indexFile *os.File, indexOffset int64) (lastAppendAtNs uint64, err error) {
@@ -273,7 +264,7 @@ func (v *Volume) recoverLastModifiedTs(indexFile *os.File) {
 	if err != nil || indexSize == 0 {
 		return
 	}
-	appendAtNs, err := findLastWriteAppendAtNs(v, indexFile, indexSize)
+	appendAtNs, key, err := findLastWriteAppendAtNs(v, indexFile, indexSize)
 	if err != nil {
 		glog.Warningf("volume %d recover last write from %s: %v", v.Id, indexFile.Name(), err)
 		return
@@ -282,6 +273,11 @@ func (v *Volume) recoverLastModifiedTs(indexFile *os.File) {
 		return
 	}
 	v.lastModifiedTsSeconds = appendAtNs / uint64(time.Second)
+	if appendAtNs > v.lastWriteAppendAtNs {
+		v.lastWriteAppendAtNs = appendAtNs
+		v.lastWriteNeedleKey = key
+		v.lastWriteDeleted = false
+	}
 }
 
 // vacuumedLastWriteScanEntries bounds the work a vacuumed volume's recovery
@@ -294,22 +290,27 @@ var vacuumedLastWriteScanEntries = 1 << 16
 
 // findLastWriteAppendAtNs scans the .idx backwards for the newest write -- an
 // entry that is not a deletion tombstone -- and returns that needle's append
-// timestamp. The .idx and the .dat share an order, so an append-ordered volume
-// answers with the first write the scan reaches. Vacuum rewrites both in key
-// order, which tracks write order only because the master issues keys
-// increasing: an overwrite keeps its original, lower key, so a vacuumed volume
-// has to take the maximum over every write it indexes. Returns 0 when the .idx
-// holds nothing but tombstones, when a vacuumed volume holds more needles than
-// the scan budget, or for a volume older than version 3, whose needles carry no
-// append timestamp.
-func findLastWriteAppendAtNs(v *Volume, indexFile *os.File, indexSize int64) (uint64, error) {
+// timestamp and key. The .idx and the .dat share an order, so an
+// append-ordered volume answers with the first write the scan reaches. Vacuum
+// rewrites both in key order, which tracks write order only because the master
+// issues keys increasing: an overwrite keeps its original, lower key, so a
+// vacuumed volume has to take the maximum over every write it indexes. Returns
+// 0 when the .idx holds nothing but tombstones, when a vacuumed volume holds
+// more needles than the scan budget, or for a volume older than version 3,
+// whose needles carry no append timestamp.
+func findLastWriteAppendAtNs(v *Volume, indexFile *os.File, indexSize int64) (uint64, types.NeedleId, error) {
 	version := v.Version()
 	if version != needle.Version3 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	scanEveryWrite := v.SuperBlock.CompactionRevision > 0
 	entryBudget := vacuumedLastWriteScanEntries
+	if scanEveryWrite && !affordableVacuumedScan(indexFile, indexSize, v.Id, v.FileName(".dat")) {
+		return 0, 0, nil
+	}
 	var lastWriteAppendAtNs uint64
+	var lastWriteKey types.NeedleId
+	dead := make(map[types.NeedleId]struct{})
 	block := make([]byte, types.NeedleMapEntrySize*idx.RowsToRead)
 	for end := indexSize; end > 0; {
 		start := max(end-int64(len(block)), 0)
@@ -319,11 +320,17 @@ func findLastWriteAppendAtNs(v *Volume, indexFile *os.File, indexSize int64) (ui
 			err = nil
 		}
 		if err != nil {
-			return 0, fmt.Errorf("read %s at %d: %v", indexFile.Name(), start, err)
+			return 0, 0, fmt.Errorf("read %s at %d: %v", indexFile.Name(), start, err)
 		}
 		for i := len(entries) - types.NeedleMapEntrySize; i >= 0; i -= types.NeedleMapEntrySize {
 			key, offset, size := idx.IdxFileEntry(entries[i : i+types.NeedleMapEntrySize])
+			// The first row a key presents is its latest state: a tombstone
+			// there retires the write rows beneath it.
+			if _, gone := dead[key]; gone {
+				continue
+			}
 			if offset.IsZero() || size.IsDeleted() {
+				dead[key] = struct{}{}
 				continue
 			}
 			needleOffset := findNeedleOffset(v.DataBackend, version, offset.ToActualOffset(), key, size)
@@ -332,21 +339,78 @@ func findLastWriteAppendAtNs(v *Volume, indexFile *os.File, indexSize int64) (ui
 			}
 			appendAtNs, err := readNeedleAppendAtNs(v.DataBackend, needleOffset, size)
 			if err != nil {
-				return 0, err
+				return 0, 0, err
 			}
-			lastWriteAppendAtNs = max(lastWriteAppendAtNs, appendAtNs)
+			if appendAtNs > lastWriteAppendAtNs {
+				lastWriteAppendAtNs = appendAtNs
+				lastWriteKey = key
+			}
 			if !scanEveryWrite {
-				return lastWriteAppendAtNs, nil
+				return lastWriteAppendAtNs, lastWriteKey, nil
 			}
 			if entryBudget--; entryBudget == 0 {
 				glog.V(0).Infof("volume %d: more than %d needles to scan for its last write, keeping the %s mtime",
 					v.Id, vacuumedLastWriteScanEntries, v.FileName(".dat"))
-				return 0, nil
+				return 0, 0, nil
 			}
 		}
 		end = start
 	}
-	return lastWriteAppendAtNs, nil
+	return lastWriteAppendAtNs, lastWriteKey, nil
+}
+
+// affordableVacuumedScan reports whether a vacuumed volume's recovery scan fits
+// its budget. A vacuumed volume must take the maximum over every write it
+// indexes, so a volume holding more live needles than vacuumedLastWriteScanEntries
+// would spend up to two random .dat reads per needle and then give up, keeping
+// the .dat mtime anyway. Counting the live .idx entries first is one short
+// sequential pass over a small file, and it skips the scan before any .dat I/O
+// when the scan provably cannot succeed.
+func affordableVacuumedScan(indexFile *os.File, indexSize int64, volumeId needle.VolumeId, datFileName string) bool {
+	liveEntries, err := countLiveIndexEntries(indexFile, indexSize, vacuumedLastWriteScanEntries)
+	if err != nil {
+		glog.Warningf("volume %d count live entries in %s: %v", volumeId, indexFile.Name(), err)
+		return true
+	}
+	if liveEntries >= vacuumedLastWriteScanEntries {
+		glog.V(0).Infof("volume %d: more than %d needles to scan for its last write, keeping the %s mtime",
+			volumeId, vacuumedLastWriteScanEntries, datFileName)
+		return false
+	}
+	return true
+}
+
+// countLiveIndexEntries counts the .idx entries describing a live needle,
+// stopping early once the count passes limit. Tombstones and zero offsets are
+// skipped exactly as findLastWriteAppendAtNs skips them.
+func countLiveIndexEntries(indexFile *os.File, indexSize int64, limit int) (int, error) {
+	count := 0
+	block := make([]byte, types.NeedleMapEntrySize*idx.RowsToRead)
+	for start := int64(0); start < indexSize; {
+		end := start + int64(len(block))
+		if end > indexSize {
+			end = indexSize
+		}
+		entries := block[:end-start]
+		readCount, err := indexFile.ReadAt(entries, start)
+		if err == io.EOF && readCount == len(entries) {
+			err = nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read %s at %d: %v", indexFile.Name(), start, err)
+		}
+		for i := 0; i+types.NeedleMapEntrySize <= len(entries); i += types.NeedleMapEntrySize {
+			_, offset, size := idx.IdxFileEntry(entries[i : i+types.NeedleMapEntrySize])
+			if offset.IsZero() || size.IsDeleted() {
+				continue
+			}
+			if count++; count > limit {
+				return count, nil
+			}
+		}
+		start = end
+	}
+	return count, nil
 }
 
 // findNeedleOffset returns the .dat offset holding the needle an .idx entry

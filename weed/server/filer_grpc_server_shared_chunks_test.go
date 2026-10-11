@@ -63,7 +63,7 @@ func linkSharedTestEntries(t *testing.T, f *filer.Filer, src, dst string) {
 		for k, v := range source.Extended {
 			marked.Extended[k] = v
 		}
-		if err := f.UpdateEntry(ctx, source, marked); err != nil {
+		if err := f.UpdateEntry(ctx, source, marked, false); err != nil {
 			t.Fatal(err)
 		}
 	}

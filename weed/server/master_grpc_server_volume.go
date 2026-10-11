@@ -383,7 +383,7 @@ func (ms *MasterServer) VacuumVolume(ctx context.Context, req *master_pb.VacuumV
 
 	resp := &master_pb.VacuumVolumeResponse{}
 
-	if err := ms.Topo.VacuumWithContext(ctx, ms.grpcDialOption, float64(req.GarbageThreshold), ms.option.MaxParallelVacuumPerServer, req.VolumeId, req.Collection, ms.preallocateSize, false); err != nil {
+	if err := ms.Topo.VacuumWithContext(ctx, ms.grpcDialOption, float64(req.GarbageThreshold), ms.option.MaxParallelVacuumPerServer, req.VolumeId, req.Collection, ms.preallocateSize, false, 0); err != nil {
 		return nil, status.FromContextError(err).Err()
 	}
 

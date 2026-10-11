@@ -62,6 +62,7 @@ type FilerSink struct {
 	signature         int32
 	activeTransfers   sync.Map // chunkFileId -> *ChunkTransferStatus
 	uploader          *operation.Uploader
+	jwtForFiler       security.FilerJwtProvider
 	// lastServedFileId is the most recent chunk the source did serve, the probe
 	// sourceStillServesChunks re-checks before writing an entry off.
 	lastServedFileId atomic.Pointer[string]
@@ -116,6 +117,12 @@ func (fs *FilerSink) SetUploader(uploader *operation.Uploader) {
 	fs.uploader = uploader
 }
 
+// SetFilerJwtProvider sets the filer API credential for proxied chunk writes.
+// Must be called during initialization, before any replication goroutines start.
+func (fs *FilerSink) SetFilerJwtProvider(provider security.FilerJwtProvider) {
+	fs.jwtForFiler = provider
+}
+
 func (fs *FilerSink) getUploader() (*operation.Uploader, error) {
 	if fs.uploader != nil {
 		return fs.uploader, nil
@@ -165,14 +172,34 @@ func (fs *FilerSink) ActiveTransfers() []ChunkTransferSnapshot {
 }
 
 func (fs *FilerSink) DeleteEntry(key string, isDirectory, deleteIncludeChunks bool, signatures []int32) error {
+	return fs.deleteEntry(key, deleteIncludeChunks, false, signatures)
+}
+
+func (fs *FilerSink) DeleteEntryKeepingRemoteObject(key string, isDirectory, deleteIncludeChunks bool, signatures []int32) error {
+	return fs.deleteEntry(key, deleteIncludeChunks, true, signatures)
+}
+
+func (fs *FilerSink) deleteEntry(key string, deleteIncludeChunks, keepRemoteObject bool, signatures []int32) error {
 
 	dir, name := util.FullPath(key).DirAndName()
 
 	glog.V(4).Infof("delete entry: %v", key)
-	err := filer_pb.Remove(context.Background(), fs, dir, name, deleteIncludeChunks, true, true, true, signatures)
+	err := fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		_, err := filer_pb.DoRemoveRequest(context.Background(), client, &filer_pb.DeleteEntryRequest{
+			Directory:            dir,
+			Name:                 name,
+			IsDeleteData:         deleteIncludeChunks,
+			IsRecursive:          true,
+			IgnoreRecursiveError: true,
+			IsFromOtherCluster:   true,
+			Signatures:           signatures,
+			KeepRemoteObject:     keepRemoteObject,
+		})
+		return err
+	})
 	if err != nil {
 		glog.V(0).Infof("delete entry %s: %v", key, err)
-		return fmt.Errorf("delete entry %s: %v", key, err)
+		return fmt.Errorf("delete entry %s: %w", key, err)
 	}
 	return nil
 }
@@ -292,7 +319,7 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 		glog.V(3).Infof("create: %v", request)
 		if err := filer_pb.CreateEntry(context.Background(), client, request); err != nil {
 			glog.V(0).Infof("create entry %s: %v", key, err)
-			return fmt.Errorf("create entry %s: %v", key, err)
+			return fmt.Errorf("create entry %s: %w", key, err)
 		}
 
 		return nil
@@ -325,7 +352,7 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 	})
 
 	if err != nil {
-		return false, fmt.Errorf("lookup %s: %v", key, err)
+		return false, fmt.Errorf("lookup %s: %w", key, err)
 	}
 
 	glog.V(4).Infof("oldEntry %+v, newEntry %+v, existingEntry: %+v", oldEntry, newEntry, existingEntry)
@@ -358,9 +385,9 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		existingEntry.RemoteEntry = newEntry.RemoteEntry
 	default:
 		// source-side chunks resolve via source filer; sink volume IDs may collide.
-		deletedChunks, newChunks, err := compareChunks(context.Background(), filer.LookupFn(fs.filerSource), oldEntry, newEntry)
+		deletedChunks, newChunks, err := compareChunks(context.Background(), filer.LookupFn(fs.filerSource), fs.filerSource.FilerJwt(), oldEntry, newEntry)
 		if err != nil {
-			return true, fmt.Errorf("replicate %s compare chunks error: %v", key, err)
+			return true, fmt.Errorf("replicate %s compare chunks error: %w", key, err)
 		}
 
 		// delete the chunks that are deleted from the source
@@ -397,19 +424,19 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		}
 
 		if _, err := client.UpdateEntry(context.Background(), request); err != nil {
-			return fmt.Errorf("update existingEntry %s: %v", key, err)
+			return fmt.Errorf("update existingEntry %s: %w", key, err)
 		}
 
 		return nil
 	})
 
 }
-func compareChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, oldEntry, newEntry *filer_pb.Entry) (deletedChunks, newChunks []*filer_pb.FileChunk, err error) {
-	aData, aMeta, aErr := filer.ResolveChunkManifest(ctx, lookupFileIdFn, oldEntry.GetChunks(), 0, math.MaxInt64, nil)
+func compareChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, filerJwtFn security.FilerJwtProvider, oldEntry, newEntry *filer_pb.Entry) (deletedChunks, newChunks []*filer_pb.FileChunk, err error) {
+	aData, aMeta, aErr := filer.ResolveChunkManifestWithFilerJwt(ctx, lookupFileIdFn, filerJwtFn, oldEntry.GetChunks(), 0, math.MaxInt64, nil)
 	if aErr != nil {
 		return nil, nil, aErr
 	}
-	bData, bMeta, bErr := filer.ResolveChunkManifest(ctx, lookupFileIdFn, newEntry.GetChunks(), 0, math.MaxInt64, nil)
+	bData, bMeta, bErr := filer.ResolveChunkManifestWithFilerJwt(ctx, lookupFileIdFn, filerJwtFn, newEntry.GetChunks(), 0, math.MaxInt64, nil)
 	if bErr != nil {
 		return nil, nil, bErr
 	}

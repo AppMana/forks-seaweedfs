@@ -33,6 +33,22 @@ func ResolveS3Action(r *http.Request, baseAction string, bucket string, object s
 		return baseAction
 	}
 
+	// Dedicated object-lock actions already name the operation — a query
+	// parameter must not re-map them. In particular the governance-bypass
+	// check authorizes against a synthetic DELETE ?versionId request, whose
+	// shape would otherwise resolve to s3:DeleteObjectVersion and satisfy
+	// the bypass check with the delete-version permission alone.
+	switch baseAction {
+	case s3_constants.ACTION_BYPASS_GOVERNANCE_RETENTION,
+		s3_constants.ACTION_GET_OBJECT_RETENTION,
+		s3_constants.ACTION_PUT_OBJECT_RETENTION,
+		s3_constants.ACTION_GET_OBJECT_LEGAL_HOLD,
+		s3_constants.ACTION_PUT_OBJECT_LEGAL_HOLD,
+		s3_constants.ACTION_GET_BUCKET_OBJECT_LOCK_CONFIG,
+		s3_constants.ACTION_PUT_BUCKET_OBJECT_LOCK_CONFIG:
+		return mapBaseActionToS3Format(baseAction)
+	}
+
 	if r == nil || r.URL == nil {
 		// No HTTP context available: fall back to coarse-grained mapping
 		// This ensures consistent behavior and avoids returning empty strings
@@ -116,11 +132,6 @@ var bucketQueryActions = map[string]map[string]string{
 		http.MethodPut:    s3_constants.S3_ACTION_PUT_BUCKET_OWNERSHIP_CONTROLS,
 		http.MethodDelete: s3_constants.S3_ACTION_PUT_BUCKET_OWNERSHIP_CONTROLS, // DELETE uses same permission as PUT
 	},
-	// SeaweedFS extension: bucket quota subresource
-	"seaweedfs-quota": {
-		http.MethodGet: s3_constants.S3_ACTION_GET_BUCKET_QUOTA,
-		http.MethodPut: s3_constants.S3_ACTION_PUT_BUCKET_QUOTA,
-	},
 }
 
 // resolveFromQueryParameters checks query parameters to determine specific S3 actions
@@ -130,7 +141,9 @@ func resolveFromQueryParameters(query url.Values, method string, hasObject bool)
 	if hasObject && query.Has("uploadId") {
 		switch method {
 		case http.MethodPut:
-			if query.Has("partNumber") {
+			// Match the multipart route's [0-9]+ pattern; invalid part parameters fall through to regular uploads.
+			partNumber := query.Get("partNumber")
+			if partNumber != "" && strings.Trim(partNumber, "0123456789") == "" {
 				return s3_constants.S3_ACTION_UPLOAD_PART
 			}
 		case http.MethodPost:
@@ -265,6 +278,17 @@ func resolveFromQueryParameters(query url.Values, method string, hasObject bool)
 	// Example: POST /bucket?delete (not POST /bucket/object?delete)
 	if query.Has("delete") && method == http.MethodPost && !hasObject {
 		return s3_constants.S3_ACTION_DELETE_OBJECT
+	}
+
+	// SeaweedFS extension: the quota routes are registered last among the
+	// bucket subresource routes, so resolve seaweedfs-quota last to match.
+	if !hasObject && query.Has("seaweedfs-quota") {
+		switch method {
+		case http.MethodGet:
+			return s3_constants.S3_ACTION_GET_BUCKET_QUOTA
+		case http.MethodPut:
+			return s3_constants.S3_ACTION_PUT_BUCKET_QUOTA
+		}
 	}
 
 	return ""

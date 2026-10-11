@@ -72,6 +72,15 @@ func (c *testFilerClient) ListEntries(ctx context.Context, in *filer_pb.ListEntr
 	return &testListEntriesStream{entries: entries}, nil
 }
 
+func (c *testFilerClient) LookupDirectoryEntry(ctx context.Context, in *filer_pb.LookupDirectoryEntryRequest, opts ...grpc.CallOption) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	for _, e := range c.entriesByDir[in.Directory] {
+		if e.Name == in.Name {
+			return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
+		}
+	}
+	return nil, filer_pb.ErrNotFound
+}
+
 type markerEchoFilerClient struct {
 	filer_pb.SeaweedFilerClient
 	entriesByDir    map[string][]*filer_pb.Entry
@@ -119,7 +128,7 @@ func TestListObjectsHandler(t *testing.T) {
 	// https://docs.aws.amazon.com/AmazonS3/latest/API/v2-RESTBucketGET.html
 
 	expected := `<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult><Name>test_container</Name><Prefix></Prefix><Marker></Marker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>1.zip</Key><ETag>&#34;4397da7a7649e8085de9916c240e8166&#34;</ETag><Size>1234567</Size><Owner><ID>65a011niqo39cdf8ec533ec3d1ccaafsa932</ID></Owner><StorageClass>STANDARD</StorageClass><LastModified>2011-04-09T12:34:49Z</LastModified></Contents><EncodingType></EncodingType></ListBucketResult>`
+<ListBucketResult><Name>test_container</Name><Prefix></Prefix><Marker></Marker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>1.zip</Key><ETag>&#34;4397da7a7649e8085de9916c240e8166&#34;</ETag><Size>1234567</Size><Owner><ID>65a011niqo39cdf8ec533ec3d1ccaafsa932</ID></Owner><StorageClass>STANDARD</StorageClass><LastModified>2011-04-09T12:34:49.000Z</LastModified></Contents><EncodingType></EncodingType></ListBucketResult>`
 
 	response := ListBucketResult{
 		Name:        "test_container",
@@ -166,11 +175,12 @@ func Test_normalizePrefixMarker(t *testing.T) {
 		marker string
 	}
 	tests := []struct {
-		name              string
-		args              args
-		wantAlignedDir    string
-		wantAlignedPrefix string
-		wantAlignedMarker string
+		name                      string
+		args                      args
+		wantAlignedDir            string
+		wantAlignedPrefix         string
+		wantAlignedMarker         string
+		wantPrefixEndsOnDelimiter bool
 	}{
 		{"bucket root listing with delimiter",
 			args{"/",
@@ -178,6 +188,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"",
 			"",
+			true,
 		},
 		{"prefix is a directory",
 			args{"/parentDir/data/",
@@ -185,6 +196,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"parentDir",
 			"data",
 			"",
+			true,
 		},
 		{"normal case",
 			args{"/parentDir/data/0",
@@ -192,6 +204,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"parentDir/data",
 			"0",
 			"0e/0e149049a2137b0cc12e",
+			false,
 		},
 		{"empty prefix",
 			args{"",
@@ -199,6 +212,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"",
 			"parentDir/data/0e/0e149049a2137b0cc12e",
+			false,
 		},
 		{"empty directory",
 			args{"parent",
@@ -206,6 +220,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"parent",
 			"parentDir/data/0e/0e149049a2137b0cc12e",
+			false,
 		},
 		{"partial name prefix, marker resumes inside a matching subdirectory",
 			args{"data/a",
@@ -213,6 +228,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"data",
 			"a",
 			"a/1",
+			false,
 		},
 		{"partial name prefix, marker resumes inside a matching sibling directory",
 			args{"data/a",
@@ -220,6 +236,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"data",
 			"a",
 			"ab/1",
+			false,
 		},
 		{"top-level partial name prefix, marker resumes inside a matching subdirectory",
 			args{"a",
@@ -227,14 +244,32 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"a",
 			"a/1",
+			false,
+		},
+		{"marker sorts before the prefix, so it excludes nothing under it",
+			args{"parentDir/data/",
+				"parentDir"},
+			"parentDir",
+			"data",
+			"",
+			true,
+		},
+		{"marker is the prefix directory, whose own key it excludes",
+			args{"parentDir/data/",
+				"parentDir/data/"},
+			"parentDir/data",
+			"",
+			"",
+			false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotAlignedDir, gotAlignedPrefix, gotAlignedMarker := normalizePrefixMarker(tt.args.prefix, tt.args.marker)
+			gotAlignedDir, gotAlignedPrefix, gotAlignedMarker, gotPrefixEndsOnDelimiter := normalizePrefixMarker(tt.args.prefix, tt.args.marker)
 			assert.Equalf(t, tt.wantAlignedDir, gotAlignedDir, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
 			assert.Equalf(t, tt.wantAlignedPrefix, gotAlignedPrefix, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
 			assert.Equalf(t, tt.wantAlignedMarker, gotAlignedMarker, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
+			assert.Equalf(t, tt.wantPrefixEndsOnDelimiter, gotPrefixEndsOnDelimiter, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
 		})
 	}
 }
@@ -632,12 +667,48 @@ func TestMaxKeysParameterValidation(t *testing.T) {
 		assert.Equal(t, s3err.ErrInvalidMaxKeys, errCode, "non-numeric max-keys should return ErrInvalidMaxKeys")
 	})
 
+	t.Run("out of range max-keys values should return error", func(t *testing.T) {
+		for _, v := range []string{"-1", "2147483648", "1.5", " 10"} {
+			values := map[string][]string{
+				"max-keys": {v},
+			}
+			_, _, _, _, _, _, errCode := getListObjectsV1Args(values)
+			assert.Equal(t, s3err.ErrInvalidMaxKeys, errCode, "V1 max-keys=%q should return ErrInvalidMaxKeys", v)
+
+			_, _, _, _, _, _, _, _, errCode = getListObjectsV2Args(values)
+			assert.Equal(t, s3err.ErrInvalidMaxKeys, errCode, "V2 max-keys=%q should return ErrInvalidMaxKeys", v)
+		}
+	})
+
+	t.Run("max-keys up to 2147483647 is accepted and capped at 1000", func(t *testing.T) {
+		for v, want := range map[string]int{
+			"0":          0,
+			"999":        999,
+			"1000":       1000,
+			"1001":       1000,
+			"32768":      1000,
+			"65536":      1000,
+			"2147483647": 1000,
+		} {
+			values := map[string][]string{
+				"max-keys": {v},
+			}
+			_, _, _, _, maxkeys, _, errCode := getListObjectsV1Args(values)
+			assert.Equal(t, s3err.ErrNone, errCode, "V1 max-keys=%q should not return error", v)
+			assert.Equal(t, uint16(want), maxkeys, "V1 max-keys=%q", v)
+
+			_, _, _, _, _, _, maxkeys2, _, errCode := getListObjectsV2Args(values)
+			assert.Equal(t, s3err.ErrNone, errCode, "V2 max-keys=%q should not return error", v)
+			assert.Equal(t, uint16(want), maxkeys2, "V2 max-keys=%q", v)
+		}
+	})
+
 	t.Run("empty max-keys should use default", func(t *testing.T) {
 		// Test empty max-keys
 		values := map[string][]string{}
 		_, _, _, _, maxkeys, _, errCode := getListObjectsV1Args(values)
 		assert.Equal(t, s3err.ErrNone, errCode, "empty max-keys should not return error")
-		assert.Equal(t, int16(1000), maxkeys, "empty max-keys should use default value")
+		assert.Equal(t, uint16(1000), maxkeys, "empty max-keys should use default value")
 
 		_, _, _, _, _, _, maxkeys2, _, errCode := getListObjectsV2Args(values)
 		assert.Equal(t, s3err.ErrNone, errCode, "empty max-keys should not return error")

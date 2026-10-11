@@ -121,7 +121,7 @@ func TestFilerRequestsGiveUpOnASilentFiler(t *testing.T) {
 	})
 	withinDeadline(t, "rename", func() {
 		req := &filer_pb.StreamRenameEntryRequest{OldDirectory: "/dir", OldName: "a", NewDirectory: "/dir", NewName: "b"}
-		if err := wfs.doRename(context.Background(), req, "/dir/a", "/dir/b"); err == nil {
+		if err := wfs.doRename(context.Background(), req, "/dir/a", "/dir/b", nil); err == nil {
 			t.Error("rename succeeded against a silent filer")
 		}
 	})

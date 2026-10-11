@@ -61,7 +61,7 @@ func (ms *MasterServer) volumeVacuumHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	// glog.Infoln("garbageThreshold =", gcThreshold)
-	if err := ms.Topo.VacuumWithContext(r.Context(), ms.grpcDialOption, gcThreshold, ms.option.MaxParallelVacuumPerServer, 0, "", ms.preallocateSize, false); err != nil {
+	if err := ms.Topo.VacuumWithContext(r.Context(), ms.grpcDialOption, gcThreshold, ms.option.MaxParallelVacuumPerServer, 0, "", ms.preallocateSize, false, 0); err != nil {
 		writeJsonError(w, r, http.StatusRequestTimeout, err)
 		return
 	}

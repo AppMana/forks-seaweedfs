@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/credential"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"golang.org/x/sync/singleflight"
@@ -89,9 +91,16 @@ type FilerOption struct {
 	TusSessionExpiry          time.Duration
 	S3ConfigFile              string // optional path to static S3 identity config file
 	CredentialManager         *credential.CredentialManager
+	// AnnounceCh, when set, must be closed before the filer registers on the
+	// master; it joins the filer list only once the gRPC port is serving and
+	// the metadata replay has caught up with the peers found at startup.
+	AnnounceCh chan struct{}
 	// AllowUntrustedRemoteEndpoints lets a read of a remote-only entry dial a
 	// mounted endpoint that resolves to a loopback / private / metadata host.
 	AllowUntrustedRemoteEndpoints bool
+	// RemoteCacheEvictThreshold is the disk usage fraction at which the filer
+	// evicts remote-mounted cached chunks; 0 disables eviction.
+	RemoteCacheEvictThreshold float64
 }
 
 type FilerServer struct {
@@ -121,6 +130,15 @@ type FilerServer struct {
 	// deduplicates concurrent remote object caching operations
 	remoteCacheGroup singleflight.Group
 
+	// serializes remote-cache eviction passes; lastVacuum rate-limits the
+	// compaction trigger that reclaims evicted chunks.
+	remoteCacheEvictMu       sync.Mutex
+	remoteCacheLastVacuum    atomic.Pointer[time.Time]
+	remoteCacheEvictCtx      context.Context
+	remoteCacheEvictCancel   context.CancelFunc
+	remoteCachePendingVidsMu sync.Mutex
+	remoteCachePendingVids   map[uint32]int
+
 	recentCopyRequestsMu sync.Mutex
 	recentCopyRequests   map[string]recentCopyRequest
 
@@ -135,6 +153,21 @@ type FilerServer struct {
 	// a concurrent PATCH or DELETE is refused instead of recording duplicate
 	// chunks behind the first request's back.
 	tusActiveUploads sync.Map
+
+	// ringPeerIPs caches resolved ring member addresses per ring version so
+	// verifying a forwarded request's peer does not pay a DNS lookup per hop.
+	ringPeerIPs      atomic.Pointer[ringPeerIPs]
+	ringResolveGroup singleflight.Group
+
+	// masterCtx drives KeepConnectedToMaster; cancelling it ends the stream
+	// so the master drops this filer from its list before gRPC stops.
+	masterCtx    context.Context
+	masterCancel context.CancelFunc
+
+	// startupPeers are the filers discovered during NewFilerServer, before
+	// this filer announced itself; AnnounceOnceCaughtUp waits for their
+	// replayed backlogs before the filer joins the master's list.
+	startupPeers []pb.ServerAddress
 
 	// entryLockTable serializes mutations to the same entry path on this filer.
 	// CreateEntry takes it today; UpdateEntry and DeleteEntry are intended to take
@@ -151,6 +184,12 @@ type FilerServer struct {
 	posixLocks *posixlock.Manager
 	// posixLockSweeperStop stops the lease-reaping sweeper goroutine on Shutdown.
 	posixLockSweeperStop chan struct{}
+
+	// subscriptionsStopped is cancelled by StopSubscriptions when the filer
+	// starts shutting down; every metadata subscription derives its context
+	// from it as well as from its stream.
+	subscriptionsStopped context.Context
+	stopSubscriptions    context.CancelFunc
 	// posixLockReadyAt is the unix-nanos when this filer began serving POSIX
 	// locks. For posixLockWarmup after it, the owner defers would-be grants while
 	// mounts re-assert, so a (re)started owner does not double-grant from empty
@@ -201,9 +240,11 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		entryLockTable:        util.NewLockTable[util.FullPath](),
 		posixLocks:            posixlock.NewManager(),
 	}
+	fs.subscriptionsStopped, fs.stopSubscriptions = context.WithCancel(context.Background())
 	fs.startPosixLockSweeper()
 	fs.mountPeerRegistry = filer.NewMountPeerRegistry()
 	go fs.runMountPeerRegistrySweeper()
+	fs.remoteCacheEvictCtx, fs.remoteCacheEvictCancel = context.WithCancel(context.Background())
 
 	option.Masters.RefreshBySrvIfAvailable()
 	if len(option.Masters.GetInstances()) == 0 {
@@ -234,6 +275,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.filer.RemoteStorage.SetConfValidator(func(ctx context.Context, conf *remote_pb.RemoteConf) error {
 		return ValidateRemoteConfForLoad(ctx, conf, option.AllowUntrustedRemoteEndpoints)
 	})
+	go fs.runRemoteCacheEviction()
 	// we do not support IP whitelist right now https://github.com/seaweedfs/seaweedfs/issues/7094
 	if v.GetString("guard.white_list") != "" {
 		glog.Warningf("filer: guard.white_list is configured but the IP whitelist feature is currently disabled. See https://github.com/seaweedfs/seaweedfs/issues/7094")
@@ -244,7 +286,11 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.checkWithMaster()
 
 	go stats.LoopPushingMetric("filer", string(fs.option.Host), fs.metricsAddress, fs.metricsIntervalSec)
-	go fs.filer.MasterClient.KeepConnectedToMaster(context.Background())
+	if option.AnnounceCh != nil {
+		fs.filer.MasterClient.SetAnnounceCh(option.AnnounceCh)
+	}
+	fs.masterCtx, fs.masterCancel = context.WithCancel(context.Background())
+	go fs.filer.MasterClient.KeepConnectedToMaster(fs.masterCtx)
 
 	fs.option.recursiveDelete = v.GetBool("filer.options.recursive_delete")
 	v.SetDefault("filer.options.buckets_folder", "/buckets")
@@ -293,7 +339,20 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		readonlyMux.HandleFunc("/", fs.filerGuard.WhiteList(requestIDMiddleware(fs.readonlyFilerHandler)))
 	}
 
-	existingNodes := fs.filer.ListExistingPeerUpdates(context.Background())
+	// A failed peer scan is not an empty cluster: a fresh filer that skipped
+	// bootstrap here would serve without the existing files, so retry until a
+	// master answers. This runs before the announce gate opens, so the filer
+	// is not yet advertised.
+	var existingNodes []*master_pb.ClusterNodeUpdate
+	for {
+		var listErr error
+		existingNodes, listErr = fs.filer.ListExistingPeerUpdates(context.Background())
+		if listErr == nil {
+			break
+		}
+		glog.Warningf("%s cannot list existing peers: %v; retrying", option.Host, listErr)
+		time.Sleep(2 * time.Second)
+	}
 	startFromTime := time.Now().Add(-filer.LogFlushInterval)
 	if isFresh {
 		glog.V(0).Infof("%s bootstrap from peers %+v", option.Host, existingNodes)
@@ -307,9 +366,20 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	}
 	fs.filer.AggregateFromPeers(option.Host, existingNodes, startFromTime)
 
+	// A peer replaying its backlog applies the old owner's events over this
+	// filer's fresh writes if it takes lock-ring ownership before the replay
+	// finishes, so the announce gate waits for these peers to catch up.
+	for _, node := range existingNodes {
+		if addr := pb.ServerAddress(node.Address); !addr.Equals(option.Host) {
+			fs.startupPeers = append(fs.startupPeers, addr)
+		}
+	}
+
 	fs.filer.LoadFilerConf()
 
 	fs.filer.LoadRemoteStorageConfAndMapping()
+
+	fs.filer.RebuildRemoteDeletionTombstones(context.Background())
 
 	grace.OnReload(fs.Reload)
 
@@ -356,7 +426,173 @@ func (fs *FilerServer) Shutdown() {
 	if fs.posixLockSweeperStop != nil {
 		close(fs.posixLockSweeperStop)
 	}
+	if fs.remoteCacheEvictCancel != nil {
+		fs.remoteCacheEvictCancel()
+	}
 	fs.filer.Shutdown()
+	// LeaveLockRing already ended the master stream in the normal path; this
+	// covers callers that skip it, and runs after the filer's own shutdown so
+	// the final metadata-log flush can still reach the master.
+	if fs.masterCancel != nil {
+		fs.masterCancel()
+	}
+}
+
+// priorOwnerWindowSkew covers peers and gateways that start their prior-owner
+// window after this filer, since each times it from its own ring update.
+const priorOwnerWindowSkew = time.Second
+
+// leaveLockRingBudget bounds the leave: installing the ring update runs lock
+// transfers under the ring lock, which can outlast the removal timeout.
+const leaveLockRingBudget = 10 * time.Second
+
+// LeaveLockRing hands this filer's lock-ring keys to its peers while its own
+// servers still accept the lock transfers and prior-owner writes that follow.
+func (fs *FilerServer) LeaveLockRing() {
+	fs.leaveLockRingWithin(3*cluster.LockRingStabilizationInterval, leaveLockRingBudget)
+}
+
+func (fs *FilerServer) leaveLockRingWithin(removalTimeout, budget time.Duration) {
+	left := make(chan struct{})
+	go func() {
+		defer close(left)
+		fs.leaveLockRing(removalTimeout)
+	}()
+	select {
+	case <-left:
+	case <-time.After(budget):
+		glog.Warningf("LockRing: %s did not finish leaving within %v, shutting down anyway", fs.option.Host, budget)
+	}
+	// End the master stream so the master drops this filer from the cluster
+	// list before gRPC stops accepting connections.
+	if fs.masterCancel != nil {
+		fs.masterCancel()
+	}
+	fs.waitForClusterRemoval()
+}
+
+// announceCatchUpCap bounds how long startup holds the master registration
+// while the metadata replay catches up with the peers found at startup. Past
+// it the filer announces anyway, as it did when the gate opened on serve.
+const announceCatchUpCap = time.Minute
+
+// AnnounceOnceCaughtUp closes announce once every peer found at startup has
+// replayed its backlog. Each peer's stream advances a watermark per event or
+// idle heartbeat, so a watermark past waitStart means nothing older can still
+// land on top of this filer's fresh writes. Called once gRPC is serving, so
+// routed traffic is answerable the moment the filer is listed.
+func (fs *FilerServer) AnnounceOnceCaughtUp(announce chan struct{}, waitStart time.Time) {
+	defer close(announce)
+	if len(fs.startupPeers) == 0 || fs.filer.MetaAggregator == nil {
+		return
+	}
+	deadline := time.Now().Add(announceCatchUpCap)
+	for {
+		// Take the channel before reading the watermarks so a rise in
+		// between still wakes this wait (see DeliveryWatermarkAdvancedChan).
+		advanced := fs.filer.MetaAggregator.DeliveryWatermarkAdvancedChan()
+		if fs.filer.MetaAggregator.PeersCaughtUpTo(fs.startupPeers, waitStart.UnixNano()) {
+			glog.V(0).Infof("%s caught up with %d startup peers, announcing to masters", fs.option.Host, len(fs.startupPeers))
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			glog.Warningf("%s metadata replay not caught up after %v, announcing anyway", fs.option.Host, announceCatchUpCap)
+			return
+		}
+		select {
+		case <-advanced:
+		case <-time.After(min(remaining, time.Second)):
+		}
+	}
+}
+
+// masterRemovalWaitBudget bounds how long shutdown waits for masters to
+// drop this filer before gRPC drains anyway.
+const masterRemovalWaitBudget = 5 * time.Second
+
+// waitForClusterRemoval polls the configured masters until none still lists
+// this filer. The master removes membership when the KeepConnected handler
+// unwinds, which is asynchronous to cancel, so new requests could otherwise
+// route to this filer after its gRPC listener has already closed.
+func (fs *FilerServer) waitForClusterRemoval() {
+	ctx, cancel := context.WithTimeout(context.Background(), masterRemovalWaitBudget)
+	defer cancel()
+	confirmedAbsent := make(map[pb.ServerAddress]struct{})
+	for ctx.Err() == nil {
+		pending := false
+		// The cached list keeps a slow SRV lookup from stretching the
+		// removal-wait budget.
+		for _, master := range fs.filer.MasterClient.ListCachedMasters() {
+			if _, ok := confirmedAbsent[master]; ok {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			// The per-query timeout shares the overall deadline, so a stalled
+			// master cannot stretch the wait past the budget.
+			queryCtx, queryCancel := context.WithTimeout(ctx, 2*time.Second)
+			nodes, err := cluster.ListExistingPeerUpdates(queryCtx, master, fs.grpcDialOption, fs.filer.MasterClient.FilerGroup, cluster.FilerType)
+			queryCancel()
+			if err != nil {
+				// A failed query is not confirmed removal; retry until the
+				// master answers or the overall deadline expires.
+				pending = true
+				continue
+			}
+			listed := false
+			for _, node := range nodes {
+				if node.Address == string(fs.option.Host) {
+					listed = true
+					break
+				}
+			}
+			if listed {
+				pending = true
+			} else {
+				confirmedAbsent[master] = struct{}{}
+			}
+		}
+		if !pending {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func (fs *FilerServer) leaveLockRing(removalTimeout time.Duration) {
+	if fs.filer.Dlm == nil {
+		return
+	}
+	ring := fs.filer.Dlm.LockRing
+	self := fs.option.Host
+	members := ring.GetSnapshot()
+	// A lone filer has no peer to take its keys: leaving would strand lock
+	// requests arriving during the drain without an owner.
+	if len(members) < 2 || !slices.Contains(members, self) {
+		return
+	}
+	// A failed send still leaves: the broken stream's close drops this filer
+	// from the ring and the reconnect registers without it.
+	if err := fs.filer.MasterClient.LeaveLockRing(); err != nil {
+		glog.Warningf("LockRing: %s leave request failed, waiting for reconnect: %v", self, err)
+	}
+	deadline := time.Now().Add(removalTimeout)
+	for slices.Contains(ring.GetSnapshot(), self) {
+		if time.Now().After(deadline) {
+			glog.Warningf("LockRing: %s still in the ring after %v, shutting down anyway", self, removalTimeout)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	until := ring.PriorOwnerWindowEnd().Add(priorOwnerWindowSkew)
+	glog.V(0).Infof("LockRing: %s left, serving prior-owner requests until %v", self, until)
+	time.Sleep(time.Until(until))
 }
 
 func (fs *FilerServer) Reload() {

@@ -126,6 +126,27 @@ func normalizePayloadHash(payloadHashValue string) string {
 	return payloadHashValue
 }
 
+// requestSigningService extracts the service name from the SigV4 credential
+// scope (…/region/service/aws4_request) so a failed request can be answered in
+// that service's error envelope.
+func requestSigningService(r *http.Request) string {
+	credential := r.URL.Query().Get("X-Amz-Credential")
+	if credential == "" {
+		v4Auth := strings.Replace(r.Header.Get("Authorization"), " ", "", -1)
+		v4Auth = strings.TrimPrefix(v4Auth, signV4Algorithm)
+		for _, field := range strings.Split(v4Auth, ",") {
+			if cred, ok := strings.CutPrefix(field, "Credential="); ok {
+				credential = cred
+				break
+			}
+		}
+	}
+	if parts := strings.Split(credential, "/"); len(parts) == 5 {
+		return parts[3]
+	}
+	return ""
+}
+
 // signValues data type represents structured form of AWS Signature V4 header.
 type signValues struct {
 	Credential    credentialHeader
@@ -151,8 +172,20 @@ func parseSignV4(v4Auth string) (sv signValues, aec s3err.ErrorCode) {
 	// Strip off the Algorithm prefix.
 	v4Auth = strings.TrimPrefix(v4Auth, signV4Algorithm)
 	authFields := strings.Split(strings.TrimSpace(v4Auth), ",")
-	if len(authFields) != 3 {
-		return sv, s3err.ErrMissingFields
+	malformed := len(authFields) != 3
+	var hasCredential, hasSignature bool
+	for _, field := range authFields {
+		field = strings.TrimSpace(field)
+		malformed = malformed || field == ""
+		hasCredential = hasCredential || strings.HasPrefix(field, "Credential=")
+		hasSignature = hasSignature || strings.HasPrefix(field, "Signature=")
+	}
+	if malformed {
+		// AWS distinguishes which required field is absent.
+		if !hasCredential {
+			return sv, s3err.ErrInvalidArgument
+		}
+		return sv, s3err.ErrAuthorizationHeaderMalformed
 	}
 
 	// Initialize signature version '4' structured header.
@@ -232,38 +265,40 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 
 	var cred *Credential
 
-	// 2. Check for STS session token
-	sessionToken := r.Header.Get("X-Amz-Security-Token")
-	if sessionToken == "" {
-		sessionToken = r.URL.Query().Get("X-Amz-Security-Token")
-	}
-	if sessionToken != "" {
-		// Validate STS session token
-		identity, cred, errCode = iam.validateSTSSessionToken(r, sessionToken, authInfo.AccessKey)
-		if errCode != s3err.ErrNone {
-			return nil, nil, "", nil, errCode
-		}
-	} else {
-		// 3. Lookup user and credentials
-		var found bool
-		identity, cred, found = iam.lookupByAccessKey(authInfo.AccessKey)
-		if !found {
-			// Log detailed error information for InvalidAccessKeyId (avoid slice allocation for performance)
-			iam.m.RLock()
-			keyCount := len(iam.accessKeyIdent)
-			iam.m.RUnlock()
-
-			glog.Warningf("InvalidAccessKeyId: attempted key '%s' not found. Available keys: %d, Auth enabled: %v",
-				authInfo.AccessKey, keyCount, iam.isAuthEnabled)
-			return nil, nil, "", nil, s3err.ErrInvalidAccessKeyID
-		}
-
+	// 2. Resolve the credential. A configured access key wins over a session
+	// token: credential vendors like Unity Catalog emit a token with static
+	// credentials too, and it adds nothing the signature does not prove.
+	// STS-issued access keys are never registered in the static map, so they
+	// still land on session-token validation.
+	sessionToken := extractSessionToken(r)
+	var found bool
+	identity, cred, found = iam.lookupByAccessKey(authInfo.AccessKey)
+	switch {
+	case found:
 		// Check service account expiration
 		if cred.isCredentialExpired() {
 			glog.V(2).Infof("Service account credential %s has expired (expiration: %d, now: %d)",
 				authInfo.AccessKey, cred.Expiration, time.Now().Unix())
 			return nil, nil, "", nil, s3err.ErrAccessDenied
 		}
+		if sessionToken != "" {
+			*r = *r.WithContext(s3_constants.IgnoreSessionTokenInContext(r.Context()))
+		}
+	case sessionToken != "":
+		// Validate STS session token
+		identity, cred, errCode = iam.validateSTSSessionToken(r, sessionToken, authInfo.AccessKey)
+		if errCode != s3err.ErrNone {
+			return nil, nil, "", nil, errCode
+		}
+	default:
+		// Log detailed error information for InvalidAccessKeyId (avoid slice allocation for performance)
+		iam.m.RLock()
+		keyCount := len(iam.accessKeyIdent)
+		iam.m.RUnlock()
+
+		glog.Warningf("InvalidAccessKeyId: attempted key '%s' not found. Available keys: %d, Auth enabled: %v",
+			authInfo.AccessKey, keyCount, iam.isAuthEnabled)
+		return nil, nil, "", nil, s3err.ErrInvalidAccessKeyID
 	}
 
 	// 3. Perform permission check
@@ -744,13 +779,13 @@ func parseCredentialHeader(credElement string) (ch credentialHeader, aec s3err.E
 func parseSignature(signElement string) (string, s3err.ErrorCode) {
 	signFields := strings.Split(strings.TrimSpace(signElement), "=")
 	if len(signFields) != 2 {
-		return "", s3err.ErrMissingFields
+		return "", s3err.ErrAuthorizationHeaderMalformed
 	}
 	if signFields[0] != "Signature" {
 		return "", s3err.ErrMissingSignTag
 	}
 	if signFields[1] == "" {
-		return "", s3err.ErrMissingFields
+		return "", s3err.ErrAuthorizationHeaderMalformed
 	}
 	signature := signFields[1]
 	return signature, s3err.ErrNone
@@ -848,6 +883,16 @@ var presignedSigV4ProtocolHeaders = map[string]struct{}{
 	"x-amz-signature":     {},
 }
 
+// presignedUnsignedSSECHeaders exempts SSE-C key material that AWS requires to
+// be sent but not signed on presigned requests: only the algorithm header is
+// part of the signature calculation.
+var presignedUnsignedSSECHeaders = map[string]struct{}{
+	strings.ToLower(s3_constants.AmzServerSideEncryptionCustomerKey):              {},
+	strings.ToLower(s3_constants.AmzServerSideEncryptionCustomerKeyMD5):           {},
+	strings.ToLower(s3_constants.AmzCopySourceServerSideEncryptionCustomerKey):    {},
+	strings.ToLower(s3_constants.AmzCopySourceServerSideEncryptionCustomerKeyMD5): {},
+}
+
 // verifySignedHeadersCoverage rejects requests that carry x-amz-* headers
 // outside of the SignedHeaders list. AWS SigV4 requires every x-amz-* header
 // present in the request to be covered by the signature; without this check a
@@ -872,6 +917,9 @@ func verifySignedHeadersCoverage(r *http.Request, signedHeaders []string, isPres
 		}
 		if isPresigned {
 			if _, exempt := presignedSigV4ProtocolHeaders[lower]; exempt {
+				continue
+			}
+			if _, exempt := presignedUnsignedSSECHeaders[lower]; exempt {
 				continue
 			}
 		}

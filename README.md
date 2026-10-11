@@ -1,6 +1,6 @@
 # SeaweedFS fork: Windows mounts and bounded FUSE mounts
 
-SeaweedFS 4.47 with a WinFsp `weed mount` for Windows, FUSE mounts that
+SeaweedFS 4.48 with a WinFsp `weed mount` for Windows, FUSE mounts that
 always answer the kernel, and fixes for allocation, vacuum and recovery,
 memory use, S3 copies and cross-mount coherence. Every change carries a
 regression test that fails without it.
@@ -126,6 +126,28 @@ setup.
 | Missing-file `stat` in a cached directory (cross-mount freshness) | 24 µs before, about 200 µs after (one filer round trip) |
 | `opendir` + list of 200 entries | 63 to 75 µs before, 210 to 320 µs after |
 | `TestCrossMountCloseToOpenVisibility`, 40 rounds through a 100 ms proxy | 186 stale observations before, 0 after |
+
+### 4.48 merge against the deployed 4.47 line
+
+`test/mount_bench` on one Linux host (32 cores, NVMe), `weed mini` plus a
+default `weed mount` per binary, both built with `-tags 5BytesOffset`:
+0f3d7bec5 (deployed) against the 4.48 merge. Median of four rounds run in
+alternating order; round-to-round spread is up to about 8%, so every
+difference below is within noise.
+
+| Phase | 4.47 fork (0f3d7bec5) | 4.48 merge | Change |
+| --- | --- | --- | --- |
+| seq_write 256 MiB | 251.0 MB/s | 251.1 MB/s | 0.0% |
+| seq_read 256 MiB | 1053 MB/s | 1028 MB/s | -2.4% |
+| rand_read 4 KiB x 500 | 1776 MB/s | 1914 MB/s | +7.8% |
+| small_write 64 KiB x 400 | 30.3 MB/s | 29.8 MB/s | -1.7% |
+| small_read 64 KiB x 400 | 105.9 MB/s | 106.1 MB/s | +0.2% |
+| stat_files | 112650 ops/s | 107687 ops/s | -4.4% |
+| list_dir | 2580 ops/s | 2382 ops/s | -7.7% |
+| overwrite | 41.9 MB/s | 41.4 MB/s | -1.1% |
+| delete | 2025 ops/s | 2019 ops/s | -0.3% |
+| list_5k | 224041 ops/s | 232973 ops/s | +4.0% |
+| walk_5k | 382720 ops/s | 358447 ops/s | -6.3% |
 
 ## How CI builds and qualifies
 

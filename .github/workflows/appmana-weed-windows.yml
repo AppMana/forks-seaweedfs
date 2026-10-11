@@ -2,9 +2,9 @@ name: AppMana weed.exe (WinFsp) build and test
 
 on:
   push:
-    branches: [appmana-4.23-large-disk-winfsp, 'merge/**']
+    branches: ['merge/**']
   pull_request:
-    branches: [appmana-4.23-large-disk-winfsp, 'merge/**']
+    branches: ['merge/**']
   workflow_dispatch:
 
 permissions:

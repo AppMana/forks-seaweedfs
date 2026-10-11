@@ -157,7 +157,11 @@ GOWORK=off go test ./test/storage_lab/vm -run '^(TestFuseStuckBackendLab|TestFus
 ```
 
 The [storage lab README](test/storage_lab/README.md) covers the four-VM
-fault, Windows and mixed-OS scenarios and their inputs.
+fault, Windows and mixed-OS scenarios and their inputs. CI takes the
+Labcontainers VM image (`name@sha256:…`, labelled with `LABCONTAINERS_REF`)
+from the repository secret `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE`, or
+the variable of the same name; a secret keeps a private registry's name out
+of public logs.
 
 ## Branches
 

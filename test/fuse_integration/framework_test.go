@@ -40,6 +40,8 @@ type TestConfig struct {
 	CacheSizeMB int
 	NumVolumes  int
 	EnableDebug bool
+	// MiniOptions are appended to the "weed mini" command line.
+	MiniOptions []string
 	// MountGlobalOptions are glog flags (-v, -logtostderr, ...) registered on
 	// weed's global flagset; they must precede the subcommand name or the
 	// mount process dies at flag parsing.
@@ -311,6 +313,7 @@ func (f *FuseTestFramework) startMini(config *TestConfig) error {
 		"-webdav=false",
 		"-admin.ui=false",
 	)
+	args = append(args, config.MiniOptions...)
 
 	proc, err := f.startProcess("mini", args)
 	if err != nil {

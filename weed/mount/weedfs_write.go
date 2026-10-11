@@ -12,10 +12,28 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// chunkUploadAttemptTimeout bounds one attempt to upload a chunk. A volume
-// server that stops reading would otherwise hold the upload, and every flush
-// waiting on it, forever.
-const chunkUploadAttemptTimeout = 60 * time.Second
+// chunkUploadBaseTimeout and chunkUploadMinRate size chunkUploadAttemptTimeout.
+// A close() or fsync waits for every chunk still uploading and must be
+// answered within the FUSE request deadline (60 s), so one attempt has to end
+// well inside it with room left for a second attempt elsewhere. A healthy
+// 2 MiB chunk upload measured 0.06 to 0.24 s on the production cluster under
+// load; one that has not finished in 10 s is held by a stalled server.
+const (
+	chunkUploadBaseTimeout = 10 * time.Second
+	chunkUploadMinRate     = 16 << 20 // bytes per second
+)
+
+// chunkUploadAttemptTimeout bounds one attempt to upload a chunk of up to
+// chunkSize bytes. It stays above the volume server's replica write timeout
+// for the same size, so a stalled replica fails the primary first and the
+// primary's 500 names the replica to avoid.
+func chunkUploadAttemptTimeout(chunkSize int64) time.Duration {
+	return chunkUploadBaseTimeout + time.Duration(chunkSize*int64(time.Second)/chunkUploadMinRate)
+}
+
+// stalledVolumeServerTTL is how long chunk uploads avoid a volume server after
+// an attempt stalled on it.
+const stalledVolumeServerTTL = time.Minute
 
 func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFunctionType {
 
@@ -33,6 +51,9 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 		}
 
 		// WantMd5 gives mount writes a real filer.ETag (server echoes Content-MD5 back).
+		// One attempt per assignment: a retry against the same fid goes back
+		// to the server that just failed, so every retry gets a new
+		// assignment that avoids the servers recent attempts stalled on.
 		uploadOption := &operation.UploadOption{
 			Filename:          filename,
 			Cipher:            wfs.option.Cipher,
@@ -40,7 +61,9 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			MimeType:          "",
 			PairMap:           nil,
 			WantMd5:           true,
-			AttemptTimeout:    chunkUploadAttemptTimeout,
+			MaxAttempts:       1,
+			AttemptTimeout:    chunkUploadAttemptTimeout(wfs.option.ChunkSizeLimit),
+			StalledServers:    wfs.stalledVolumeServers,
 		}
 		if wfs.option.VolumeServerAccess == "filerProxy" {
 			uploadOption.GenUploadUrl = func(host, fileId string) string {

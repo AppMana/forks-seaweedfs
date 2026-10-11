@@ -63,6 +63,10 @@ type UploadOption struct {
 	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
 	AttemptTimeout    time.Duration                    // >0 bounds each upload attempt
 	FilerJwt          security.FilerJwtProvider        // credential for proxy chunk URLs; nil → process-wide jwt.filer_signing
+	// StalledServers, when set, makes UploadWithRetry record the servers an
+	// attempt stalled or failed on and skip assignments that would write
+	// through one of them again.
+	StalledServers *StalledServers
 }
 
 type UploadResult struct {
@@ -137,8 +141,10 @@ func (e *uploadStatusError) Unwrap() error { return e.err }
 // On the write path a volume server only 5xxs on a ReplicatedWrite failure
 // (local disk, replica peer down, or under-replication) — all of which a
 // different volume dodges — so any 5xx is reassignable. A status of 0 means the
-// assigned target never answered (down/unreachable), also reassignable. A 4xx
-// is a genuine client error and is surfaced. Errors without a status come from
+// assigned target never answered (down/unreachable, or the attempt timed out),
+// also reassignable. 429 means the server's upload admission stayed full for
+// its whole wait; another volume is the way around it. Any other 4xx is a
+// genuine client error and is surfaced. Errors without a status come from
 // the AssignVolume RPC or request setup; retry only transient transport ones.
 func ShouldReassignUpload(err error) bool {
 	if err == nil {
@@ -146,7 +152,7 @@ func ShouldReassignUpload(err error) bool {
 	}
 	var se *uploadStatusError
 	if errors.As(err, &se) {
-		return se.StatusCode == 0 || se.StatusCode >= 500
+		return se.StatusCode == 0 || se.StatusCode == http.StatusTooManyRequests || se.StatusCode >= 500
 	}
 	return strings.Contains(err.Error(), "transport")
 }
@@ -195,25 +201,60 @@ func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
 	}
 }
 
-func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, fsync bool, err error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+// uploadAssignment is where one upload attempt writes: the file id, the host
+// the request goes to, and every server holding a copy of the volume (the
+// primary first), which a replicated write passes through synchronously.
+type uploadAssignment struct {
+	fileId  string
+	host    string
+	auth    security.EncodedJwt
+	fsync   bool
+	servers []string
+}
+
+// maxAssignmentsAvoidingStalled bounds how many assignments one upload asks
+// for while looking for a volume none of whose servers recently stalled.
+const maxAssignmentsAvoidingStalled = 8
+
+// assignAvoiding asks for assignments until one avoids every server in
+// stalled, or maxAssignmentsAvoidingStalled are spent, and then takes the
+// last one: a stalled server may have recovered, and an upload with no clean
+// volume left must still be tried.
+func assignAvoiding(assignFn func() (uploadAssignment, error), stalled *StalledServers) (uploadAssignment, error) {
+	var a uploadAssignment
+	var err error
+	for i := 0; i < maxAssignmentsAvoidingStalled; i++ {
+		a, err = assignFn()
+		if err != nil || stalled == nil {
+			return a, err
+		}
+		server, avoided := stalled.firstStalled(a.servers)
+		if !avoided {
+			return a, nil
+		}
+		glog.V(1).Infof("skip assignment %s: %s stalled recently", a.fileId, server)
+	}
+	return a, err
+}
+
+func (uploader *Uploader) uploadWithRetryData(assignFn func() (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
 	doUploadFunc := func() error {
-		var host string
-		var auth security.EncodedJwt
-		var fsync bool
-		fileId, host, auth, fsync, err = assignFn()
+		var a uploadAssignment
+		a, err = assignAvoiding(assignFn, uploadOption.StalledServers)
 		if err != nil {
 			return err
 		}
+		fileId = a.fileId
 
 		genUrl := uploadOption.GenUploadUrl
 		if genUrl == nil {
 			genUrl = func(host, fileId string) string { return fmt.Sprintf("http://%s/%s", host, fileId) }
 		}
-		uploadOption.UploadUrl = genUrl(host, fileId)
-		if fsync {
+		uploadOption.UploadUrl = genUrl(a.host, a.fileId)
+		if a.fsync {
 			uploadOption.UploadUrl = util_http.AppendQueryParameter(uploadOption.UploadUrl, "fsync", "true")
 		}
-		uploadOption.Jwt = auth
+		uploadOption.Jwt = a.auth
 		if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
 			// The request addresses the filer, which authorizes it and mints the
 			// volume credential itself. The AssignVolume token is not a filer
@@ -226,6 +267,9 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 		}
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
+		if err != nil && uploadOption.StalledServers != nil {
+			uploadOption.StalledServers.noteFailure(a.servers, err)
+		}
 		return err
 	}
 
@@ -272,7 +316,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 		uploadOption.Md5 = base64.StdEncoding.EncodeToString(digest[:])
 	}
 
-	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, fsync bool, err error) {
+	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (a uploadAssignment, err error) {
 		// grpc assign volume
 		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 			assignCtx, assignCancel := context.WithTimeout(context.Background(), assignVolumeTimeout)
@@ -286,10 +330,14 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 				return fmt.Errorf("assign volume failure %v: %v", assignRequest, resp.Error)
 			}
 
-			fileId, auth = resp.FileId, security.EncodedJwt(resp.Auth)
-			fsync = resp.Fsync
+			a.fileId, a.auth = resp.FileId, security.EncodedJwt(resp.Auth)
+			a.fsync = resp.Fsync
 			loc := resp.Location
-			host = filerClient.AdjustedUrl(loc)
+			a.host = filerClient.AdjustedUrl(loc)
+			a.servers = append(a.servers, loc.GetUrl())
+			for _, replica := range resp.Replicas {
+				a.servers = append(a.servers, replica.GetUrl())
+			}
 
 			return nil
 		}); grpcAssignErr != nil {

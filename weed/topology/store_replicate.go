@@ -140,6 +140,7 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 				Jwt:               jwt,
 				Md5:               contentMd5,
 				MaxAttempts:       1, // fail fast on a dead replica; the client write retries
+				AttemptTimeout:    ReplicaWriteTimeout(len(n.Data)),
 			}
 
 			uploader, err := operation.NewUploader()
@@ -166,6 +167,25 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 		stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpWrite, stats.ReplicationSuccess).Inc()
 	}
 	return
+}
+
+// replicaWriteBaseTimeout and replicaWriteMinRate size ReplicaWriteTimeout. A
+// 2 MiB replica write measured 0.06 to 0.24 s on a loaded 1 GbE cluster; one
+// that has not finished in seconds is held by a stalled replica, not by work.
+const (
+	replicaWriteBaseTimeout = 5 * time.Second
+	replicaWriteMinRate     = 16 << 20 // bytes per second
+)
+
+// ReplicaWriteTimeout bounds forwarding a needle of size bytes to one replica.
+// A replica that holds the forward (a full upload admission, a saturated
+// link) would otherwise hold the client's request with it until the client
+// gives up, and the client could only blame the primary. Failing the forward
+// first answers the client with a 500 that names the replica, so its retry
+// can avoid that server. It stays below the mount's chunk upload attempt
+// timeout for the same size.
+func ReplicaWriteTimeout(size int) time.Duration {
+	return replicaWriteBaseTimeout + time.Duration(int64(size)*int64(time.Second)/replicaWriteMinRate)
 }
 
 // ReplicatedDelete deletes a needle from the local volume and sends delete

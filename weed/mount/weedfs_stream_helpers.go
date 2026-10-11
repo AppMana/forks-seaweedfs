@@ -24,9 +24,9 @@ func (wfs *WFS) streamCreateEntry(ctx context.Context, req *filer_pb.CreateEntry
 	}
 	return awaitFilerReply(ctx, "create", func() (*filer_pb.CreateEntryResponse, error) {
 		var resp *filer_pb.CreateEntryResponse
-		err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		err := wfs.withFilerClient(context.Background(), false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 			var err error
-			resp, err = filer_pb.CreateEntryWithResponse(context.Background(), client, req)
+			resp, err = filer_pb.CreateEntryWithResponse(ctx, client, req)
 			return err
 		})
 		return resp, err
@@ -47,9 +47,9 @@ func (wfs *WFS) streamUpdateEntry(ctx context.Context, req *filer_pb.UpdateEntry
 	}
 	return awaitFilerReply(ctx, "update", func() (*filer_pb.UpdateEntryResponse, error) {
 		var resp *filer_pb.UpdateEntryResponse
-		err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		err := wfs.withFilerClient(context.Background(), false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 			var err error
-			resp, err = client.UpdateEntry(context.Background(), req)
+			resp, err = client.UpdateEntry(ctx, req)
 			return err
 		})
 		return resp, err
@@ -75,9 +75,9 @@ func (wfs *WFS) streamDeleteEntry(ctx context.Context, req *filer_pb.DeleteEntry
 
 func (wfs *WFS) unaryDeleteEntry(req *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
 	var resp *filer_pb.DeleteEntryResponse
-	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	err := wfs.withFilerClient(context.Background(), false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 		var err error
-		resp, err = client.DeleteEntry(context.Background(), req)
+		resp, err = client.DeleteEntry(ctx, req)
 		if err != nil {
 			return err
 		}

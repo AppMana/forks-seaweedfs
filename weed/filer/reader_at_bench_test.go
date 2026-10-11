@@ -127,7 +127,10 @@ func newReadAtScenarioFixture(tb testing.TB, numChunks, chunkSize int, latency t
 
 	ctx := context.Background()
 	lookupFn := masterClient.GetLookupFileIdFunction()
-	chunkViews := ViewFromChunks(ctx, lookupFn, chunks, 0, int64(totalSize))
+	chunkViews, err := ViewFromChunks(ctx, lookupFn, chunks, 0, int64(totalSize))
+	if err != nil {
+		tb.Fatal(err)
+	}
 
 	readerAt := &ChunkReadAt{
 		chunkViews:    chunkViews,

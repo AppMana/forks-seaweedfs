@@ -153,6 +153,20 @@ type azureRemoteStorageClient struct {
 var _ = remote_storage.RemoteStorageClient(&azureRemoteStorageClient{})
 var _ = remote_storage.RemoteStorageConcurrentReader(&azureRemoteStorageClient{})
 
+func (az *azureRemoteStorageClient) uploadConcurrency() int {
+	if n := int(az.conf.GetUploadConcurrency()); n > 0 {
+		return n
+	}
+	return defaultConcurrency
+}
+
+func (az *azureRemoteStorageClient) downloadConcurrency() int {
+	if n := int(az.conf.GetDownloadConcurrency()); n > 0 {
+		return n
+	}
+	return defaultReadConcurrency
+}
+
 func (az *azureRemoteStorageClient) ListDirectory(ctx context.Context, loc *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) (err error) {
 	pathKey := loc.Path[1:]
 	if pathKey != "" && !strings.HasSuffix(pathKey, "/") {
@@ -303,7 +317,7 @@ func (az *azureRemoteStorageClient) Traverse(loc *remote_pb.RemoteStorageLocatio
 }
 
 func (az *azureRemoteStorageClient) ReadFile(loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (data []byte, err error) {
-	return az.ReadFileWithConcurrency(loc, offset, size, defaultReadConcurrency)
+	return az.ReadFileWithConcurrency(loc, offset, size, 0)
 }
 
 // ReadFileWithConcurrency fetches a byte range of a blob using the Azure SDK's
@@ -322,9 +336,9 @@ func (az *azureRemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.Remot
 	}
 
 	if concurrency <= 0 {
-		concurrency = defaultReadConcurrency
-	} else if concurrency > math.MaxUint16 {
-		// DownloadBufferOptions.Concurrency is uint16; clamp to avoid wraparound.
+		concurrency = az.downloadConcurrency()
+	}
+	if concurrency > math.MaxUint16 {
 		concurrency = math.MaxUint16
 	}
 
@@ -339,6 +353,9 @@ func (az *azureRemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.Remot
 		props, propsErr := blobClient.GetProperties(propsCtx, nil)
 		cancelProps()
 		if propsErr != nil {
+			if bloberror.HasCode(propsErr, bloberror.BlobNotFound) {
+				return nil, remote_storage.ErrRemoteObjectNotFound
+			}
 			return nil, fmt.Errorf("get properties %s%s: %w", loc.Bucket, loc.Path, propsErr)
 		}
 		if props.ContentLength == nil {
@@ -360,6 +377,9 @@ func (az *azureRemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.Remot
 		Concurrency: uint16(concurrency),
 	})
 	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, remote_storage.ErrRemoteObjectNotFound
+		}
 		return nil, fmt.Errorf("failed to download file %s%s: %w", loc.Bucket, loc.Path, err)
 	}
 	// Pre-sized buffer: a short read stays zero-padded. Reject it rather than
@@ -448,7 +468,7 @@ func (az *azureRemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocati
 
 	_, err = blobClient.UploadStream(context.Background(), reader, &blockblob.UploadStreamOptions{
 		BlockSize:   defaultBlockSize,
-		Concurrency: defaultConcurrency,
+		Concurrency: az.uploadConcurrency(),
 		HTTPHeaders: httpHeaders,
 		Metadata:    metadata,
 	})

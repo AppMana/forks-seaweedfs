@@ -64,6 +64,10 @@ func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSo
 		StartTsNs:              lastOffsetTs.UnixNano(),
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		GetResumeTsNs: func() int64 {
+			return processor.processedTsWatermark.Load()
+		},
+		Resubscribe: processor.ResubscribeCh(),
 	}
 
 	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
@@ -283,6 +287,10 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 		if filer_pb.IsDelete(resp) {
+			if filer.IsMetadataOnlyDelete(message.OldEntry) {
+				glog.V(2).Infof("skipping remote delete of metadata-only delete: %s/%s", resp.Directory, message.OldEntry.Name)
+				return nil
+			}
 			if resp.Directory == option.bucketsDir {
 				return handleDeleteBucket(message.OldEntry)
 			}
@@ -351,7 +359,14 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 					if message.OldEntry.RemoteEntry != nil && filer.IsSameData(message.OldEntry, message.NewEntry) {
 						glog.V(2).Infof("update meta: %+v", resp)
 						oldDest := toRemoteStorageLocation(oldBucket, util.NewFullPath(resp.Directory, message.OldEntry.Name), oldRemoteStorageMountLocation)
-						return client.UpdateFileMetadata(oldDest, message.OldEntry, message.NewEntry)
+						if err := client.UpdateFileMetadata(oldDest, message.OldEntry, message.NewEntry); err != nil {
+							return err
+						}
+						remoteEntry := message.NewEntry.RemoteEntry
+						if remoteEntry == nil {
+							remoteEntry = message.OldEntry.RemoteEntry
+						}
+						return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 					} else {
 						newDest := toRemoteStorageLocation(newBucket, util.NewFullPath(message.NewParentPath, message.NewEntry.Name), newRemoteStorageMountLocation)
 						remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewParentPath, message.NewEntry, newDest)

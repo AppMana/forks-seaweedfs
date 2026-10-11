@@ -237,7 +237,10 @@ func (wfs *WFS) flushMetadataToFilerLocked(ctx context.Context, fh *FileHandle, 
 
 	manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.GetChunks())
 
-	chunks, _ := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
+	chunks, _, err := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
+	if err != nil {
+		return fmt.Errorf("compact chunks of %s: %w", fileFullPath, err)
+	}
 
 	if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
 		glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)

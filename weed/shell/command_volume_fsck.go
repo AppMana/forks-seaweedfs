@@ -1043,7 +1043,7 @@ func (c *commandVolumeFsck) purgeFileIdsForOneVolume(volumeId uint32, fileIds []
 			if c.deleteFileIds != nil {
 				deleteResults = c.deleteFileIds(server, fidList)
 			} else {
-				deleteResults = operation.DeleteFileIdsAtOneVolumeServer(server, c.env.option.GrpcDialOption, fidList, false)
+				deleteResults = operation.DeleteFileIdsAtOneVolumeServer(context.Background(), server, c.env.option.GrpcDialOption, fidList, false)
 			}
 			resultChan <- serverDeleteResults{server: server, results: deleteResults}
 		}(server, fileIds)

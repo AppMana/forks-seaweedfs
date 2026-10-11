@@ -85,14 +85,16 @@ func isSameChunks(a, b []*filer_pb.FileChunk) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	slices.SortFunc(a, func(i, j *filer_pb.FileChunk) int {
+	sortedA := slices.Clone(a)
+	sortedB := slices.Clone(b)
+	slices.SortFunc(sortedA, func(i, j *filer_pb.FileChunk) int {
 		return strings.Compare(i.ETag, j.ETag)
 	})
-	slices.SortFunc(b, func(i, j *filer_pb.FileChunk) int {
+	slices.SortFunc(sortedB, func(i, j *filer_pb.FileChunk) int {
 		return strings.Compare(i.ETag, j.ETag)
 	})
-	for i := 0; i < len(a); i++ {
-		if a[i].ETag != b[i].ETag {
+	for i := 0; i < len(sortedA); i++ {
+		if sortedA[i].ETag != sortedB[i].ETag {
 			return false
 		}
 	}
@@ -171,10 +173,11 @@ func retryFetchWithFreshLocations(ctx context.Context, invalidator CacheInvalida
 
 func PrepareStreamContentWithThrottler(ctx context.Context, masterClient wdclient.HasLookupFileIdFunction, jwtFunc VolumeServerJwtFunction, chunks []*filer_pb.FileChunk, offset int64, size int64, downloadMaxBytesPs int64) (DoStreamContent, error) {
 	glog.V(4).InfofCtx(ctx, "prepare to stream content for chunks: %d", len(chunks))
-	chunkViews, err := viewFromChunksOrErr(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, size)
+	visibles, err := NonOverlappingVisibleIntervals(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, offset+size)
 	if err != nil {
 		return nil, err
 	}
+	chunkViews := ViewFromVisibleIntervals(visibles, offset, size)
 
 	fileId2Url := make(map[string][]string)
 
@@ -288,10 +291,11 @@ func PrepareStreamContentWithPrefetch(ctx context.Context, masterClient wdclient
 	}
 
 	glog.V(4).InfofCtx(ctx, "prepare to stream content with prefetch=%d for chunks: %d", prefetchAhead, len(chunks))
-	chunkViews, err := viewFromChunksOrErr(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, size)
+	visibles, err := NonOverlappingVisibleIntervals(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, offset+size)
 	if err != nil {
 		return nil, err
 	}
+	chunkViews := ViewFromVisibleIntervals(visibles, offset, size)
 
 	fileId2Url := make(map[string][]string)
 
@@ -382,12 +386,17 @@ var _ = io.ReadSeeker(&ChunkStreamReader{})
 var _ = io.ReaderAt(&ChunkStreamReader{})
 var _ = io.Closer(&ChunkStreamReader{})
 
+// doNewChunkStreamReader builds a reader over chunks. If their manifests cannot
+// be resolved, the reader fails every read with that error and reports it as its
+// SourceError.
 func doNewChunkStreamReader(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk) *ChunkStreamReader {
 
-	chunkViews, err := viewFromChunksOrErr(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
+	chunkViews, err := ViewFromChunks(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
 	if err != nil {
-		// An empty view would read as an empty file; fail every read instead.
-		return &ChunkStreamReader{lookupFileId: lookupFileIdFn, sourceErr: err}
+		return &ChunkStreamReader{
+			lookupFileId: lookupFileIdFn,
+			sourceErr:    err,
+		}
 	}
 
 	var totalSize int64
@@ -487,7 +496,8 @@ func insideChunk(offset int64, chunk *ChunkView) bool {
 }
 
 func (c *ChunkStreamReader) prepareBufferFor(offset int64) (err error) {
-	if c.chunkView == nil && c.sourceErr != nil {
+	// a reader without chunk views has a source error only if ViewFromChunks failed
+	if c.head == nil && c.sourceErr != nil {
 		return c.sourceErr
 	}
 	// stay in the same chunk

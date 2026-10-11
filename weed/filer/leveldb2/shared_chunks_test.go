@@ -300,7 +300,7 @@ func link(f *filer.Filer, src, dst string, stopAfter int) (bool, error) {
 				marked.Extended[k] = v
 			}
 			marked.Extended[sharedChunksKey] = []byte(filer.SharedChunksGroupOf(current.GetChunks()) + "/" + newNonce())
-			if err := f.UpdateEntry(ctx, current, marked); err != nil {
+			if err := f.UpdateEntry(ctx, current, marked, false); err != nil {
 				unlock()
 				return false, err
 			}
@@ -531,7 +531,7 @@ func TestSharedChunksPerObjectMetadataStaysSeparate(t *testing.T) {
 	}
 	updated.Extended["X-Amz-Meta-Color"] = []byte("blue")
 	updated.Extended["X-Amz-Tagging-Env"] = []byte("prod")
-	if err := f.UpdateEntry(testCtx(), dst, updated); err != nil {
+	if err := f.UpdateEntry(testCtx(), dst, updated, false); err != nil {
 		t.Fatal(err)
 	}
 	assertNoneDeleted(t, drainDeleted(f), fids(chunks), "metadata-only update")
@@ -1065,7 +1065,7 @@ func TestSharedChunksRewriteWithoutTheMarkerKeepsMembership(t *testing.T) {
 	dst := mustFind(t, f, "/buckets/bkt/dst")
 	rewritten := dst.ShallowClone()
 	rewritten.Extended = map[string][]byte{"X-Amz-Meta-Replaced": []byte("yes")}
-	if err := f.UpdateEntry(testCtx(), dst, rewritten); err != nil {
+	if err := f.UpdateEntry(testCtx(), dst, rewritten, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, member := sharedRef(mustFind(t, f, "/buckets/bkt/dst")); !member {

@@ -112,7 +112,10 @@ func TestRandomModeStillCachesWholeChunk(t *testing.T) {
 
 	ctx := context.Background()
 	lookupFn := masterClient.GetLookupFileIdFunction()
-	chunkViews := ViewFromChunks(ctx, lookupFn, chunks, 0, int64(chunkSize))
+	chunkViews, err := ViewFromChunks(ctx, lookupFn, chunks, 0, int64(chunkSize))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	readerAt := &ChunkReadAt{
 		chunkViews:    chunkViews,

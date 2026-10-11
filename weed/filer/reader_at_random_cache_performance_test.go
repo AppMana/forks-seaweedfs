@@ -97,7 +97,10 @@ func newRandomCachePerfFixture(t *testing.T, chunks int, latency time.Duration) 
 	lookup := func(_ context.Context, fileID string) ([]string, error) {
 		return []string{f.server.URL + "/" + fileID}, nil
 	}
-	views := ViewFromChunks(context.Background(), lookup, fileChunks, 0, int64(chunks*randomCachePerfChunkSize))
+	views, err := ViewFromChunks(context.Background(), lookup, fileChunks, 0, int64(chunks*randomCachePerfChunkSize))
+	if err != nil {
+		t.Fatal(err)
+	}
 	// This fixture measures what the *cache* does once the reader is already in
 	// random mode; the classifier itself is covered by reader_pattern_test.go.
 	// Pin the mode explicitly rather than priming the heuristic with far-apart

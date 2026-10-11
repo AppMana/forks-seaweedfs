@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -132,7 +133,7 @@ type S3ApiServer struct {
 	icebergCredentialRole     string
 	icebergCredentialDuration int64
 	cipher                    bool // encrypt data on volume servers
-	newObjectWriteLock        func(bucket, object string) objectWriteLock
+	newObjectWriteLock        func(bucket, object string) (objectWriteLock, error)
 	// objectWriteLockClient resolves a key's owner filer for route-by-key.
 	objectWriteLockClient *cluster.LockClient
 	// unreachableOwners holds owners (pb.ServerAddress -> expiry time.Time) whose
@@ -249,15 +250,19 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 				}
 				objectWriteLockClient.SetRing(servers, update.Version)
 			})
+			masterClient.SetOnMasterChangeFn(func(previous, current pb.ServerAddress) {
+				objectWriteLockClient.ResetRing()
+			})
 		}
-		// Start the master client connection loop - required for GetMaster() to work
-		go masterClient.KeepConnectedToMaster(context.Background())
-
 		filerClient = wdclient.NewFilerClient(option.Filers, option.GrpcDialOption, option.DataCenter, &wdclient.FilerClientOption{
 			MasterClient:      masterClient,
 			FilerGroup:        option.FilerGroup,
 			DiscoveryInterval: 5 * time.Minute,
 		})
+		masterClient.SetOnPeerUpdateFn(filerClient.OnPeerUpdate)
+
+		// Start the master client connection loop - required for GetMaster() to work
+		go masterClient.KeepConnectedToMaster(context.Background())
 
 		glog.V(1).Infof("S3 API initialized FilerClient with %d filer(s) and discovery enabled (group: %s, masters: %v)",
 			len(option.Filers), option.FilerGroup, option.Masters)
@@ -369,16 +374,19 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 			objectWriteLockClient = cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])
 		}
 		s3ApiServer.objectWriteLockClient = objectWriteLockClient
-		s3ApiServer.newObjectWriteLock = func(bucket, object string) objectWriteLock {
+		s3ApiServer.newObjectWriteLock = func(bucket, object string) (objectWriteLock, error) {
 			lockKey := objectWriteRouteKeyPrefix + s3ApiServer.toFilerPath(bucket, object)
 			owner := fmt.Sprintf("s3api-%d", s3ApiServer.randomClientId)
 			lock := objectWriteLockClient.NewShortLivedLock(lockKey, owner)
+			if lock == nil {
+				return nil, fmt.Errorf("objectWriteLock: failed to acquire lock for %s", lockKey)
+			}
 			if err := lock.AttemptToLock(objectWriteLockTTL); err != nil {
 				// The initial acquisition already succeeded with the default short TTL.
 				// Renewal to a longer TTL is opportunistic to cover slower metadata paths.
 				glog.Warningf("objectWriteLock: failed to extend lock TTL for %s: %v", lockKey, err)
 			}
-			return lock
+			return lock, nil
 		}
 	}
 
@@ -459,6 +467,8 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		}
 	}
 
+	s3ApiServer.applyTrustedProxies(util.GetViper())
+
 	// Initialize embedded IAM API if enabled
 	if option.EnableIam {
 		s3ApiServer.embeddedIam = NewEmbeddedIamApi(s3ApiServer.credentialManager, iam, option.IamReadOnly)
@@ -497,6 +507,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 			v.GetString("jwt.filer_signing.read.key"),
 			v.GetInt("jwt.filer_signing.read.expires_after_seconds"),
 		)
+		s3ApiServer.applyTrustedProxies(v)
 		util_http.ReloadJwtSigningReadConfig()
 	})
 	s3ApiServer.bucketRegistry = NewBucketRegistry(s3ApiServer)
@@ -520,7 +531,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 
 	s3ApiServer.registerRouter(router)
 
-	go s3ApiServer.subscribeMetaEvents("s3", startTsNs, filer.DirectoryEtcRoot, []string{
+	watched := []string{
 		option.BucketsPath,
 		filer.IamConfigDirectory,
 		filer.IamConfigDirectory + "/identities",
@@ -528,7 +539,13 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		filer.IamConfigDirectory + "/service_accounts",
 		filer.IamConfigDirectory + "/groups",
 		filer.IamConfigDirectory + "/oidc-providers",
-	})
+		filer.IamConfigDirectory + "/roles",
+	}
+	// A role store configured with its own basePath is watched there too.
+	if dir := s3ApiServer.roleStoreDir(); !slices.Contains(watched, dir) {
+		watched = append(watched, dir)
+	}
+	go s3ApiServer.subscribeMetaEvents("s3", startTsNs, filer.DirectoryEtcRoot, watched)
 
 	// Start bucket size metrics collection in background
 	go s3ApiServer.startBucketSizeMetricsLoop(context.Background())
@@ -541,6 +558,22 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	s3ApiServer.versionsReconcilerStop = s3ApiServer.startVersioningReconciler()
 
 	return s3ApiServer, nil
+}
+
+// applyTrustedProxies reads [s3.trusted_proxies] from the security config and
+// propagates the allowlist to the bucket policy engine, the IAM policy
+// engine, and the IAM integration so aws:SourceIp honors forwarded headers
+// only from configured trusted proxies.
+func (s3a *S3ApiServer) applyTrustedProxies(v util.Configuration) {
+	whiteList := util.StringSplit(v.GetString("s3.trusted_proxies.white_list"), ",")
+	tp := policy_engine.NewTrustedProxies(whiteList)
+	if s3a.policyEngine != nil {
+		s3a.policyEngine.engine.SetTrustedProxies(tp)
+	}
+	s3a.iam.SetTrustedProxies(tp)
+	if s3a.iamIntegration != nil {
+		s3a.iamIntegration.SetTrustedProxies(tp)
+	}
 }
 
 func (s3a *S3ApiServer) Shutdown() {
@@ -604,6 +637,13 @@ func (s3a *S3ApiServer) checkPolicyWithEntry(r *http.Request, bucket, object, ac
 		return s3err.ErrNone, false
 	}
 
+	// Upload handler rechecks use the same effective ACL conditions as authentication without changing the signed request.
+	policyRequest, policyCode := putObjectACLPolicyRequest(r, Action(action), bucket, object)
+	if policyCode != s3err.ErrNone {
+		return policyCode, true
+	}
+	r = policyRequest
+
 	identityRaw := GetIdentityFromContext(r)
 	var identity *Identity
 	if identityRaw != nil {
@@ -645,6 +685,9 @@ func (s3a *S3ApiServer) checkPolicyWithEntry(r *http.Request, bucket, object, ac
 //
 // Returns s3err.ErrNone if allowed, or an error code if denied or on error.
 func (s3a *S3ApiServer) recheckPolicyWithObjectEntry(r *http.Request, bucket, object, action string, objectEntry map[string][]byte, handlerName string) s3err.ErrorCode {
+	if isAnonymousObjectRead(r) {
+		return s3a.authorizeAnonymousObjectRead(r, bucket, object, objectEntry)
+	}
 	identityRaw := GetIdentityFromContext(r)
 	var identity *Identity
 	if identityRaw != nil {
@@ -716,10 +759,21 @@ func (s3a *S3ApiServer) handleCORSOriginValidation(w http.ResponseWriter, r *htt
 // UnifiedPostHandler handles authenticated POST requests to the root path
 // It inspects the Action parameter to dispatch to either STS or IAM handlers
 func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Request) {
+	// Failures on this route answer in the IAM/STS query-protocol envelope
+	// unless the request was actually signed for s3.
+	r, reqID := request_id.Ensure(r)
+	writeQueryError := func(iamCode string, s3Code s3err.ErrorCode) {
+		if requestSigningService(r) == "s3" {
+			s3err.WriteErrorResponse(w, r, s3Code)
+			return
+		}
+		writeIamErrorResponse(w, r, reqID, &iamError{Code: iamCode, Error: errors.New(s3err.GetAPIError(s3Code).Description)})
+	}
+
 	// 1. Authenticate (preserves body)
 	identity, errCode := s3a.iam.AuthSignatureOnly(r)
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, r, errCode)
+		writeQueryError(iamAuthErrorCode(errCode), errCode)
 		return
 	}
 
@@ -727,13 +781,11 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 	// Save the body first so we can restore it for STS handler signature verification
 	var bodyBytes []byte
 	if r.Body != nil {
-		// Limit body size to prevent DoS attacks
-		r.Body = http.MaxBytesReader(w, r.Body, iamRequestBodyLimit)
 		var err error
-		bodyBytes, err = io.ReadAll(r.Body)
+		bodyBytes, err = readRequestBody(r, iamRequestBodyLimit)
 		if err != nil {
 			glog.Errorf("failed to read request body: %v", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+			writeQueryError("InvalidInput", s3err.ErrInvalidRequest)
 			return
 		}
 		r.Body.Close()
@@ -742,7 +794,7 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := r.ParseForm(); err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+		writeQueryError("InvalidInput", s3err.ErrInvalidRequest)
 		return
 	}
 
@@ -769,7 +821,7 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 		// IAM
 		// IAM API requests must be authenticated - reject nil identity
 		if identity == nil {
-			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+			writeQueryError("AccessDenied", s3err.ErrAccessDenied)
 			return
 		}
 
@@ -780,7 +832,7 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 		// UserName comes from the body only, the same place DoActions reads it
 		// from, so the authorized target and the acted-on target cannot differ.
 		if s3a.iam.AuthorizeIamAction(r, identity, action, iamTargetUserName(action, r)) != s3err.ErrNone {
-			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+			writeQueryError("AccessDenied", s3err.ErrAccessDenied)
 			return
 		}
 
@@ -890,16 +942,16 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		// PutObjectACL
 		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectAclHandler, ACTION_WRITE_ACP)), "PUT")).Queries("acl", "")
 		// PutObjectRetention
-		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectRetentionHandler, ACTION_WRITE)), "PUT")).Queries("retention", "")
+		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectRetentionHandler, ACTION_PUT_OBJECT_RETENTION)), "PUT")).Queries("retention", "")
 		// PutObjectLegalHold
-		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectLegalHoldHandler, ACTION_WRITE)), "PUT")).Queries("legal-hold", "")
+		bucket.Methods(http.MethodPut).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectLegalHoldHandler, ACTION_PUT_OBJECT_LEGAL_HOLD)), "PUT")).Queries("legal-hold", "")
 
 		// GetObjectACL
 		bucket.Methods(http.MethodGet).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectAclHandler, ACTION_READ_ACP)), "GET")).Queries("acl", "")
 		// GetObjectRetention
-		bucket.Methods(http.MethodGet).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectRetentionHandler, ACTION_READ)), "GET")).Queries("retention", "")
+		bucket.Methods(http.MethodGet).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectRetentionHandler, ACTION_GET_OBJECT_RETENTION)), "GET")).Queries("retention", "")
 		// GetObjectLegalHold
-		bucket.Methods(http.MethodGet).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectLegalHoldHandler, ACTION_READ)), "GET")).Queries("legal-hold", "")
+		bucket.Methods(http.MethodGet).Path(objectPath).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectLegalHoldHandler, ACTION_GET_OBJECT_LEGAL_HOLD)), "GET")).Queries("legal-hold", "")
 
 		// objects with query
 
@@ -984,8 +1036,8 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketVersioningHandler, ACTION_WRITE)), "PUT")).Queries("versioning", "")
 
 		// GetObjectLockConfiguration / PutObjectLockConfiguration (bucket-level operations)
-		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectLockConfigurationHandler, ACTION_READ)), "GET")).Queries("object-lock", "")
-		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectLockConfigurationHandler, ACTION_WRITE)), "PUT")).Queries("object-lock", "")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectLockConfigurationHandler, ACTION_GET_BUCKET_OBJECT_LOCK_CONFIG)), "GET")).Queries("object-lock", "")
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutObjectLockConfigurationHandler, ACTION_PUT_BUCKET_OBJECT_LOCK_CONFIG)), "PUT")).Queries("object-lock", "")
 
 		// GetBucketTagging
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketTaggingHandler, ACTION_TAGGING)), "GET")).Queries("tagging", "")
@@ -1173,6 +1225,12 @@ func loadIAMManagerFromConfig(configPath string, filerAddressProvider func() str
 		Policy    *policy.PolicyEngineConfig    `json:"policy"`
 		Providers []map[string]interface{}      `json:"providers"`
 		Roles     []*integration.RoleDefinition `json:"roles"`
+		// OIDCProviderStore selects where IAM-managed OIDC providers persist.
+		// Absent, they live in memory and are lost on restart.
+		OIDCProviderStore *integration.OIDCProviderStoreConfig `json:"oidcProviderStore"`
+		// RoleStore selects where roles persist. Absent, they live in memory and
+		// only the roles in this file exist.
+		RoleStore *integration.RoleStoreConfig `json:"roleStore"`
 		Policies  []struct {
 			Name     string                 `json:"name"`
 			Document *policy.PolicyDocument `json:"document"`
@@ -1218,13 +1276,30 @@ func loadIAMManagerFromConfig(configPath string, filerAddressProvider func() str
 		glog.V(1).Infof("Using policy defaults: DefaultEffect=%s, StoreType=%s", configRoot.Policy.DefaultEffect, configRoot.Policy.StoreType)
 	}
 
+	// With no IAM config file there is nothing static for a persisted
+	// provider or role to shadow or outlive, so those created at runtime
+	// default to the filer, where restarts and peer S3 servers see them. A
+	// config file keeps the in-memory defaults unless it sets
+	// oidcProviderStore / roleStore.
+	persistByDefault := configPath == "" && filerAddressProvider != nil
+	oidcProviderStore := configRoot.OIDCProviderStore
+	if oidcProviderStore == nil && persistByDefault {
+		oidcProviderStore = &integration.OIDCProviderStoreConfig{StoreType: "filer"}
+	}
+	roleStore := configRoot.RoleStore
+	if roleStore == nil {
+		roleStore = &integration.RoleStoreConfig{StoreType: sts.StoreTypeMemory}
+		if persistByDefault {
+			roleStore = &integration.RoleStoreConfig{StoreType: "filer"}
+		}
+	}
+
 	// Create IAM configuration
 	iamConfig := &integration.IAMConfig{
-		STS:    configRoot.STS,
-		Policy: configRoot.Policy,
-		Roles: &integration.RoleStoreConfig{
-			StoreType: sts.StoreTypeMemory, // Use memory store for JSON config-based setup
-		},
+		STS:           configRoot.STS,
+		Policy:        configRoot.Policy,
+		Roles:         roleStore,
+		OIDCProviders: oidcProviderStore,
 	}
 
 	// Apply default signing key if not present in config
@@ -1307,11 +1382,7 @@ func loadIAMManagerFromConfig(configPath string, filerAddressProvider func() str
 	}
 
 	// Load roles
-	for _, roleDef := range configRoot.Roles {
-		if err := iamManager.CreateRole(context.Background(), "", roleDef.RoleName, roleDef); err != nil {
-			glog.Warningf("Failed to create role %s: %v", roleDef.RoleName, err)
-		}
-	}
+	iamManager.LoadStaticRoles(context.Background(), configRoot.Roles)
 
 	glog.V(1).Infof("Loaded %d providers, %d policies and %d roles from config", len(configRoot.Providers), len(configRoot.Policies), len(configRoot.Roles))
 

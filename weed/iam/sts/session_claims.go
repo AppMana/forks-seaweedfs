@@ -3,7 +3,6 @@ package sts
 import (
 	"crypto/sha256"
 	"encoding/base64"
-	"fmt"
 	"strings"
 	"time"
 
@@ -54,11 +53,6 @@ func ResolveIdentityClaim(ctx map[string]interface{}) string {
 	return ""
 }
 
-// defaultCredentialGenerator is a reusable instance for generating temporary credentials
-// Reusing a single instance across all calls to ToSessionInfo() reduces allocation overhead
-// since this method may be called frequently during signature verification
-var defaultCredentialGenerator = NewCredentialGenerator()
-
 // STSSessionClaims represents comprehensive session information embedded in JWT tokens
 // This eliminates the need for separate session storage by embedding all session
 // metadata directly in the token itself - enabling true stateless operation
@@ -71,9 +65,10 @@ type STSSessionClaims struct {
 	TokenType   string `json:"typ"`  // token_type
 
 	// Role information
-	RoleArn     string `json:"role"`      // role_arn
-	AssumedRole string `json:"assumed"`   // assumed_role_user
-	Principal   string `json:"principal"` // principal_arn
+	RoleArn     string `json:"role"`          // role_arn
+	RoleId      string `json:"rid,omitempty"` // unique ID of the assumed role
+	AssumedRole string `json:"assumed"`       // assumed_role_user
+	Principal   string `json:"principal"`     // principal_arn
 
 	// Authorization data
 	Policies []string `json:"pol,omitempty"` // policies (abbreviated)
@@ -122,27 +117,27 @@ func NewSTSSessionClaims(sessionId, issuer string, expiresAt time.Time) *STSSess
 
 // ToSessionInfo converts JWT claims back to SessionInfo structure
 // This enables seamless integration with existing code expecting SessionInfo
-func (c *STSSessionClaims) ToSessionInfo() *SessionInfo {
+func (c *STSSessionClaims) ToSessionInfo(credGen *CredentialGenerator) *SessionInfo {
 	var expiresAt time.Time
 	if c.ExpiresAt != nil {
 		expiresAt = c.ExpiresAt.Time
 	}
 
-	// Generate temporary credentials from the session ID
-	// This is deterministic based on the session ID, so the same credentials are regenerated
-	credentials, err := defaultCredentialGenerator.GenerateTemporaryCredentials(c.SessionId, expiresAt)
-	if err != nil {
-		// Log the error with context - credential generation failure is important for debugging
-		errMsg := fmt.Errorf("generate temporary credentials for session %s: %w", c.SessionId, err)
-		glog.Warningf("Failed to generate credentials for STS session: %v", errMsg)
-		// Return session info without credentials - validation will catch this as invalid
-		credentials = nil
+	var credentials *Credentials
+	if credGen != nil {
+		creds, err := credGen.GenerateTemporaryCredentials(c.SessionId, expiresAt)
+		if err != nil {
+			glog.Warningf("Failed to generate credentials for STS session %s: %v", c.SessionId, err)
+		} else {
+			credentials = creds
+		}
 	}
 
 	return &SessionInfo{
 		SessionId:        c.SessionId,
 		SessionName:      c.SessionName,
 		RoleArn:          c.RoleArn,
+		RoleId:           c.RoleId,
 		AssumedRoleUser:  c.AssumedRole,
 		Principal:        c.Principal,
 		Policies:         c.Policies,
@@ -203,6 +198,13 @@ func (c *STSSessionClaims) WithRoleInfo(roleArn, assumedRole, principal string) 
 }
 
 // WithPolicies sets the policies associated with this session
+// WithRoleId binds the session to the assumed role's unique ID. An empty ID
+// leaves the session unbound (roles that predate role IDs).
+func (c *STSSessionClaims) WithRoleId(roleId string) *STSSessionClaims {
+	c.RoleId = roleId
+	return c
+}
+
 func (c *STSSessionClaims) WithPolicies(policies []string) *STSSessionClaims {
 	c.Policies = policies
 	return c

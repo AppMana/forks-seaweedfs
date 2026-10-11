@@ -94,6 +94,7 @@ type STSService struct {
 	providers            map[string]providers.IdentityProvider
 	issuerToProvider     map[string]providers.IdentityProvider // Efficient issuer-based provider lookup
 	tokenGenerator       *TokenGenerator
+	credGenerator        *CredentialGenerator
 	trustPolicyValidator TrustPolicyValidator // Interface for trust policy validation
 
 	// iamManagedOIDCMu guards iamManagedOIDCByIssuer. The map is the live view
@@ -126,6 +127,11 @@ type ScopedOIDCProvider struct {
 // This keeps the underlying field unexported while still allowing read-only access.
 func (s *STSService) GetTokenGenerator() *TokenGenerator {
 	return s.tokenGenerator
+}
+
+// GetCredentialGenerator returns the credential generator used by the STS service.
+func (s *STSService) GetCredentialGenerator() *CredentialGenerator {
+	return s.credGenerator
 }
 
 // STSConfig holds STS service configuration
@@ -181,6 +187,11 @@ type AssumeRoleWithWebIdentityRequest struct {
 
 	// Policy is an optional session policy (optional)
 	Policy *string `json:"Policy,omitempty"`
+
+	// RoleId is the assumed role's unique ID, set by the IAM manager after it
+	// resolves the role. It is embedded in the session so the session is bound
+	// to this role and not to whatever role later holds the same name.
+	RoleId string `json:"-"`
 }
 
 // AssumeRoleWithCredentialsRequest represents a request to assume role with username/password
@@ -205,6 +216,9 @@ type AssumeRoleWithCredentialsRequest struct {
 
 	// Policy is an optional session policy (optional)
 	Policy *string `json:"Policy,omitempty"`
+
+	// RoleId is set by the IAM manager; see AssumeRoleWithWebIdentityRequest.
+	RoleId string `json:"-"`
 }
 
 // AssumeRoleResponse represents the response from assume role operations
@@ -298,6 +312,10 @@ type SessionInfo struct {
 
 	// ParentUser is the stable hashed identity (sub+iss) derived at federation time.
 	ParentUser string `json:"parentUser,omitempty"`
+
+	// RoleId is the unique ID of the role the session was issued for; empty
+	// for sessions issued before role IDs were recorded.
+	RoleId string `json:"roleId,omitempty"`
 }
 
 // NewSTSService creates a new STS service
@@ -325,6 +343,7 @@ func (s *STSService) Initialize(config *STSConfig) error {
 
 	// Initialize token generator for stateless JWT operations
 	s.tokenGenerator = NewTokenGenerator(config.SigningKey, config.Issuer)
+	s.credGenerator = NewCredentialGenerator(config.SigningKey)
 
 	// Load identity providers from configuration
 	if err := s.loadProvidersFromConfig(config); err != nil {
@@ -597,7 +616,7 @@ func (s *STSService) AssumeRoleWithWebIdentity(ctx context.Context, request *Ass
 	}
 
 	// 4. Calculate session duration
-	sessionDuration := s.calculateSessionDuration(request.DurationSeconds)
+	sessionDuration := s.CalculateSessionDuration(request.DurationSeconds)
 	expiresAt := time.Now().Add(sessionDuration)
 
 	// 5. Generate session ID and credentials
@@ -606,8 +625,7 @@ func (s *STSService) AssumeRoleWithWebIdentity(ctx context.Context, request *Ass
 		return nil, fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
-	credGenerator := NewCredentialGenerator()
-	credentials, err := credGenerator.GenerateTemporaryCredentials(sessionId, expiresAt)
+	credentials, err := s.credGenerator.GenerateTemporaryCredentials(sessionId, expiresAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate credentials: %w", err)
 	}
@@ -682,6 +700,7 @@ func (s *STSService) AssumeRoleWithWebIdentity(ctx context.Context, request *Ass
 	sessionClaims := NewSTSSessionClaims(sessionId, s.Config.Issuer, expiresAt).
 		WithSessionName(request.RoleSessionName).
 		WithRoleInfo(effectiveRoleArn, assumedRoleUser.Arn, assumedRoleUser.Arn).
+		WithRoleId(request.RoleId).
 		WithIdentityProvider(provider.Name(), externalIdentity.UserID, externalIdentity.Issuer).
 		WithMaxDuration(sessionDuration).
 		WithRequestContext(requestContext)
@@ -754,16 +773,16 @@ func (s *STSService) AssumeRoleWithCredentials(ctx context.Context, request *Ass
 	}
 
 	// 4-7. Mint the session
-	return s.issueSession(request.RoleArn, request.RoleSessionName, sessionPolicy,
+	return s.issueSession(request.RoleArn, request.RoleId, request.RoleSessionName, sessionPolicy,
 		request.DurationSeconds, provider.Name(), externalIdentity.UserID)
 }
 
 // issueSession mints temporary credentials and the self-contained JWT that
 // carries the whole session, shared by every assume-role entry point.
-func (s *STSService) issueSession(roleArn, roleSessionName, sessionPolicy string,
+func (s *STSService) issueSession(roleArn, roleId, roleSessionName, sessionPolicy string,
 	durationSeconds *int64, providerName, subject string) (*AssumeRoleResponse, error) {
 
-	sessionDuration := s.calculateSessionDuration(durationSeconds)
+	sessionDuration := s.CalculateSessionDuration(durationSeconds)
 	expiresAt := time.Now().Add(sessionDuration)
 
 	sessionId, err := GenerateSessionId()
@@ -771,8 +790,7 @@ func (s *STSService) issueSession(roleArn, roleSessionName, sessionPolicy string
 		return nil, fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
-	credGenerator := NewCredentialGenerator()
-	tempCredentials, err := credGenerator.GenerateTemporaryCredentials(sessionId, expiresAt)
+	tempCredentials, err := s.credGenerator.GenerateTemporaryCredentials(sessionId, expiresAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate credentials: %w", err)
 	}
@@ -786,6 +804,7 @@ func (s *STSService) issueSession(roleArn, roleSessionName, sessionPolicy string
 	sessionClaims := NewSTSSessionClaims(sessionId, s.Config.Issuer, expiresAt).
 		WithSessionName(roleSessionName).
 		WithRoleInfo(roleArn, assumedRoleUser.Arn, assumedRoleUser.Arn).
+		WithRoleId(roleId).
 		WithIdentityProvider(providerName, subject, "").
 		WithMaxDuration(sessionDuration)
 	if sessionPolicy != "" {
@@ -886,7 +905,9 @@ func (s *STSService) AssumeRoleForPrincipal(ctx context.Context, request *Assume
 		return nil, fmt.Errorf("role assumption denied: %w", err)
 	}
 
-	return s.issueSession(request.RoleArn, request.RoleSessionName, sessionPolicy,
+	// Iceberg credential vending resolves no role definition, so its sessions
+	// carry no role ID and stay bound by name.
+	return s.issueSession(request.RoleArn, "", request.RoleSessionName, sessionPolicy,
 		request.DurationSeconds, request.ProviderName, request.Principal)
 }
 
@@ -909,7 +930,7 @@ func (s *STSService) ValidateSessionToken(ctx context.Context, sessionToken stri
 
 	// Convert JWT claims back to SessionInfo
 	// All session information is embedded in the JWT token itself
-	return claims.ToSessionInfo(), nil
+	return claims.ToSessionInfo(s.credGenerator), nil
 }
 
 // NOTE: Session revocation is not supported in the stateless JWT design.
@@ -1115,11 +1136,11 @@ func (s *STSService) validateRoleAssumptionForCredentials(ctx context.Context, r
 	return nil
 }
 
-// calculateSessionDuration returns the requested DurationSeconds, or the
+// CalculateSessionDuration returns the requested DurationSeconds, or the
 // configured TokenDuration default, capped at MaxSessionLength. The source
 // token's exp deliberately plays no part: per AWS semantics the session
 // outlives the (already verified) web identity token.
-func (s *STSService) calculateSessionDuration(durationSeconds *int64) time.Duration {
+func (s *STSService) CalculateSessionDuration(durationSeconds *int64) time.Duration {
 	var duration time.Duration
 	if durationSeconds != nil {
 		duration = time.Duration(*durationSeconds) * time.Second

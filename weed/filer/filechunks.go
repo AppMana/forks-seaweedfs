@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -64,14 +63,14 @@ func ETagChunks(chunks []*filer_pb.FileChunk) (etag string) {
 	return finalETag
 }
 
-func CompactFileChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk) (compacted, garbage []*filer_pb.FileChunk) {
+// CompactFileChunks splits chunks into those still visible and those fully
+// covered by newer writes. It fails if the chunk manifests cannot be resolved,
+// including when ctx is cancelled.
+func CompactFileChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk) (compacted, garbage []*filer_pb.FileChunk, err error) {
 
 	visibles, err := NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, 0, math.MaxInt64)
 	if err != nil {
-		// Unresolved, nothing is known to be covered. Callers delete what is
-		// returned as garbage, so keep every chunk.
-		glog.V(1).InfofCtx(ctx, "CompactFileChunks: keeping all %d chunks: %v", len(chunks), err)
-		return chunks, nil
+		return nil, nil, err
 	}
 
 	compacted, garbage = SeparateGarbageChunks(visibles, chunks)
@@ -80,6 +79,9 @@ func CompactFileChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileId
 }
 
 func SeparateGarbageChunks(visibles *IntervalList[*VisibleInterval], chunks []*filer_pb.FileChunk) (compacted []*filer_pb.FileChunk, garbage []*filer_pb.FileChunk) {
+	if visibles == nil {
+		return chunks, nil
+	}
 	fileIds := make(map[string]bool)
 	for x := visibles.Front(); x != nil; x = x.Next {
 		interval := x.Value
@@ -192,18 +194,19 @@ func (cv *ChunkView) IsFullChunk() bool {
 	return cv.OffsetInChunk == 0 && cv.ViewSize == cv.ChunkSize
 }
 
-func ViewFromChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk, offset int64, size int64) (chunkViews *IntervalList[*ChunkView]) {
-
-	visibles, _ := NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, offset, offset+size)
-
-	return ViewFromVisibleIntervals(visibles, offset, size)
-
+// CanRangeFetch reports whether fetching just the view's byte range avoids
+// reading more than the view needs. Ciphered and compressed chunks are
+// stored and served whole — a range on either still costs a full read plus
+// decrypt or decompress on the volume server — so partial views of them
+// take the shared whole-chunk path instead.
+func (cv *ChunkView) CanRangeFetch() bool {
+	return cv.CipherKey == nil && !cv.IsGzipped
 }
 
-// viewFromChunksOrErr is ViewFromChunks with the manifest resolve error
-// propagated. Ignoring it yields empty chunk views and the caller zero-fills
-// the whole requested range (https://github.com/seaweedfs/seaweedfs/issues/11286).
-func viewFromChunksOrErr(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk, offset int64, size int64) (*IntervalList[*ChunkView], error) {
+// ViewFromChunks returns the views of chunks that cover [offset, offset+size).
+// It fails if the chunk manifests cannot be resolved, including when ctx is
+// cancelled.
+func ViewFromChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, chunks []*filer_pb.FileChunk, offset int64, size int64) (chunkViews *IntervalList[*ChunkView], err error) {
 
 	visibles, err := NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, offset, offset+size)
 	if err != nil {
@@ -211,6 +214,7 @@ func viewFromChunksOrErr(ctx context.Context, lookupFileIdFn wdclient.LookupFile
 	}
 
 	return ViewFromVisibleIntervals(visibles, offset, size), nil
+
 }
 
 func ViewFromVisibleIntervals(visibles *IntervalList[*VisibleInterval], offset int64, size int64) (chunkViews *IntervalList[*ChunkView]) {
@@ -224,6 +228,9 @@ func ViewFromVisibleIntervals(visibles *IntervalList[*VisibleInterval], offset i
 	}
 
 	chunkViews = NewIntervalList[*ChunkView]()
+	if visibles == nil {
+		return chunkViews
+	}
 	for x := visibles.Front(); x != nil; x = x.Next {
 		chunk := x.Value
 

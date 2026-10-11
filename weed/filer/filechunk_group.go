@@ -24,9 +24,7 @@ type ChunkGroup struct {
 	// manifestCache caches resolved chunk manifest bytes across repeated opens
 	// for the same mount. nil for non-mount callers (no caching).
 	manifestCache *ChunkManifestCache
-	// resolveErr is set when chunk manifest resolution failed, guarded by
-	// sectionsLock. Reads must fail with this error instead of silently
-	// zero-filling the unresolved sections as if they were sparse holes.
+	// resolveErr records a manifest resolution failure, guarded by sectionsLock
 	resolveErr error
 	// maxModifiedTsNs is computed while resolving chunks, so mount writes can
 	// advance past observed versions without scanning every chunk per write.
@@ -117,9 +115,6 @@ func (group *ChunkGroup) ReadDataAt(ctx context.Context, fileSize int64, buff []
 	group.sectionsLock.RLock()
 	defer group.sectionsLock.RUnlock()
 
-	// Fail fast when chunk manifest resolution failed: the sections map is
-	// empty or partial, and zero-filling it would silently return all-zero
-	// data as if the file were one big sparse hole.
 	if group.resolveErr != nil {
 		return 0, 0, group.resolveErr
 	}
@@ -263,10 +258,8 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 			continue
 		}
 
-		resolvedChunks, err := resolveOneChunkManifest(context.Background(), group.lookupFn, chunk, group.cacheInvalidator, group.manifestCache)
+		resolvedChunks, err := resolveOneChunkManifest(context.Background(), group.lookupFn, chunk, group.cacheInvalidator, group.manifestCache, nil)
 		if err != nil {
-			// remember the failure so ReadDataAt returns an error instead of
-			// treating the unresolved sections as sparse holes
 			group.resolveErr = err
 			return err
 		}

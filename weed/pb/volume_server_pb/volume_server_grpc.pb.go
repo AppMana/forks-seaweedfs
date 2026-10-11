@@ -75,7 +75,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type VolumeServerClient interface {
-	// Experts only: takes multiple fid parameters. This function does not propagate deletes to replicas.
+	//Experts only: takes multiple fid parameters. This function does not propagate deletes to replicas.
 	BatchDelete(ctx context.Context, in *BatchDeleteRequest, opts ...grpc.CallOption) (*BatchDeleteResponse, error)
 	VacuumVolumeCheck(ctx context.Context, in *VacuumVolumeCheckRequest, opts ...grpc.CallOption) (*VacuumVolumeCheckResponse, error)
 	VacuumVolumeCompact(ctx context.Context, in *VacuumVolumeCompactRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[VacuumVolumeCompactResponse], error)
@@ -742,7 +742,7 @@ func (c *volumeServerClient) Ping(ctx context.Context, in *PingRequest, opts ...
 // All implementations must embed UnimplementedVolumeServerServer
 // for forward compatibility.
 type VolumeServerServer interface {
-	// Experts only: takes multiple fid parameters. This function does not propagate deletes to replicas.
+	//Experts only: takes multiple fid parameters. This function does not propagate deletes to replicas.
 	BatchDelete(context.Context, *BatchDeleteRequest) (*BatchDeleteResponse, error)
 	VacuumVolumeCheck(context.Context, *VacuumVolumeCheckRequest) (*VacuumVolumeCheckResponse, error)
 	VacuumVolumeCompact(*VacuumVolumeCompactRequest, grpc.ServerStreamingServer[VacuumVolumeCompactResponse]) error

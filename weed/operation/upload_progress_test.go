@@ -108,3 +108,58 @@ func TestUploadThatStopsMovingIsAbandoned(t *testing.T) {
 	}
 	t.Logf("abandoned after %v: %v", took, err)
 }
+
+// The Synology volume server, measured 2026-10-12 after its SSD cache was
+// rebuilt, sustains about 80 MB/s and answers 2 MiB uploads at 16 in flight
+// with a p99 of 1.4 s and a maximum of 2.9 s. Such a server is slow but
+// healthy: with the mount's timeouts every upload must land on the first
+// attempt.
+func TestSlowHealthyNasShapedServerIsNotAbandoned(t *testing.T) {
+	const (
+		concurrent = 16
+		perUpload  = 5 << 20 // 80 MB/s shared by 16 uploads
+		answerIn   = 3 * time.Second
+	)
+	var posts atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		buf := make([]byte, perUpload/10)
+		for {
+			if _, err := io.ReadFull(r.Body, buf); err != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		time.Sleep(answerIn)
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"name":"chunk","size":3}`)
+	}))
+	srv.Listener = smallBufferListener{srv.Listener}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	uploader := newUploader(&http.Client{})
+	errs := make(chan error, concurrent)
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			payload := make([]byte, 2<<20)
+			rand.Read(payload)
+			_, err := uploader.UploadData(context.Background(), payload, &UploadOption{
+				UploadUrl:       srv.URL + "/3,01637037d6",
+				Filename:        "chunk",
+				MaxAttempts:     1,
+				StallTimeout:    UploadStallTimeout,
+				ResponseTimeout: MountUploadResponseTimeout,
+			})
+			errs <- err
+		}()
+	}
+	for i := 0; i < concurrent; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("upload to a slow but healthy server abandoned: %v", err)
+		}
+	}
+	if n := posts.Load(); n != concurrent {
+		t.Fatalf("%d posts for %d uploads, want one each", n, concurrent)
+	}
+}

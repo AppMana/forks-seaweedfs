@@ -45,6 +45,10 @@ type ChunkedUploadOption struct {
 	Cipher          bool // encrypt data on volume servers
 	AssignFunc      func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error)
 	UploadFunc      func(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) // Optional: for testing
+	// StalledServers, when set, bounds each chunk write at UploadAttemptTimeout,
+	// records the servers a write stalled or failed on, and skips assignments
+	// that would write through one of them again.
+	StalledServers *StalledServers
 }
 
 var chunkBufferPool = sync.Pool{
@@ -177,7 +181,19 @@ uploadLoop:
 			}()
 
 			// Assign volume for this chunk
-			_, assignResult, assignErr := opt.AssignFunc(ctx, 1, uint64(size))
+			assign := func() (*AssignResult, error) {
+				var assigned *AssignResult
+				err := opt.StalledServers.Pick(func() ([]string, error) {
+					_, result, err := opt.AssignFunc(ctx, 1, uint64(size))
+					if err != nil {
+						return nil, err
+					}
+					assigned = result
+					return chunkHolders(result), nil
+				})
+				return assigned, err
+			}
+			assignResult, assignErr := assign()
 			if assignErr != nil {
 				uploadErrLock.Lock()
 				if uploadErr == nil {
@@ -205,7 +221,7 @@ uploadLoop:
 			// every attempt against the same fid, so ask for a fresh assignment and
 			// retry there rather than losing the whole object to one bad volume.
 			for attempt := 1; ; attempt++ {
-				uploadResult, uploadResultErr = uploadChunk(ctx, assignResult, buf.Bytes(), jwt, chunkMd5B64, opt)
+				uploadResult, uploadResultErr = uploadChunkAttempt(ctx, assignResult, buf.Bytes(), jwt, chunkMd5B64, opt)
 				if uploadResultErr == nil {
 					break
 				}
@@ -213,12 +229,18 @@ uploadLoop:
 				// failed write can still leave a copy behind. No chunk will name
 				// this fid whether we retry or give up here, and an unreferenced
 				// needle is not garbage vacuum can find, so drop it either way.
-				deleteChunkFromHolders(chunkHolders(assignResult), assignResult.Fid, jwt)
+				// With stall avoidance the next attempt does not wait for it: a
+				// delete sent to the server that just stalled would stall too.
+				if opt.StalledServers != nil {
+					go deleteChunkFromHolders(chunkHolders(assignResult), assignResult.Fid, jwt)
+				} else {
+					deleteChunkFromHolders(chunkHolders(assignResult), assignResult.Fid, jwt)
+				}
 				if attempt == chunkAssignAttempts || !ShouldReassignUpload(uploadResultErr) || objectFailed() {
 					break
 				}
 				glog.V(2).Infof("re-assigning chunk at offset %d after attempt %d/%d: %v", offset, attempt, chunkAssignAttempts, uploadResultErr)
-				_, assignResult, assignErr = opt.AssignFunc(ctx, 1, uint64(size))
+				assignResult, assignErr = assign()
 				if assignErr != nil {
 					uploadResultErr = fmt.Errorf("reassign volume after %w: %w", uploadResultErr, assignErr)
 					break
@@ -300,12 +322,30 @@ uploadLoop:
 // before the upload gives up.
 const chunkAssignAttempts = 3
 
+// uploadChunkAttempt is one write of a chunk to its assigned volume. With
+// stall avoidance each write is bounded at UploadAttemptTimeout, and a
+// relayed write that fails records the server it points at; a fan-out
+// records the holder itself.
+func uploadChunkAttempt(ctx context.Context, assignResult *AssignResult, data []byte, jwt security.EncodedJwt, md5b64 string, opt *ChunkedUploadOption) (*UploadResult, error) {
+	result, err := uploadChunk(ctx, assignResult, data, jwt, md5b64, opt)
+	if err != nil && !chunkFansOut(assignResult, opt) {
+		opt.StalledServers.NoteFailure(chunkHolders(assignResult), err)
+	}
+	return result, err
+}
+
+// chunkFansOut reports whether uploadChunk writes the chunk to every holder
+// itself rather than relaying it through the assigned server.
+func chunkFansOut(assignResult *AssignResult, opt *ChunkedUploadOption) bool {
+	return opt.UploadFunc == nil && !opt.Cipher && len(chunkHolders(assignResult)) > 1
+}
+
 // uploadChunk writes one chunk to its assigned volume. It fans out to every
 // holder, except for cipher: per-call encryption would give each replica
 // different bytes, so keep its relay path.
 func uploadChunk(ctx context.Context, assignResult *AssignResult, data []byte, jwt security.EncodedJwt, md5b64 string, opt *ChunkedUploadOption) (*UploadResult, error) {
 	holders := chunkHolders(assignResult)
-	if opt.UploadFunc == nil && !opt.Cipher && len(holders) > 1 {
+	if chunkFansOut(assignResult, opt) {
 		return uploadChunkToHolders(ctx, holders, assignResult.Fid, data, jwt, md5b64, assignResult.Fsync, opt)
 	}
 	uploadOption := &UploadOption{
@@ -324,6 +364,9 @@ func uploadChunk(ctx context.Context, assignResult *AssignResult, data []byte, j
 		// keeps its retries, where absorbing a blip locally beats cancelling
 		// every holder and re-uploading the chunk.
 		MaxAttempts: 1,
+	}
+	if opt.StalledServers != nil {
+		uploadOption.AttemptTimeout = UploadAttemptTimeout(int64(len(data)))
 	}
 	if assignResult.Fsync {
 		uploadOption.UploadUrl += "?fsync=true"
@@ -383,7 +426,18 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 				Jwt:               jwt,
 				Md5:               md5b64,
 			}
+			if opt.StalledServers != nil {
+				// One bounded attempt per holder: a retry against a holder
+				// that stalled would only spend the time a new assignment
+				// needs.
+				uploadOption.MaxAttempts = 1
+				uploadOption.AttemptTimeout = UploadAttemptTimeout(int64(len(data)))
+			}
 			r, e := uploader.UploadData(ctx, data, uploadOption)
+			if e != nil {
+				// The holder that failed or stalled is known exactly here.
+				opt.StalledServers.NoteFailure([]string{host}, e)
+			}
 			outcomes <- outcome{host, r, e}
 		}(host)
 	}
@@ -428,4 +482,10 @@ func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt)
 			glog.Warningf("replica fan-out cleanup: delete %s from %s: %v", fid, host, err)
 		}
 	}
+}
+
+// DeleteChunkFromHolders best-effort removes the needle fid from each of
+// hosts, for a write that failed after a copy may have landed.
+func DeleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt) {
+	deleteChunkFromHolders(hosts, fid, jwt)
 }

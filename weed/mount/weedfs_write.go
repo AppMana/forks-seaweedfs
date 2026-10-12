@@ -3,7 +3,6 @@ package mount
 import (
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -11,29 +10,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
-
-// chunkUploadBaseTimeout and chunkUploadMinRate size chunkUploadAttemptTimeout.
-// A close() or fsync waits for every chunk still uploading and must be
-// answered within the FUSE request deadline (60 s), so one attempt has to end
-// well inside it with room left for a second attempt elsewhere. A healthy
-// 2 MiB chunk upload measured 0.06 to 0.24 s on the production cluster under
-// load; one that has not finished in 10 s is held by a stalled server.
-const (
-	chunkUploadBaseTimeout = 10 * time.Second
-	chunkUploadMinRate     = 16 << 20 // bytes per second
-)
-
-// chunkUploadAttemptTimeout bounds one attempt to upload a chunk of up to
-// chunkSize bytes. It stays above the volume server's replica write timeout
-// for the same size, so a stalled replica fails the primary first and the
-// primary's 500 names the replica to avoid.
-func chunkUploadAttemptTimeout(chunkSize int64) time.Duration {
-	return chunkUploadBaseTimeout + time.Duration(chunkSize*int64(time.Second)/chunkUploadMinRate)
-}
-
-// stalledVolumeServerTTL is how long chunk uploads avoid a volume server after
-// an attempt stalled on it.
-const stalledVolumeServerTTL = time.Minute
 
 func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFunctionType {
 
@@ -62,7 +38,7 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			PairMap:           nil,
 			WantMd5:           true,
 			MaxAttempts:       1,
-			AttemptTimeout:    chunkUploadAttemptTimeout(wfs.option.ChunkSizeLimit),
+			AttemptTimeout:    operation.UploadAttemptTimeout(wfs.option.ChunkSizeLimit),
 			StalledServers:    wfs.stalledVolumeServers,
 		}
 		if wfs.option.VolumeServerAccess == "filerProxy" {

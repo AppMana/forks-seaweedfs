@@ -10,9 +10,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"sync"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
@@ -125,14 +127,17 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 
 	srcResp, err := util_http.GetGlobalHttpClient().Do(srcReq)
 	if err != nil {
-		return fmt.Errorf("source GET: %w", err)
+		return copySourceFailure(fmt.Errorf("source GET: %w", err))
 	}
 	// CloseResponse drains and closes resp.Body for keepalive.
 	defer util_http.CloseResponse(srcResp)
 
 	if srcResp.StatusCode >= 400 {
-		return fmt.Errorf("source GET %s: %s", srcUrl, srcResp.Status)
+		return &copySourceError{statusCode: srcResp.StatusCode, err: fmt.Errorf("source GET %s: %s", srcUrl, srcResp.Status)}
 	}
+	// Records a failed read of the source, so a failed POST can tell a source
+	// that stopped sending from a destination that stopped taking.
+	source := &recordingReader{r: srcResp.Body}
 
 	// What's actually on the wire — trust this over caller hints. For range
 	// fetches the volume always returns raw bytes (no Content-Encoding); for
@@ -181,7 +186,9 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		contentLength = int64(framing.Len()) + srcResp.ContentLength
 	}
 
+	producerDone := make(chan struct{})
 	go func() {
+		defer close(producerDone)
 		// CloseWithError on the writer end propagates the failure to the
 		// HTTP transport reading from pipeReader, which then aborts the
 		// POST. Plain Close (with err==nil) sends EOF normally.
@@ -196,7 +203,7 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 			return
 		}
 
-		if _, err := io.Copy(fw, srcResp.Body); err != nil {
+		if _, err := io.Copy(fw, source); err != nil {
 			if shouldLogStreamError(err) {
 				glog.V(2).Infof("stream copy %s offset=%d size=%d: %v",
 					srcUrl, offset, size, err)
@@ -233,12 +240,19 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		// Closing the reader unblocks the producer if it was still mid-write;
 		// the deferred cancel above also stops any in-flight source read.
 		pipeReader.CloseWithError(err)
-		return fmt.Errorf("POST: %w", err)
+		cancel()
+		<-producerDone
+		if readErr := source.err(); readErr != nil {
+			return copySourceFailure(fmt.Errorf("source read: %w", readErr))
+		}
+		return operation.NewUploadStatusError(0, fmt.Errorf("POST: %w", err))
 	}
 	defer util_http.CloseResponse(resp)
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("POST %s: %s", dstUrl, resp.Status)
+		// The body names the replica a replicated write failed on.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return operation.NewUploadStatusError(resp.StatusCode, fmt.Errorf("POST %s: %s: %s", dstUrl, resp.Status, bytes.TrimSpace(body)))
 	}
 	return nil
 }
@@ -248,4 +262,30 @@ func shouldLogStreamError(err error) bool {
 	// after the POST failed; the underlying error is reported via the POST
 	// path, no need to log twice.
 	return err != nil && err != io.ErrClosedPipe
+}
+
+// recordingReader passes reads through and keeps the first error other than
+// io.EOF.
+type recordingReader struct {
+	r       io.Reader
+	mu      sync.Mutex
+	readErr error
+}
+
+func (r *recordingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err != nil && err != io.EOF {
+		r.mu.Lock()
+		if r.readErr == nil {
+			r.readErr = err
+		}
+		r.mu.Unlock()
+	}
+	return n, err
+}
+
+func (r *recordingReader) err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.readErr
 }

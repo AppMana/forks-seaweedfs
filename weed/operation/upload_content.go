@@ -210,35 +210,14 @@ type uploadAssignment struct {
 	servers []string
 }
 
-// maxAssignmentsAvoidingStalled bounds how many assignments one upload asks
-// for while looking for a volume none of whose servers recently stalled.
-const maxAssignmentsAvoidingStalled = 8
-
-// assignAvoiding asks for assignments until one avoids every server in
-// stalled, or maxAssignmentsAvoidingStalled are spent, and then takes the
-// last one: a stalled server may have recovered, and an upload with no clean
-// volume left must still be tried.
-func assignAvoiding(assignFn func() (uploadAssignment, error), stalled *StalledServers) (uploadAssignment, error) {
-	var a uploadAssignment
-	var err error
-	for i := 0; i < maxAssignmentsAvoidingStalled; i++ {
-		a, err = assignFn()
-		if err != nil || stalled == nil {
-			return a, err
-		}
-		server, avoided := stalled.firstStalled(a.servers)
-		if !avoided {
-			return a, nil
-		}
-		glog.V(1).Infof("skip assignment %s: %s stalled recently", a.fileId, server)
-	}
-	return a, err
-}
-
 func (uploader *Uploader) uploadWithRetryData(assignFn func() (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
 	doUploadFunc := func() error {
 		var a uploadAssignment
-		a, err = assignAvoiding(assignFn, uploadOption.StalledServers)
+		err = uploadOption.StalledServers.Pick(func() ([]string, error) {
+			var assignErr error
+			a, assignErr = assignFn()
+			return a.servers, assignErr
+		})
 		if err != nil {
 			return err
 		}
@@ -258,8 +237,8 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (uploadAssignment,
 		}
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
-		if err != nil && uploadOption.StalledServers != nil {
-			uploadOption.StalledServers.noteFailure(a.servers, err)
+		if err != nil {
+			uploadOption.StalledServers.NoteFailure(a.servers, err)
 		}
 		return err
 	}

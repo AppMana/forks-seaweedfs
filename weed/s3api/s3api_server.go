@@ -26,6 +26,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/integration"
 	"github.com/seaweedfs/seaweedfs/weed/iam/policy"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
@@ -147,6 +148,9 @@ type S3ApiServer struct {
 	// teardown waits on context.Background() fetches. The chunkCache field
 	// is nil in this commit; a follow-up wires in an in-memory chunk cache.
 	readerCache *filer.ReaderCache
+	// stalledServers records the volume servers chunk writes recently stalled
+	// on, so object writes and copies are assigned around them.
+	stalledServers *operation.StalledServers
 
 	// ownerIndexReady caches the presence of the owner index backfill marker.
 	ownerIndexReady atomic.Bool
@@ -361,6 +365,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		cipher:                option.Cipher,
 		readerCache:           readerCache,
 	}
+	s3ApiServer.stalledServers = operation.NewStalledServers(operation.StalledServerTTL)
 
 	if len(option.Filers) > 0 {
 		// Reuse the lock client built in the masters block (already subscribed to

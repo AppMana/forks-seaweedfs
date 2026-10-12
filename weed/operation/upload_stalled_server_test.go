@@ -242,11 +242,56 @@ func TestStalledServersExpire(t *testing.T) {
 	s := NewStalledServers(time.Minute)
 	s.now = func() time.Time { return now }
 	s.Mark("a:8080")
-	if server, ok := s.firstStalled([]string{"b:8080", "a:8080"}); !ok || server != "a:8080" {
+	if server, ok := s.FirstStalled([]string{"b:8080", "a:8080"}); !ok || server != "a:8080" {
 		t.Fatalf("firstStalled = %q, %v; want a:8080", server, ok)
 	}
 	now = now.Add(time.Minute)
-	if server, ok := s.firstStalled([]string{"a:8080"}); ok {
+	if server, ok := s.FirstStalled([]string{"a:8080"}); ok {
 		t.Fatalf("%s still stalled after its ttl", server)
+	}
+}
+
+// An S3 object write fans each chunk out to every holder of its volume. A
+// holder that stalls must cost one bounded attempt, after which the chunk is
+// written to a volume that holder is not in.
+func TestUploadReaderInChunksMovesOffAStalledHolder(t *testing.T) {
+	stalled := startStalledVolumeServer(t)
+	healthyA := startHealthyVolumeServer(t, nil)
+	healthyB := startHealthyVolumeServer(t, nil)
+	var mu sync.Mutex
+	assigned := 0
+	assignments := []*AssignResult{
+		{Fid: "1,01637037d6", Url: healthyA.addr(), Replicas: []Location{{Url: stalled.addr()}}},
+		{Fid: "2,02637037d6", Url: healthyB.addr(), Replicas: []Location{{Url: stalled.addr()}}},
+		{Fid: "3,03637037d6", Url: healthyA.addr(), Replicas: []Location{{Url: healthyB.addr()}}},
+	}
+	payload := bytes.Repeat([]byte("layer"), 200<<10) // 1000 KiB, one chunk
+	start := time.Now()
+	result, err := UploadReaderInChunks(context.Background(), bytes.NewReader(payload), &ChunkedUploadOption{
+		ChunkSize:      4 << 20,
+		SmallFileLimit: 0,
+		StalledServers: NewStalledServers(time.Minute),
+		AssignFunc: func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			a := assignments[min(assigned, len(assignments)-1)]
+			assigned++
+			return nil, a, nil
+		},
+	})
+	took := time.Since(start)
+	if err != nil {
+		t.Fatalf("object write with a stalled holder failed after %v: %v", took, err)
+	}
+	if len(result.FileChunks) != 1 || result.FileChunks[0].FileId != "3,03637037d6" {
+		t.Fatalf("chunks = %v, want one chunk on 3,03637037d6", result.FileChunks)
+	}
+	// One attempt bounded at UploadAttemptTimeout, one reassignment; the
+	// second assignment, which also holds the stalled server, is skipped.
+	if limit := UploadAttemptTimeout(int64(len(payload))) + 2*time.Second; took > limit {
+		t.Fatalf("object write took %v, want under %v", took, limit)
+	}
+	if assigned != 3 {
+		t.Fatalf("asked for %d assignments, want 3", assigned)
 	}
 }

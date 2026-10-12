@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
@@ -165,6 +166,7 @@ func TestCopyChunkRangeMovesOffAStalledDestination(t *testing.T) {
 	require.Equal(t, "4,02637037d6", dst.FileId)
 	require.Equal(t, []string{"/4,02637037d6"}, healthyPaths())
 	require.GreaterOrEqual(t, stalledConnections(), 1, "the first attempt never reached the stalled server")
-	// One bounded attempt on the stalled server, then the copy elsewhere.
-	require.Less(t, took, 15*time.Second)
+	// One attempt on the stalled server, abandoned once it stops making
+	// progress, then the copy elsewhere.
+	require.Less(t, took, operation.UploadStallTimeout+operation.GatewayUploadResponseTimeout+5*time.Second)
 }

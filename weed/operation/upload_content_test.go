@@ -95,7 +95,7 @@ func TestUploadWithRetryDataReassignsOnVolumeSizeExceeded(t *testing.T) {
 	uploader := newUploader(httpClient)
 
 	assignCalls := 0
-	fileID, uploadResult, err := uploader.uploadWithRetryData(func() (uploadAssignment, error) {
+	fileID, uploadResult, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
 		assignCalls++
 		if assignCalls == 1 {
 			return uploadAssignment{fileId: "1,first", host: "volume-a"}, nil
@@ -143,7 +143,7 @@ func TestUploadWithRetryDataReassignsOnReplicaWriteFailure(t *testing.T) {
 	uploader := newUploader(httpClient)
 
 	assignCalls := 0
-	fileID, uploadResult, err := uploader.uploadWithRetryData(func() (uploadAssignment, error) {
+	fileID, uploadResult, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
 		assignCalls++
 		if assignCalls == 1 {
 			return uploadAssignment{fileId: "1,first", host: "volume-a"}, nil

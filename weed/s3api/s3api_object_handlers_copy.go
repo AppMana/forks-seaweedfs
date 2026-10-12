@@ -1500,8 +1500,9 @@ func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChu
 	return dstChunk, nil
 }
 
-// assignNewVolume assigns a new volume for the chunk
-func (s3a *S3ApiServer) assignNewVolume(dstPath string, expectedDataSize uint64) (*filer_pb.AssignVolumeResponse, error) {
+// assignNewVolume assigns a new volume for the chunk, asking the master to
+// avoid the given volume servers.
+func (s3a *S3ApiServer) assignNewVolume(dstPath string, expectedDataSize uint64, avoid ...string) (*filer_pb.AssignVolumeResponse, error) {
 	var assignResult *filer_pb.AssignVolumeResponse
 	err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.AssignVolume(context.Background(), &filer_pb.AssignVolumeRequest{
@@ -1512,6 +1513,7 @@ func (s3a *S3ApiServer) assignNewVolume(dstPath string, expectedDataSize uint64)
 			DataCenter:       s3a.option.DataCenter,
 			Path:             dstPath,
 			ExpectedDataSize: expectedDataSize,
+			AvoidServers:     avoid,
 		})
 		if err != nil {
 			return fmt.Errorf("assign volume: %w", err)

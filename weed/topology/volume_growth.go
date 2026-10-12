@@ -68,6 +68,10 @@ type VolumeGrowOption struct {
 	DataNode           string                        `json:"dataNode,omitempty"`
 	MemoryMapMaxSizeMb uint32                        `json:"memoryMapMaxSizeMb,omitempty"`
 	Version            uint32                        `json:"version,omitempty"`
+	// AvoidServers are volume server URLs a writer recently saw stall.
+	// PickForWrite prefers volumes none of whose holders is among them;
+	// growth ignores it, and String() leaves it out.
+	AvoidServers []string `json:"-"`
 }
 
 type VolumeGrowth struct {

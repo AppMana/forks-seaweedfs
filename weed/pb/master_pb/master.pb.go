@@ -1607,8 +1607,12 @@ type AssignRequest struct {
 	WritableVolumeCount uint32                 `protobuf:"varint,9,opt,name=writable_volume_count,json=writableVolumeCount,proto3" json:"writable_volume_count,omitempty"`
 	DiskType            string                 `protobuf:"bytes,10,opt,name=disk_type,json=diskType,proto3" json:"disk_type,omitempty"`
 	ExpectedDataSize    uint64                 `protobuf:"varint,11,opt,name=expected_data_size,json=expectedDataSize,proto3" json:"expected_data_size,omitempty"` // hint for size-aware volume selection
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Volume server URLs the writer recently saw stall. The master prefers a
+	// writable volume none of whose holders is listed, and picks from all of
+	// them when none is left. Numbered apart from upstream's sequence.
+	AvoidServers  []string `protobuf:"bytes,100,rep,name=avoid_servers,json=avoidServers,proto3" json:"avoid_servers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AssignRequest) Reset() {
@@ -1716,6 +1720,13 @@ func (x *AssignRequest) GetExpectedDataSize() uint64 {
 		return x.ExpectedDataSize
 	}
 	return 0
+}
+
+func (x *AssignRequest) GetAvoidServers() []string {
+	if x != nil {
+		return x.AvoidServers
+	}
+	return nil
 }
 
 type VolumeGrowRequest struct {
@@ -5202,7 +5213,7 @@ const file_master_proto_rawDesc = "" +
 	"dataCenter\x12$\n" +
 	"\x0edata_in_remote\x18\x05 \x01(\bR\fdataInRemote\x12\x1b\n" +
 	"\tread_only\x18\x06 \x01(\bR\breadOnly\x12/\n" +
-	"\x14read_only_can_delete\x18\a \x01(\bR\x11readOnlyCanDelete\"\xfe\x02\n" +
+	"\x14read_only_can_delete\x18\a \x01(\bR\x11readOnlyCanDelete\"\xa3\x03\n" +
 	"\rAssignRequest\x12\x14\n" +
 	"\x05count\x18\x01 \x01(\x04R\x05count\x12 \n" +
 	"\vreplication\x18\x02 \x01(\tR\vreplication\x12\x1e\n" +
@@ -5218,7 +5229,8 @@ const file_master_proto_rawDesc = "" +
 	"\x15writable_volume_count\x18\t \x01(\rR\x13writableVolumeCount\x12\x1b\n" +
 	"\tdisk_type\x18\n" +
 	" \x01(\tR\bdiskType\x12,\n" +
-	"\x12expected_data_size\x18\v \x01(\x04R\x10expectedDataSize\"\xbe\x02\n" +
+	"\x12expected_data_size\x18\v \x01(\x04R\x10expectedDataSize\x12#\n" +
+	"\ravoid_servers\x18d \x03(\tR\favoidServers\"\xbe\x02\n" +
 	"\x11VolumeGrowRequest\x122\n" +
 	"\x15writable_volume_count\x18\x01 \x01(\rR\x13writableVolumeCount\x12 \n" +
 	"\vreplication\x18\x02 \x01(\tR\vreplication\x12\x1e\n" +

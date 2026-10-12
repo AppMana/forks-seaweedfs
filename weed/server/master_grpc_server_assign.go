@@ -87,6 +87,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		DataNode:           req.DataNode,
 		MemoryMapMaxSizeMb: req.MemoryMapMaxSizeMb,
 		Version:            uint32(ver),
+		AvoidServers:       req.AvoidServers,
 	}
 
 	if !ms.Topo.DataCenterExists(option.DataCenter) {

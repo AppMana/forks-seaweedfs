@@ -50,7 +50,6 @@ security settings:
 //     performed after the needle size is known
 func (vs *VolumeServer) checkDownloadLimit(w http.ResponseWriter, r *http.Request) bool {
 	inFlightDownloadSize := atomic.LoadInt64(&vs.inFlightDownloadDataSize)
-	stats.VolumeServerInFlightDownloadSize.Set(float64(inFlightDownloadSize))
 
 	if vs.concurrentDownloadLimit == 0 || inFlightDownloadSize < vs.concurrentDownloadLimit {
 		return true // no limit configured or within limit - proceed normally
@@ -136,11 +135,27 @@ func reserveDataSize(ctx context.Context, counter *int64, limit, size int64, tim
 	}
 }
 
+// releaseDownloadSize and releaseUploadSize return a reservation. The
+// in-flight size gauges move with every reservation and release, so they
+// report what is reserved now; setting them only at admission left them at
+// the last admitted total, nonzero with nothing in flight.
+func (vs *VolumeServer) releaseDownloadSize(size int64) {
+	size = max(size, 0)
+	atomic.AddInt64(&vs.inFlightDownloadDataSize, -size)
+	stats.VolumeServerInFlightDownloadSize.Sub(float64(size))
+}
+
+func (vs *VolumeServer) releaseUploadSize(size int64) {
+	size = max(size, 0)
+	atomic.AddInt64(&vs.inFlightUploadDataSize, -size)
+	stats.VolumeServerInFlightUploadSize.Sub(float64(size))
+}
+
 func (vs *VolumeServer) reserveDownloadSize(w http.ResponseWriter, r *http.Request, size int64) bool {
 	status := reserveDataSize(r.Context(), &vs.inFlightDownloadDataSize,
 		vs.concurrentDownloadLimit, size, vs.inflightDownloadDataTimeout)
-	stats.VolumeServerInFlightDownloadSize.Set(float64(atomic.LoadInt64(&vs.inFlightDownloadDataSize)))
 	if status == http.StatusOK {
+		stats.VolumeServerInFlightDownloadSize.Add(float64(max(size, 0)))
 		return true
 	}
 	stats.VolumeServerHandlerCounter.WithLabelValues(stats.DownloadLimitCond).Inc()
@@ -171,8 +186,8 @@ func (vs *VolumeServer) reserveDownloadSize(w http.ResponseWriter, r *http.Reque
 func (vs *VolumeServer) checkUploadLimit(w http.ResponseWriter, r *http.Request, size int64) bool {
 	status := reserveDataSize(r.Context(), &vs.inFlightUploadDataSize,
 		vs.concurrentUploadLimit, size, vs.inflightUploadDataTimeout)
-	stats.VolumeServerInFlightUploadSize.Set(float64(atomic.LoadInt64(&vs.inFlightUploadDataSize)))
 	if status == http.StatusOK {
+		stats.VolumeServerInFlightUploadSize.Add(float64(max(size, 0)))
 		return true
 	}
 	stats.VolumeServerHandlerCounter.WithLabelValues(stats.UploadLimitCond).Inc()
@@ -227,12 +242,7 @@ func (vs *VolumeServer) handleUploadRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	defer func() {
-		atomic.AddInt64(&vs.inFlightUploadDataSize, -contentLength)
-		if vs.concurrentUploadLimit != 0 {
-			vs.inFlightUploadDataLimitCond.Broadcast()
-		}
-	}()
+	defer vs.releaseUploadSize(contentLength)
 
 	// processes uploads
 	stats.WriteRequest()

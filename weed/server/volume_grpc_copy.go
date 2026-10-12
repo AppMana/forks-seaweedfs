@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,13 +36,9 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		return err
 	}
 
-	// A pre-existing local replica is NOT deleted up front. Deleting before the
-	// source is confirmed reachable destroys a healthy copy on a transient
-	// source outage (and, on retry, can lose the volume entirely). The delete is
-	// deferred until ReadVolumeFileStatus below proves the source holds the
-	// volume; readability alone is the gate (size/count comparisons invert after
-	// divergent vacuum/compaction and would block valid re-replication).
-	hasExistingVolume := vs.store.GetVolume(needle.VolumeId(req.VolumeId)) != nil
+	// A pre-existing local replica stays mounted while the copy streams into a
+	// staging directory; ReplaceVolume swaps it out only once the copy is
+	// complete and its sizes match the source.
 
 	// the master will not start compaction for read-only volumes, so it is safe to just copy files directly
 	// copy .dat and .idx files
@@ -54,6 +51,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 	var sourceVolumeStatusAfterCopy *volume_server_pb.VolumeStatusResponse
 	var dataBaseFileName, indexBaseFileName, idxFileName, datFileName string
 	var hasRemoteDatFile bool
+	var location *storage.DiskLocation
 	err := operation.WithVolumeServerClient(true, pb.ServerAddress(req.SourceDataNode), vs.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 		var err error
 		sourceVolumeStatus, err = client.VolumeStatus(stream.Context(), &volume_server_pb.VolumeStatusRequest{
@@ -82,7 +80,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		if hasRemoteDatFile {
 			neededSpace = volFileInfoResp.IdxFileSize
 		}
-		location := vs.store.FindFreeLocation(func(location *storage.DiskLocation) bool {
+		location = vs.store.FindFreeLocation(func(location *storage.DiskLocation) bool {
 			return location.DiskType == types.ToDiskType(diskType) &&
 				location.AvailableSpace.Load() > neededSpace
 		}, needle.VolumeId(req.VolumeId))
@@ -90,36 +88,16 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			return fmt.Errorf("%s %s", util.ErrVolumeNoSpaceLeft, types.ToDiskType(diskType).ReadableString())
 		}
 
-		// Source is reachable and a destination is reserved: only now is it
-		// safe to drop an existing local replica before overwriting its files.
-		if hasExistingVolume {
-			glog.V(0).Infof("volume %d already exists. deleting before copying from %s...", req.VolumeId, req.SourceDataNode)
-			// keep remote data: the inbound copy carries a .vif that may point at
-			// the same cloud-tier object the existing volume references.
-			if delErr := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), false, true); delErr != nil {
-				return fmt.Errorf("failed to delete existing volume %d: %v", req.VolumeId, delErr)
+		dataBaseFileName = storage.StagedVolumeFileName(location.Directory, volFileInfoResp.Collection, int(req.VolumeId))
+		indexBaseFileName = storage.StagedVolumeFileName(location.IdxDirectory, volFileInfoResp.Collection, int(req.VolumeId))
+		for _, stagingDir := range []string{filepath.Dir(dataBaseFileName), filepath.Dir(indexBaseFileName)} {
+			if err = os.RemoveAll(stagingDir); err == nil {
+				err = os.MkdirAll(stagingDir, 0755)
 			}
-			glog.V(0).Infof("deleted existing volume %d before copying.", req.VolumeId)
-		}
-
-		dataBaseFileName = storage.VolumeFileName(location.Directory, volFileInfoResp.Collection, int(req.VolumeId))
-		indexBaseFileName = storage.VolumeFileName(location.IdxDirectory, volFileInfoResp.Collection, int(req.VolumeId))
-
-		// The .note marks the copy as in-progress; a leftover note fails the
-		// volume load on restart, so a write failure must abort the copy.
-		if noteErr := util.WriteFile(dataBaseFileName+".note", []byte(fmt.Sprintf("copying from %s", req.SourceDataNode)), 0755); noteErr != nil {
-			err = noteErr
-			return fmt.Errorf("write .note for volume %d: %w", req.VolumeId, noteErr)
-		}
-
-		defer func() {
 			if err != nil {
-				os.Remove(dataBaseFileName + ".dat")
-				os.Remove(indexBaseFileName + ".idx")
-				os.Remove(dataBaseFileName + ".vif")
-				os.Remove(dataBaseFileName + ".note")
+				return fmt.Errorf("prepare staging directory %s for volume %d: %w", stagingDir, req.VolumeId, err)
 			}
-		}()
+		}
 
 		var preallocateSize int64
 		if grpcErr := pb.WithMasterClient(context.Background(), false, vs.GetMaster(context.Background()), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
@@ -192,13 +170,6 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			os.Chtimes(dataBaseFileName+".vif", time.Unix(0, modifiedTsNs), time.Unix(0, modifiedTsNs))
 		}
 
-		// A leftover .note fails the load on the next restart, so a removal
-		// failure must fail the copy rather than be silently swallowed.
-		if noteErr := os.Remove(dataBaseFileName + ".note"); noteErr != nil && !os.IsNotExist(noteErr) {
-			err = noteErr
-			return fmt.Errorf("remove .note for volume %d: %w", req.VolumeId, noteErr)
-		}
-
 		var statusErr error
 		sourceVolumeStatusAfterCopy, statusErr = client.VolumeStatus(stream.Context(), &volume_server_pb.VolumeStatusRequest{
 			VolumeId: req.VolumeId,
@@ -211,6 +182,12 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		return nil
 	})
 
+	if dataBaseFileName != "" {
+		defer func() {
+			os.RemoveAll(filepath.Dir(dataBaseFileName))
+			os.RemoveAll(filepath.Dir(indexBaseFileName))
+		}()
+	}
 	if err != nil {
 		return err
 	}
@@ -220,14 +197,6 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 
 	idxFileName = indexBaseFileName + ".idx"
 	datFileName = dataBaseFileName + ".dat"
-
-	defer func() {
-		if err != nil && dataBaseFileName != "" {
-			os.Remove(idxFileName)
-			os.Remove(datFileName)
-			os.Remove(dataBaseFileName + ".vif")
-		}
-	}()
 
 	if err = checkCopyFiles(volFileInfoResp, hasRemoteDatFile, idxFileName, datFileName); err != nil { // added by panyc16
 		return err
@@ -250,7 +219,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 	// Load and validate the volume before announcing it to the master. A failed
 	// validation is unloaded by the store without ever making the replica
 	// routable.
-	err = vs.store.MountVolume(needle.VolumeId(req.VolumeId), &req.Collection, func(targetVolume *storage.Volume) error {
+	err = vs.store.ReplaceVolume(needle.VolumeId(req.VolumeId), volFileInfoResp.Collection, location, func(targetVolume *storage.Volume) error {
 		if !shouldValidateCopyCounts {
 			return nil
 		}

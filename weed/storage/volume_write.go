@@ -110,24 +110,32 @@ func removeVolumeFiles(filename string, keepVif bool) {
 			glog.Infof("removed volume file %s (size=%d)", fullFilename, st.Size())
 		}
 	}
-	deleteAndLog("dat")
-	deleteAndLog("idx")
-	if !keepVif {
-		deleteAndLog("vif")
+	for _, ext := range volumeFileExts {
+		if keepVif && ext == "vif" {
+			continue
+		}
+		deleteAndLog(ext)
 	}
+}
+
+// volumeFileExts are the files a regular volume owns beside its EC shards.
+var volumeFileExts = []string{
+	"dat",
+	"idx",
+	"vif",
 	// sorted index file
-	deleteAndLog("sdx")
+	"sdx",
 	// compaction
-	deleteAndLog("cpd")
-	deleteAndLog("cpx")
+	"cpd",
+	"cpx",
 	// compaction commit marker
-	deleteAndLog("cpc")
+	"cpc",
 	// level db index file
-	deleteAndLog("ldb")
+	"ldb",
 	// redb index file (Rust volume server)
-	deleteAndLog("rdb")
+	"rdb",
 	// marker for damaged or incomplete volume
-	deleteAndLog("note")
+	"note",
 }
 
 // asyncRequestAppend queues a request for the batch worker, starting it on the

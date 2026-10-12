@@ -199,8 +199,9 @@ The [storage lab README](test/storage_lab/README.md) covers the four-VM
 fault, Windows and mixed-OS scenarios and their inputs. CI takes the
 Labcontainers VM image (`name@sha256:…`, labelled with `LABCONTAINERS_REF`)
 from the repository secret `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE`, or
-the variable of the same name; a secret keeps a private registry's name out
-of public logs.
+the variable of the same name, and the Windows Server image from
+`SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` the same way; a secret
+keeps a private registry's name out of public logs.
 
 ## Branches
 

@@ -280,7 +280,7 @@ jobs:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate
         run: >-
           cd test/fuse_integration && go test -count=1 -v -timeout=20m .
-          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility|TestCloseSucceedsWhenAnAssignedVolumeServerStalls)$'
+          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility|TestCloseSucceedsWhenAnAssignedVolumeServerStalls|TestSlowButProgressingUploadsClose)$'
       - name: Maintenance CLI preservation, scoped fsck, scheduler and absent-only repair
         env:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate

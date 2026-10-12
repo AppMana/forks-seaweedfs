@@ -45,6 +45,12 @@ func (p *throttledProxy) serve() {
 		if err != nil {
 			return
 		}
+		// A small receive buffer keeps the throttle at the sender, as a slow
+		// link does: the client sees its bytes acknowledged only as fast as
+		// they are forwarded.
+		if tc, ok := client.(*net.TCPConn); ok {
+			tc.SetReadBuffer(64 << 10)
+		}
 		go func() {
 			defer client.Close()
 			server, err := net.Dial("tcp", p.target)
@@ -131,6 +137,48 @@ func TestLargeSequentialWriteClosesWithinWriteBufferDrainTime(t *testing.T) {
 	closeTook := time.Since(closeStart)
 	t.Logf("wrote %d MiB in %v, close() took %v (bound %v)", fileSize>>20, closeStart.Sub(writeStart).Round(time.Millisecond), closeTook.Round(time.Millisecond), closeBound)
 	require.Less(t, closeTook, closeBound, "close() drained more than the write buffer cap")
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(payload, got), "content mismatch after close")
+}
+
+// A checkpoint whose chunk uploads are slow but keep moving must close()
+// successfully, however long each chunk takes: on a saturated 1 GbE link a
+// healthy 2 MiB upload can take tens of seconds. A per-attempt bound that
+// does not look at progress abandoned such uploads, resent them from the
+// start, and failed the write with EIO.
+func TestSlowButProgressingUploadsClose(t *testing.T) {
+	const (
+		rate     = 128 << 10 // bytes per second through the proxy
+		fileSize = 4 << 20   // two 2 MiB chunks, each about 16 s at half the rate
+		bound    = 50 * time.Second
+	)
+
+	config := DefaultTestConfig()
+	config.ChunkSizeMB = 2
+	framework := NewFuseTestFramework(t, config)
+	defer framework.Cleanup()
+	proxy := startThrottledProxy(t, framework.GetFilerAddr(), rate)
+	config.MountOptions = []string{
+		fmt.Sprintf("-filer=127.0.0.1:%d.%d", proxy.port(), framework.filerPort+10000),
+		"-volumeServerAccess=filerProxy",
+	}
+	require.NoError(t, framework.Setup(config))
+
+	payload := make([]byte, fileSize)
+	rand.Read(payload)
+	path := filepath.Join(framework.GetMountPoint(), "checkpoint.pt")
+	start := time.Now()
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	_, err = f.Write(payload)
+	require.NoError(t, err)
+	closeErr := f.Close()
+	took := time.Since(start)
+	t.Logf("%d MiB at %d KiB/s: write and close() took %v: %v", fileSize>>20, rate>>10, took.Round(time.Millisecond), closeErr)
+	require.NoError(t, closeErr, "close() of slow but progressing uploads")
+	require.Less(t, took, bound)
 
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)

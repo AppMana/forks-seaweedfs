@@ -95,7 +95,13 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 	// until EOF — wasting source-volume bandwidth and CPU on a copy
 	// that's already failed. Cancelling streamCtx tears down both the
 	// source GET and the destination POST when this function returns.
-	streamCtx, cancel := context.WithCancel(ctx)
+	// The watch abandons the copy once it stops making progress: no byte
+	// read from the source and sent for UploadStallTimeout, or no answer
+	// from the destination within GatewayUploadResponseTimeout once the body
+	// is sent. A copy that is slow but moving is never cut off.
+	watchCtx, watch := operation.NewProgressWatch(ctx, operation.UploadStallTimeout, operation.GatewayUploadResponseTimeout)
+	defer watch.Stop()
+	streamCtx, cancel := context.WithCancel(watchCtx)
 	defer cancel()
 	dstUrl := fmt.Sprintf("http://%s/%s", assignResult.Location.Url, assignResult.FileId)
 	if assignResult.Fsync {
@@ -127,6 +133,9 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 
 	srcResp, err := util_http.GetGlobalHttpClient().Do(srcReq)
 	if err != nil {
+		if stalled := operation.StalledCause(watchCtx); stalled != nil {
+			err = stalled
+		}
 		return copySourceFailure(fmt.Errorf("source GET: %w", err))
 	}
 	// CloseResponse drains and closes resp.Body for keepalive.
@@ -218,7 +227,7 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		}
 	}()
 
-	req, err := http.NewRequestWithContext(streamCtx, http.MethodPost, dstUrl, pipeReader)
+	req, err := http.NewRequestWithContext(watch.Trace(streamCtx), http.MethodPost, dstUrl, io.NopCloser(watch.Body(pipeReader)))
 	if err != nil {
 		pipeReader.CloseWithError(err)
 		return fmt.Errorf("create POST request: %w", err)
@@ -235,18 +244,29 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		req.Header.Set("Authorization", security.BearerPrefix+string(dstJwt))
 	}
 
-	resp, err := util_http.GetGlobalHttpClient().Do(req)
+	// No response-header timeout: the watch bounds the wait for an answer
+	// while the destination acknowledges nothing.
+	client, err := operation.WatchedHttpClient()
+	if err != nil {
+		pipeReader.CloseWithError(err)
+		return fmt.Errorf("POST client: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		// Closing the reader unblocks the producer if it was still mid-write;
 		// the deferred cancel above also stops any in-flight source read.
 		pipeReader.CloseWithError(err)
 		cancel()
 		<-producerDone
+		if stalled := operation.StalledCause(watchCtx); stalled != nil {
+			err = stalled
+		}
 		if readErr := source.err(); readErr != nil {
-			return copySourceFailure(fmt.Errorf("source read: %w", readErr))
+			return copySourceFailure(fmt.Errorf("source read: %w", err))
 		}
 		return operation.NewUploadStatusError(0, fmt.Errorf("POST: %w", err))
 	}
+	watch.Responded()
 	defer util_http.CloseResponse(resp)
 
 	if resp.StatusCode >= 400 {

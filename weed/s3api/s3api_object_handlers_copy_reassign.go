@@ -41,7 +41,7 @@ func (e *copySourceError) stalled() bool {
 // failed decryption, is about the chunk.
 func copySourceFailure(err error) error {
 	var netErr net.Error
-	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) {
+	if errors.Is(err, operation.ErrUploadStalled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) {
 		return &copySourceError{statusCode: 0, err: err}
 	}
 	return &copySourceError{statusCode: -1, err: err}
@@ -70,8 +70,8 @@ func (s3a *S3ApiServer) readLocation(locations []*filer_pb.Location) *filer_pb.L
 
 // copyChunkToNewVolume copies one chunk: it assigns a destination volume,
 // avoiding servers that recently stalled, finds a source location the same
-// way, and runs write against them within operation.UploadAttemptTimeout. An
-// attempt that fails on a server, the source or the destination, records the
+// way, and runs write against them; write abandons an attempt that stops
+// making progress (operation.ProgressWatch). An attempt that fails on a server, the source or the destination, records the
 // server and retries with a new assignment, up to copyChunkAttempts times.
 // Before this a single stalled destination failed the whole copy: Harbor's
 // UploadPartCopy of a large layer returned 500 InternalError when one chunk
@@ -96,9 +96,7 @@ func (s3a *S3ApiServer) copyChunkToNewVolume(ctx context.Context, sourceFileId, 
 			return nil, fmt.Errorf("lookup source URL: %w", err)
 		}
 
-		attemptCtx, cancel := context.WithTimeout(ctx, operation.UploadAttemptTimeout(int64(size)))
-		err = write(attemptCtx, srcUrl, assignResult)
-		cancel()
+		err = write(ctx, srcUrl, assignResult)
 		if err == nil {
 			return assignResult, nil
 		}
@@ -136,6 +134,8 @@ func (s3a *S3ApiServer) copyChunkToNewVolume(ctx context.Context, sourceFileId, 
 func (s3a *S3ApiServer) uploadChunkDataOnce(ctx context.Context, chunkData []byte, assignResult *filer_pb.AssignVolumeResponse, isCompressed bool) error {
 	uploadOption := newChunkUploadOption(assignResult, isCompressed)
 	uploadOption.MaxAttempts = 1
+	uploadOption.StallTimeout = operation.UploadStallTimeout
+	uploadOption.ResponseTimeout = operation.GatewayUploadResponseTimeout
 	uploader, err := operation.NewUploader()
 	if err != nil {
 		return fmt.Errorf("create uploader: %w", err)

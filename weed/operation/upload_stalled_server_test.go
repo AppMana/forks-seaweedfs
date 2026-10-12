@@ -297,3 +297,69 @@ func TestUploadReaderInChunksMovesOffAStalledHolder(t *testing.T) {
 		t.Fatalf("asked for %d assignments, want 3", assigned)
 	}
 }
+
+// avoidingAssignFilerClient assigns the way a master does once a stalled
+// server's volumes are the emptiest: always on stalled, unless the request
+// asks to avoid it.
+type avoidingAssignFilerClient struct {
+	filer_pb.SeaweedFilerClient
+	stalled, healthy string
+	mu               sync.Mutex
+	requests         []*filer_pb.AssignVolumeRequest
+}
+
+func (c *avoidingAssignFilerClient) AssignVolume(ctx context.Context, in *filer_pb.AssignVolumeRequest, opts ...grpc.CallOption) (*filer_pb.AssignVolumeResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requests = append(c.requests, &filer_pb.AssignVolumeRequest{AvoidServers: append([]string(nil), in.AvoidServers...)})
+	n := len(c.requests)
+	for _, avoided := range in.AvoidServers {
+		if avoided == c.stalled {
+			return assignment(fmt.Sprintf("2,%02x", n), c.healthy), nil
+		}
+	}
+	return assignment(fmt.Sprintf("1,%02x", n), c.stalled), nil
+}
+
+func (c *avoidingAssignFilerClient) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+	return fn(c)
+}
+func (c *avoidingAssignFilerClient) AdjustedUrl(loc *filer_pb.Location) string { return loc.GetUrl() }
+func (c *avoidingAssignFilerClient) GetDataCenter() string                     { return "" }
+
+// Once an attempt stalls, every later assignment must ask the master to
+// avoid that server. Drawing assignments until one misses it is not enough:
+// a master weighting by free space hands out the stalled server's volumes,
+// which stopped filling, most of the time, and a retry that went back to it
+// stalled a second time; a mount close() that met that twice ran past the
+// 60 s FUSE request deadline.
+func TestUploadWithRetryAsksTheMasterToAvoidAStalledServer(t *testing.T) {
+	stalled := startStalledVolumeServer(t)
+	healthy := startHealthyVolumeServer(t, nil)
+	const attemptTimeout = 300 * time.Millisecond
+	client := &avoidingAssignFilerClient{stalled: stalled.addr(), healthy: healthy.addr()}
+	uploader := newUploader(&http.Client{})
+
+	start := time.Now()
+	fid, _, err, _ := uploader.UploadWithRetry(client, &filer_pb.AssignVolumeRequest{Count: 1},
+		mountChunkUploadOption(attemptTimeout), bytes.NewReader([]byte("abc")))
+	took := time.Since(start)
+	if err != nil {
+		t.Fatalf("upload failed after %v: %v", took, err)
+	}
+	if !strings.HasPrefix(fid, "2,") {
+		t.Fatalf("upload landed on %q, want a volume of the healthy server", fid)
+	}
+	if n := stalled.connections(); n != 1 {
+		t.Fatalf("stalled server got %d upload connections, want 1", n)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.requests) != 2 || len(client.requests[0].AvoidServers) != 0 ||
+		len(client.requests[1].AvoidServers) != 1 || client.requests[1].AvoidServers[0] != stalled.addr() {
+		t.Fatalf("assignment requests avoided %v, want nothing and then [%s]", client.requests, stalled.addr())
+	}
+	if limit := attemptTimeout + 2*time.Second; took > limit {
+		t.Fatalf("upload took %v, want under %v", took, limit)
+	}
+}

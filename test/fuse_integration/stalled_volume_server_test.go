@@ -75,8 +75,12 @@ func TestCloseSucceedsWhenAnAssignedVolumeServerStalls(t *testing.T) {
 	const (
 		fileSize = 64 << 20
 		// The production FUSE request deadline is 60 s; close() has to finish
-		// well inside it, with one stalled attempt per chunk.
-		closeBound = 30 * time.Second
+		// well inside it, with one stalled attempt per chunk. A stalled
+		// attempt is abandoned 20 s after its body is sent, sampled each
+		// second (up to 22 s); its retry starts after a 1 s backoff and is
+		// never abandoned while it moves. A second stalled attempt on one
+		// chunk would take at least another 21 s.
+		closeBound = 41 * time.Second
 	)
 
 	config := DefaultTestConfig()
@@ -93,8 +97,12 @@ func TestCloseSucceedsWhenAnAssignedVolumeServerStalls(t *testing.T) {
 
 	stalling, stallingNode := framework.startVolumeServer(t, "volume-stalling", masterPort)
 	_, healthyNode := framework.startVolumeServer(t, "volume-healthy", masterPort)
+	// Most writable volumes, and once it stops filling the emptiest, are on
+	// the server that stalls, as on a cluster where one large server has
+	// the most free space: a writer that finds a volume avoiding it by
+	// drawing assignments at random keeps drawing it.
 	growVolumesOn(t, masterPort, stallingNode, 8)
-	growVolumesOn(t, masterPort, healthyNode, 8)
+	growVolumesOn(t, masterPort, healthyNode, 3)
 
 	mnt := framework.GetMountPoint()
 	// Writes reach every server before the stall.
@@ -122,6 +130,16 @@ func TestCloseSucceedsWhenAnAssignedVolumeServerStalls(t *testing.T) {
 	t.Logf("wrote %d MiB in %v, close() took %v: %v", fileSize>>20, closeStart.Sub(start).Round(time.Millisecond), closeTook.Round(time.Millisecond), closeErr)
 	require.NoError(t, closeErr, "close() with one stalled volume server")
 	require.Less(t, closeTook, closeBound)
+
+	// Each chunk that stalled was retried once, on a volume the stalled
+	// server does not hold: as many stalled attempts as successful retries.
+	mountLog, err := os.ReadFile(filepath.Join(framework.logDir, "mount.log"))
+	require.NoError(t, err)
+	stalls := bytes.Count(mountLog, []byte("retry uploadWithRetry: err: "))
+	retried := bytes.Count(mountLog, []byte("retry uploadWithRetry successfully"))
+	t.Logf("%d chunk uploads stalled, %d retries landed", stalls, retried)
+	require.Positive(t, stalls, "no chunk was assigned to the stalled server")
+	require.Equal(t, stalls, retried, "a chunk upload stalled more than once")
 
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)

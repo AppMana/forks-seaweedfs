@@ -567,6 +567,9 @@ message AssignVolumeRequest {
     string data_node = 9;
     string disk_type = 8;
     uint64 expected_data_size = 10; // hint for size-aware volume selection
+    // Volume server URLs the writer recently saw stall, passed to the
+    // master's assignment. Numbered apart from upstream's sequence.
+    repeated string avoid_servers = 100;
 }
 
 message AssignVolumeResponse {

@@ -3164,8 +3164,11 @@ type AssignVolumeRequest struct {
 	DataNode         string                 `protobuf:"bytes,9,opt,name=data_node,json=dataNode,proto3" json:"data_node,omitempty"`
 	DiskType         string                 `protobuf:"bytes,8,opt,name=disk_type,json=diskType,proto3" json:"disk_type,omitempty"`
 	ExpectedDataSize uint64                 `protobuf:"varint,10,opt,name=expected_data_size,json=expectedDataSize,proto3" json:"expected_data_size,omitempty"` // hint for size-aware volume selection
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Volume server URLs the writer recently saw stall, passed to the
+	// master's assignment. Numbered apart from upstream's sequence.
+	AvoidServers  []string `protobuf:"bytes,100,rep,name=avoid_servers,json=avoidServers,proto3" json:"avoid_servers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AssignVolumeRequest) Reset() {
@@ -3266,6 +3269,13 @@ func (x *AssignVolumeRequest) GetExpectedDataSize() uint64 {
 		return x.ExpectedDataSize
 	}
 	return 0
+}
+
+func (x *AssignVolumeRequest) GetAvoidServers() []string {
+	if x != nil {
+		return x.AvoidServers
+	}
+	return nil
 }
 
 type AssignVolumeResponse struct {
@@ -7643,7 +7653,7 @@ const file_filer_proto_rawDesc = "" +
 	"\x19StreamRenameEntryResponse\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12J\n" +
 	"\x12event_notification\x18\x02 \x01(\v2\x1b.filer_pb.EventNotificationR\x11eventNotification\x12\x13\n" +
-	"\x05ts_ns\x18\x03 \x01(\x03R\x04tsNs\"\xb7\x02\n" +
+	"\x05ts_ns\x18\x03 \x01(\x03R\x04tsNs\"\xdc\x02\n" +
 	"\x13AssignVolumeRequest\x12\x14\n" +
 	"\x05count\x18\x01 \x01(\x05R\x05count\x12\x1e\n" +
 	"\n" +
@@ -7658,7 +7668,8 @@ const file_filer_proto_rawDesc = "" +
 	"\tdata_node\x18\t \x01(\tR\bdataNode\x12\x1b\n" +
 	"\tdisk_type\x18\b \x01(\tR\bdiskType\x12,\n" +
 	"\x12expected_data_size\x18\n" +
-	" \x01(\x04R\x10expectedDataSize\"\xdc\x02\n" +
+	" \x01(\x04R\x10expectedDataSize\x12#\n" +
+	"\ravoid_servers\x18d \x03(\tR\favoidServers\"\xdc\x02\n" +
 	"\x14AssignVolumeResponse\x12\x17\n" +
 	"\afile_id\x18\x01 \x01(\tR\x06fileId\x12\x14\n" +
 	"\x05count\x18\x04 \x01(\x05R\x05count\x12\x12\n" +

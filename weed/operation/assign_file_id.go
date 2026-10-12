@@ -27,6 +27,9 @@ type VolumeAssignRequest struct {
 	DataNode            string
 	WritableVolumeCount uint32
 	ExpectedDataSize    uint64
+	// AvoidServers are volume server URLs the writer recently saw stall; the
+	// master prefers a volume none of whose holders is among them.
+	AvoidServers []string
 }
 
 type AssignResult struct {
@@ -111,6 +114,7 @@ func Assign(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialO
 						DataNode:            request.DataNode,
 						WritableVolumeCount: request.WritableVolumeCount,
 						ExpectedDataSize:    request.ExpectedDataSize,
+						AvoidServers:        request.AvoidServers,
 					}
 					resp, grpcErr := masterClient.Assign(attemptCtx, req)
 					if grpcErr != nil {

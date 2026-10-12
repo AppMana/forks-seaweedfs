@@ -22,16 +22,14 @@ import (
 
 type VolumeServer struct {
 	volume_server_pb.UnimplementedVolumeServerServer
-	inFlightUploadDataSize        int64
-	inFlightDownloadDataSize      int64
-	concurrentUploadLimit         int64
-	concurrentDownloadLimit       int64
-	inFlightUploadDataLimitCond   *sync.Cond
-	inFlightDownloadDataLimitCond *sync.Cond
-	inflightUploadDataTimeout     time.Duration
-	inflightDownloadDataTimeout   time.Duration
-	hasSlowRead                   bool
-	readBufferSizeMB              int
+	inFlightUploadDataSize      int64
+	inFlightDownloadDataSize    int64
+	concurrentUploadLimit       int64
+	concurrentDownloadLimit     int64
+	inflightUploadDataTimeout   time.Duration
+	inflightDownloadDataTimeout time.Duration
+	hasSlowRead                 bool
+	readBufferSizeMB            int
 
 	SeedMasterNodes []pb.ServerAddress
 	// seedMasterSet mirrors SeedMasterNodes keyed by the canonical http
@@ -114,8 +112,6 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		fileSizeLimitBytes:            int64(fileSizeLimitMB) * 1024 * 1024,
 		isHeartbeating:                true,
 		stopChan:                      make(chan bool),
-		inFlightUploadDataLimitCond:   sync.NewCond(new(sync.Mutex)),
-		inFlightDownloadDataLimitCond: sync.NewCond(new(sync.Mutex)),
 		concurrentUploadLimit:         concurrentUploadLimit,
 		concurrentDownloadLimit:       concurrentDownloadLimit,
 		inflightUploadDataTimeout:     inflightUploadDataTimeout,

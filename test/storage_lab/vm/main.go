@@ -27,6 +27,9 @@ import (
 const (
 	controller = "controller"
 	masterIP   = "192.0.2.10"
+	// vacuumCopyMarker lists the compaction copies the victim's volume server
+	// was stopped inside; it is on tmpfs, so the power cut removes it.
+	vacuumCopyMarker = "/run/vacuum-copy-barrier"
 )
 
 var volumes = []string{"volume1", "volume2", "volume3"}
@@ -329,7 +332,7 @@ func (h *harness) execOK(node string, argv ...string) error {
 func (h *harness) collectFailureDiagnostics() {
 	for _, name := range append([]string{controller}, volumes...) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		result, err := h.lab.Node(name).Exec(ctx, "sh", "-c", "date -Ins; mount; ls -la /mnt/volume; tail -n 200 /var/log/seaweedfs/*.log /tmp/vacuum-power.log; dmesg | tail -n 100")
+		result, err := h.lab.Node(name).Exec(ctx, "sh", "-c", "date -Ins; mount; ls -la /mnt/volume; tail -n 200 /var/log/seaweedfs/*.log /tmp/vacuum-power.log /tmp/vacuum-copy-barrier.log; dmesg | tail -n 100")
 		cancel()
 		data := []byte(fmt.Sprintf("diagnostic error: %v\n", err))
 		if result != nil {
@@ -604,9 +607,10 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	if err := h.execOK(victim, "python3", "-c", prepareVolatileWitness); err != nil {
 		return err
 	}
-	// A larger overwrite history makes the copy phase observable without adding
-	// a test-only hook to SeaweedFS core code. If no .cpd is observed, fail rather
-	// than pretending a power cut happened during vacuum.
+	// A larger overwrite history gives the compaction a copy phase, which the
+	// victim's vacuumCopyBarrier holds open without a test-only hook in
+	// SeaweedFS core code. If no .cpd is held, fail rather than pretending a
+	// power cut happened during vacuum.
 	liveJSON, err := h.output(controller, "python3", "/opt/workload.py", "seedmany", "20")
 	if err != nil {
 		return fmt.Errorf("seed same-volume live vacuum set: %w", err)
@@ -633,6 +637,14 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 			return fmt.Errorf("pre-vacuum live set: %w", err)
 		}
 	}
+	// The copy can finish in a quarter second, shorter than one host-side
+	// exec round trip, so the victim holds its volume server inside the copy.
+	if err := h.lab.Node(victim).Put(h.ctx, "/opt/vacuum_copy_barrier.py", 0o600, []byte(vacuumCopyBarrier)); err != nil {
+		return err
+	}
+	if err := h.execOK(victim, "sh", "-ec", "rm -f "+vacuumCopyMarker+"; nohup python3 /opt/vacuum_copy_barrier.py /mnt/volume /run/weed-volume.pid "+vacuumCopyMarker+" 120 >/tmp/vacuum-copy-barrier.log 2>&1 </dev/null &"); err != nil {
+		return err
+	}
 	commands := "lock\nvolume.vacuum -volumeId=" + volumeID(fid) + " -garbageThreshold=0\nunlock\n"
 	if err := h.lab.Node(controller).Put(h.ctx, "/opt/vacuum.shell", 0o600, []byte(commands)); err != nil {
 		return err
@@ -640,10 +652,18 @@ func (h *harness) vacuumPowerLoss(fid, victim string) error {
 	if err := h.execOK(controller, "sh", "-ec", "nohup sh -c '/opt/weed shell -master=192.0.2.10:9333 < /opt/vacuum.shell' >/tmp/vacuum-power.log 2>&1 </dev/null & echo $! >/tmp/vacuum-power.pid"); err != nil {
 		return err
 	}
+	if err := h.waitOK(victim, 90*time.Second, "test", "-s", vacuumCopyMarker); err != nil {
+		return fmt.Errorf("vacuum copy was not observed and held: %w", err)
+	}
+	frozen, err := h.output(victim, "cat", vacuumCopyMarker)
+	if err != nil {
+		return err
+	}
+	h.manifest["vacuum_copy_held"] = strings.Fields(frozen)
 	ref := &labv1.NodeRef{SessionId: h.lab.ID(), Node: victim}
 	result, err := h.lab.RunTimeline(h.ctx,
 		&labv1.TimelineAction{Action: &labv1.TimelineAction_WaitExec{WaitExec: &labv1.WaitExec{
-			Exec:        &labv1.ExecRequest{Node: ref, Argv: []string{"python3", "-c", "import glob\nassert glob.glob('/mnt/volume/*.cpd'), 'waiting for vacuum copy'\n" + dirtyVolatileWitness}, TimeoutMillis: 5000},
+			Exec:        &labv1.ExecRequest{Node: ref, Argv: []string{"python3", "-c", "import os\nassert os.path.getsize('" + vacuumCopyMarker + "'), 'waiting for vacuum copy'\n" + dirtyVolatileWitness}, TimeoutMillis: 5000},
 			RetryMillis: 100, TimeoutMillis: 90000,
 		}}},
 		&labv1.TimelineAction{Action: &labv1.TimelineAction_Lifecycle{Lifecycle: &labv1.LifecycleRequest{Node: ref, Action: labv1.LifecycleAction_CRASH}}},

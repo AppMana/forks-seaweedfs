@@ -207,10 +207,15 @@ printed `/tmp/seaweedfs-vm-lab-results-*` directory.
 The crash gates now call Labcontainers `Crash`, which sends SIGKILL to the
 session's VM wrapper and QEMU. Earlier `PowerOff` results exercised Containerlab
 stop/restart and must not be treated as verified hard-power-loss evidence.
-The vacuum gate uses a `wait_exec` timeline predicate to observe the victim's
-`.cpd` before requesting a crash. This proves observation order, but cannot
-guarantee the copy is still active when SIGKILL arrives; an application barrier
-is needed for an exact instruction boundary. The migration gate is
+The vacuum gate runs a barrier on the victim that polls for its `.cpd` every
+millisecond, stops the volume server with SIGSTOP once the copy exists, and
+writes a marker only if the `.cpd` is still there after every thread stopped;
+a `wait_exec` timeline predicate on that marker then requests the crash. The
+copy is therefore still in progress when SIGKILL arrives, however fast the
+disk is: `-compactionMBps` does not throttle a copy that finishes within the
+throttler's first 100 ms window, and on XFS the 44 MB live set then compacts in
+about a quarter second, shorter than one host-side exec round trip. The
+manifest records the held copies as `vacuum_copy_held`. The migration gate is
 deliberately graceful and tests baseline → candidate → baseline → candidate one
 replica at a time; abrupt failure is tested separately. This matters for the
 4.40 baseline: a hard cut can expose its pre-fix acknowledged-index durability

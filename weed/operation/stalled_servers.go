@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -78,18 +79,60 @@ func (s *StalledServers) FirstStalled(servers []string) (string, bool) {
 	return "", false
 }
 
+// Active returns the servers still marked stalled, for an assignment request
+// to ask the master to avoid.
+func (s *StalledServers) Active() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	var active []string
+	for server, until := range s.until {
+		if now.Before(until) {
+			active = append(active, server)
+		} else {
+			delete(s.until, server)
+		}
+	}
+	sort.Strings(active)
+	return active
+}
+
+type avoidServersKey struct{}
+
+// WithAvoidServers returns ctx carrying the servers an assignment made with
+// it should ask the master to avoid, for assign functions whose signature
+// has no room for them.
+func WithAvoidServers(ctx context.Context, servers []string) context.Context {
+	if len(servers) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, avoidServersKey{}, servers)
+}
+
+// AvoidServers returns the servers ctx asks an assignment to avoid.
+func AvoidServers(ctx context.Context) []string {
+	servers, _ := ctx.Value(avoidServersKey{}).([]string)
+	return servers
+}
+
 // maxAssignmentsAvoidingStalled bounds how many assignments one write asks
 // for while looking for a volume none of whose servers recently stalled.
 const maxAssignmentsAvoidingStalled = 8
 
-// Pick calls assign, which makes one assignment and returns the servers that
-// hold the assigned volume, until one avoids every stalled server or
-// maxAssignmentsAvoidingStalled are spent. The caller keeps the assignment
+// Pick calls assign, which makes one assignment, asking the master to avoid
+// the servers it is given, and returns the servers that hold the assigned
+// volume. A master that honors the request only assigns a stalled server's
+// volume when no other is writable; Pick still checks, for masters that
+// ignore it, and asks again until an assignment avoids every stalled server
+// or maxAssignmentsAvoidingStalled are spent. The caller keeps the assignment
 // from the last call: when no clean volume turns up the write still goes
 // ahead, since a stalled server may have recovered.
-func (s *StalledServers) Pick(assign func() ([]string, error)) error {
+func (s *StalledServers) Pick(assign func(avoid []string) ([]string, error)) error {
 	for i := 0; ; i++ {
-		servers, err := assign()
+		servers, err := assign(s.Active())
 		if err != nil {
 			return err
 		}

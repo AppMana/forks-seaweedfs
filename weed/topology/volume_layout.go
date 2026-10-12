@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -644,25 +645,44 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 	vl.accessLock.RLock()
 	defer vl.accessLock.RUnlock()
 
-	lenWriters := len(vl.writables)
-	if lenWriters <= 0 {
+	if len(vl.writables) <= 0 {
 		return 0, 0, nil, true, fmt.Errorf("%s", NoWritableVolumes)
 	}
+	candidates := vl.writables
+	if len(option.AvoidServers) > 0 {
+		if avoiding := vl.writablesAvoiding(option.AvoidServers); len(avoiding) > 0 {
+			candidates = avoiding
+		}
+	}
 	if option.DataCenter == "" && option.Rack == "" && option.DataNode == "" {
-		vid, locationList = vl.pickWeightedByRemaining(vl.writables)
+		vid, locationList = vl.pickWeightedByRemaining(candidates)
 		if locationList == nil || len(locationList.list) == 0 {
 			return 0, 0, nil, false, fmt.Errorf("Strangely vid %s is on no machine!", vid.String())
 		}
 		return vid, count, locationList.Copy(), false, nil
 	}
 
-	// Scan from a random offset to collect up to pickSampleSize matching
-	// candidates, avoiding a full scan + allocation in the common case.
-	var sample [pickSampleSize]needle.VolumeId
-	found := 0
+	sample, found := vl.sampleMatching(candidates, option)
+	if found == 0 && len(candidates) < len(vl.writables) {
+		// Only volumes of avoided servers match the constraint.
+		sample, found = vl.sampleMatching(vl.writables, option)
+	}
+	if found == 0 {
+		return vid, count, locationList, true, fmt.Errorf("%s in DataCenter:%v Rack:%v DataNode:%v", NoWritableVolumes, option.DataCenter, option.Rack, option.DataNode)
+	}
+	vid, locationList = vl.weightedPick(sample[:found])
+	return vid, count, locationList.Copy(), false, nil
+}
+
+// sampleMatching scans candidates from a random offset and collects up to
+// pickSampleSize volumes with a holder in option's data center, rack and
+// node, avoiding a full scan and allocation in the common case. The caller
+// holds accessLock.
+func (vl *VolumeLayout) sampleMatching(candidates []needle.VolumeId, option *VolumeGrowOption) (sample [pickSampleSize]needle.VolumeId, found int) {
+	lenWriters := len(candidates)
 	start := rand.IntN(lenWriters)
 	for i := 0; i < lenWriters && found < pickSampleSize; i++ {
-		writableVolumeId := vl.writables[(start+i)%lenWriters]
+		writableVolumeId := candidates[(start+i)%lenWriters]
 		volumeLocationList := vl.vid2location[writableVolumeId]
 		for _, dn := range volumeLocationList.list {
 			if option.DataCenter != "" && dn.GetDataCenter().Id() != NodeId(option.DataCenter) {
@@ -679,11 +699,30 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 			break
 		}
 	}
-	if found == 0 {
-		return vid, count, locationList, true, fmt.Errorf("%s in DataCenter:%v Rack:%v DataNode:%v", NoWritableVolumes, option.DataCenter, option.Rack, option.DataNode)
+	return sample, found
+}
+
+// writablesAvoiding returns the writable volumes none of whose holders is
+// one of servers. The caller holds accessLock.
+func (vl *VolumeLayout) writablesAvoiding(servers []string) []needle.VolumeId {
+	var avoiding []needle.VolumeId
+	for _, vid := range vl.writables {
+		locations := vl.vid2location[vid]
+		if locations == nil || locations.Length() == 0 {
+			continue
+		}
+		clean := true
+		for _, dn := range locations.list {
+			if slices.Contains(servers, dn.Url()) {
+				clean = false
+				break
+			}
+		}
+		if clean {
+			avoiding = append(avoiding, vid)
+		}
 	}
-	vid, locationList = vl.weightedPick(sample[:found])
-	return vid, count, locationList.Copy(), false, nil
+	return avoiding
 }
 
 // pickSampleSize is how many random candidates to sample before doing a

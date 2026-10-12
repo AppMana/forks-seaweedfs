@@ -43,8 +43,10 @@ type ChunkedUploadOption struct {
 	Jwt             security.EncodedJwt
 	MimeType        string
 	Cipher          bool // encrypt data on volume servers
-	AssignFunc      func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error)
-	UploadFunc      func(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) // Optional: for testing
+	// AssignFunc assigns a volume; it should ask the master to avoid
+	// AvoidServers(ctx).
+	AssignFunc func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error)
+	UploadFunc func(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) // Optional: for testing
 	// StalledServers, when set, abandons a chunk write that stops making
 	// progress (UploadStallTimeout, GatewayUploadResponseTimeout), records the servers a write stalled or failed on, and skips assignments
 	// that would write through one of them again.
@@ -183,8 +185,8 @@ uploadLoop:
 			// Assign volume for this chunk
 			assign := func() (*AssignResult, error) {
 				var assigned *AssignResult
-				err := opt.StalledServers.Pick(func() ([]string, error) {
-					_, result, err := opt.AssignFunc(ctx, 1, uint64(size))
+				err := opt.StalledServers.Pick(func(avoid []string) ([]string, error) {
+					_, result, err := opt.AssignFunc(WithAvoidServers(ctx, avoid), 1, uint64(size))
 					if err != nil {
 						return nil, err
 					}

@@ -2857,6 +2857,17 @@ func (m *AssignVolumeRequest) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.AvoidServers) > 0 {
+		for iNdEx := len(m.AvoidServers) - 1; iNdEx >= 0; iNdEx-- {
+			i -= len(m.AvoidServers[iNdEx])
+			copy(dAtA[i:], m.AvoidServers[iNdEx])
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.AvoidServers[iNdEx])))
+			i--
+			dAtA[i] = 0x6
+			i--
+			dAtA[i] = 0xa2
+		}
+	}
 	if m.ExpectedDataSize != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.ExpectedDataSize))
 		i--
@@ -7722,6 +7733,12 @@ func (m *AssignVolumeRequest) SizeVT() (n int) {
 	}
 	if m.ExpectedDataSize != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.ExpectedDataSize))
+	}
+	if len(m.AvoidServers) > 0 {
+		for _, s := range m.AvoidServers {
+			l = len(s)
+			n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
+		}
 	}
 	n += len(m.unknownFields)
 	return n
@@ -17187,6 +17204,38 @@ func (m *AssignVolumeRequest) UnmarshalVT(dAtA []byte) error {
 					break
 				}
 			}
+		case 100:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AvoidServers", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.AvoidServers = append(m.AvoidServers, string(dAtA[iNdEx:postIndex]))
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])

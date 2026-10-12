@@ -35,7 +35,10 @@ developer binary and needs the WinFsp MSI on the host; see
   fails after its data was stored.
 - A chunk upload that stops making progress is abandoned and retried on a
   new assignment, never the same fid, that avoids every volume server an
-  attempt stalled on in the last minute. Progress is bytes handed to the
+  attempt stalled on in the last minute: the writer names those servers in
+  the assignment request (`avoid_servers`), and the master hands out a volume
+  none of them holds while one is writable (with an older master the writer
+  asks again, up to eight times). Progress is bytes handed to the
   connection or acknowledged by the peer (TCP_INFO on Linux): an upload is
   abandoned after 10 s with nothing sent and acknowledged, or 20 s with no
   response once the body is out. A slow upload that keeps moving is never
@@ -141,7 +144,7 @@ setup.
 | Missing-file `stat` in a cached directory (cross-mount freshness) | 24 µs before, about 200 µs after (one filer round trip) |
 | `opendir` + list of 200 entries | 63 to 75 µs before, 210 to 320 µs after |
 | `TestCrossMountCloseToOpenVisibility`, 40 rounds through a 100 ms proxy | 186 stale observations before, 0 after |
-| 64 MiB write and `close()` with one of three volume servers stopped (`TestCloseSucceedsWhenAnAssignedVolumeServerStalls`) | EIO after 60.0 s before; `close()` 23.0 s after |
+| 64 MiB write and `close()` with one of three volume servers stopped, holding 8 of 11 writable volumes (`TestCloseSucceedsWhenAnAssignedVolumeServerStalls`) | EIO after 60.0 s before; with retries drawing assignments at random, EIO after 60.0 s or `close()` 45.5 s (3 of 3 runs); asking the master to avoid it, `close()` 23.0 s (9 of 10), 29.4 s once |
 | 4 MiB write and `close()` through a 128 KiB/s link (`TestSlowButProgressingUploadsClose`) | EIO after 60 s with a 30 s response-header or absolute attempt bound; `close()` in 31.9 s progress-based |
 
 ## How CI builds and qualifies

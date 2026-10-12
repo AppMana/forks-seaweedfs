@@ -132,7 +132,8 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 				Jwt:               jwt,
 				Md5:               contentMd5,
 				MaxAttempts:       1, // fail fast on a dead replica; the client write retries
-				AttemptTimeout:    ReplicaWriteTimeout(len(n.Data)),
+				StallTimeout:      ReplicaWriteStallTimeout,
+				ResponseTimeout:   ReplicaWriteResponseTimeout,
 			}
 
 			uploader, err := operation.NewUploader()
@@ -161,24 +162,19 @@ func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDi
 	return
 }
 
-// replicaWriteBaseTimeout and replicaWriteMinRate size ReplicaWriteTimeout. A
-// 2 MiB replica write measured 0.06 to 0.24 s on a loaded 1 GbE cluster; one
-// that has not finished in seconds is held by a stalled replica, not by work.
+// ReplicaWriteStallTimeout and ReplicaWriteResponseTimeout abandon a
+// forward to one replica that stops making progress: no byte of the body
+// accepted for the stall timeout, or no answer within the response timeout
+// once the body is sent. A replica that holds the forward (a full upload
+// admission, a stuck disk) would otherwise hold the client's request with it
+// until the client gives up, and the client could only blame the primary.
+// Failing the forward first answers the client with a 500 that names the
+// replica, so its retry can avoid that server. A forward that is slow but
+// moving, on a saturated link, is never cut off.
 const (
-	replicaWriteBaseTimeout = 5 * time.Second
-	replicaWriteMinRate     = 16 << 20 // bytes per second
+	ReplicaWriteStallTimeout    = 5 * time.Second
+	ReplicaWriteResponseTimeout = 5 * time.Second
 )
-
-// ReplicaWriteTimeout bounds forwarding a needle of size bytes to one replica.
-// A replica that holds the forward (a full upload admission, a saturated
-// link) would otherwise hold the client's request with it until the client
-// gives up, and the client could only blame the primary. Failing the forward
-// first answers the client with a 500 that names the replica, so its retry
-// can avoid that server. It stays below the mount's chunk upload attempt
-// timeout for the same size.
-func ReplicaWriteTimeout(size int) time.Duration {
-	return replicaWriteBaseTimeout + time.Duration(int64(size)*int64(time.Second)/replicaWriteMinRate)
-}
 
 // ReplicatedDelete deletes a needle from the local volume and sends delete
 // requests to all remote replica locations. Replica deletes use

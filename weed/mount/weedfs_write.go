@@ -38,7 +38,8 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			PairMap:           nil,
 			WantMd5:           true,
 			MaxAttempts:       1,
-			AttemptTimeout:    operation.UploadAttemptTimeout(wfs.option.ChunkSizeLimit),
+			StallTimeout:      operation.UploadStallTimeout,
+			ResponseTimeout:   operation.MountUploadResponseTimeout,
 			StalledServers:    wfs.stalledVolumeServers,
 		}
 		if wfs.option.VolumeServerAccess == "filerProxy" {

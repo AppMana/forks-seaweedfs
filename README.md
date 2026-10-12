@@ -33,16 +33,19 @@ developer binary and needs the WinFsp MSI on the host; see
 - Chunk uploads are bounded per attempt; the metadata commit deadline starts
   after the data upload, so a large `close()` over a slow link no longer
   fails after its data was stored.
-- A chunk upload that stalls is abandoned after about 10 s and retried on a
+- A chunk upload that stops making progress is abandoned and retried on a
   new assignment, never the same fid, that avoids every volume server an
-  attempt stalled on in the last minute. A primary whose replica stalls fails
-  the forward after `5 s + size at 16 MiB/s` and names the replica, so the
-  client avoids it too. One stalled volume server no longer fails `close()`.
+  attempt stalled on in the last minute. Progress is bytes handed to the
+  connection or acknowledged by the peer (TCP_INFO on Linux): an upload is
+  abandoned after 10 s with nothing sent and acknowledged, or 20 s with no
+  response once the body is out. A slow upload that keeps moving is never
+  cut off. A primary whose forward to a replica stops moving for 5 s fails
+  it and names the replica, so the client avoids it too. One stalled volume
+  server no longer fails `close()`.
 - The S3 gateway applies the same rule to object writes and to
-  `CopyObject`/`UploadPartCopy` chunk copies: each chunk write or copy is
-  bounded at `10 s + size at 16 MiB/s`, a stalled destination or source is
-  avoided for a minute, and the chunk moves to a new assignment instead of
-  failing the request with 500.
+  `CopyObject`/`UploadPartCopy` chunk copies (30 s response wait), avoids a
+  stalled destination or source for a minute, and moves the chunk to a new
+  assignment instead of failing the request with 500.
 - `-writeBufferSizeMB` bounds dirty data (memory and swap), so `close()` and
   `fsync()` drain within the request deadline.
 - Kernel invalidations that take a directory or page lock are held until no
@@ -114,9 +117,9 @@ symlinks; opt-in basic permissions. Details in [WINDOWS_PORT.md](WINDOWS_PORT.md
 | `-winfspOptions`, `-winfspCaseSensitive`, `-winfspBasicPermissions`, `-volumeLabel` | | Windows mounts only; see [WINDOWS_PORT.md](WINDOWS_PORT.md). |
 
 Fixed deadlines inside the mount: a filer call a FUSE request waits on gives
-up after 60 s, one chunk upload attempt after `10 s + chunk size at 16 MiB/s`
-(10.1 s for 2 MiB chunks), a volume server's forward to one replica after
-`5 s + size at 16 MiB/s`, and the metadata commit
+up after 60 s, one chunk upload attempt after 10 s without progress or 20 s
+without a response once sent, a volume server's forward to one replica after
+5 s without progress or response, and the metadata commit
 after a flush 30 s after the data upload finished. A listing or negative
 lookup in a cached directory waits up to 1 s for an in-flight event, and
 serves the cache after 5 s when the filer is unreachable.
@@ -138,7 +141,8 @@ setup.
 | Missing-file `stat` in a cached directory (cross-mount freshness) | 24 µs before, about 200 µs after (one filer round trip) |
 | `opendir` + list of 200 entries | 63 to 75 µs before, 210 to 320 µs after |
 | `TestCrossMountCloseToOpenVisibility`, 40 rounds through a 100 ms proxy | 186 stale observations before, 0 after |
-| 64 MiB write and `close()` with one of three volume servers stopped (`TestCloseSucceedsWhenAnAssignedVolumeServerStalls`) | EIO after 60.0 s before; `close()` 11.1 s after |
+| 64 MiB write and `close()` with one of three volume servers stopped (`TestCloseSucceedsWhenAnAssignedVolumeServerStalls`) | EIO after 60.0 s before; `close()` 23.0 s after |
+| 4 MiB write and `close()` through a 128 KiB/s link (`TestSlowButProgressingUploadsClose`) | EIO after 60 s with a 30 s response-header or absolute attempt bound; `close()` in 31.9 s progress-based |
 
 ## How CI builds and qualifies
 
@@ -161,7 +165,7 @@ python3 -m unittest discover -s test/storage_lab -v
 # real FUSE mounts on this host; WEED_BINARY selects the binary under test
 go build -tags 5BytesOffset -o /abs/weed ./weed
 (cd test/fuse_integration && WEED_BINARY=/abs/weed go test -count=1 -v -timeout=20m . \
-  -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility|TestCloseSucceedsWhenAnAssignedVolumeServerStalls)$')
+  -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility|TestCloseSucceedsWhenAnAssignedVolumeServerStalls|TestSlowButProgressingUploadsClose)$')
 
 # disposable-VM gates (guest panics on hung tasks); needs KVM and Labcontainers
 SEAWEEDFS_STUCK_LAB_LIVE=1 SEAWEEDFS_NOTIFY_LAB_LIVE=1 SEAWEEDFS_LINUX_WEED=/abs/weed \

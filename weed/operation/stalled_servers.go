@@ -12,24 +12,19 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
-// uploadAttemptBaseTimeout and uploadAttemptMinRate size UploadAttemptTimeout.
-// A FUSE close() or an S3 request waits for every chunk still uploading, and
-// one attempt has to end well inside the 60 s FUSE request deadline with room
-// for a second attempt elsewhere. A healthy 2 MiB chunk upload measured 0.06
-// to 0.24 s on the production cluster under load; one that has not finished
-// in 10 s is held by a stalled server.
+// Write timeouts, all progress-based (see ProgressWatch): an attempt is
+// abandoned only when its body moves no byte for the stall timeout, or no
+// response arrives within the response timeout after the body was sent. A
+// FUSE close() must be answered within the 60 s request deadline, with room
+// for a second attempt elsewhere, so the mount waits less for a response than
+// the S3 gateway, whose clients wait minutes. A healthy 2 MiB chunk upload
+// measured 0.06 to 0.24 s under load; a server that accepts no byte for 10 s
+// has stopped.
 const (
-	uploadAttemptBaseTimeout = 10 * time.Second
-	uploadAttemptMinRate     = 16 << 20 // bytes per second
+	UploadStallTimeout           = 10 * time.Second
+	MountUploadResponseTimeout   = 20 * time.Second
+	GatewayUploadResponseTimeout = 30 * time.Second
 )
-
-// UploadAttemptTimeout bounds one attempt to write size bytes to a volume
-// server. It stays above the volume server's replica write timeout for the
-// same size, so a stalled replica fails the primary first and the primary's
-// 500 names the replica to avoid.
-func UploadAttemptTimeout(size int64) time.Duration {
-	return uploadAttemptBaseTimeout + time.Duration(size*int64(time.Second)/uploadAttemptMinRate)
-}
 
 // StalledServerTTL is how long writers avoid a volume server after an attempt
 // stalled on it.

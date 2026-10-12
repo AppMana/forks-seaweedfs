@@ -45,8 +45,8 @@ type ChunkedUploadOption struct {
 	Cipher          bool // encrypt data on volume servers
 	AssignFunc      func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error)
 	UploadFunc      func(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) // Optional: for testing
-	// StalledServers, when set, bounds each chunk write at UploadAttemptTimeout,
-	// records the servers a write stalled or failed on, and skips assignments
+	// StalledServers, when set, abandons a chunk write that stops making
+	// progress (UploadStallTimeout, GatewayUploadResponseTimeout), records the servers a write stalled or failed on, and skips assignments
 	// that would write through one of them again.
 	StalledServers *StalledServers
 }
@@ -323,7 +323,7 @@ uploadLoop:
 const chunkAssignAttempts = 3
 
 // uploadChunkAttempt is one write of a chunk to its assigned volume. With
-// stall avoidance each write is bounded at UploadAttemptTimeout, and a
+// stall avoidance a write that stops making progress is abandoned, and a
 // relayed write that fails records the server it points at; a fan-out
 // records the holder itself.
 func uploadChunkAttempt(ctx context.Context, assignResult *AssignResult, data []byte, jwt security.EncodedJwt, md5b64 string, opt *ChunkedUploadOption) (*UploadResult, error) {
@@ -366,7 +366,8 @@ func uploadChunk(ctx context.Context, assignResult *AssignResult, data []byte, j
 		MaxAttempts: 1,
 	}
 	if opt.StalledServers != nil {
-		uploadOption.AttemptTimeout = UploadAttemptTimeout(int64(len(data)))
+		uploadOption.StallTimeout = UploadStallTimeout
+		uploadOption.ResponseTimeout = GatewayUploadResponseTimeout
 	}
 	if assignResult.Fsync {
 		uploadOption.UploadUrl += "?fsync=true"
@@ -427,11 +428,12 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 				Md5:               md5b64,
 			}
 			if opt.StalledServers != nil {
-				// One bounded attempt per holder: a retry against a holder
-				// that stalled would only spend the time a new assignment
-				// needs.
+				// One attempt per holder, abandoned if it stops making
+				// progress: a retry against a holder that stalled would only
+				// spend the time a new assignment needs.
 				uploadOption.MaxAttempts = 1
-				uploadOption.AttemptTimeout = UploadAttemptTimeout(int64(len(data)))
+				uploadOption.StallTimeout = UploadStallTimeout
+				uploadOption.ResponseTimeout = GatewayUploadResponseTimeout
 			}
 			r, e := uploader.UploadData(ctx, data, uploadOption)
 			if e != nil {

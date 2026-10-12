@@ -309,7 +309,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		attrValidSec:      1,
 		dirIdleEvict:      dirIdleEvict,
 	}
-	wfs.stalledVolumeServers = operation.NewStalledServers(stalledVolumeServerTTL)
+	wfs.stalledVolumeServers = operation.NewStalledServers(operation.StalledServerTTL)
 
 	// With writeback caching, this mount is the single writer. Increase kernel
 	// FUSE cache TTLs so the kernel doesn't re-issue Lookup/GetAttr for every

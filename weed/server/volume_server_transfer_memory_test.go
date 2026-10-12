@@ -80,7 +80,15 @@ func newTransferTestServer(t *testing.T, needles int, uploadLimit, downloadLimit
 	}
 	server := &http.Server{Handler: http.HandlerFunc(vs.privateStoreHandler)}
 	go server.Serve(listener)
-	t.Cleanup(func() { server.Close() })
+	t.Cleanup(func() {
+		// The in-flight gauges are process wide: let this server's handlers
+		// release every reservation before the next test reads them.
+		server.Close()
+		waitUntil(t, "the test server's reservations to be released", func() bool {
+			return atomic.LoadInt64(&vs.inFlightUploadDataSize) == 0 &&
+				atomic.LoadInt64(&vs.inFlightDownloadDataSize) == 0
+		})
+	})
 	return &transferTestServer{vs: vs, addr: listener.Addr().String()}
 }
 
@@ -158,47 +166,72 @@ func waitHeapSettled(t *testing.T) int64 {
 	return 0
 }
 
+const transferBoundary = "seaweedfs-transfer-memory"
+
+// stalledUpload sends a multipart POST of a 4 MiB part, the shape of the
+// filer's chunk writes and of ?type=replicate forwards, but never the closing
+// boundary, so the request sits in ParseUpload with the whole part read. It
+// returns the request's Content-Length, the bytes upload admission reserves.
+func (s *transferTestServer) stalledUpload(t *testing.T, i int, data []byte) int64 {
+	t.Helper()
+	head := fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chunk\"\r\n"+
+		"Content-Type: application/octet-stream\r\n\r\n", transferBoundary)
+	tail := fmt.Sprintf("\r\n--%s--\r\n", transferBoundary)
+	contentLength := int64(len(head) + len(data) + len(tail))
+	conn := s.dialSmallWindow(t)
+	fmt.Fprintf(conn, "POST /%s HTTP/1.1\r\nHost: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\n"+
+		"Content-Length: %d\r\n\r\n", transferFileId(i), s.addr, transferBoundary, contentLength)
+	go func() {
+		// A client held back by admission is not read from until admitted.
+		conn.Write([]byte(head))
+		conn.Write(data)
+	}()
+	return contentLength
+}
+
+// stalledRangeGet asks for the second 2 MiB half of a 4 MiB needle, the
+// request Harbor's S3 gateways issued, and never reads the response.
+func (s *transferTestServer) stalledRangeGet(t *testing.T, i int) net.Conn {
+	t.Helper()
+	conn := s.dialSmallWindow(t)
+	fmt.Fprintf(conn, "GET /%s HTTP/1.1\r\nHost: %s\r\nRange: bytes=%d-%d\r\n\r\n",
+		transferFileId(i), s.addr, transferNeedleSize/2, transferNeedleSize-1)
+	return conn
+}
+
+func totalAlloc() int64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.TotalAlloc)
+}
+
 // TestStalledUploadsHoldOnlyTheirAdmittedBytes reproduces the 2026-10-12
 // OOM of seaweedfs-volume-zxa2a5f0: 534 POSTs of 4 MiB chunks in flight
 // (filer writes and ?type=replicate forwards that later failed with
 // "unexpected EOF"), a heap of 5.2 GB while upload admission had reserved
-// about half of that.
-//
-// Each client sends the whole 4 MiB part but not the closing multipart
-// boundary, so its request sits in ParseUpload with the body read. Upload
-// admission reserved each request's Content-Length; the heap the server holds
-// for them must not exceed that reservation plus a fixed per-request overhead.
+// about half of that. Upload admission reserved each request's
+// Content-Length; the heap the server holds for them must not exceed that
+// reservation plus a fixed per-request overhead.
 func TestStalledUploadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 	const clients = 24
 	s := newTransferTestServer(t, 0, 1<<30, 0)
-
-	const boundary = "seaweedfs-transfer-memory"
 	data := randomBytes(99, transferNeedleSize)
-	head := fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chunk\"\r\n"+
-		"Content-Type: application/octet-stream\r\n\r\n", boundary)
-	tail := fmt.Sprintf("\r\n--%s--\r\n", boundary)
-	contentLength := int64(len(head) + len(data) + len(tail))
 
 	base := liveHeap()
+	allocBase := totalAlloc()
+	var contentLength int64
 	for i := 1; i <= clients; i++ {
-		conn := s.dialSmallWindow(t)
-		fmt.Fprintf(conn, "POST /%s HTTP/1.1\r\nHost: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\n"+
-			"Content-Length: %d\r\n\r\n", transferFileId(i), s.addr, boundary, contentLength)
-		if _, err := conn.Write([]byte(head)); err != nil {
-			t.Fatalf("write part header: %v", err)
-		}
-		if _, err := conn.Write(data); err != nil {
-			t.Fatalf("write part body: %v", err)
-		}
+		contentLength = s.stalledUpload(t, i, data)
 	}
 	waitUntil(t, "all uploads admitted", func() bool {
 		return atomic.LoadInt64(&s.vs.inFlightUploadDataSize) == clients*contentLength
 	})
 	held := waitHeapSettled(t) - base
+	allocated := totalAlloc() - allocBase
 	admitted := atomic.LoadInt64(&s.vs.inFlightUploadDataSize)
 	budget := admitted + clients*transferOverheadPerRequest
-	t.Logf("%d stalled 4 MiB uploads: admitted %d MiB, live heap +%d MiB (%.2f bytes per admitted byte)",
-		clients, admitted>>20, held>>20, float64(held)/float64(admitted))
+	t.Logf("%d stalled 4 MiB uploads: admitted %d MiB, live heap +%d MiB (%.2f bytes per admitted byte), allocated %d MiB (%.2f per admitted byte)",
+		clients, admitted>>20, held>>20, float64(held)/float64(admitted), allocated>>20, float64(allocated)/float64(admitted))
 	if held > budget {
 		t.Fatalf("stalled uploads hold %d bytes of heap, more than the %d admitted plus %d overhead",
 			held, admitted, budget-admitted)
@@ -221,13 +254,12 @@ func TestStalledRangeReadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 	base := liveHeap()
 	conns := make([]net.Conn, 0, clients)
 	for i := 0; i < clients; i++ {
-		conn := s.dialSmallWindow(t)
-		fmt.Fprintf(conn, "GET /%s HTTP/1.1\r\nHost: %s\r\nRange: bytes=%d-%d\r\n\r\n",
-			transferFileId(1+i%needles), s.addr, transferNeedleSize/2, transferNeedleSize-1)
-		conns = append(conns, conn)
+		conns = append(conns, s.stalledRangeGet(t, 1+i%needles))
 	}
 	held := waitHeapSettled(t) - base
 	admitted := atomic.LoadInt64(&s.vs.inFlightDownloadDataSize)
+	t.Logf("%d stalled 2 MiB range reads: admitted %d MiB, live heap +%d MiB (%.2f bytes per admitted byte)",
+		clients, admitted>>20, held>>20, float64(held)/float64(admitted))
 	if budget := admitted + clients*transferOverheadPerRequest; held > budget {
 		t.Fatalf("stalled range reads hold %d bytes of heap, more than the %d admitted plus %d overhead",
 			held, admitted, budget-admitted)
@@ -240,8 +272,51 @@ func TestStalledRangeReadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 		return atomic.LoadInt64(&s.vs.inFlightDownloadDataSize) == 0 &&
 			runtime.NumGoroutine() <= baseGoroutines
 	})
-	if got := testutil.ToFloat64(stats.VolumeServerInFlightDownloadSize); got != 0 {
-		t.Fatalf("in_flight_download_size gauge reads %v with no download in flight", got)
+	waitUntil(t, "in_flight_download_size gauge to return to zero", func() bool {
+		return testutil.ToFloat64(stats.VolumeServerInFlightDownloadSize) == 0
+	})
+}
+
+// TestTransfersStayWithinAdmissionBudgets is the memlimit plan's invariant:
+// with the upload and download budgets full and more clients queued behind
+// them, all of them stalled, the heap above the idle base stays within the
+// two budgets plus a fixed per-connection overhead. The incident mix: slow
+// 4 MiB chunk uploads and slow 2 MiB range reads at the same time.
+func TestTransfersStayWithinAdmissionBudgets(t *testing.T) {
+	const (
+		needles       = 8
+		uploads       = 24
+		reads         = 16
+		uploadSlots   = 16
+		downloadSlots = 8
+	)
+	data := randomBytes(99, transferNeedleSize)
+	// The multipart framing stalledUpload adds around the part.
+	uploadContentLength := int64(len(fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chunk\"\r\n"+
+		"Content-Type: application/octet-stream\r\n\r\n", transferBoundary)) + len(data) + len(fmt.Sprintf("\r\n--%s--\r\n", transferBoundary)))
+	uploadLimit := uploadSlots * uploadContentLength
+	downloadLimit := int64(downloadSlots * transferNeedleSize)
+	s := newTransferTestServer(t, needles, uploadLimit, downloadLimit)
+
+	base := liveHeap()
+	for i := 1; i <= uploads; i++ {
+		s.stalledUpload(t, 100+i, data)
+	}
+	for i := 0; i < reads; i++ {
+		s.stalledRangeGet(t, 1+i%needles)
+	}
+	waitUntil(t, "both budgets full", func() bool {
+		return atomic.LoadInt64(&s.vs.inFlightUploadDataSize) == uploadLimit &&
+			atomic.LoadInt64(&s.vs.inFlightDownloadDataSize) > downloadLimit-transferNeedleSize-(64<<10)
+	})
+	held := waitHeapSettled(t) - base
+	budget := uploadLimit + downloadLimit + (uploads+reads)*transferOverheadPerRequest
+	t.Logf("budgets %d MiB upload + %d MiB download, admitted %d + %d MiB, live heap +%d MiB",
+		uploadLimit>>20, downloadLimit>>20, atomic.LoadInt64(&s.vs.inFlightUploadDataSize)>>20,
+		atomic.LoadInt64(&s.vs.inFlightDownloadDataSize)>>20, held>>20)
+	if held > budget {
+		t.Fatalf("stalled transfers hold %d bytes of heap, more than the %d upload and %d download budgets plus %d overhead",
+			held, uploadLimit, downloadLimit, budget-uploadLimit-downloadLimit)
 	}
 }
 
@@ -259,6 +334,11 @@ func TestCompletedTransfersClearInFlightGauges(t *testing.T) {
 	if _, err := drainResponse(resp); err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("get status %d err %v", resp.StatusCode, err)
 	}
+	// The client has the whole body before the handler's deferred release
+	// runs, so wait for the handler to return.
+	waitUntil(t, "the download reservation to be released", func() bool {
+		return atomic.LoadInt64(&s.vs.inFlightDownloadDataSize) == 0
+	})
 	if got := testutil.ToFloat64(stats.VolumeServerInFlightDownloadSize); got != 0 {
 		t.Fatalf("in_flight_download_size gauge reads %v after the only download finished", got)
 	}
@@ -271,6 +351,9 @@ func TestCompletedTransfersClearInFlightGauges(t *testing.T) {
 	if _, err := drainResponse(resp); err != nil || resp.StatusCode != http.StatusCreated {
 		t.Fatalf("post status %d err %v", resp.StatusCode, err)
 	}
+	waitUntil(t, "the upload reservation to be released", func() bool {
+		return atomic.LoadInt64(&s.vs.inFlightUploadDataSize) == 0
+	})
 	if got := testutil.ToFloat64(stats.VolumeServerInFlightUploadSize); got != 0 {
 		t.Fatalf("in_flight_upload_size gauge reads %v after the only upload finished", got)
 	}

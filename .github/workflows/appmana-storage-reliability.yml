@@ -262,7 +262,7 @@ jobs:
       - name: Streamed S3 copy durability regressions
         run: >-
           go test -tags "$STORAGE_BUILD_TAGS" -race -count=1 -timeout="$STORAGE_UNIT_TEST_TIMEOUT"
-          ./weed/s3api -run 'TestStreamCopyChunkRange|TestNewChunkUploadOption'
+          ./weed/s3api -run 'TestStreamCopyChunkRange|TestNewChunkUploadOption|TestCopyChunkRangeMovesOffAStalledDestination'
       - name: Build explicit baseline and candidate
         run: |
           # Both worktrees resolve ../forks-go-fuse to the pinned checkout.
@@ -280,7 +280,7 @@ jobs:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate
         run: >-
           cd test/fuse_integration && go test -count=1 -v -timeout=20m .
-          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility)$'
+          -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility|TestCloseSucceedsWhenAnAssignedVolumeServerStalls)$'
       - name: Maintenance CLI preservation, scoped fsck, scheduler and absent-only repair
         env:
           WEED_BINARY: ${{ runner.temp }}/weed-candidate

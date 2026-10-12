@@ -17,29 +17,49 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// maxEagerPreGrow caps how many bytes ParseUpload is willing to pre-allocate
-// from a request's announced Content-Length. Large enough to skip a few
-// rounds of bytes.Buffer.ReadFrom geometric grow on typical small uploads;
-// small enough that a misreported Content-Length or a slow/idle client can
-// only ever waste this much memory per request. Bigger uploads fall back to
-// the standard ReadFrom-grow path for the remainder.
-const maxEagerPreGrow = 4 * 1024 * 1024
-
-// eagerPreGrow ensures bytesBuffer has at least min(contentLength, sizeLimit,
-// maxEagerPreGrow) bytes of capacity, so the bytes.Buffer.ReadFrom pumps
-// inside parseUpload below skip the first round(s) of geometric grow on the
-// common upload sizes — see #6541. The cap policy is the load-bearing piece
-// here; it's extracted so unit tests can exercise the policy directly
-// without spinning a real http upload.
+// eagerPreGrow sizes bytesBuffer for the whole body in one allocation: the
+// request's Content-Length, when it is known and within sizeLimit. The body
+// (or the file part, for a multipart request) is never longer, because
+// net/http stops a request body at its Content-Length. That is exactly the
+// amount the volume server's upload admission reserved for the request before
+// the handler ran, so sizing the buffer to it never exceeds the reservation,
+// even while a slow client is still sending.
 func eagerPreGrow(bytesBuffer *bytes.Buffer, contentLength, sizeLimit int64) {
 	if contentLength <= 0 || contentLength > sizeLimit {
 		return
 	}
-	grow := contentLength
-	if grow > maxEagerPreGrow {
-		grow = maxEagerPreGrow
+	bytesBuffer.Grow(int(contentLength))
+}
+
+// readUploadBody appends everything r yields to bytesBuffer and returns the
+// number of bytes read. It replaces bytes.Buffer.ReadFrom, which insists on
+// 512 free bytes before every read: a body that fills its buffer, as every
+// body does once the buffer is sized to Content-Length, made ReadFrom double
+// the buffer just to read EOF. A 4 MiB chunk then held an 8 MiB buffer and
+// allocated 12 MiB, while upload admission had reserved 4 MiB for it. Here the
+// buffer grows only when it is full and r still yields a byte.
+func readUploadBody(bytesBuffer *bytes.Buffer, r io.Reader) (int64, error) {
+	var total int64
+	var probe [1]byte
+	for {
+		var n int
+		var err error
+		if bytesBuffer.Available() == 0 {
+			n, err = r.Read(probe[:])
+			bytesBuffer.Write(probe[:n])
+		} else {
+			free := bytesBuffer.AvailableBuffer()
+			n, err = r.Read(free[:cap(free)])
+			bytesBuffer.Write(free[:n])
+		}
+		total += int64(n)
+		if err == io.EOF {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
 	}
-	bytesBuffer.Grow(int(grow))
 }
 
 type ParsedUpload struct {
@@ -169,7 +189,7 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 			pu.FileName = util.CleanWindowsPathBase(pu.FileName)
 		}
 
-		dataSize, e = pu.bytesBuffer.ReadFrom(io.LimitReader(part, sizeLimit+1))
+		dataSize, e = readUploadBody(pu.bytesBuffer, io.LimitReader(part, sizeLimit+1))
 		if e != nil {
 			glog.V(0).Infoln("Reading Content [ERROR]", e)
 			return
@@ -195,7 +215,7 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 			// found the first <file type> multi-part has filename
 			if fName != "" {
 				pu.bytesBuffer.Reset()
-				dataSize2, fe2 := pu.bytesBuffer.ReadFrom(io.LimitReader(part2, sizeLimit+1))
+				dataSize2, fe2 := readUploadBody(pu.bytesBuffer, io.LimitReader(part2, sizeLimit+1))
 				if fe2 != nil {
 					glog.V(0).Infoln("Reading Content [ERROR]", fe2)
 					e = fe2
@@ -252,7 +272,7 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 			pu.FileName = path.Base(r.URL.Path)
 		}
 
-		dataSize, e = pu.bytesBuffer.ReadFrom(io.LimitReader(r.Body, sizeLimit+1))
+		dataSize, e = readUploadBody(pu.bytesBuffer, io.LimitReader(r.Body, sizeLimit+1))
 
 		if e != nil {
 			glog.V(0).Infoln("Reading Content [ERROR]", e)

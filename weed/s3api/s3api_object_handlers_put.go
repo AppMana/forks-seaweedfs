@@ -686,6 +686,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		MimeType:        r.Header.Get("Content-Type"),
 		Cipher:          s3a.cipher, // encrypt data on volume servers
 		AssignFunc:      assignFunc,
+		StalledServers:  s3a.stalledServers,
 	})
 	if err != nil {
 		glog.Errorf("putToFiler: chunked upload failed: %v", err)

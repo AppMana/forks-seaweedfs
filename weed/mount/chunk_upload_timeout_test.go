@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 )
 
@@ -14,7 +15,7 @@ import (
 func TestChunkUploadAttemptTimeoutOrdering(t *testing.T) {
 	const fuseRequestDeadline = 60 * time.Second
 	for _, chunkSize := range []int64{2 << 20, 4 << 20, 8 << 20, 64 << 20} {
-		attempt := chunkUploadAttemptTimeout(chunkSize)
+		attempt := operation.UploadAttemptTimeout(chunkSize)
 		replica := topology.ReplicaWriteTimeout(int(chunkSize))
 		if attempt <= replica {
 			t.Errorf("%d MiB chunk: attempt timeout %v does not outlast the replica write timeout %v", chunkSize>>20, attempt, replica)

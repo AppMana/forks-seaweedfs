@@ -1487,9 +1487,32 @@ func (s3a *S3ApiServer) copySingleChunk(ctx context.Context, chunk *filer_pb.Fil
 	// Create destination chunk
 	dstChunk := s3a.createDestinationChunkPreservingSSE(chunk, chunk.Offset, chunk.Size)
 
-	// Prepare chunk copy (assign new volume and get source URL)
 	fileId := chunk.GetFileIdString()
-	assignResult, srcUrl, err := s3a.prepareChunkCopy(fileId, dstPath, chunk.Size)
+	assignResult, err := s3a.copyChunkToNewVolume(ctx, fileId, dstPath, chunk.Size, func(ctx context.Context, srcUrl string, assignResult *filer_pb.AssignVolumeResponse) error {
+		// Stream the chunk through io.Pipe when no in-transit transformation is
+		// required; this holds only ~32 KiB per copy in flight, vs. the
+		// chunk-sized buffers the buffered path needs. isFullChunk=true asks
+		// the source volume for compressed bytes, so a gzipped chunk is
+		// forwarded to the destination without anyone having to decompress.
+		if canStreamCopyChunk(chunk) {
+			if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, 0, int64(chunk.Size), true /*isFullChunk*/, assignResult); err != nil {
+				return fmt.Errorf("stream chunk: %w", err)
+			}
+			return nil
+		}
+
+		// SSE / per-chunk-cipher: bytes need to be transformed in transit, so
+		// download into a buffer first.
+		chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
+		if err != nil {
+			return copySourceFailure(fmt.Errorf("download chunk data: %w", err))
+		}
+
+		if err := s3a.uploadChunkDataOnce(ctx, chunkData, assignResult, chunk.IsCompressed); err != nil {
+			return fmt.Errorf("upload chunk data: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1498,30 +1521,6 @@ func (s3a *S3ApiServer) copySingleChunk(ctx context.Context, chunk *filer_pb.Fil
 	if err := s3a.setChunkFileId(dstChunk, assignResult); err != nil {
 		return nil, err
 	}
-
-	// Stream the chunk through io.Pipe when no in-transit transformation is
-	// required; this holds only ~32 KiB per copy in flight, vs. the
-	// chunk-sized buffers the buffered path needs. isFullChunk=true asks
-	// the source volume for compressed bytes, so a gzipped chunk is
-	// forwarded to the destination without anyone having to decompress.
-	if canStreamCopyChunk(chunk) {
-		if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, 0, int64(chunk.Size), true /*isFullChunk*/, assignResult); err != nil {
-			return nil, fmt.Errorf("stream chunk: %w", err)
-		}
-		return dstChunk, nil
-	}
-
-	// SSE / per-chunk-cipher: bytes need to be transformed in transit, so
-	// download into a buffer first.
-	chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, 0, int64(chunk.Size), chunk.CipherKey)
-	if err != nil {
-		return nil, fmt.Errorf("download chunk data: %w", err)
-	}
-
-	if err := s3a.uploadChunkData(ctx, chunkData, assignResult, chunk.IsCompressed); err != nil {
-		return nil, fmt.Errorf("upload chunk data: %w", err)
-	}
-
 	return dstChunk, nil
 }
 
@@ -1530,9 +1529,43 @@ func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChu
 	// Create destination chunk
 	dstChunk := s3a.createDestinationChunk(rangeChunk, rangeChunk.Offset, rangeChunk.Size)
 
-	// Prepare chunk copy (assign new volume and get source URL)
+	// Calculate the portion of the original chunk that we need to copy
+	chunkStart := originalChunk.Offset
+	overlapStart := max(rangeStart, chunkStart)
+	offsetInChunk := overlapStart - chunkStart
+
 	fileId := originalChunk.GetFileIdString()
-	assignResult, srcUrl, err := s3a.prepareChunkCopy(fileId, dstPath, rangeChunk.Size)
+	assignResult, err := s3a.copyChunkToNewVolume(ctx, fileId, dstPath, rangeChunk.Size, func(ctx context.Context, srcUrl string, assignResult *filer_pb.AssignVolumeResponse) error {
+		// Stream the byte range through io.Pipe when there's no in-transit
+		// transformation required (see canStreamCopyChunk for the eligibility
+		// rules); this is the dominant path for Harbor-style multipart
+		// assemble loads, which use UploadPartCopy with a CopySourceRange.
+		//
+		// When the requested range happens to cover the entire source chunk
+		// exactly, switch to the full-chunk fetch mode: that asks the source
+		// volume for compressed bytes (Accept-Encoding: gzip) and forwards
+		// them as-is, avoiding the volume-side decompression that a Range
+		// fetch on a gzipped chunk would otherwise pay. Harbor's typical
+		// part-size = chunk-size assemble pattern hits this branch.
+		if canStreamCopyChunk(originalChunk) {
+			isFullChunk := offsetInChunk == 0 && rangeChunk.Size == originalChunk.Size
+			if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), isFullChunk, assignResult); err != nil {
+				return fmt.Errorf("stream chunk range: %w", err)
+			}
+			return nil
+		}
+
+		// Download and upload the chunk portion
+		chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), originalChunk.CipherKey)
+		if err != nil {
+			return copySourceFailure(fmt.Errorf("download chunk range data: %w", err))
+		}
+
+		if err := s3a.uploadChunkDataOnce(ctx, chunkData, assignResult, originalChunk.IsCompressed); err != nil {
+			return fmt.Errorf("upload chunk range data: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1541,41 +1574,6 @@ func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChu
 	if err := s3a.setChunkFileId(dstChunk, assignResult); err != nil {
 		return nil, err
 	}
-
-	// Calculate the portion of the original chunk that we need to copy
-	chunkStart := originalChunk.Offset
-	overlapStart := max(rangeStart, chunkStart)
-	offsetInChunk := overlapStart - chunkStart
-
-	// Stream the byte range through io.Pipe when there's no in-transit
-	// transformation required (see canStreamCopyChunk for the eligibility
-	// rules); this is the dominant path for Harbor-style multipart
-	// assemble loads, which use UploadPartCopy with a CopySourceRange.
-	//
-	// When the requested range happens to cover the entire source chunk
-	// exactly, switch to the full-chunk fetch mode: that asks the source
-	// volume for compressed bytes (Accept-Encoding: gzip) and forwards
-	// them as-is, avoiding the volume-side decompression that a Range
-	// fetch on a gzipped chunk would otherwise pay. Harbor's typical
-	// part-size = chunk-size assemble pattern hits this branch.
-	if canStreamCopyChunk(originalChunk) {
-		isFullChunk := offsetInChunk == 0 && rangeChunk.Size == originalChunk.Size
-		if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), isFullChunk, assignResult); err != nil {
-			return nil, fmt.Errorf("stream chunk range: %w", err)
-		}
-		return dstChunk, nil
-	}
-
-	// Download and upload the chunk portion
-	chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), originalChunk.CipherKey)
-	if err != nil {
-		return nil, fmt.Errorf("download chunk range data: %w", err)
-	}
-
-	if err := s3a.uploadChunkData(ctx, chunkData, assignResult, originalChunk.IsCompressed); err != nil {
-		return nil, fmt.Errorf("upload chunk range data: %w", err)
-	}
-
 	return dstChunk, nil
 }
 
@@ -1799,7 +1797,7 @@ func (s3a *S3ApiServer) lookupVolumeUrl(fileId string) (string, error) {
 		}
 
 		if locations, found := resp.LocationsMap[vid]; found && len(locations.Locations) > 0 {
-			srcUrl = "http://" + locations.Locations[0].Url + "/" + fileId
+			srcUrl = "http://" + s3a.readLocation(locations.Locations).Url + "/" + fileId
 		} else {
 			return fmt.Errorf("no location found for volume %s", vid)
 		}

@@ -38,6 +38,11 @@ developer binary and needs the WinFsp MSI on the host; see
   attempt stalled on in the last minute. A primary whose replica stalls fails
   the forward after `5 s + size at 16 MiB/s` and names the replica, so the
   client avoids it too. One stalled volume server no longer fails `close()`.
+- The S3 gateway applies the same rule to object writes and to
+  `CopyObject`/`UploadPartCopy` chunk copies: each chunk write or copy is
+  bounded at `10 s + size at 16 MiB/s`, a stalled destination or source is
+  avoided for a minute, and the chunk moves to a new assignment instead of
+  failing the request with 500.
 - `-writeBufferSizeMB` bounds dirty data (memory and swap), so `close()` and
   `fsync()` drain within the request deadline.
 - Kernel invalidations that take a directory or page lock are held until no

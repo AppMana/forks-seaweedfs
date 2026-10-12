@@ -139,12 +139,13 @@ func assignment(fid, primary string, replicas ...string) *filer_pb.AssignVolumeR
 
 // mountChunkUploadOption is how weed mount uploads a chunk: one attempt per
 // assignment, bounded, and avoiding servers that recently stalled.
-func mountChunkUploadOption(attemptTimeout time.Duration) *UploadOption {
+func mountChunkUploadOption(stallTimeout time.Duration) *UploadOption {
 	return &UploadOption{
-		Filename:       "chunk",
-		MaxAttempts:    1,
-		AttemptTimeout: attemptTimeout,
-		StalledServers: NewStalledServers(time.Minute),
+		Filename:        "chunk",
+		MaxAttempts:     1,
+		StallTimeout:    stallTimeout,
+		ResponseTimeout: stallTimeout,
+		StalledServers:  NewStalledServers(time.Minute),
 	}
 }
 
@@ -286,9 +287,10 @@ func TestUploadReaderInChunksMovesOffAStalledHolder(t *testing.T) {
 	if len(result.FileChunks) != 1 || result.FileChunks[0].FileId != "3,03637037d6" {
 		t.Fatalf("chunks = %v, want one chunk on 3,03637037d6", result.FileChunks)
 	}
-	// One attempt bounded at UploadAttemptTimeout, one reassignment; the
-	// second assignment, which also holds the stalled server, is skipped.
-	if limit := UploadAttemptTimeout(int64(len(payload))) + 2*time.Second; took > limit {
+	// One attempt abandoned once it stops making progress, one
+	// reassignment; the second assignment, which also holds the stalled
+	// server, is skipped.
+	if limit := UploadStallTimeout + GatewayUploadResponseTimeout + 2*time.Second; took > limit {
 		t.Fatalf("object write took %v, want under %v", took, limit)
 	}
 	if assigned != 3 {

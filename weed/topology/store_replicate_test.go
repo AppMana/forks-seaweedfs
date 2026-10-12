@@ -274,7 +274,7 @@ func TestReplicatedWriteRejectsWriteWithNoTarget(t *testing.T) {
 }
 
 // A replica that accepts the forward and never answers must fail the
-// replicated write within ReplicaWriteTimeout, with an error that names the
+// replicated write once the forward stops making progress, with an error that names the
 // replica, instead of holding the client's request until the client gives up.
 // The client can then avoid that server; on 2026-10-11 it could only blame
 // the primary.
@@ -298,7 +298,7 @@ func TestReplicatedWriteFailsFastNamingAStalledReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &needle.Needle{Id: 1, Data: make([]byte, 2<<20), Ttl: needle.EMPTY_TTL}
-	bound := ReplicaWriteTimeout(len(n.Data))
+	bound := ReplicaWriteStallTimeout + ReplicaWriteResponseTimeout
 
 	start := time.Now()
 	_, err := ReplicatedWrite(context.Background(), masterFn, dialOption, &storage.Store{}, volumeId, n, r, "")

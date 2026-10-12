@@ -63,6 +63,13 @@ type UploadOption struct {
 	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
 	AttemptTimeout    time.Duration                    // >0 bounds each upload attempt
 	FilerJwt          security.FilerJwtProvider        // credential for proxy chunk URLs; nil → process-wide jwt.filer_signing
+	// StallTimeout, when >0, abandons an attempt whose request body moves no
+	// byte for this long, and ResponseTimeout one with no response this long
+	// after its body was sent (StallTimeout when 0). A slow attempt that keeps
+	// moving is never abandoned.
+	StallTimeout    time.Duration
+	ResponseTimeout time.Duration
+	progress        *ProgressWatch
 	// StalledServers, when set, makes UploadWithRetry record the servers an
 	// attempt stalled or failed on and skip assignments that would write
 	// through one of them again.
@@ -169,6 +176,10 @@ type HTTPClient interface {
 // Uploader
 type Uploader struct {
 	httpClient HTTPClient
+	// watchedHttpClient serves writes a ProgressWatch guards. It has no
+	// response-header timeout: the watch's response timeout replaces that
+	// absolute bound, and waits only while the peer acknowledges nothing.
+	watchedHttpClient HTTPClient
 }
 
 func NewUploader() (*Uploader, error) {
@@ -181,6 +192,12 @@ func NewUploader() (*Uploader, error) {
 		}
 		if httpClient != nil {
 			uploader = newUploader(httpClient)
+			watched, watchedErr := util_http.NewGlobalHttpClient(util_http_client.AddDialContext, util_http_client.WithResponseHeaderTimeout(0))
+			if watchedErr != nil {
+				uploaderErr = fmt.Errorf("error initializing the loader: %s", watchedErr)
+				return
+			}
+			uploader.watchedHttpClient = watched
 		}
 	})
 	return uploader, uploaderErr
@@ -383,12 +400,23 @@ func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, op
 // doUploadDataAttempt is one upload attempt, bounded by option.AttemptTimeout
 // so a volume server that stops reading cannot hold it forever.
 func (uploader *Uploader) doUploadDataAttempt(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) {
-	if option.AttemptTimeout <= 0 {
-		return uploader.doUploadData(ctx, data, option)
+	if option.AttemptTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, option.AttemptTimeout)
+		defer cancel()
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, option.AttemptTimeout)
-	defer cancel()
-	return uploader.doUploadData(attemptCtx, data, option)
+	if option.StallTimeout > 0 {
+		response := option.ResponseTimeout
+		if response <= 0 {
+			response = option.StallTimeout
+		}
+		var watch *ProgressWatch
+		ctx, watch = NewProgressWatch(ctx, option.StallTimeout, response)
+		defer watch.Stop()
+		option.progress = watch
+		defer func() { option.progress = nil }()
+	}
+	return uploader.doUploadData(ctx, data, option)
 }
 
 func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
@@ -458,6 +486,7 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 			PairMap:           nil,
 			Jwt:               option.Jwt,
 			BytesBuffer:       option.BytesBuffer,
+			progress:          option.progress,
 		})
 		if uploadResult == nil {
 			return
@@ -484,6 +513,7 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 			Jwt:               option.Jwt,
 			Md5:               option.Md5,
 			BytesBuffer:       option.BytesBuffer,
+			progress:          option.progress,
 		})
 		if uploadResult == nil {
 			return
@@ -557,7 +587,11 @@ func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, or
 	bodies := &detachableBodies{}
 	defer bodies.detach()
 	newBody := func() io.ReadCloser {
-		return bodies.add(io.MultiReader(bytes.NewReader(preamble), bytes.NewReader(payload), bytes.NewReader(trailer)))
+		var body io.Reader = io.MultiReader(bytes.NewReader(preamble), bytes.NewReader(payload), bytes.NewReader(trailer))
+		if option.progress != nil {
+			body = option.progress.Body(body)
+		}
+		return bodies.add(body)
 	}
 	req, postErr := http.NewRequestWithContext(ctx, http.MethodPost, option.UploadUrl, newBody())
 	if postErr != nil {
@@ -574,10 +608,17 @@ func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, or
 		req.Header.Set("Authorization", security.BearerPrefix+string(option.Jwt))
 	}
 
+	if option.progress != nil {
+		req = req.WithContext(option.progress.Trace(req.Context()))
+	}
 	request_id.InjectToRequest(ctx, req)
 
 	// print("+")
-	resp, post_err := uploader.httpClient.Do(req)
+	client := uploader.httpClient
+	if option.progress != nil && uploader.watchedHttpClient != nil {
+		client = uploader.watchedHttpClient
+	}
+	resp, post_err := client.Do(req)
 	defer util_http.CloseResponse(resp)
 	if post_err != nil {
 		if strings.Contains(post_err.Error(), "connection reset by peer") ||
@@ -596,7 +637,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, or
 			if req.GetBody != nil {
 				if newBody, gbErr := req.GetBody(); gbErr == nil {
 					req.Body = newBody
-					resp, post_err = uploader.httpClient.Do(req)
+					resp, post_err = client.Do(req)
 					defer util_http.CloseResponse(resp)
 				} else {
 					glog.V(1).InfofCtx(ctx, "skip inner retry for %s: GetBody returned %v", option.UploadUrl, gbErr)
@@ -607,10 +648,16 @@ func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, or
 		}
 	}
 	if post_err != nil {
+		if stalled := StalledCause(ctx); stalled != nil {
+			post_err = stalled
+		}
 		stats.UploadErrorCounter.WithLabelValues("0").Inc()
 		return nil, &uploadStatusError{StatusCode: 0, err: fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)}
 	}
 	// print("-")
+	if option.progress != nil {
+		option.progress.Responded()
+	}
 
 	var ret UploadResult
 	etag := getEtag(resp)
@@ -688,3 +735,13 @@ func (b *detachableBody) Read(p []byte) (int, error) {
 }
 
 func (b *detachableBody) Close() error { return nil }
+
+// WatchedHttpClient returns the client for volume server writes that a
+// ProgressWatch guards: it has no response-header timeout of its own.
+func WatchedHttpClient() (HTTPClient, error) {
+	u, err := NewUploader()
+	if err != nil {
+		return nil, err
+	}
+	return u.watchedHttpClient, nil
+}

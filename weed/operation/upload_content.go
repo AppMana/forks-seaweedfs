@@ -229,12 +229,12 @@ type uploadAssignment struct {
 	servers []string
 }
 
-func (uploader *Uploader) uploadWithRetryData(assignFn func() (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
 	doUploadFunc := func() error {
 		var a uploadAssignment
-		err = uploadOption.StalledServers.Pick(func() ([]string, error) {
+		err = uploadOption.StalledServers.Pick(func(avoid []string) ([]string, error) {
 			var assignErr error
-			a, assignErr = assignFn()
+			a, assignErr = assignFn(avoid)
 			return a.servers, assignErr
 		})
 		if err != nil {
@@ -312,7 +312,8 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 		uploadOption.Md5 = base64.StdEncoding.EncodeToString(digest[:])
 	}
 
-	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (a uploadAssignment, err error) {
+	fileId, uploadResult, err = uploader.uploadWithRetryData(func(avoid []string) (a uploadAssignment, err error) {
+		assignRequest.AvoidServers = avoid
 		// grpc assign volume
 		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 			assignCtx, assignCancel := context.WithTimeout(context.Background(), assignVolumeTimeout)

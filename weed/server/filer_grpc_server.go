@@ -949,8 +949,10 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 
 	assignRequest, altRequest := so.ToAssignRequests(int(req.Count))
 	assignRequest.ExpectedDataSize = req.ExpectedDataSize
+	assignRequest.AvoidServers = req.AvoidServers
 	if altRequest != nil {
 		altRequest.ExpectedDataSize = req.ExpectedDataSize
+		altRequest.AvoidServers = req.AvoidServers
 	}
 
 	assignResult, err := operation.Assign(ctx, fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)

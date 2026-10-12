@@ -641,6 +641,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				Path:             assignPath,
 				ExpectedDataSize: expectedDataSize,
 				TtlSec:           lifecycleTTLSec,
+				AvoidServers:     operation.AvoidServers(ctx),
 			})
 			if err != nil {
 				return fmt.Errorf("assign volume: %w", err)

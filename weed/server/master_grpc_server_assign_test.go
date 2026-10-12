@@ -337,3 +337,28 @@ func TestUnservedLayoutWarningBoundedAndExpiring(t *testing.T) {
 		t.Fatalf("expected full reset at cap, got %d entries", len(flood.last))
 	}
 }
+
+// A writer names the volume servers it saw stall; Assign hands out a volume
+// none of them holds while one is writable, so a chunk retry is not drawn
+// back to the server it just left. Without it the master's preference for
+// emptier volumes sent most retries to the stalled server, whose volumes had
+// stopped filling.
+func TestAssignAvoidsTheServersTheWriterNames(t *testing.T) {
+	ms := newLeaderMaster()
+	rack := ms.Topo.GetOrCreateDataCenter("dc1").GetOrCreateRack("rack1")
+	stalled := rack.GetOrCreateDataNode("127.0.0.1", 8080, 18080, "127.0.0.1", "stalled", map[string]uint32{"": 10})
+	healthy := rack.GetOrCreateDataNode("127.0.0.2", 8080, 18080, "127.0.0.2", "healthy", map[string]uint32{"": 10})
+	rp, err := super_block.NewReplicaPlacementFromString("000")
+	require.NoError(t, err)
+	for vid, dn := range map[needle.VolumeId]*topology.DataNode{1: stalled, 2: stalled, 3: stalled, 4: healthy} {
+		v := storage.VolumeInfo{Id: vid, Version: needle.GetCurrentVersion(), ReplicaPlacement: rp, Ttl: needle.EMPTY_TTL}
+		dn.UpdateVolumes(append(dn.GetVolumes(), v))
+		ms.Topo.RegisterVolumeLayout(v, dn)
+	}
+
+	for i := 0; i < 200; i++ {
+		resp, err := ms.Assign(context.Background(), &master_pb.AssignRequest{Count: 1, Replication: "000", ExpectedDataSize: 1, AvoidServers: []string{stalled.Url()}})
+		require.NoError(t, err)
+		require.Equal(t, healthy.Url(), resp.Location.Url, "assignment %d: fid %s", i, resp.Fid)
+	}
+}

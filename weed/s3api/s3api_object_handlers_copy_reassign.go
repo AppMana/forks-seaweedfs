@@ -81,8 +81,8 @@ func (s3a *S3ApiServer) copyChunkToNewVolume(ctx context.Context, sourceFileId, 
 	var lastErr error
 	for attempt := 1; attempt <= copyChunkAttempts; attempt++ {
 		var assignResult *filer_pb.AssignVolumeResponse
-		if err := s3a.stalledServers.Pick(func() ([]string, error) {
-			result, err := s3a.assignNewVolume(dstPath, size)
+		if err := s3a.stalledServers.Pick(func(avoid []string) ([]string, error) {
+			result, err := s3a.assignNewVolume(dstPath, size, avoid...)
 			if err != nil {
 				return nil, err
 			}

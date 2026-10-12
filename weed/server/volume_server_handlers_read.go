@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
@@ -201,12 +200,7 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 		count, err = vs.store.ReadEcShardNeedle(volumeId, n, onReadSizeFn)
 	}
 
-	defer func() {
-		atomic.AddInt64(&vs.inFlightDownloadDataSize, -int64(memoryCost))
-		if vs.concurrentDownloadLimit != 0 {
-			vs.inFlightDownloadDataLimitCond.Broadcast()
-		}
-	}()
+	defer vs.releaseDownloadSize(int64(memoryCost))
 	if downloadLimitHandled {
 		return
 	}

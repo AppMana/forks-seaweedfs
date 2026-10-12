@@ -141,14 +141,14 @@ func reserveDataSize(ctx context.Context, counter *int64, limit, size int64, tim
 // the last admitted total, nonzero with nothing in flight.
 func (vs *VolumeServer) releaseDownloadSize(size int64) {
 	size = max(size, 0)
-	atomic.AddInt64(&vs.inFlightDownloadDataSize, -size)
 	stats.VolumeServerInFlightDownloadSize.Sub(float64(size))
+	atomic.AddInt64(&vs.inFlightDownloadDataSize, -size)
 }
 
 func (vs *VolumeServer) releaseUploadSize(size int64) {
 	size = max(size, 0)
-	atomic.AddInt64(&vs.inFlightUploadDataSize, -size)
 	stats.VolumeServerInFlightUploadSize.Sub(float64(size))
+	atomic.AddInt64(&vs.inFlightUploadDataSize, -size)
 }
 
 func (vs *VolumeServer) reserveDownloadSize(w http.ResponseWriter, r *http.Request, size int64) bool {

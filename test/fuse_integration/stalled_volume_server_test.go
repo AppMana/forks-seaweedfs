@@ -75,8 +75,12 @@ func TestCloseSucceedsWhenAnAssignedVolumeServerStalls(t *testing.T) {
 	const (
 		fileSize = 64 << 20
 		// The production FUSE request deadline is 60 s; close() has to finish
-		// well inside it, with one stalled attempt per chunk.
-		closeBound = 30 * time.Second
+		// well inside it, with one stalled attempt per chunk. A stalled
+		// attempt is abandoned 20 s after its body is sent, sampled each
+		// second (up to 22 s); its retry starts after a 1 s backoff and is
+		// never abandoned while it moves. A second stalled attempt on one
+		// chunk would take at least another 21 s.
+		closeBound = 41 * time.Second
 	)
 
 	config := DefaultTestConfig()

@@ -8,21 +8,13 @@ import (
 // TestEagerPreGrow is a regression guard for the volume-side amplifier in
 // https://github.com/seaweedfs/seaweedfs/issues/6541.
 //
-// ParseUpload reads the multipart part body via bytes.Buffer.ReadFrom; if the
-// receive buffer arrives with cap=0 (sync.Pool dropped the prior buffer),
-// ReadFrom doubles capacity on each grow and pays 2-4x the chunk size in
-// cumulative allocations. eagerPreGrow shaves the first few rounds off that
-// grow chain by pre-sizing from r.ContentLength.
+// ParseUpload reads the body into a buffer sized from r.ContentLength, the
+// amount upload admission reserved for the request, so the body is allocated
+// once instead of through a chain of doubling grows.
 //
-// Two policy invariants the cases below pin:
-//
-//  1. The cap. We never grow more than maxEagerPreGrow per request, so a
-//     misreported Content-Length or a slow/idle client cannot force
-//     per-request preallocation up to the configured sizeLimit. This is the
-//     review concern that landed during PR review and is what changed the
-//     test from a TotalAlloc bound to this structural form.
-//  2. The validity gates. Negative / zero / oversized Content-Length and
-//     buffers that already have enough capacity should not trigger a Grow.
+// The cases pin the sizing (exactly Content-Length, however large, up to
+// sizeLimit) and the validity gates: negative / zero / oversized
+// Content-Length and buffers that already have enough capacity do not Grow.
 func TestEagerPreGrow(t *testing.T) {
 	const sizeLimit = int64(256 * 1024 * 1024)
 
@@ -39,14 +31,14 @@ func TestEagerPreGrow(t *testing.T) {
 			wantMinCap: 1 * 1024 * 1024,
 		},
 		{
-			name:       "content-length at cap grows to cap",
-			cl:         maxEagerPreGrow,
-			wantMinCap: maxEagerPreGrow,
+			name:       "4 MiB chunk grows to its content-length",
+			cl:         4 * 1024 * 1024,
+			wantMinCap: 4 * 1024 * 1024,
 		},
 		{
-			name:       "content-length above cap is clamped to cap",
+			name:       "large content-length grows to it in one allocation",
 			cl:         200 * 1024 * 1024,
-			wantMinCap: maxEagerPreGrow,
+			wantMinCap: 200 * 1024 * 1024,
 		},
 		{
 			name:     "content-length above sizeLimit is rejected",
@@ -65,9 +57,9 @@ func TestEagerPreGrow(t *testing.T) {
 		},
 		{
 			name:       "buffer with sufficient cap is left alone",
-			startCap:   maxEagerPreGrow,
+			startCap:   4 * 1024 * 1024,
 			cl:         1 * 1024 * 1024,
-			wantMinCap: maxEagerPreGrow,
+			wantMinCap: 4 * 1024 * 1024,
 		},
 	}
 
@@ -92,12 +84,13 @@ func TestEagerPreGrow(t *testing.T) {
 			if got := bb.Cap(); got < c.wantMinCap {
 				t.Fatalf("after eagerPreGrow(cl=%d): cap=%d, want >=%d", c.cl, got, c.wantMinCap)
 			}
-			// Hard upper bound: never above the cap (regardless of cl/sizeLimit).
-			// Note bytes.Buffer.Grow may round capacity up modestly, so allow
-			// a generous overshoot but still well below sizeLimit.
-			if got := int64(bb.Cap()); got > 2*int64(maxEagerPreGrow) {
-				t.Fatalf("after eagerPreGrow(cl=%d): cap=%d exceeds 2*maxEagerPreGrow=%d "+
-					"(regression: cap removed?)", c.cl, got, 2*maxEagerPreGrow)
+			// A grow from empty allocates Content-Length rounded up to whole
+			// 8 KiB pages, never a doubling.
+			if c.startCap == 0 {
+				if got := int64(bb.Cap()); got > c.cl+8*1024 {
+					t.Fatalf("after eagerPreGrow(cl=%d): cap=%d, want at most %d",
+						c.cl, got, c.cl+8*1024)
+				}
 			}
 		})
 	}

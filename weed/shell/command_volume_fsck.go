@@ -991,6 +991,9 @@ func (c *commandVolumeFsck) collectVolumeIds() (volumeIdToServer map[string]map[
 	if err != nil {
 		return
 	}
+	if err = requireServerIndexLayout(topologyVolumeServers(topologyInfo), volumeServerVersion(c.env.option.GrpcDialOption)); err != nil {
+		return
+	}
 
 	eachDataNode(topologyInfo, func(dc DataCenterId, rack RackId, t *master_pb.DataNodeInfo) {
 		var volumeCount, ecShardCount int

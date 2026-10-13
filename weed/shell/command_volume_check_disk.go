@@ -149,6 +149,9 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 	if err != nil {
 		return err
 	}
+	if err := requireServerIndexLayout(topologyVolumeServers(topologyInfo), volumeServerVersion(commandEnv.option.GrpcDialOption)); err != nil {
+		return err
+	}
 	// collect volume replicas, optionally filtered by volume ID
 	volumeReplicas, _ := collectVolumeReplicaLocations(topologyInfo)
 	if vid := uint32(*volumeId); vid > 0 {

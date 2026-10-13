@@ -1,0 +1,27 @@
+name: Check out the go-fuse fork
+description: >
+  go.mod replaces github.com/seaweedfs/go-fuse/v2 with ../forks-go-fuse, so any
+  job that builds weed needs that sibling checkout next to the repository.
+  Clones AppMana/forks-go-fuse at the pinned SEAWEEDFS_RELIABILITY_GO_FUSE_REF.
+  Run it right after actions/checkout.
+
+inputs:
+  ref:
+    description: Full go-fuse commit SHA
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GO_FUSE_REF: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        [[ "$GO_FUSE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::go-fuse ref must be a full commit SHA"; exit 1; }
+        dest="$GITHUB_WORKSPACE/../forks-go-fuse"
+        rm -rf "$dest"
+        git init -q "$dest"
+        git -C "$dest" fetch -q --depth 1 https://github.com/AppMana/forks-go-fuse "$GO_FUSE_REF"
+        git -C "$dest" checkout -q FETCH_HEAD
+        git -C "$dest" log -1 --format='go-fuse %H'

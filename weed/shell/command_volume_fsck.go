@@ -73,10 +73,13 @@ type commandVolumeFsck struct {
 	// reads it at the copied index offset; tests replace it.
 	readNeedleMeta func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) (appendAtNs uint64, err error)
 	// Test seams for purge transport; production uses MasterClient and operation.
-	volumeServers  func(volumeId uint32) (servers []pb.ServerAddress, found bool)
-	deleteFileIds  func(server pb.ServerAddress, fileIds []string) []*volume_server_pb.DeleteResult
-	purgedDirsLock sync.Mutex
-	purgedDirs     map[util.FullPath]struct{}
+	volumeServers func(volumeId uint32) (servers []pb.ServerAddress, found bool)
+	deleteFileIds func(server pb.ServerAddress, fileIds []string) []*volume_server_pb.DeleteResult
+	// Repair transport for -repairMissingFromReplicas; tests replace it.
+	readNeedleBlob          func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) ([]byte, error)
+	writeNeedleBlobIfAbsent func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue, blob []byte) error
+	purgedDirsLock          sync.Mutex
+	purgedDirs              map[util.FullPath]struct{}
 }
 
 func (c *commandVolumeFsck) Name() string {
@@ -99,6 +102,11 @@ func (c *commandVolumeFsck) Help() string {
 	1. collect all file ids from all volumes, as set A
 	2. collect all file ids from the filer, as set B
 	3. find out the set B subtract A
+
+	With -repairMissingFromReplicas, each chunk in B that a replica lacks is
+	copied to that replica from one holding it. The filer reference is the
+	proof it is a missed write rather than a deletion; the copy uses an
+	absent-only write, so existing needles and tombstones are never replaced.
 
 	-cutoffTimeAgo is used to only check chunks older than the cutoff time.
 	This is important because:
@@ -128,12 +136,16 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	cutoffTimeAgo := fsckCommand.Duration("cutoffTimeAgo", 5*time.Hour, "only include entries on volume servers before this cutoff time to check orphan chunks")
 	modifyTimeAgo := fsckCommand.Duration("modifyTimeAgo", 0, "only include entries after this modify time to check orphan chunks")
 	c.verifyNeedle = fsckCommand.Bool("verifyNeedles", false, "check needles status from volume server")
+	repairFromReplicas := fsckCommand.Bool("repairMissingFromReplicas", false, "with -findMissingChunksInFiler: copy each filer-referenced needle a replica lacks from a replica that holds it, never overwriting or undeleting")
 
 	if err = fsckCommand.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
 		}
 		return err
+	}
+	if *repairFromReplicas && (!*c.findMissingChunksInFiler || *applyPurging || *purgeAbsent) {
+		return fmt.Errorf("-repairMissingFromReplicas needs -findMissingChunksInFiler and cannot be combined with -reallyDeleteFromVolume or -reallyDeleteFilerEntries")
 	}
 
 	// The command struct is a singleton registered in init(), so any state
@@ -275,6 +287,11 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 
 		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, *purgeAbsent, collectModifyFromAtNs, collectCutoffFromAtNs); err != nil {
 			return fmt.Errorf("collectFilerFileIdAndPaths: %w", err)
+		}
+		if *repairFromReplicas {
+			repaired, lost, repairErr := c.repairMissingFromReplicas(dataNodeVolumeIdToVInfo)
+			fmt.Fprintf(c.writer, "repaired %d missing replica needle(s); %d referenced needle(s) on no replica\n", repaired, lost)
+			return repairErr
 		}
 		for dataNodeId, volumeIdToVInfo := range dataNodeVolumeIdToVInfo {
 			// for each volume, check filer file ids

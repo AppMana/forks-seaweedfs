@@ -18,6 +18,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/mount/winfsp"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mount_pb"
@@ -411,6 +412,14 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 			mountPoint = bare
 		} else if abs, err := filepath.Abs(dir); err == nil && len(abs) >= 2 && abs[1] == ':' {
 			mountPoint = `\\.\` + abs
+			go func() {
+				from, to, err := winfsp.RetargetDirectoryMountToVolumeGUID(abs, time.Minute)
+				if err != nil {
+					glog.Errorf("winfsp directory mount %s keeps junction %q: %v", abs, from, err)
+					return
+				}
+				glog.V(0).Infof("winfsp directory mount %s junction %q -> %q", abs, from, to)
+			}()
 		}
 	}
 	mountErr := host.Mount(mountPoint, *option.volumeLabel, extraOptions)

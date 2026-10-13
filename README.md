@@ -210,7 +210,7 @@ keeps a private registry's name out of public logs.
 
 | Branch | Role |
 | --- | --- |
-| `merge/upstream-4.47` | Default branch and the deployed line. Every fix merges here (never rebased); server images are built from it. |
+| `merge/upstream-4.48` | Default branch and the deployed line; the only maintained branch. Every fix merges here (never rebased); server images are built from it. `merge/upstream-4.47` is fully merged into it and no longer maintained. |
 | `merge/upstream-<next>` | Next upstream release merged into the default branch. It becomes the default once qualified; the server image workflow's branch filter moves with it. |
 | `release/<change>-<base>` | Short-lived ship branch: a deployed commit plus only the change being rolled out. It merges back into the default branch and is then deleted. |
 

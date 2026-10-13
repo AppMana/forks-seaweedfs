@@ -559,13 +559,13 @@ jobs:
           }
           fetch winfsp.msi https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi \
             073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
-          fetch git-installer.exe https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-64-bit.exe \
-            d065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6
+          fetch git-installer.exe https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.1/Git-2.56.0-64-bit.exe \
+            bfe94e7b419b16eee9fecbd1253a98e3d4f49ba8f029630549052278ffe286a6
           {
             echo "PINNED_WINFSP_MSI=$inputs/winfsp.msi"
             echo 'PINNED_WINFSP_MSI_SHA256=073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
             echo "PINNED_GIT_INSTALLER=$inputs/git-installer.exe"
-            echo 'PINNED_GIT_INSTALLER_SHA256=d065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6'
+            echo 'PINNED_GIT_INSTALLER_SHA256=bfe94e7b419b16eee9fecbd1253a98e3d4f49ba8f029630549052278ffe286a6'
           } >> "$GITHUB_ENV"
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:

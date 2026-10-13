@@ -226,10 +226,7 @@ go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=
 
 The DLL's adjacent `.manifest.txt` and `.source.patch` are required. Results
 remain in `seaweedfs-mixed-results-*`: provenance, topology, phase logs, guest
-diagnostics and a final manifest requiring all seven paired phases. The existing
-MSVC qualification job builds the two workload executables and invokes this
-gate after native WinFsp qualification; its upload retains the results and outer
-test log. Fast oracle tests run in the hosted Linux job, including deliberate
+diagnostics and a final manifest requiring all seven paired phases.  Fast oracle tests run in the hosted Linux job, including deliberate
 corruption, truncation, missing/extra files and a lost-delete negative control.
 They are not VM passes. This coverage does not establish same-file concurrent
 write/locking semantics, case-collision behavior, CSI package lifecycle, mixed
@@ -542,13 +539,6 @@ shim hashes, epoch and tool versions; retain the build directory separately
 for full compiler output. Manifest consistency is not proof of provenance or
 cross-run equivalence: compare recipe, shim and tool versions between baseline
 and candidate, not just their source labels.
-The lab-only core candidate `hack/appmana/winfsp-guid-mount.patch` applies to
-the pinned WinFsp checkout with `git apply`. It resolves the registered volume
-GUID without opening the not-yet-dispatched filesystem, sets that target on
-the owned junction handle, and rolls back registration if the update fails.
-It changes both registration modes but not ordinary unregistered mounts or
-drive mounts. It is experimental, not deployment-qualified; the unchanged
-native reproducer and real LFS workload must qualify it before adoption.
 
 Select `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerRegistrationRollback`
 with an explicit manifested `SEAWEEDFS_WINDOWS_WINFSP_DLL` and an amd64 native
@@ -619,80 +609,13 @@ hostile build host. In particular, manifest compiler/SDK fields currently record
 requested versions; verifying effective compiler/linker/resource-tool paths,
 versions and hashes against the retained build logs remains required before
 calling an MSVC artifact provenance-qualified.
-The native compiler lab is automated by `TestWindowsWinFspMSVCBuildLab` in the
-existing VM test module. It uses Labcontainers/QGA and a read-only attached ISO;
-the guest has no external network. Required inputs are
-`LABCONTAINERS_WINDOWS_IMAGE`, `LABCONTAINERS_LABD`,
-`SEAWEEDFS_WINDOWS_MSVC_ISO` (absolute host path), and
-`SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256`. Explicitly opt in with
-`SEAWEEDFS_WINDOWS_MSVC_BUILD_LIVE=1`, then run:
-
-```sh
-go test ./test/storage_lab/vm -run '^TestWindowsWinFspMSVCBuildLab$' -v -count=1 -timeout 65m
-```
-
-Use the same workspace/module setup as the other VM tests. This expensive gate
-is separate from normal unit tests; an unset opt-in skips it, not a native-build
-pass. The ISO must have label `WINFSP_BUILD`, the verified image-layer trees
-`Files/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools` and
-`Files/Program Files (x86)/Windows Kits/10`, the verified
-`Git-2.51.0-64-bit.exe`, and a `winfsp.bundle` advertising the pinned WinFsp HEAD.
-Generate media with deep directories enabled (`genisoimage -D -udf -iso-level 3
--J -joliet-long`); omitting `-D` silently omits deeply nested compiler files.
-Windows layer entries can have zero Unix permissions: give the isolated staging
-tree owner read/traverse permission before generating media. Do not import
-registry hives or OS trees from the container image.
-
-`hack/appmana/provision-winfsp-msvc-lab.ps1` copies the toolchain into the fresh
-guest, configures only its SDK discovery roots, and selects x64-hosted MSVC
-14.44.35207/v143 with SDK 10.0.26100.0. These explicit versions, the Git installer
-filename, and the pinned source/shallow boundary must be reviewed when changing
-the payload. Windows' existing UCRT props also read SDK registry roots; setting
-only `WindowsSdkDir` is insufficient (the native compiler reported missing
-`ctype.h` despite that header being present). The shallow source bundle needs
-its pinned shallow boundary restored after clone. Line-ending conversion is
-disabled during clone to preserve tracked source bytes.
-
-Prepare media using the checked-in, hash-verifying helper, not an ad-hoc ISO:
-
-```sh
-bash hack/appmana/prepare-winfsp-msvc-media.sh \
-  /runner/cache/toolchain-layer.tar.gz /runner/src/winfsp-v2.1 \
-  /runner/cache/Git-2.51.0-64-bit.exe /runner/cache
-```
-
-The output parent must already exist; the helper creates a fresh child directory
-and retains the extracted payload plus ISO (allow roughly 25 GiB beyond the
-downloaded layer). It rejects incorrect layer/installer hashes, a wrong source
-HEAD, symbolic links, and missing compiler inputs. It emits the ISO path and
-digest. Copy/preload that ISO on the dedicated runner and set the Actions
-variables `SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH` and
-`SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256`. Set
-`SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED=1` for continuous qualification, or use
-workflow dispatch `windows_msvc_build=true`. Also configure the pinned
-Labcontainers source/Windows image, Go-FUSE source, WinFsp MSI, Git installer,
-and explicit standalone LFS path/hash variables documented in the root README.
-The MSVC job requires standalone LFS rather than silently using the bundle.
-Its inputs are supplied as environment variables, not interpolated into scripts.
-Compiler/image/Git/source pins in the media helper and provisioning/build
-scripts must move together with the manifest assertions and qualification data.
-
-The workflow runs the exact compiled candidate through graceful same-path
-cleanup, process-crash cleanup, and injected registration rollback in both
-registration modes, then five real Git atomic-rename and LFS cycles. It retains
-build and runtime evidence for 30 days even on failure. It has no signing,
-registry publishing, release creation, or production deployment step; app-local
-DLL loading in a test does not establish the eventual package's load path.
-
-The caller stages the current checked-in build recipe and candidate patch,
-not copies embedded in the ISO. Each run builds baseline then candidate using
-the same guest/toolchain. Fresh completion tokens, mandatory DLL/log/binlog/
-argument/manifest retrieval, guest-to-host SHA-256 verification, clean baseline,
-and exact candidate patch comparison are required. Results are retained outside
-the repository under the printed `winfsp-msvc-results-*` directory, including
-toolchain executable paths/versions/hashes. Inspect the diagnostic build logs
-for the effective compiler/linker/resource-compiler paths before making stronger
-toolchain provenance claims; requested versions alone are not attestation.
+WinFsp DLL builds and their qualification now live in the WinFsp fork
+(`AppMana/forks-winfsp-fixes`, branch `appmana-v2.1`, which carries the
+directory mount registration fix and its EWDK lab in `tools/lab`). This
+repository no longer builds WinFsp. SeaweedFS itself retargets its own
+mount-manager directory junction to the volume GUID path
+(`weed/mount/winfsp/junction_windows.go`), so the default stock WinFsp passes
+the repeated Git LFS gate without a patched DLL.
 Subsequent harness runs materialize auxiliary log tails in the guest and use the
 existing chunked, SHA-256-verified artifact transfer instead of one oversized
 exec response. `guest-logs.txt` contains the diagnostic text;

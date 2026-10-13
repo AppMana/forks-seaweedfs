@@ -19,10 +19,6 @@ on:
         description: 'Run same-path graceful and process-crash mount cleanup in both registration modes'
         type: boolean
         default: false
-      windows_msvc_build:
-        description: 'Build matched WinFsp DLLs offline with MSVC and qualify the candidate in disposable Windows VMs'
-        type: boolean
-        default: false
   push:
     branches: [master, main, 'merge/**']
     paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/s3/copying/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
@@ -51,148 +47,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows-msvc-qualification:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.windows_msvc_build) || (github.event_name == 'push' && vars.SEAWEEDFS_RELIABILITY_WINFSP_MSVC_ENABLED == '1') }}
-    runs-on: [self-hosted, linux, x64, kvm, seaweedfs-lab]
-    timeout-minutes: 240
-    defaults:
-      run:
-        working-directory: seaweedfs
-    env:
-      SEAWEEDFS_WINDOWS_MSVC_BUILD_LIVE: '1'
-      SEAWEEDFS_WINDOWS_MSVC_ISO: ${{ vars.SEAWEEDFS_RELIABILITY_MSVC_ISO_PATH }}
-      SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_MSVC_ISO_SHA256 }}
-      SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
-      WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 }}
-      SEAWEEDFS_WINDOWS_CONFORMANCE_EXE: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_PATH }}
-      WINFSP_TESTS_EXE_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_TESTS_EXE_SHA256 }}
-      SEAWEEDFS_GIT_INSTALLER: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH }}
-      GIT_INSTALLER_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 }}
-      SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_PATH }}
-      GIT_LFS_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 }}
-      LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: seaweedfs
-      - name: Validate pinned native build inputs
-        run: |
-          set -euo pipefail
-          [[ "$LABCONTAINERS_REF" =~ ^[0-9a-f]{40}$ && "$GO_FUSE_REF" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$LABCONTAINERS_WINDOWS_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]]
-          [[ "$LABCONTAINERS_VM_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]]
-          test -c /dev/kvm
-          test "$(containerlab version --short 2>/dev/null | tr -d 'v')" = '0.79.0'
-          docker image inspect "$LABCONTAINERS_WINDOWS_IMAGE" >/dev/null
-          docker image inspect "$LABCONTAINERS_VM_IMAGE" >/dev/null
-          for image in "$LABCONTAINERS_WINDOWS_IMAGE" "$LABCONTAINERS_VM_IMAGE"; do
-            test "$(docker image inspect --format '{{ index .Config.Labels "appmana.labcontainers.revision" }}' "$image")" = "$LABCONTAINERS_REF"
-          done
-          # Require an explicit LFS client for this release-build qualification.
-          for pair in 'SEAWEEDFS_WINDOWS_MSVC_ISO SEAWEEDFS_WINDOWS_MSVC_ISO_SHA256' 'SEAWEEDFS_WINFSP_MSI WINFSP_MSI_SHA256' 'SEAWEEDFS_WINDOWS_CONFORMANCE_EXE WINFSP_TESTS_EXE_SHA256' 'SEAWEEDFS_GIT_INSTALLER GIT_INSTALLER_SHA256' 'SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC GIT_LFS_SHA256'; do
-            read -r path_name hash_name <<< "$pair"
-            [[ "${!path_name}" = /* && "${!hash_name}" =~ ^[0-9a-f]{64}$ ]]
-            printf '%s  %s\n' "${!hash_name}" "${!path_name}" | sha256sum -c -
-          done
-      - uses: actions/checkout@v7
-        with:
-          repository: AppMana/labcontainers
-          ref: ${{ env.LABCONTAINERS_REF }}
-          path: labcontainers
-      - uses: actions/checkout@v7
-        with:
-          repository: AppMana/forks-go-fuse
-          ref: ${{ env.GO_FUSE_REF }}
-          path: forks-go-fuse
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: seaweedfs/go.mod
-          cache-dependency-path: |
-            seaweedfs/go.sum
-            labcontainers/go.sum
-      - name: Build and verify matched native DLL artifacts
-        env:
-          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
-          # setup-go exported GOTOOLCHAIN=local for the root module's.
-          GOTOOLCHAIN: auto
-        run: |
-          set -euo pipefail
-          sdk_pin=$(sed -n 's/.*github.com\/appmana\/labcontainers .*-[^-]*-\([0-9a-f]*\)$/\1/p' test/storage_lab/vm/go.mod)
-          test "${LABCONTAINERS_REF:0:12}" = "$sdk_pin"
-          (cd "$GITHUB_WORKSPACE/labcontainers" && make build)
-          compiler_work=$(mktemp -d "$RUNNER_TEMP/winfsp-msvc-work.XXXXXXXX")
-          (cd "$compiler_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
-          export GOWORK="$compiler_work/go.work"
-          printf 'GOWORK=%s\n' "$GOWORK" >> "$GITHUB_ENV"
-          compiler_results=$(mktemp -d "$RUNNER_TEMP/winfsp-msvc-ci.XXXXXXXX")
-          RUNNER_TEMP="$compiler_results" go test ./test/storage_lab/vm -run '^TestWindowsWinFspMSVCBuildLab$' -count=1 -v -timeout=65m 2>&1 | tee "$compiler_results/test.log"
-          results=("$compiler_results"/winfsp-msvc-results-*)
-          [[ "${#results[@]}" == 1 && -d "${results[0]}" ]]
-          test -s "${results[0]}/candidate-winfsp-x64.dll"
-          printf 'SEAWEEDFS_WINDOWS_WINFSP_DLL=%s\n' "${results[0]}/candidate-winfsp-x64.dll" >> "$GITHUB_ENV"
-          printf 'Native WinFsp source/patch/toolchain manifests and binaries: `%s`\n' "${results[0]}" >> "$GITHUB_STEP_SUMMARY"
-      - name: Qualify the exact compiled candidate
-        env:
-          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
-          # setup-go exported GOTOOLCHAIN=local for the root module's.
-          GOTOOLCHAIN: auto
-          SEAWEEDFS_WINDOWS_MOUNT_LIVE: '1'
-          SEAWEEDFS_WINDOWS_MOUNT_REPEATS: '5'
-          SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/msvc-winfsp.test.exe
-          SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/msvc-weed.exe
-        run: |
-          set -euo pipefail
-          candidate_sha=$(git rev-parse HEAD)
-          GOWORK=off GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_WINDOWS_WINFSP_TEST" ./test/winfsp
-          GOWORK=off GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
-          # Strict upstream inventory, including optional/known-failure cases.
-          # Legacy sharing intentionally does not promise basic access denial.
-          SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS=1 SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=Conformance SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1 go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/msvc-conformance.log"
-          for registration in '' 1; do
-            export SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD="$registration"
-            SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1 SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
-            for scenario in MountManagerProcessCrash MountManagerRegistrationRollback; do
-              SEAWEEDFS_WINDOWS_MOUNT_SCENARIO="$scenario" go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m
-            done
-          done
-          unset SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD
-          for policy in 0 1; do
-            # Preserve the real Git/LFS campaigns for each policy as well as
-            # the native mounted suite's LFS syscall reproducers.
-            SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$policy" go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/msvc-git-lfs-permissions-$policy.log"
-            SEAWEEDFS_WINDOWS_BASIC_PERMISSIONS="$policy" SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=All SEAWEEDFS_WINDOWS_MOUNT_REPEATS=1 go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/msvc-permissions-$policy.log"
-          done
-          printf 'Rebuilt DLL qualified with explicit legacy compatibility and basic permission enforcement inventories.\n' >> "$GITHUB_STEP_SUMMARY"
-      - name: Mixed Windows and Linux mounted clients
-        env:
-          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
-          # setup-go exported GOTOOLCHAIN=local for the root module's.
-          GOTOOLCHAIN: auto
-          SEAWEEDFS_MIXED_LIVE: '1'
-          SEAWEEDFS_LINUX_WEED: ${{ runner.temp }}/mixed-weed-linux
-          SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/msvc-weed.exe
-          SEAWEEDFS_MIXED_LINUX_WORKLOAD: ${{ runner.temp }}/mixed-linux
-          SEAWEEDFS_MIXED_WINDOWS_WORKLOAD: ${{ runner.temp }}/mixed-windows.exe
-        run: |
-          set -euo pipefail
-          candidate_sha=$(git rev-parse HEAD)
-          GOWORK=off CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_LINUX_WEED" ./weed
-          CGO_ENABLED=0 go build -o "$SEAWEEDFS_MIXED_LINUX_WORKLOAD" ./test/storage_lab/vm/mixed_workload
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o "$SEAWEEDFS_MIXED_WINDOWS_WORKLOAD" ./test/storage_lab/vm/mixed_workload
-          go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=30m 2>&1 | tee "$RUNNER_TEMP/mixed-mount-test.log"
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: winfsp-msvc-build-and-qualification
-          path: |
-            ${{ runner.temp }}/winfsp-msvc-ci.*/
-            ${{ runner.temp }}/seaweedfs-windows-mount-results-*/
-            ${{ runner.temp }}/seaweedfs-mixed-results-*/
-            ${{ runner.temp }}/mixed-mount-test.log
-            ${{ runner.temp }}/msvc-conformance.log
-          if-no-files-found: error
-          retention-days: 30
-
   large-disk-regressions:
     # 22.04's Bubblewrap lacks --size; never drop the bounded-tmpfs guard.
     runs-on: ubuntu-24.04
@@ -213,7 +67,6 @@ jobs:
           pwsh -NoProfile -File hack/appmana/mount-smoke-contract-test.ps1
           pwsh -NoProfile -File test/winfsp-conformance/contract-test.ps1
           pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1
-          pwsh -NoProfile -File hack/appmana/build-winfsp-msvc-test.ps1
       - name: Validate explicit compatibility inputs
         run: |
           for name in BASELINE_REF GO_FUSE_REF; do

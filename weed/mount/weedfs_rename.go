@@ -16,6 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 // doRename tries the streaming mux first, falling back to unary on transport
@@ -565,10 +566,30 @@ func (wfs *WFS) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamR
 		}
 
 	} else if resp.EventNotification.OldEntry != nil {
-		// without new entry, only old entry name exists. This is the second step to delete old entry
+		// A delete without a new entry is the target the rename replaced. When
+		// that name was one of several hard links, the filer decremented the
+		// shared counter; the surviving names' cached entries must follow, as
+		// unlink does (pjdfstest rename/23). The filer streams this event
+		// before the move, so the target path still resolves to the shared inode.
+		replaced := resp.EventNotification.OldEntry
+		replacedPath := util.FullPath(resp.Directory).Child(replaced.Name)
+		var sharedInode uint64
+		if len(replaced.HardLinkId) > 0 && replaced.HardLinkCounter > 1 {
+			sharedInode, _ = wfs.inodeToPath.GetInode(replacedPath)
+		}
 		if err := wfs.applyLocalMetadataEvent(ctx, metadataEventFromRenameResponse(resp)); err != nil {
 			glog.Warningf("rename apply delete event: %v", err)
 			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(resp.Directory))
+		}
+		if sharedInode != 0 {
+			decremented := proto.Clone(replaced).(*filer_pb.Entry)
+			decremented.HardLinkCounter = replaced.HardLinkCounter - 1
+			if decremented.Attributes != nil {
+				now := time.Now()
+				decremented.Attributes.Ctime = now.Unix()
+				decremented.Attributes.CtimeNs = int32(now.Nanosecond())
+			}
+			wfs.syncHardLinkSiblings(sharedInode, decremented, replacedPath)
 		}
 	}
 

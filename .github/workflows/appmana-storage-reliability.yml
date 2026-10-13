@@ -545,6 +545,28 @@ jobs:
           go test ./test/storage_lab/vm -list '^TestWindowsStorageLab$' | grep -Fx TestWindowsStorageLab
           go test ./test/storage_lab/vm -run '^TestWindowsStorageLab$' -count=1 -v -timeout=18m
           go test ./test/storage_lab/vm -run '^TestWindows(MountXAttr|Adapter)Lab$' -count=1 -v -timeout=35m
+      - name: Fetch pinned Windows installers
+        # The lab runner is an ephemeral pod, so repository variables cannot
+        # name files on it. When they are unset, download the pinned releases
+        # and verify them against the published digests.
+        if: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH == '' || vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH == '' }}
+        run: |
+          set -euo pipefail
+          inputs=$(mktemp -d "$RUNNER_TEMP/windows-inputs.XXXXXXXX")
+          fetch() {
+            curl -fsSL --retry 3 -o "$inputs/$1" "$2"
+            printf '%s  %s\n' "$3" "$inputs/$1" | sha256sum -c -
+          }
+          fetch winfsp.msi https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi \
+            073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+          fetch git-installer.exe https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-64-bit.exe \
+            d065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6
+          {
+            echo "PINNED_WINFSP_MSI=$inputs/winfsp.msi"
+            echo 'PINNED_WINFSP_MSI_SHA256=073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
+            echo "PINNED_GIT_INSTALLER=$inputs/git-installer.exe"
+            echo 'PINNED_GIT_INSTALLER_SHA256=d065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6'
+          } >> "$GITHUB_ENV"
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:
           # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
@@ -558,10 +580,10 @@ jobs:
           WINDOWS_MOUNT_CLEANUP: ${{ inputs.windows_mount_cleanup && '1' || '0' }}
           SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/windows-winfsp.test.exe
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
-          SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH }}
-          WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 }}
-          SEAWEEDFS_GIT_INSTALLER: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH }}
-          GIT_INSTALLER_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 }}
+          SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH || env.PINNED_WINFSP_MSI }}
+          WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 || env.PINNED_WINFSP_MSI_SHA256 }}
+          SEAWEEDFS_GIT_INSTALLER: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH || env.PINNED_GIT_INSTALLER }}
+          GIT_INSTALLER_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_INSTALLER_SHA256 || env.PINNED_GIT_INSTALLER_SHA256 }}
           SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_PATH }}
           GIT_LFS_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 }}
           LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd

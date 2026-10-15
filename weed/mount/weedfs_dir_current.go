@@ -22,26 +22,29 @@ import (
 // delivery claims, a fraction of this.
 var directoryCurrentWait = time.Second
 
-// directoryPositions answers, per directory, how far the kernel's cached
-// listing is current: OpenDir lets the kernel keep its listing only while no
-// change has landed since the listing it already holds.
+// directoryPositions answers, per directory, whether the kernel's cached
+// listing is still the cache's: OpenDir lets the kernel keep its listing only
+// while no change has been applied since the open that let it read it.
 type directoryPositions struct {
 	sync.Mutex
-	kernelListing map[uint64]int64
+	kernelListing map[uint64]uint64
 	unsupported   bool
 }
 
 const directoryPositionsLimit = 1 << 16
 
-func (p *directoryPositions) keepKernelListing(inode uint64, changeTsNs, currentTsNs int64) bool {
+// keepKernelListing reports whether the listing the kernel read after the
+// last open of inode is still the cache's at generation, and records
+// generation for the next open.
+func (p *directoryPositions) keepKernelListing(inode uint64, generation uint64) bool {
 	p.Lock()
 	defer p.Unlock()
 	if p.kernelListing == nil || len(p.kernelListing) >= directoryPositionsLimit {
-		p.kernelListing = make(map[uint64]int64)
+		p.kernelListing = make(map[uint64]uint64)
 	}
 	kept, found := p.kernelListing[inode]
-	p.kernelListing[inode] = currentTsNs
-	return found && changeTsNs <= kept
+	p.kernelListing[inode] = generation
+	return found && kept == generation
 }
 
 func (p *directoryPositions) dropKernelListing(inode uint64) {
@@ -64,8 +67,8 @@ func (p *directoryPositions) markUnsupported() {
 
 var errDirectoryPositionUnsupported = errors.New("filer does not report directory change positions")
 
-// directoryChangePosition asks the filers for the newest change to dir's
-// children.
+// directoryChangePosition asks the filers how far each one's log reaches for
+// dir's children, leaving out this mount's own changes.
 func (wfs *WFS) directoryChangePosition(ctx context.Context, dir util.FullPath) (*filer_pb.DirectoryChangePositionResponse, error) {
 	if wfs.dirPositions.isUnsupported() {
 		return nil, errDirectoryPositionUnsupported
@@ -74,7 +77,7 @@ func (wfs *WFS) directoryChangePosition(ctx context.Context, dir util.FullPath) 
 		var resp *filer_pb.DirectoryChangePositionResponse
 		err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 			var callErr error
-			resp, callErr = client.DirectoryChangePosition(ctx, &filer_pb.DirectoryChangePositionRequest{Directory: string(dir)})
+			resp, callErr = client.DirectoryChangePosition(ctx, &filer_pb.DirectoryChangePositionRequest{Directory: string(dir), Signature: wfs.signature})
 			return callErr
 		})
 		return resp, err
@@ -85,6 +88,18 @@ func (wfs *WFS) directoryChangePosition(ctx context.Context, dir util.FullPath) 
 		return nil, errDirectoryPositionUnsupported
 	}
 	return resp, err
+}
+
+// directoryFilerPositions is directoryChangePosition for a directory build,
+// bounded on its own; nil positions leave the build without a basis.
+func (wfs *WFS) directoryFilerPositions(ctx context.Context, dir util.FullPath) ([]*filer_pb.FilerDirectoryPosition, error) {
+	positionCtx, cancel := context.WithTimeout(ctx, directoryPositionTimeout)
+	defer cancel()
+	resp, err := wfs.directoryChangePosition(positionCtx, dir)
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetFilers(), nil
 }
 
 // directoryPositionTimeout bounds the position request on its own: with the
@@ -101,15 +116,16 @@ type directoryCurrency struct {
 	// before the call. Unverified means the filer could not be asked, and the
 	// cache is served as it is.
 	verified bool
-	// changeTsNs is the newest change the filers named.
-	changeTsNs int64
 }
 
 // awaitDirectoryCurrent makes a cached directory's listing show every change
-// the filers acknowledged before the call: close-to-open across mounts. A
-// change still on its way through the metadata stream is waited for; one the
-// stream does not bring in time, or a position missing a peer filer's
-// changes, has the directory read from the filer again.
+// the filers acknowledged before the call: close-to-open across mounts. Each
+// filer names how far its log reaches for the directory, leaving out this
+// mount's own changes, and the listing is current once it holds every filer's
+// log up to there. A change still on its way through the metadata stream is
+// waited for; one the stream does not bring in time, a filer that names no
+// change to wait for, or an answer without per-filer positions, has the
+// directory read from the filer again.
 func (wfs *WFS) awaitDirectoryCurrent(ctx context.Context, dir util.FullPath) directoryCurrency {
 	if !wfs.metaCache.IsDirectoryCached(dir) {
 		return directoryCurrency{}
@@ -122,39 +138,51 @@ func (wfs *WFS) awaitDirectoryCurrent(ctx context.Context, dir util.FullPath) di
 	}
 	if status.Code(err) == codes.Aborted {
 		glog.V(1).Infof("directory position %s: %v; reading it from the filer", dir, err)
-		return wfs.relistDirectory(ctx, dir, 0)
+		return wfs.relistDirectory(ctx, dir, nil)
 	}
 	if err != nil {
 		glog.V(1).Infof("directory position %s: %v; serving the cached listing", dir, err)
 		return directoryCurrency{cached: true}
 	}
-	if wfs.metaCache.DirectoryCurrentThrough(dir) >= resp.TsNs {
-		return directoryCurrency{cached: true, verified: true, changeTsNs: resp.TsNs}
+	if len(resp.Filers) == 0 {
+		// a filer predating per-filer positions: its single newest timestamp
+		// cannot tell one filer's log from another's
+		return wfs.relistDirectory(ctx, dir, nil)
 	}
-	if resp.Remembered {
-		waitCtx, cancel := context.WithTimeout(ctx, directoryCurrentWait)
-		current := wfs.metaCache.AwaitDirectoryCurrentThrough(waitCtx, dir, resp.TsNs)
-		cancel()
-		if current {
-			return directoryCurrency{cached: true, verified: true, changeTsNs: resp.TsNs}
+	basis, pending := wfs.metaCache.DirectoryPending(dir, resp.Filers)
+	if !basis {
+		return wfs.relistDirectory(ctx, dir, resp.Filers)
+	}
+	if len(pending) == 0 {
+		return directoryCurrency{cached: true, verified: true}
+	}
+	for _, p := range pending {
+		if !p.Remembered {
+			// a floor names no event the stream will bring
+			return wfs.relistDirectory(ctx, dir, resp.Filers)
 		}
-		glog.V(1).Infof("metadata stream has not brought %s to %d within %v; reading it from the filer", dir, resp.TsNs, directoryCurrentWait)
 	}
-	return wfs.relistDirectory(ctx, dir, resp.TsNs)
+	waitCtx, cancel := context.WithTimeout(ctx, directoryCurrentWait)
+	current := wfs.metaCache.AwaitDirectoryPositions(waitCtx, dir, pending)
+	cancel()
+	if current {
+		return directoryCurrency{cached: true, verified: true}
+	}
+	glog.V(1).Infof("metadata stream has not brought %s up to %v within %v; reading it from the filer", dir, pending, directoryCurrentWait)
+	return wfs.relistDirectory(ctx, dir, resp.Filers)
 }
 
 // relistDirectory rebuilds dir's cached listing from the filer. The listing is
-// read after the filers reported changeTsNs, so it is current through it even
-// when it carries no snapshot of its own (an empty directory). A directory not
-// cached again reads through.
-func (wfs *WFS) relistDirectory(ctx context.Context, dir util.FullPath, changeTsNs int64) directoryCurrency {
+// read after the filers named positions, so it holds every change up to them.
+// A directory not cached again reads through.
+func (wfs *WFS) relistDirectory(ctx context.Context, dir util.FullPath, positions []*filer_pb.FilerDirectoryPosition) directoryCurrency {
 	wfs.inodeToPath.InvalidateChildrenCache(dir)
 	_, err := awaitFilerReply(ctx, "relist "+string(dir), func() (struct{}, error) {
 		if err := wfs.ensureDirectoryVisited(dir); err != nil {
 			return struct{}{}, err
 		}
-		if changeTsNs != 0 {
-			wfs.metaCache.NoteDirectoryCurrentThrough(dir, changeTsNs)
+		if len(positions) > 0 {
+			wfs.metaCache.NoteDirectoryBasis(dir, positions)
 		}
 		return struct{}{}, nil
 	})
@@ -166,5 +194,5 @@ func (wfs *WFS) relistDirectory(ctx context.Context, dir util.FullPath, changeTs
 		return directoryCurrency{}
 	}
 	cached := wfs.metaCache.IsDirectoryCached(dir)
-	return directoryCurrency{cached: cached, verified: cached, changeTsNs: changeTsNs}
+	return directoryCurrency{cached: cached, verified: cached}
 }

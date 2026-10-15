@@ -59,12 +59,17 @@ type MetaCache struct {
 	// whole listing. See meta_cache_sections.go.
 	dirSections map[util.FullPath]*sectionList
 
-	// dirChangesApplied is, per cached directory, the newest change to its
-	// children this cache has applied. With the listing floor it says how far
-	// the cached listing is current. See meta_cache_dir_position.go.
-	dirChangesApplied map[util.FullPath]int64
+	// dirChangesApplied is, per cached directory, how far its listing is
+	// current in each filer's log, and a generation that moves on every
+	// change applied to it. See meta_cache_dir_position.go.
+	dirChangesApplied map[util.FullPath]*directoryOrigins
+	generations       uint64
 	appliedMu         sync.Mutex
 	appliedAdvanced   chan struct{}
+
+	// positionFn asks the filers how far each one's log reaches for a
+	// directory; a build asks it before listing, so the listing covers it.
+	positionFn func(ctx context.Context, dir util.FullPath) ([]*filer_pb.FilerDirectoryPosition, error)
 
 	// Entry invalidations run on a worker, not inline on the apply loop:
 	// invalidateFunc takes the fh lock, which a flush can hold while waiting on
@@ -150,7 +155,7 @@ func NewMetaCache(dbFolder string, uidGidMapper *UidGidMapper, root util.FullPat
 		dedupRing:            newDedupRingBuffer(),
 		dirVersionFloors:     make(map[util.FullPath]int64),
 		dirSections:          make(map[util.FullPath]*sectionList),
-		dirChangesApplied:    make(map[util.FullPath]int64),
+		dirChangesApplied:    make(map[util.FullPath]*directoryOrigins),
 		oversizedDirs:        make(map[util.FullPath]struct{}),
 	}
 	mc.invalidateWorker = util.NewAsyncBatchWorker(func(batch []EntryInvalidation) {
@@ -1094,6 +1099,9 @@ func (mc *MetaCache) completeDirectoryBuildNow(ctx context.Context, dirPath util
 	// children's records, or a re-inserted entry would inherit a stale one.
 	mc.Lock()
 	mc.dirSections[dirPath] = sections
+	origins := mc.originsLocked(dirPath)
+	mc.generations++
+	origins.generation = mc.generations
 	if snapshotTsNs != 0 {
 		mc.dirVersionFloors[dirPath] = snapshotTsNs
 		mc.pruneSupersededTombstonesLocked(ctx, dirPath, snapshotTsNs)

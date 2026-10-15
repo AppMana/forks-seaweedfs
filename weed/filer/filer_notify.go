@@ -7,6 +7,7 @@ import (
 	"io"
 	nethttp "net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -234,9 +235,14 @@ func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetad
 		return
 	}
 
-	if err := f.LocalMetaLogBuffer.AddDataToBuffer([]byte(event.Directory), data, event.TsNs); err != nil {
+	positionNs, err := f.LocalMetaLogBuffer.AddDataToBufferAt([]byte(event.Directory), data, event.TsNs)
+	if err != nil {
 		glog.Errorf("failed to add data to log buffer for %s: %v", event.Directory, err)
+		return
 	}
+	// Still before the mutation's caller is answered, and at the position a
+	// reader of this log meets the event.
+	f.dirWriters.note(positionNs, slices.Clone(event.EventNotification.GetSignatures()), ChangedDirectories(event)...)
 
 }
 

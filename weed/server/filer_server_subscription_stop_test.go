@@ -142,7 +142,7 @@ func TestEachLogEntryFnEndsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var filtered int64
-	fn := eachLogEntryFn(ctx, &filer_pb.SubscribeMetadataRequest{}, nil, nil, &filtered)
+	fn := eachLogEntryFn(ctx, &filer_pb.SubscribeMetadataRequest{}, nil, nil, &filtered, nil)
 	done, err := fn(&filer_pb.LogEntry{})
 	if !done || err != nil {
 		t.Fatalf("cancelled subscription returned done=%v err=%v, want a clean end", done, err)

@@ -176,6 +176,18 @@ func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 			return entryCount, snapshotTsNs, sections, err
 		}
 
+		// Asked before the listing is read, so the listing holds every change
+		// up to the positions named.
+		var basis []*filer_pb.FilerDirectoryPosition
+		if mc.positionFn != nil {
+			positions, positionErr := mc.positionFn(ctx, path)
+			if positionErr != nil {
+				glog.V(1).Infof("directory positions %s: %v", path, positionErr)
+			} else {
+				basis = positions
+			}
+		}
+
 		entryCount, snapshotTsNs, sections, fetchErr := reloadFromFiler()
 		if fetchErr != nil {
 			var tooLarge *DirectoryTooLargeError
@@ -220,6 +232,9 @@ func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 			return nil, fmt.Errorf("complete build for %s: %w", path, err)
 		}
 		cleanupDone = true // Prevent deferred cleanup after successful publish
+		if basis != nil {
+			mc.NoteDirectoryBasis(path, basis)
+		}
 		return nil, nil
 	})
 	return err

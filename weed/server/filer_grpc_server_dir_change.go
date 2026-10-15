@@ -13,7 +13,8 @@ import (
 )
 
 // DirectoryChangePosition answers with the newest change to the directory's
-// children that any filer of the cluster stamped. Peers are asked directly
+// children that any filer of the cluster stamped, and per filer process the
+// log position of the newest one not carrying the caller's signature. Peers are asked directly
 // rather than read from the aggregated stream: a change a peer has already
 // acknowledged to its writer may not have reached this filer's stream yet,
 // and that lag is exactly what the caller is asking about. A peer that cannot
@@ -24,6 +25,12 @@ func (fs *FilerServer) DirectoryChangePosition(ctx context.Context, req *filer_p
 	dir := util.FullPath(req.Directory)
 	tsNs, remembered := fs.filer.DirectoryChangePosition(dir)
 	resp := &filer_pb.DirectoryChangePositionResponse{TsNs: tsNs, Remembered: remembered}
+	positionNs, positionRemembered := fs.filer.DirectoryWriterPosition(dir, req.Signature)
+	resp.Filers = []*filer_pb.FilerDirectoryPosition{{
+		FilerId:    fs.filer.UniqueFilerId,
+		PositionNs: positionNs,
+		Remembered: positionRemembered,
+	}}
 	if req.LocalOnly || fs.filer.MetaAggregator == nil {
 		return resp, nil
 	}
@@ -35,18 +42,25 @@ func (fs *FilerServer) DirectoryChangePosition(ctx context.Context, req *filer_p
 		mu       sync.Mutex
 		wg       sync.WaitGroup
 		firstErr error
+		// a peer that names no per-filer position leaves the caller unable to
+		// tell whether it holds that peer's changes
+		incomplete bool
 	)
 	for _, peer := range peers {
 		wg.Add(1)
 		go func(peer pb.ServerAddress) {
 			defer wg.Done()
 			err := pb.WithFilerClient(false, 0, peer, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-				peerResp, err := client.DirectoryChangePosition(ctx, &filer_pb.DirectoryChangePositionRequest{Directory: req.Directory, LocalOnly: true})
+				peerResp, err := client.DirectoryChangePosition(ctx, &filer_pb.DirectoryChangePositionRequest{Directory: req.Directory, LocalOnly: true, Signature: req.Signature})
 				if err != nil {
 					return err
 				}
 				mu.Lock()
 				defer mu.Unlock()
+				if len(peerResp.Filers) == 0 {
+					incomplete = true
+				}
+				resp.Filers = append(resp.Filers, peerResp.Filers...)
 				if peerResp.TsNs > resp.TsNs {
 					resp.TsNs, resp.Remembered = peerResp.TsNs, peerResp.Remembered
 				} else if peerResp.TsNs == resp.TsNs && peerResp.Remembered {
@@ -66,6 +80,9 @@ func (fs *FilerServer) DirectoryChangePosition(ctx context.Context, req *filer_p
 	wg.Wait()
 	if firstErr != nil {
 		return nil, firstErr
+	}
+	if incomplete {
+		resp.Filers = nil
 	}
 	return resp, nil
 }

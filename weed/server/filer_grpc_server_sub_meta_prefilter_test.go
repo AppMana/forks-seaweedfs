@@ -42,7 +42,7 @@ func TestEachLogEntryFnPrefilterSkipsDecode(t *testing.T) {
 		decoded++
 		unsyncedEvents = 0 // emulate a delivery, like the notification fn after a send
 		return nil
-	}, &unsyncedEvents)
+	}, &unsyncedEvents, nil)
 
 	// non-matching entries skip the full decode but keep heartbeating
 	for i := 0; i <= MaxUnsyncedEvents; i++ {
@@ -87,7 +87,7 @@ func TestEachLogEntryFnNoFilterDecodesEverything(t *testing.T) {
 	fn := eachLogEntryFn(context.Background(), req, &recordingSender{}, func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
 		decoded++
 		return nil
-	}, &unsyncedEvents)
+	}, &unsyncedEvents, nil)
 	if _, err := fn(metadataLogEntry(t, "/anywhere", "x", 1)); err != nil {
 		t.Fatal(err)
 	}

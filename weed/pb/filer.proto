@@ -193,6 +193,12 @@ message EventNotification {
     string new_parent_path = 4;
     bool is_from_other_cluster = 5;
     repeated int32 signatures = 6;
+    // Where the filer that logged the event appended it to its own log: the
+    // filer process (UniqueFilerId) and the entry's position there, which rises
+    // strictly in append order. Set by that filer when it streams the event
+    // from memory, and carried unchanged through peers' aggregated streams.
+    int32 origin_filer_id = 7;
+    int64 origin_position_ns = 8;
 }
 
 enum SSEType {
@@ -643,6 +649,9 @@ message StatisticsResponse {
 message DirectoryChangePositionRequest {
     string directory = 1;
     bool local_only = 2; // this filer's own changes only; set when a filer asks its peers
+    // The caller's signature: changes carrying it are left out of filers, since
+    // the caller's metadata stream never delivers them.
+    int32 signature = 3;
 }
 message DirectoryChangePositionResponse {
     // A log timestamp at or above every change to the directory's children:
@@ -652,6 +661,18 @@ message DirectoryChangePositionResponse {
     // ts_ns is a remembered change, so the metadata stream carries an event at
     // it; a floor names no event to wait for.
     bool remembered = 2;
+    // Per filer process, the log position of the newest change to the
+    // directory's children not carrying the caller's signature. A caller holds
+    // every such change once it has applied, from each filer, an event at or
+    // past that filer's position.
+    repeated FilerDirectoryPosition filers = 3;
+}
+message FilerDirectoryPosition {
+    int32 filer_id = 1; // the filer process (UniqueFilerId)
+    // origin_position_ns of the newest such change while the filer remembers
+    // it; otherwise a floor at or above every change it has forgotten.
+    int64 position_ns = 2;
+    bool remembered = 3;
 }
 
 message PingRequest {

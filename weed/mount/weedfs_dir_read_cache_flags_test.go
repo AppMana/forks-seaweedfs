@@ -20,6 +20,8 @@ type positionFiler struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	tsNs       int64
 	remembered bool
+	filers     []*filer_pb.FilerDirectoryPosition
+	signature  atomic.Int32 // the caller's, from the last request
 	err        error
 	listed     []*filer_pb.Entry // served by ListEntries
 	calls      atomic.Int32
@@ -27,10 +29,11 @@ type positionFiler struct {
 
 func (s *positionFiler) DirectoryChangePosition(ctx context.Context, req *filer_pb.DirectoryChangePositionRequest) (*filer_pb.DirectoryChangePositionResponse, error) {
 	s.calls.Add(1)
+	s.signature.Store(req.Signature)
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &filer_pb.DirectoryChangePositionResponse{TsNs: s.tsNs, Remembered: s.remembered}, nil
+	return &filer_pb.DirectoryChangePositionResponse{TsNs: s.tsNs, Remembered: s.remembered, Filers: s.filers}, nil
 }
 
 func (s *positionFiler) ListEntries(req *filer_pb.ListEntriesRequest, stream filer_pb.SeaweedFiler_ListEntriesServer) error {
@@ -61,12 +64,32 @@ func openDir(t *testing.T, wfs *WFS, inode uint64) uint32 {
 func TestOpenDirKeepsKernelListingOfUnchangedDirectory(t *testing.T) {
 	dir := util.FullPath("/images")
 	wfs := newBenchWFS(t, dir, 4)
-	startFakeFiler(t, wfs, &positionFiler{tsNs: 0})
+	startFakeFiler(t, wfs, &positionFiler{filers: []*filer_pb.FilerDirectoryPosition{{FilerId: 11}}})
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 
 	openDir(t, wfs, dirInode)
 	if openDir(t, wfs, dirInode)&fuse.FOPEN_KEEP_CACHE == 0 {
 		t.Fatal("reopening an unchanged directory dropped the kernel's listing")
+	}
+}
+
+// A filer naming only its newest change across filers cannot say whether a
+// peer's change is still on its way, so every open reads the directory again.
+func TestOpenDirRelistsWithFilerWithoutPerFilerPositions(t *testing.T) {
+	dir := util.FullPath("/images")
+	wfs := newBenchWFS(t, dir, 4)
+	fake := &positionFiler{tsNs: 0, listed: []*filer_pb.Entry{
+		{Name: "late.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}},
+	}}
+	startFakeFiler(t, wfs, fake)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+
+	openDir(t, wfs, dirInode)
+	if openDir(t, wfs, dirInode)&fuse.FOPEN_KEEP_CACHE != 0 {
+		t.Fatal("kept a listing a filer without per-filer positions could not verify")
+	}
+	if entry, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child("late.pt")); err != nil || entry == nil {
+		t.Fatalf("relisted directory lacks the filer's entry: %v", err)
 	}
 }
 
@@ -76,28 +99,38 @@ func TestOpenDirKeepsKernelListingOfUnchangedDirectory(t *testing.T) {
 func TestOpenDirWaitsForAcknowledgedChange(t *testing.T) {
 	dir := util.FullPath("/images")
 	wfs := newBenchWFS(t, dir, 4)
-	fake := &positionFiler{tsNs: 0}
+	fake := &positionFiler{filers: []*filer_pb.FilerDirectoryPosition{{FilerId: 11}}}
 	startFakeFiler(t, wfs, fake)
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 	openDir(t, wfs, dirInode)
 
-	fake.tsNs, fake.remembered = 5000, true
+	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true}}
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
-			Directory: string(dir),
-			TsNs:      5000,
-			EventNotification: &filer_pb.EventNotification{
-				NewEntry:      &filer_pb.Entry{Name: "mp_rank_03_model_states.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}},
-				NewParentPath: string(dir),
-			},
-		}, meta_cache.SubscriberMetadataResponseApplyOptions)
+		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), relayedCreate(dir, "mp_rank_03_model_states.pt", 11, 5000), meta_cache.SubscriberMetadataResponseApplyOptions)
 	}()
+	listed := fake.calls.Load()
 	if openDir(t, wfs, dirInode)&fuse.FOPEN_KEEP_CACHE != 0 {
 		t.Error("kernel kept a listing read before the change")
 	}
 	if entry, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child("mp_rank_03_model_states.pt")); err != nil || entry == nil {
 		t.Fatalf("listing opened after the change was acknowledged does not hold it: %v", err)
+	}
+	if calls := fake.calls.Load(); calls != listed+1 {
+		t.Fatalf("asked the filer %d times for one open the stream answered, want once", calls-listed)
+	}
+}
+
+func relayedCreate(dir util.FullPath, name string, origin int32, positionNs int64) *filer_pb.SubscribeMetadataResponse {
+	return &filer_pb.SubscribeMetadataResponse{
+		Directory: string(dir),
+		TsNs:      positionNs,
+		EventNotification: &filer_pb.EventNotification{
+			NewEntry:         &filer_pb.Entry{Name: name, Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}},
+			NewParentPath:    string(dir),
+			OriginFilerId:    origin,
+			OriginPositionNs: positionNs,
+		},
 	}
 }
 
@@ -109,11 +142,13 @@ func TestOpenDirRelistsWhenTheStreamDoesNotDeliver(t *testing.T) {
 
 	dir := util.FullPath("/images")
 	wfs := newBenchWFS(t, dir, 4)
-	startFakeFiler(t, wfs, &positionFiler{tsNs: 5000, remembered: true, listed: []*filer_pb.Entry{
-		{Name: "late.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}},
-	}})
+	fake := &positionFiler{filers: []*filer_pb.FilerDirectoryPosition{{FilerId: 11}}}
+	startFakeFiler(t, wfs, fake)
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	openDir(t, wfs, dirInode)
 
+	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true}}
+	fake.listed = []*filer_pb.Entry{{Name: "late.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}}}
 	openDir(t, wfs, dirInode)
 	if entry, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child("late.pt")); err != nil || entry == nil {
 		t.Fatalf("relisted directory lacks the filer's entry: %v", err)
@@ -121,8 +156,8 @@ func TestOpenDirRelistsWhenTheStreamDoesNotDeliver(t *testing.T) {
 	if _, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child("image-00000000.jpg")); err == nil {
 		t.Fatal("relisted directory kept an entry the filer no longer lists")
 	}
-	if got := wfs.metaCache.DirectoryCurrentThrough(dir); got < 5000 {
-		t.Fatalf("relisted directory current through %d, want at least 5000", got)
+	if _, pending := wfs.metaCache.DirectoryPending(dir, fake.filers); len(pending) != 0 {
+		t.Fatalf("relisted directory not current through the positions named before it: %v", pending)
 	}
 }
 
@@ -188,18 +223,15 @@ func TestOpenDirWithFilerWithoutPositions(t *testing.T) {
 func TestNegativeLookupWaitsForAcknowledgedCreate(t *testing.T) {
 	dir := util.FullPath("/images")
 	wfs := newBenchWFS(t, dir, 4)
-	startFakeFiler(t, wfs, &positionFiler{tsNs: 5000, remembered: true})
+	fake := &positionFiler{filers: []*filer_pb.FilerDirectoryPosition{{FilerId: 11}}}
+	startFakeFiler(t, wfs, fake)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	openDir(t, wfs, dirInode)
 
+	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true}}
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
-			Directory: string(dir),
-			TsNs:      5000,
-			EventNotification: &filer_pb.EventNotification{
-				NewEntry:      &filer_pb.Entry{Name: "mp_rank_03_model_states.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}},
-				NewParentPath: string(dir),
-			},
-		}, meta_cache.SubscriberMetadataResponseApplyOptions)
+		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), relayedCreate(dir, "mp_rank_03_model_states.pt", 11, 5000), meta_cache.SubscriberMetadataResponseApplyOptions)
 	}()
 	entry, _, st := wfs.lookupEntry(dir.Child("mp_rank_03_model_states.pt"))
 	if st != fuse.OK || entry == nil {
@@ -207,5 +239,52 @@ func TestNegativeLookupWaitsForAcknowledgedCreate(t *testing.T) {
 	}
 	if _, _, st := wfs.lookupEntry(dir.Child("never-created")); st != fuse.ENOENT {
 		t.Fatalf("lookup of an absent name: %v, want ENOENT", st)
+	}
+}
+
+// A mount's own acknowledged change says nothing about a peer filer's change
+// still on its way: rank 0 creates a file through filer A while rank 1's file,
+// created earlier through filer B, has not been relayed to A's stream. Neither
+// the newest timestamp across filers (rank 0's) nor the mount's own apply may
+// pass the listing as current without rank 1's file.
+func TestOpenDirWaitsForPeerFilerChangeBehindOwnChange(t *testing.T) {
+	saved := directoryCurrentWait
+	directoryCurrentWait = 20 * time.Millisecond
+	t.Cleanup(func() { directoryCurrentWait = saved })
+
+	const filerA, filerB = 11, 22
+	dir := util.FullPath("/ckpt")
+	wfs := newBenchWFS(t, dir, 0)
+	images := []*filer_pb.Entry{}
+	fake := &positionFiler{filers: []*filer_pb.FilerDirectoryPosition{
+		{FilerId: filerA, PositionNs: 0}, {FilerId: filerB, PositionNs: 0},
+	}, listed: images}
+	startFakeFiler(t, wfs, fake)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	openDir(t, wfs, dirInode)
+
+	// rank 0's own file, acknowledged by filer A at 200 and applied locally
+	own := &filer_pb.Entry{Name: "mp_rank_00_model_states.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}}
+	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
+		Directory:         string(dir),
+		TsNs:              200,
+		EventNotification: &filer_pb.EventNotification{NewEntry: own, NewParentPath: string(dir), Signatures: []int32{wfs.signature}},
+	}, meta_cache.LocalMetadataResponseApplyOptions); err != nil {
+		t.Fatal(err)
+	}
+	peer := &filer_pb.Entry{Name: "mp_rank_01_model_states.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}}
+	fake.tsNs, fake.remembered = 200, true
+	fake.filers = []*filer_pb.FilerDirectoryPosition{
+		{FilerId: filerA, PositionNs: 0},
+		{FilerId: filerB, PositionNs: 100, Remembered: true},
+	}
+	fake.listed = []*filer_pb.Entry{own, peer}
+
+	openDir(t, wfs, dirInode)
+	if entry, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child(peer.Name)); err != nil || entry == nil {
+		t.Fatalf("listing passed as current without the peer filer's change: %v", err)
+	}
+	if got := fake.signature.Load(); got != wfs.signature {
+		t.Fatalf("position request carried signature %d, want the mount's %d", got, wfs.signature)
 	}
 }

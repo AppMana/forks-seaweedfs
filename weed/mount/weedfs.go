@@ -346,6 +346,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 			return wfs.inodeToPath.IsChildrenCached(path)
 		}, wfs.onEntryInvalidation, nil)
 	wfs.metaCache.SetPinnedChildFn(wfs.isLocalOnlyEntry)
+	wfs.metaCache.SetDirectoryPositionFn(wfs.directoryFilerPositions)
 	// A subscribed change the local metadata store cannot record (a full
 	// cache disk) leaves the cache behind the filer. Stop answering from it:
 	// every directory reads through to the filer until it is listed again,

@@ -530,6 +530,16 @@ func (m *EventNotification) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.OriginPositionNs != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.OriginPositionNs))
+		i--
+		dAtA[i] = 0x40
+	}
+	if m.OriginFilerId != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.OriginFilerId))
+		i--
+		dAtA[i] = 0x38
+	}
 	if len(m.Signatures) > 0 {
 		var pksize2 int
 		for _, num := range m.Signatures {
@@ -3656,6 +3666,11 @@ func (m *DirectoryChangePositionRequest) MarshalToSizedBufferVT(dAtA []byte) (in
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.Signature != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.Signature))
+		i--
+		dAtA[i] = 0x18
+	}
 	if m.LocalOnly {
 		i--
 		if m.LocalOnly {
@@ -3706,6 +3721,18 @@ func (m *DirectoryChangePositionResponse) MarshalToSizedBufferVT(dAtA []byte) (i
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.Filers) > 0 {
+		for iNdEx := len(m.Filers) - 1; iNdEx >= 0; iNdEx-- {
+			size, err := m.Filers[iNdEx].MarshalToSizedBufferVT(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+			i--
+			dAtA[i] = 0x1a
+		}
+	}
 	if m.Remembered {
 		i--
 		if m.Remembered {
@@ -3718,6 +3745,59 @@ func (m *DirectoryChangePositionResponse) MarshalToSizedBufferVT(dAtA []byte) (i
 	}
 	if m.TsNs != 0 {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.TsNs))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *FilerDirectoryPosition) MarshalVT() (dAtA []byte, err error) {
+	if m == nil {
+		return nil, nil
+	}
+	size := m.SizeVT()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBufferVT(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *FilerDirectoryPosition) MarshalToVT(dAtA []byte) (int, error) {
+	size := m.SizeVT()
+	return m.MarshalToSizedBufferVT(dAtA[:size])
+}
+
+func (m *FilerDirectoryPosition) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
+	if m == nil {
+		return 0, nil
+	}
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.unknownFields != nil {
+		i -= len(m.unknownFields)
+		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.Remembered {
+		i--
+		if m.Remembered {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x18
+	}
+	if m.PositionNs != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.PositionNs))
+		i--
+		dAtA[i] = 0x10
+	}
+	if m.FilerId != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.FilerId))
 		i--
 		dAtA[i] = 0x8
 	}
@@ -6856,6 +6936,12 @@ func (m *EventNotification) SizeVT() (n int) {
 		}
 		n += 1 + protohelpers.SizeOfVarint(uint64(l)) + l
 	}
+	if m.OriginFilerId != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.OriginFilerId))
+	}
+	if m.OriginPositionNs != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.OriginPositionNs))
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -8068,6 +8154,9 @@ func (m *DirectoryChangePositionRequest) SizeVT() (n int) {
 	if m.LocalOnly {
 		n += 2
 	}
+	if m.Signature != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.Signature))
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -8080,6 +8169,31 @@ func (m *DirectoryChangePositionResponse) SizeVT() (n int) {
 	_ = l
 	if m.TsNs != 0 {
 		n += 1 + protohelpers.SizeOfVarint(uint64(m.TsNs))
+	}
+	if m.Remembered {
+		n += 2
+	}
+	if len(m.Filers) > 0 {
+		for _, e := range m.Filers {
+			l = e.SizeVT()
+			n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+		}
+	}
+	n += len(m.unknownFields)
+	return n
+}
+
+func (m *FilerDirectoryPosition) SizeVT() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.FilerId != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.FilerId))
+	}
+	if m.PositionNs != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.PositionNs))
 	}
 	if m.Remembered {
 		n += 2
@@ -10885,6 +10999,44 @@ func (m *EventNotification) UnmarshalVT(dAtA []byte) error {
 				}
 			} else {
 				return fmt.Errorf("proto: wrong wireType = %d for field Signatures", wireType)
+			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OriginFilerId", wireType)
+			}
+			m.OriginFilerId = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.OriginFilerId |= int32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OriginPositionNs", wireType)
+			}
+			m.OriginPositionNs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.OriginPositionNs |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
 			}
 		default:
 			iNdEx = preIndex
@@ -19087,6 +19239,25 @@ func (m *DirectoryChangePositionRequest) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.LocalOnly = bool(v != 0)
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Signature", wireType)
+			}
+			m.Signature = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Signature |= int32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -19158,6 +19329,149 @@ func (m *DirectoryChangePositionResponse) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Remembered", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Remembered = bool(v != 0)
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Filers", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Filers = append(m.Filers, &FilerDirectoryPosition{})
+			if err := m.Filers[len(m.Filers)-1].UnmarshalVT(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.unknownFields = append(m.unknownFields, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *FilerDirectoryPosition) UnmarshalVT(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return protohelpers.ErrIntOverflow
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: FilerDirectoryPosition: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: FilerDirectoryPosition: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FilerId", wireType)
+			}
+			m.FilerId = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.FilerId |= int32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PositionNs", wireType)
+			}
+			m.PositionNs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PositionNs |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Remembered", wireType)
 			}

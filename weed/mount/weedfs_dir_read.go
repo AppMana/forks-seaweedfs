@@ -144,7 +144,7 @@ func (wfs *WFS) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 	ctx, cancelCtx := filerReplyContext(context.Background())
 	defer cancelCtx()
 	if currency := wfs.awaitDirectoryCurrent(ctx, dirPath); currency.verified {
-		if wfs.dirPositions.keepKernelListing(input.NodeId, currency.changeTsNs, wfs.metaCache.DirectoryCurrentThrough(dirPath)) {
+		if wfs.dirPositions.keepKernelListing(input.NodeId, wfs.metaCache.DirectoryGeneration(dirPath)) {
 			out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 		}
 	} else {

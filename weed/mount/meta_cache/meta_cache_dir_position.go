@@ -8,22 +8,53 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// A cached directory's listing is current through a log position: its listing
-// snapshot, raised by every change to its children applied since. Comparing
-// that position with the newest change the filers stamped to the directory
-// tells whether the listing already shows a change another mount has made, or
-// whether that change is still on its way through the metadata stream.
+// A cached directory's listing is current, per filer process, through a
+// position in that filer's log. Every filer appends to its own log in a strict
+// order, and the metadata stream relays each filer's events in that order, so
+// a cache that has applied a filer's event at a position holds every change
+// that filer appended before it. A listing read after the filers named their
+// positions holds everything up to them too: a filer appends a change after
+// storing it. Positions of different filers say nothing about each other, and
+// a mount's own changes, which its stream never delivers, never move them.
+type directoryOrigins struct {
+	// basis: the positions include those named before the listing was read,
+	// so a filer missing from them has appended nothing the listing lacks
+	basis     bool
+	positions map[int32]int64
+	// generation moves on every change applied to the directory, from any
+	// source; an unchanged generation means an unchanged listing.
+	generation uint64
+}
 
-// noteChangesApplied raises the position of each cached directory whose
-// children resp changed. Runs on the apply loop after the store took resp.
+func (mc *MetaCache) originsLocked(dir util.FullPath) *directoryOrigins {
+	o := mc.dirChangesApplied[dir]
+	if o == nil {
+		o = &directoryOrigins{positions: make(map[int32]int64)}
+		mc.dirChangesApplied[dir] = o
+	}
+	return o
+}
+
+// SetDirectoryPositionFn installs how a directory build asks the filers for
+// their positions before listing.
+func (mc *MetaCache) SetDirectoryPositionFn(fn func(ctx context.Context, dir util.FullPath) ([]*filer_pb.FilerDirectoryPosition, error)) {
+	mc.positionFn = fn
+}
+
+// noteChangesApplied moves the generation of each cached directory whose
+// children resp changed and, for an event the stream relayed from its origin
+// filer, that filer's position. Runs on the apply loop after the store took
+// resp.
 func (mc *MetaCache) noteChangesApplied(resp *filer_pb.SubscribeMetadataResponse) {
-	if resp == nil || resp.TsNs == 0 {
+	if resp == nil {
 		return
 	}
 	dirs := filer.ChangedDirectories(resp)
 	if len(dirs) == 0 {
 		return
 	}
+	origin := resp.GetEventNotification().GetOriginFilerId()
+	position := resp.GetEventNotification().GetOriginPositionNs()
 	advanced := false
 	mc.Lock()
 	for _, dir := range dirs {
@@ -32,8 +63,11 @@ func (mc *MetaCache) noteChangesApplied(resp *filer_pb.SubscribeMetadataResponse
 		if !mc.isCachedFn(dir) && !mc.isBuildingDir(dir) {
 			continue
 		}
-		if resp.TsNs > mc.dirChangesApplied[dir] {
-			mc.dirChangesApplied[dir] = resp.TsNs
+		o := mc.originsLocked(dir)
+		mc.generations++
+		o.generation = mc.generations
+		if origin != 0 && position > o.positions[origin] {
+			o.positions[origin] = position
 			advanced = true
 		}
 	}
@@ -43,36 +77,60 @@ func (mc *MetaCache) noteChangesApplied(resp *filer_pb.SubscribeMetadataResponse
 	}
 }
 
-// NoteDirectoryCurrentThrough records that dir's cached listing reflects every
-// change up to tsNs, as a listing taken after a change was acknowledged does.
-func (mc *MetaCache) NoteDirectoryCurrentThrough(dir util.FullPath, tsNs int64) {
+// NoteDirectoryBasis records that dir's cached listing was read after the
+// filers named positions: it holds every change up to each of them.
+func (mc *MetaCache) NoteDirectoryBasis(dir util.FullPath, positions []*filer_pb.FilerDirectoryPosition) {
 	mc.Lock()
-	if tsNs > mc.dirChangesApplied[dir] {
-		mc.dirChangesApplied[dir] = tsNs
+	if !mc.isCachedFn(dir) {
+		mc.Unlock()
+		return
+	}
+	o := mc.originsLocked(dir)
+	o.basis = true
+	for _, p := range positions {
+		if p.PositionNs > o.positions[p.FilerId] {
+			o.positions[p.FilerId] = p.PositionNs
+		}
 	}
 	mc.Unlock()
 	mc.signalAppliedAdvanced()
 }
 
-// DirectoryCurrentThrough returns the log position dir's cached listing is
-// current through: the newer of its listing snapshot and its newest applied
-// change.
-func (mc *MetaCache) DirectoryCurrentThrough(dir util.FullPath) int64 {
+// DirectoryPending returns the positions in want that dir's cached listing is
+// not yet current through, and whether the listing has a basis at all; without
+// one nothing can be judged current.
+func (mc *MetaCache) DirectoryPending(dir util.FullPath, want []*filer_pb.FilerDirectoryPosition) (basis bool, pending []*filer_pb.FilerDirectoryPosition) {
 	mc.RLock()
 	defer mc.RUnlock()
-	tsNs := mc.dirVersionFloors[dir]
-	if applied := mc.dirChangesApplied[dir]; applied > tsNs {
-		tsNs = applied
+	o := mc.dirChangesApplied[dir]
+	if o == nil || !o.basis {
+		return false, want
 	}
-	return tsNs
+	for _, p := range want {
+		if o.positions[p.FilerId] < p.PositionNs {
+			pending = append(pending, p)
+		}
+	}
+	return true, pending
 }
 
-// AwaitDirectoryCurrentThrough waits until dir's cached listing is current
-// through tsNs, reporting false if ctx ends first.
-func (mc *MetaCache) AwaitDirectoryCurrentThrough(ctx context.Context, dir util.FullPath, tsNs int64) bool {
+// DirectoryGeneration returns the generation of dir's cached listing, which
+// moves on every change applied to it and on every rebuild.
+func (mc *MetaCache) DirectoryGeneration(dir util.FullPath) uint64 {
+	mc.RLock()
+	defer mc.RUnlock()
+	if o := mc.dirChangesApplied[dir]; o != nil {
+		return o.generation
+	}
+	return 0
+}
+
+// AwaitDirectoryPositions waits until dir's cached listing is current through
+// every position in want, reporting false if ctx ends first.
+func (mc *MetaCache) AwaitDirectoryPositions(ctx context.Context, dir util.FullPath, want []*filer_pb.FilerDirectoryPosition) bool {
 	for {
 		advanced := mc.appliedAdvancedChan()
-		if mc.DirectoryCurrentThrough(dir) >= tsNs {
+		if basis, pending := mc.DirectoryPending(dir, want); basis && len(pending) == 0 {
 			return true
 		}
 		select {

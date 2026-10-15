@@ -695,7 +695,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	// written from this single goroutine, so no synchronization is needed.
 	var lastSeenTsNs int64
 	var lastHeartbeatNs int64
-	baseEachLogEntryFn := eachLogEntryFn(ctx, req, sender, eachEventNotificationFn, &unsyncedEvents)
+	baseEachLogEntryFn := eachLogEntryFn(ctx, req, sender, eachEventNotificationFn, &unsyncedEvents, nil)
 	// heldAtTsNs remembers the entry a read was held at (for the log line);
 	// diskHeldAtTsNs is the same marker for the disk pass alone: a pending
 	// disk hold keeps the pass re-reading until the entry is served.
@@ -772,11 +772,11 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	var readPersistedLogErr error
 	var readInMemoryLogErr error
 	var isDone bool
-	var lastCheckedFlushTsNs int64 = -1      // Track the last local flush we read the disk under
-	var lastCheckedFlushLowTsNs int64 = -1   // Track the last peer flush low-watermark we read the disk under
-	var lastDiskReadTsNs int64 = -1          // Track the last read position we used for disk read
-	var lastDiskRefsStopTsNs int64 = -1      // Track the last chunk listing bound we read the disk under
-	var lastDiskPassAt time.Time             // Paces re-probes for files no watermark signals
+	var lastCheckedFlushTsNs int64 = -1    // Track the last local flush we read the disk under
+	var lastCheckedFlushLowTsNs int64 = -1 // Track the last peer flush low-watermark we read the disk under
+	var lastDiskReadTsNs int64 = -1        // Track the last read position we used for disk read
+	var lastDiskRefsStopTsNs int64 = -1    // Track the last chunk listing bound we read the disk under
+	var lastDiskPassAt time.Time           // Paces re-probes for files no watermark signals
 	sentRefs := make(map[string]sentRefState)
 
 	aggBuffer := fs.filer.MetaAggregator.MetaLogBuffer
@@ -1140,18 +1140,24 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	var lastSeenTsNs int64
 	var lastHeartbeatNs int64
 	var lastFlushReportNs int64
-	baseEachLogEntryFn := eachLogEntryFn(ctx, req, sender, eachEventNotificationFn, &unsyncedEvents)
-	eachLogEntryFn := func(logEntry *filer_pb.LogEntry) (bool, error) {
-		if upgradeOnRemotePeer != nil {
-			select {
-			case <-upgradeOnRemotePeer:
-				return false, errAggregationUpgrade
-			default:
+	// Only entries read from memory are this filer process's own appends, at
+	// positions of its own buffer; persisted logs may hold an earlier process's.
+	diskEachLogEntryFn := eachLogEntryFn(ctx, req, sender, eachEventNotificationFn, &unsyncedEvents, nil)
+	memoryEachLogEntryFn := eachLogEntryFn(ctx, req, sender, eachEventNotificationFn, &unsyncedEvents, fs.stampLocalOrigin)
+	withSeen := func(base log_buffer.EachLogEntryFuncType) log_buffer.EachLogEntryFuncType {
+		return func(logEntry *filer_pb.LogEntry) (bool, error) {
+			if upgradeOnRemotePeer != nil {
+				select {
+				case <-upgradeOnRemotePeer:
+					return false, errAggregationUpgrade
+				default:
+				}
 			}
+			lastSeenTsNs = logEntry.TsNs
+			return base(logEntry)
 		}
-		lastSeenTsNs = logEntry.TsNs
-		return baseEachLogEntryFn(logEntry)
 	}
+	eachDiskLogEntryFn, eachMemoryLogEntryFn := withSeen(diskEachLogEntryFn), withSeen(memoryEachLogEntryFn)
 
 	var processedTsNs int64
 	var readPersistedLogErr error
@@ -1206,7 +1212,7 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 			if req.ClientSupportsMetadataChunks {
 				processedTsNs, isDone, readPersistedLogErr = fs.chunkDiskPass(ctx, sender, lastReadTime, req.UntilNs, sentRefs, upgradeOnRemotePeer)
 			} else {
-				processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(ctx, lastReadTime, req.UntilNs, eachLogEntryFn)
+				processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(ctx, lastReadTime, req.UntilNs, eachDiskLogEntryFn)
 			}
 			if readPersistedLogErr != nil {
 				if errors.Is(readPersistedLogErr, errAggregationUpgrade) {
@@ -1273,7 +1279,7 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 			lastHeartbeatNs = fs.maybeSendIdleHeartbeat(req, sender, fs.filer.LocalMetaLogBuffer, lastReadTime.Time.UnixNano(), lastSeenTsNs, lastHeartbeatNs)
 			lastFlushReportNs = fs.maybeSendFlushReport(req, sender, lastFlushReportNs)
 			return true
-		}, eachLogEntryFn)
+		}, eachMemoryLogEntryFn)
 		if upgradedToAggregation {
 			glog.V(0).Infof("remote peer discovered after local subscribe %s started: ending stream so the client reconnects to the aggregated stream", clientName)
 			return errAggregationUpgrade
@@ -1305,7 +1311,9 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 
 }
 
-func eachLogEntryFn(ctx context.Context, req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error, filtered *int64) log_buffer.EachLogEntryFuncType {
+// stampOrigin, when set, marks each event with where this filer appended it
+// (see stampLocalOrigin); nil passes events through as logged or relayed.
+func eachLogEntryFn(ctx context.Context, req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error, filtered *int64, stampOrigin func(event *filer_pb.SubscribeMetadataResponse, logEntry *filer_pb.LogEntry)) log_buffer.EachLogEntryFuncType {
 	// A shallow scan of the path fields skips unmarshaling chunk-heavy events
 	// this subscriber would filter out anyway; scan surprises fall back to the
 	// full decode. Only a delivery resets the shared unsynced-events counter.
@@ -1339,6 +1347,9 @@ func eachLogEntryFn(ctx context.Context, req *filer_pb.SubscribeMetadataRequest,
 		if err := proto.Unmarshal(logEntry.Data, event); err != nil {
 			glog.Errorf("unexpected unmarshal filer_pb.SubscribeMetadataResponse: %v", err)
 			return false, fmt.Errorf("unexpected unmarshal filer_pb.SubscribeMetadataResponse: %w", err)
+		}
+		if stampOrigin != nil {
+			stampOrigin(event, logEntry)
 		}
 
 		if err := eachEventNotificationFn(event.Directory, event.EventNotification, event.TsNs); err != nil {
@@ -1731,4 +1742,16 @@ func (fs *FilerServer) hasClient(clientId int32, clientEpoch int32) bool {
 		}
 	}
 	return false
+}
+
+// stampLocalOrigin marks an event read from this filer's in-memory log with
+// this filer process and the entry's buffer position, the order in which the
+// filer appended it. The event's own TsNs is stamped before the append and so
+// can be out of append order.
+func (fs *FilerServer) stampLocalOrigin(event *filer_pb.SubscribeMetadataResponse, logEntry *filer_pb.LogEntry) {
+	if event.EventNotification == nil || event.EventNotification.OriginFilerId != 0 {
+		return
+	}
+	event.EventNotification.OriginFilerId = fs.filer.UniqueFilerId
+	event.EventNotification.OriginPositionNs = logEntry.TsNs
 }

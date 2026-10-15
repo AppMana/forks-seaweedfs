@@ -82,6 +82,7 @@ type Filer struct {
 	persistedLogCache             *persistedLogCache
 	metaLogInflight               metaLogInflight
 	dirChanges                    directoryChanges
+	dirWriters                    directoryWriterChanges
 	remoteTombstones              *remoteDeletionTombstones
 	// remoteTombstonesDone, when non-nil, is closed once the startup tombstone
 	// rebuild finishes; lazy remote reads wait on it so a pending delete

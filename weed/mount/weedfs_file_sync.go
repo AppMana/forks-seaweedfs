@@ -247,6 +247,8 @@ func (wfs *WFS) flushMetadataToFilerLocked(ctx context.Context, fh *FileHandle, 
 	} else if mergedChunks != nil {
 		chunks = mergedChunks
 		manifestChunks = nil
+	} else {
+		chunks = wfs.coalesceAppendedTail(fileFullPath, fh, chunks, manifestChunks)
 	}
 
 	// no chunk deleter here: a failed fold reports the blobs it saved

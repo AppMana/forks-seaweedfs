@@ -233,7 +233,9 @@ func TestWindowsMountLab(t *testing.T) {
 	n := lab.Node("vm")
 	t.Log("Windows ready; staging offline inputs")
 	defer func() {
-		diagnosticCtx, stop := context.WithTimeout(context.Background(), 2*time.Minute)
+		// ~0.7 s per 256 KiB read (a 10-scenario run collects ~9 MB), plus a
+		// 30 s agent deadline for each reply lost and retried.
+		diagnosticCtx, stop := context.WithTimeout(context.Background(), 6*time.Minute)
 		defer stop()
 		logs, logErr := collectWindowsGuestLogs(func(command string) ([]byte, error) {
 			result, err := n.ExecWithTimeout(diagnosticCtx, 50*time.Second, ps, "-NoProfile", "-Command", command)
@@ -435,7 +437,7 @@ if($p.ExitCode -ne 0){throw "Git installer exit $($p.ExitCode)"};
 					t.Errorf("%s ETW decode: %v exit %d: %s", caseName, decodeErr, decoded.GetExitCode(), decoded.GetStderr())
 				}
 				for _, artifact := range []string{"fileio.etl", "fileio.xml.zip", "mount1-winfsp-trace.log"} {
-					traceCtx, stop := context.WithTimeout(context.Background(), 4*time.Minute)
+					traceCtx, stop := context.WithTimeout(context.Background(), 10*time.Minute)
 					data, traceErr := readWindowsArtifact(`C:\lab\smoke-`+caseName+`\logs\`+artifact, func(command string) ([]byte, error) {
 						result, execErr := n.ExecWithTimeout(traceCtx, 30*time.Second, ps, "-NoProfile", "-Command", "$ErrorActionPreference='Stop'; "+command)
 						if execErr != nil {

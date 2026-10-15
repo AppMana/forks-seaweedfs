@@ -64,6 +64,13 @@ func (wfs *WFS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buff []byte) (fuse
 	offset := int64(in.Offset)
 	totalRead, err := readDataByFileHandleWithContext(ctx, buff, fh, offset)
 	if err != nil {
+		// FUSE interrupts include ordinary signals such as Go's SIGURG
+		// preemption. When honoring a kernel cancellation, report EINTR,
+		// not an I/O fault. Check this request's context: a backend can
+		// return context.Canceled without the kernel interrupting the read.
+		if ctx.Err() != nil {
+			return nil, fuse.EINTR
+		}
 		glog.Warningf("file handle read %s %d: %v", fh.FullPath(), totalRead, err)
 		return nil, fuse.EIO
 	}

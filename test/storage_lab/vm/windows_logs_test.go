@@ -43,7 +43,7 @@ func TestWindowsGuestLogsExceedExecOutputLimit(t *testing.T) {
 		if calls == 2 {
 			return []byte(fmt.Sprintf("%d %s", len(want), sha(want))), nil
 		}
-		count := min(1<<20, len(want)-offset)
+		count := min(windowsArtifactChunk, len(want)-offset)
 		if !strings.Contains(command, fmt.Sprintf("Seek(%d,", offset)) {
 			t.Fatal("incorrect chunk offset")
 		}

@@ -145,6 +145,10 @@ func TestWindowsNetworkSymlinkTargets(t *testing.T) {
 	})
 
 	t.Run("unc_outside_rejected", func(t *testing.T) {
+		// reachable, as on a node running the SMB server
+		if _, err := os.Stat(`\\localhost\C$\Windows\win.ini`); err != nil {
+			t.Fatalf("foreign UNC target must be reachable for this case: %v", err)
+		}
 		link := filepath.Join(root, "unc")
 		defer os.Remove(link)
 		if err := os.Symlink(`\\localhost\C$\Windows\win.ini`, link); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {

@@ -302,6 +302,11 @@ function Invoke-NetworkSymlinkTest {
         $env:WEED_WINFSP_VOLUME_PREFIX = '\seaweedfs-lab2'
         $script:mountNetwork2 = Start-Mount $netMnt2 $netCache2 $logDir 'mount-network2'
     } finally { $env:WEED_WINFSP_VOLUME_PREFIX = $savedPrefix }
+    # The signed driver takes a foreign UNC target for this volume once a MUP
+    # provider answers for it, as the SMB server does on a node. Without it the
+    # driver denies the target for an unrelated reason and the case proves nothing.
+    Start-Service -Name LanmanServer -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath '\\localhost\C$\Windows\win.ini')) { throw 'SMB loopback share is not reachable' }
     if ($ExpectedWinFspDll) {
         Assert-WinFspModule $script:mountNetwork.Id $ExpectedWinFspDll
         Assert-WinFspModule $script:mountNetwork2.Id $ExpectedWinFspDll

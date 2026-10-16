@@ -81,6 +81,8 @@ function Invoke-NativeMountedSuite([string]$mnt, [string]$Phase = '', [switch]$M
         if ($LASTEXITCODE -ne 0) { throw 'native test inventory failed' }
         $separate = @('TestPersistence', 'TestWindowsAttributesPersistence', 'TestWindowsPermissionsPersistence', 'TestMountManagerDirectoryLifecycle', 'TestMountManagerProcessCrash', 'TestMountManagerRegistrationRollback', 'TestMappedImportSlotCandidate')
         $separate += @('TestWindowsAttributesPersistenceRepeatVerify', 'TestWindowsPermissionsPersistenceRepeatVerify')
+        # Needs its own network-mode mount; NativeMetadata runs it.
+        $separate += 'TestWindowsNetworkSymlinkTargets'
         $names = @($listing | Where-Object { $_ -match '^Test\w+$' -and $_ -notin $separate })
         if ($names.Count -lt 25) { throw "incomplete native inventory: $($names.Count) tests" }
         $label = 'native mounted suite'
@@ -280,6 +282,35 @@ function Invoke-GitAtomicRenamePrelude([string]$mnt) {
     Assert ((Get-Content "$mnt\victim.txt" -Raw) -eq 'seaweedfs on windows') 'rename over existing file'
 }
 
+function Invoke-NetworkSymlinkTest {
+    # Pods reach the volume the network (UNC) way, at a container mount
+    # path recorded by the CSI node plugin. The lab mount's own -dir plays
+    # that path: links under it must be stored volume-relative, and a
+    # foreign UNC target must be denied.
+    $netMnt = Join-Path $WorkRoot 'mnt-network'
+    $netCache = Join-Path $WorkRoot 'cache-network'
+    New-Item -ItemType Directory -Force -Path $netCache | Out-Null
+    $rootsFile = Join-Path $WorkRoot 'network-mount-roots.json'
+    Set-Content -LiteralPath $rootsFile -NoNewline -Value ('{"publishes":{"lab":[[{"path":' + (ConvertTo-Json $netMnt) + '}]]}}')
+    $savedPrefix = $env:WEED_WINFSP_VOLUME_PREFIX
+    try {
+        $env:WEED_WINFSP_VOLUME_PREFIX = '\seaweedfs-lab'
+        $script:mountNetwork = Start-Mount $netMnt $netCache $logDir 'mount-network' @("-winfspMountRoots=$rootsFile")
+    } finally { $env:WEED_WINFSP_VOLUME_PREFIX = $savedPrefix }
+    if ($ExpectedWinFspDll) { Assert-WinFspModule $script:mountNetwork.Id $ExpectedWinFspDll }
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $networkOutput = @(& $WinFspTestExe "-mountpoint=$netMnt" '-test.run=^TestWindowsNetworkSymlinkTargets$' '-test.v' '-test.count=1' '-test.timeout=90s' '-network-mount-roots' '-filer=127.0.0.1:8888' '-filer-root=/' 2>&1)
+        $networkExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference }
+    $networkOutput | ForEach-Object { Write-Host $_ }
+    $networkText = $networkOutput | Out-String
+    Assert ($networkExit -eq 0 -and $networkText -match '(?m)^--- PASS: TestWindowsNetworkSymlinkTargets ' -and $networkText -notmatch '--- SKIP:') 'network-mode symlink targets complete without skips'
+    Stop-Mount $script:mountNetwork $netMnt
+    $script:mountNetwork = $null
+}
+
 function Wait-Tcp([int]$port, [int]$timeoutSec = 120) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -300,7 +331,7 @@ function Wait-PathExists([string]$p, [int]$timeoutSec = 60) {
     return $false
 }
 
-function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$name) {
+function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$name, [string[]]$ExtraArgs = @()) {
     New-Item -ItemType Directory -Force -Path (Join-Path $logDir $name) | Out-Null
     # New console (no -NoNewWindow): required so Stop-Mount's CTRL_C
     # event reaches only the mount process. Logs go to -logdir.
@@ -314,6 +345,7 @@ function Start-Mount([string]$mnt, [string]$cacheDir, [string]$logDir, [string]$
     if ($Trace) { $mountArgs += '-winfspOptions=debug' }
     if ($WinFspOptions) { $mountArgs += "-winfspOptions=$WinFspOptions" }
     if ($BasicPermissions) { $mountArgs += '-winfspBasicPermissions' }
+    $mountArgs += $ExtraArgs
     $startArgs = @{
         FilePath = $WeedExe
         PassThru = $true
@@ -428,6 +460,7 @@ try {
 $mount = $null
 $mount2 = $null
 $mountB = $null
+$mountNetwork = $null
 $etwStarted = $false
 try {
     if ($EtwFileIO) {
@@ -466,6 +499,8 @@ try {
             Remove-Item -LiteralPath $securityProbe
         }
         Invoke-NativeMountedSuite $mnt -MetadataOnly
+
+        Invoke-NetworkSymlinkTest
         if ($DiagnosticHoldSeconds -gt 0) {
             Write-Host "DIAGNOSTIC_HOLD: mounted lab available for $DiagnosticHoldSeconds seconds; test status unchanged"
             Start-Sleep -Seconds $DiagnosticHoldSeconds
@@ -550,6 +585,7 @@ try {
     if ($WinFspTestExe) {
         Invoke-NativeMountedSuite $mnt
         Invoke-NativeMountedSuite $mnt 'write'
+        Invoke-NetworkSymlinkTest
     }
     Invoke-GitAtomicRenamePrelude $mnt
     Invoke-GitAtomicRenameTest $mnt
@@ -639,7 +675,7 @@ try {
         & wpr.exe -stop (Join-Path $logDir 'fileio.etl')
         if ($LASTEXITCODE -ne 0) { Write-Error "WPR FileIO stop failed: $LASTEXITCODE" -ErrorAction Continue; $etwStopFailed = $true }
     }
-    foreach ($activeMount in @($mountB, $mount2, $mount)) {
+    foreach ($activeMount in @($mountNetwork, $mountB, $mount2, $mount)) {
         if ($null -ne $activeMount -and -not $activeMount.HasExited) {
             try {
                 if (-not (Stop-MountGracefully $activeMount 5)) {

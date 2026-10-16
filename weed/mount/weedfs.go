@@ -44,6 +44,7 @@ type Option struct {
 	FilerSigningKey             security.SigningKey
 	FilerSigningExpiresAfterSec int
 	FilerMountRootPath          string
+	MountRootsFile              string // where pods mount this volume (Windows); see mount_roots.go
 	Collection                  string
 	Replication                 string
 	TtlSec                      int32

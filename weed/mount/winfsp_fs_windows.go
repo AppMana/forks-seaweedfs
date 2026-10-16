@@ -393,7 +393,7 @@ func (a *winfspFS) Symlink(target string, newpath string) int {
 	}
 	var out fuse.EntryOut
 	hdr := a.creationHeader(parent)
-	return toWinErrno(a.wfs.Symlink(nil, &hdr, target, name, &out))
+	return toWinErrno(a.wfs.Symlink(nil, &hdr, a.wfs.mountRootTarget(target), name, &out))
 }
 
 func (a *winfspFS) Readlink(path string) (int, string) {

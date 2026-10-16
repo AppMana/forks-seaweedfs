@@ -237,6 +237,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		FilerSigningKey:             security.SigningKey(util.GetViper().GetString("jwt.filer_signing.key")),
 		FilerSigningExpiresAfterSec: util.GetViper().GetInt("jwt.filer_signing.expires_after_seconds"),
 		FilerMountRootPath:          mountRoot,
+		MountRootsFile:              *option.mountRoots,
 		Collection:                  *option.collection,
 		Replication:                 *option.replication,
 		TtlSec:                      int32(*option.ttlSec),

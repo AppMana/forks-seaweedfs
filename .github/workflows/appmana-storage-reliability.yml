@@ -420,6 +420,21 @@ jobs:
             echo "PINNED_GIT_INSTALLER=$inputs/git-installer.exe"
             echo 'PINNED_GIT_INSTALLER_SHA256=bfe94e7b419b16eee9fecbd1253a98e3d4f49ba8f029630549052278ffe286a6'
           } >> "$GITHUB_ENV"
+      - name: Fetch the released WinFsp DLL
+        # The mount runs the user-mode DLL from AppMana/forks-winfsp-fixes
+        # beside weed.exe, against the stock signed driver from the MSI above;
+        # the same pinned file ships in the CSI mount image.
+        run: |
+          set -euo pipefail
+          dll_dir=$(mktemp -d "$RUNNER_TEMP/winfsp-dll.XXXXXXXX")
+          dll_sha=e1403ed5b8d39e0f6d8871d8af82f19dc562cdeb5dc469680698fe88c215eb37
+          curl -fsSL --retry 3 -o "$dll_dir/winfsp-x64.dll" \
+            https://github.com/AppMana/forks-winfsp-fixes/releases/download/appmana-dll-2.1-a52117041/winfsp-x64.dll
+          printf '%s  %s\n' "$dll_sha" "$dll_dir/winfsp-x64.dll" | sha256sum -c -
+          {
+            echo "PINNED_WINFSP_RELEASE_DLL=$dll_dir/winfsp-x64.dll"
+            echo "PINNED_WINFSP_RELEASE_DLL_SHA256=$dll_sha"
+          } >> "$GITHUB_ENV"
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:
           # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
@@ -440,6 +455,8 @@ jobs:
           SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_PATH }}
           GIT_LFS_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256 }}
           LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
+          SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL: ${{ env.PINNED_WINFSP_RELEASE_DLL }}
+          SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL_SHA256: ${{ env.PINNED_WINFSP_RELEASE_DLL_SHA256 }}
         run: |
           set -euo pipefail
           for hash in "$WINFSP_MSI_SHA256" "$GIT_INSTALLER_SHA256"; do

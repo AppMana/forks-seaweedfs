@@ -50,3 +50,44 @@ func TestStockWinFspSelectionNeverStagesPrivateDriver(t *testing.T) {
 		t.Fatal("accepted missing DLL")
 	}
 }
+
+// windowsReleaseDLL selects a released user-mode WinFsp DLL to run beside
+// weed.exe against the stock driver. It must be pinned and cannot be combined
+// with the lab DLL or native package inputs, which carry their own drivers or
+// manifests.
+func windowsReleaseDLL(path, pin, labDLL, nativePackage string) (string, string, error) {
+	if path == "" {
+		if pin != "" {
+			return "", "", fmt.Errorf("release DLL pin without a release DLL")
+		}
+		return "", "", nil
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(pin) {
+		return "", "", fmt.Errorf("release DLL requires an exact SHA256 pin")
+	}
+	if labDLL != "" || nativePackage != "" {
+		return "", "", fmt.Errorf("release DLL cannot be combined with a lab DLL or native package")
+	}
+	return path, pin, nil
+}
+
+func TestWindowsReleaseDLLRequiresPinAndExclusiveSource(t *testing.T) {
+	pin := strings.Repeat("e", 64)
+	if path, got, err := windowsReleaseDLL("/in/winfsp-x64.dll", pin, "", ""); err != nil || path != "/in/winfsp-x64.dll" || got != pin {
+		t.Fatalf("pinned release DLL rejected: %v", err)
+	}
+	if path, _, err := windowsReleaseDLL("", "", "", ""); err != nil || path != "" {
+		t.Fatalf("no release DLL: %q %v", path, err)
+	}
+	for _, c := range []struct{ path, pin, lab, native string }{
+		{"/in/winfsp-x64.dll", "", "", ""},
+		{"/in/winfsp-x64.dll", "E1403", "", ""},
+		{"", pin, "", ""},
+		{"/in/winfsp-x64.dll", pin, "/lab/winfsp-x64.dll", ""},
+		{"/in/winfsp-x64.dll", pin, "", "/native"},
+	} {
+		if _, _, err := windowsReleaseDLL(c.path, c.pin, c.lab, c.native); err == nil {
+			t.Fatalf("accepted %+v", c)
+		}
+	}
+}

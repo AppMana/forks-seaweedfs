@@ -104,6 +104,11 @@ func TestWindowsMountLab(t *testing.T) {
 	if nativePackage != "" && labDLL != "" {
 		t.Fatal("native package selects a matched DLL; unset SEAWEEDFS_WINDOWS_WINFSP_DLL")
 	}
+	releaseDLL, releaseDLLSHA, err := windowsReleaseDLL(os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL"),
+		os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL_SHA256"), labDLL, nativePackage)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if rollbackMountManager && labDLL == "" {
 		t.Fatal("rollback injection requires an explicit lab DLL")
 	}
@@ -111,6 +116,9 @@ func TestWindowsMountLab(t *testing.T) {
 		t.Fatal(err)
 	}
 	inputs := map[string]string{`C:\lab\winfsp.msi`: os.Getenv("SEAWEEDFS_WINFSP_MSI")}
+	if releaseDLL != "" {
+		inputs[`C:\lab\winfsp-x64.dll`] = releaseDLL
+	}
 	if labDLL != "" {
 		inputs[`C:\lab\winfsp-x64.dll`] = labDLL
 		inputs[`C:\lab\winfsp-x64.dll.manifest.txt`] = labDLL + ".manifest.txt"
@@ -184,6 +192,15 @@ func TestWindowsMountLab(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+	}
+	if releaseDLL != "" {
+		// Beside weed.exe, so the mount loads it before the installed DLL;
+		// the stock MSI keeps providing the signed driver.
+		if got := sha(artifacts[`C:\lab\winfsp-x64.dll`]); got != releaseDLLSHA {
+			t.Fatalf("release WinFsp DLL sha256 %s, pinned %s", got, releaseDLLSHA)
+		}
+		fmt.Fprintf(&provenance, "release_winfsp_dll_sha256=%s\n", releaseDLLSHA)
+		labDLL = releaseDLL
 	}
 	if nativePackage != "" {
 		labDLL = filepath.Join(nativePackage, "winfsp-x64.dll")

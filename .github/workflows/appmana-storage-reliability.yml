@@ -427,9 +427,9 @@ jobs:
         run: |
           set -euo pipefail
           dll_dir=$(mktemp -d "$RUNNER_TEMP/winfsp-dll.XXXXXXXX")
-          dll_sha=e1403ed5b8d39e0f6d8871d8af82f19dc562cdeb5dc469680698fe88c215eb37
+          dll_sha=082f0cedc800a7ea29f726b9d3116358d20278c0de64f21ccb1c3e14d68c9d9e
           curl -fsSL --retry 3 -o "$dll_dir/winfsp-x64.dll" \
-            https://github.com/AppMana/forks-winfsp-fixes/releases/download/appmana-dll-2.1-a52117041/winfsp-x64.dll
+            https://github.com/AppMana/forks-winfsp-fixes/releases/download/appmana-dll-2.1-066843359/winfsp-x64.dll
           printf '%s  %s\n' "$dll_sha" "$dll_dir/winfsp-x64.dll" | sha256sum -c -
           {
             echo "PINNED_WINFSP_RELEASE_DLL=$dll_dir/winfsp-x64.dll"

@@ -18,7 +18,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var networkMountRoots = flag.Bool("network-mount-roots", false, "-mountpoint is a network-mode mount (WEED_WINFSP_VOLUME_PREFIX) whose -winfspMountRoots names -mountpoint as a container mount path")
+var (
+	networkMountRoots  = flag.Bool("network-mount-roots", false, "-mountpoint is a network-mode mount (WEED_WINFSP_VOLUME_PREFIX) whose -winfspMountRoots names -mountpoint as a container mount path")
+	networkOtherVolume = flag.String("network-other-volume", "", "the -dir of a second network-mode mount, under another volume prefix")
+)
 
 // storedSymlinkTarget returns the target the filer holds for a link under -mountpoint.
 func storedSymlinkTarget(t *testing.T, link string) string {
@@ -113,6 +116,31 @@ func TestWindowsNetworkSymlinkTargets(t *testing.T) {
 		}
 		if got := storedSymlinkTarget(t, link); !strings.EqualFold(got, filepath.ToSlash(external)) {
 			t.Fatalf("outside target stored as %q, want it as written", got)
+		}
+	})
+
+	// Every WinFsp network volume shares one MUP provider, which the signed
+	// driver takes as proof that the target is on this volume.
+	t.Run("unc_other_volume_rejected", func(t *testing.T) {
+		if *networkOtherVolume == "" {
+			t.Fatal("needs -network-other-volume")
+		}
+		share, err := os.Readlink(*networkOtherVolume)
+		if err != nil || !strings.HasPrefix(share, `\\`) {
+			t.Fatalf("second network volume share: %q %v", share, err)
+		}
+		other := filepath.Join(share, "other-volume.bin")
+		if err := writeAndSync(other, payload); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(other)
+		link := filepath.Join(root, "unc-other-volume")
+		defer os.Remove(link)
+		if err := os.Symlink(other, link); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			if err == nil {
+				t.Fatalf("another volume's UNC target accepted and stored as %q", storedSymlinkTarget(t, link))
+			}
+			t.Fatalf("another volume's UNC target must be denied: %v", err)
 		}
 	})
 

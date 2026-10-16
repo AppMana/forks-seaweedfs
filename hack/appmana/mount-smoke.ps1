@@ -289,24 +289,34 @@ function Invoke-NetworkSymlinkTest {
     # foreign UNC target must be denied.
     $netMnt = Join-Path $WorkRoot 'mnt-network'
     $netCache = Join-Path $WorkRoot 'cache-network'
-    New-Item -ItemType Directory -Force -Path $netCache | Out-Null
+    $netMnt2 = Join-Path $WorkRoot 'mnt-network2'
+    $netCache2 = Join-Path $WorkRoot 'cache-network2'
+    New-Item -ItemType Directory -Force -Path $netCache, $netCache2 | Out-Null
     $rootsFile = Join-Path $WorkRoot 'network-mount-roots.json'
     Set-Content -LiteralPath $rootsFile -NoNewline -Value ('{"publishes":{"lab":[[{"path":' + (ConvertTo-Json $netMnt) + '}]]}}')
     $savedPrefix = $env:WEED_WINFSP_VOLUME_PREFIX
     try {
         $env:WEED_WINFSP_VOLUME_PREFIX = '\seaweedfs-lab'
         $script:mountNetwork = Start-Mount $netMnt $netCache $logDir 'mount-network' @("-winfspMountRoots=$rootsFile")
+        # a second network volume, as another pod's volume on the same node
+        $env:WEED_WINFSP_VOLUME_PREFIX = '\seaweedfs-lab2'
+        $script:mountNetwork2 = Start-Mount $netMnt2 $netCache2 $logDir 'mount-network2'
     } finally { $env:WEED_WINFSP_VOLUME_PREFIX = $savedPrefix }
-    if ($ExpectedWinFspDll) { Assert-WinFspModule $script:mountNetwork.Id $ExpectedWinFspDll }
+    if ($ExpectedWinFspDll) {
+        Assert-WinFspModule $script:mountNetwork.Id $ExpectedWinFspDll
+        Assert-WinFspModule $script:mountNetwork2.Id $ExpectedWinFspDll
+    }
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $networkOutput = @(& $WinFspTestExe "-mountpoint=$netMnt" '-test.run=^TestWindowsNetworkSymlinkTargets$' '-test.v' '-test.count=1' '-test.timeout=90s' '-network-mount-roots' '-filer=127.0.0.1:8888' '-filer-root=/' 2>&1)
+        $networkOutput = @(& $WinFspTestExe "-mountpoint=$netMnt" '-test.run=^TestWindowsNetworkSymlinkTargets$' '-test.v' '-test.count=1' '-test.timeout=90s' '-network-mount-roots' "-network-other-volume=$netMnt2" '-filer=127.0.0.1:8888' '-filer-root=/' 2>&1)
         $networkExit = $LASTEXITCODE
     } finally { $ErrorActionPreference = $savedPreference }
     $networkOutput | ForEach-Object { Write-Host $_ }
     $networkText = $networkOutput | Out-String
     Assert ($networkExit -eq 0 -and $networkText -match '(?m)^--- PASS: TestWindowsNetworkSymlinkTargets ' -and $networkText -notmatch '--- SKIP:') 'network-mode symlink targets complete without skips'
+    Stop-Mount $script:mountNetwork2 $netMnt2
+    $script:mountNetwork2 = $null
     Stop-Mount $script:mountNetwork $netMnt
     $script:mountNetwork = $null
 }
@@ -461,6 +471,7 @@ $mount = $null
 $mount2 = $null
 $mountB = $null
 $mountNetwork = $null
+$mountNetwork2 = $null
 $etwStarted = $false
 try {
     if ($EtwFileIO) {
@@ -675,7 +686,7 @@ try {
         & wpr.exe -stop (Join-Path $logDir 'fileio.etl')
         if ($LASTEXITCODE -ne 0) { Write-Error "WPR FileIO stop failed: $LASTEXITCODE" -ErrorAction Continue; $etwStopFailed = $true }
     }
-    foreach ($activeMount in @($mountNetwork, $mountB, $mount2, $mount)) {
+    foreach ($activeMount in @($mountNetwork2, $mountNetwork, $mountB, $mount2, $mount)) {
         if ($null -ne $activeMount -and -not $activeMount.HasExited) {
             try {
                 if (-not (Stop-MountGracefully $activeMount 5)) {

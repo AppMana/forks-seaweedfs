@@ -34,7 +34,7 @@ func qualifyIndexPerformance(baseline, candidate map[string][]float64) error {
 		if len(baseline[size]) != 5 || len(candidate[size]) != 5 {
 			return fmt.Errorf("five samples required for %s", size)
 		}
-		if median(candidate[size]) > 1.25*median(baseline[size]) {
+		if pairedRatio(baseline[size], candidate[size]) > 1.25 {
 			return fmt.Errorf("%s recovery startup regressed more than 25%%", size)
 		}
 	}
@@ -58,6 +58,35 @@ func TestIndexPerformanceGate(t *testing.T) {
 	}
 	if _, err := indexSamples("PASS"); err == nil {
 		t.Fatal("empty benchmark accepted")
+	}
+}
+
+// Gate run 38812348120: the shared runner slowed down from candidate trial 4
+// on (~55 -> ~90 ms for both binaries), so four of the ten slow samples fell
+// on the candidate side. Medians taken per side read that as a 26% regression;
+// trial by trial the candidate was faster in three of five.
+func TestIndexPerformanceGateComparesTrialsPairwise(t *testing.T) {
+	baseline := map[string][]float64{
+		"10000": {63960478, 62199791, 48276720, 52545592, 86907254},
+		"16384": {65368598, 54868369, 54408721, 53787650, 95655071},
+		"65536": {57613159, 53604653, 52552384, 58456587, 90850229},
+	}
+	candidate := map[string][]float64{
+		"10000": {65163974, 51214742, 56665099, 92139022, 104876204},
+		"16384": {69313272, 49916899, 48327706, 96838200, 86409322},
+		"65536": {68497076, 62074975, 51569861, 105182004, 96057481},
+	}
+	if err := qualifyIndexPerformance(baseline, candidate); err != nil {
+		t.Fatalf("host slowdown read as a regression: %v", err)
+	}
+	slower := map[string][]float64{}
+	for size, values := range baseline {
+		for _, v := range values {
+			slower[size] = append(slower[size], 1.3*v)
+		}
+	}
+	if qualifyIndexPerformance(baseline, slower) == nil {
+		t.Fatal("consistent 30% regression accepted")
 	}
 }
 

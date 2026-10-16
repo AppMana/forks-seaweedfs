@@ -34,7 +34,7 @@ func qualifyIndexPerformance(baseline, candidate map[string][]float64) error {
 		if len(baseline[size]) != 5 || len(candidate[size]) != 5 {
 			return fmt.Errorf("five samples required for %s", size)
 		}
-		if pairedRatio(baseline[size], candidate[size]) > 1.25 {
+		if regressed(baseline[size], candidate[size], 1.25) {
 			return fmt.Errorf("%s recovery startup regressed more than 25%%", size)
 		}
 	}
@@ -87,6 +87,35 @@ func TestIndexPerformanceGateComparesTrialsPairwise(t *testing.T) {
 	}
 	if qualifyIndexPerformance(baseline, slower) == nil {
 		t.Fatal("consistent 30% regression accepted")
+	}
+}
+
+// Gate run 38962446851 (no storage change): the single-CPU guest slowed the
+// candidate side of trials 3-5 (65536: 0.92, 0.96, 1.27, 1.64, 1.31 per trial,
+// median 1.27), while each binary's fastest trial was within 4% (50.9 vs
+// 49.1 ms). Load only adds time, so a real regression also slows the fastest.
+func TestIndexPerformanceGateIgnoresCandidateOnlySlowTrials(t *testing.T) {
+	baseline := map[string][]float64{
+		"10000": {62340688, 58287225, 68228273, 53142350, 112850497},
+		"16384": {63071721, 53630372, 67905768, 61931602, 113558667},
+		"65536": {66650220, 50887565, 55196227, 61404642, 111254393},
+	}
+	candidate := map[string][]float64{
+		"10000": {71041967, 51659841, 56734147, 63532137, 106976042},
+		"16384": {77703886, 51887904, 69439333, 108253477, 106264780},
+		"65536": {61388178, 49084449, 70169516, 100462133, 145967038},
+	}
+	if err := qualifyIndexPerformance(baseline, candidate); err != nil {
+		t.Fatalf("candidate-only slow trials read as a regression: %v", err)
+	}
+	slower := map[string][]float64{}
+	for size, values := range candidate {
+		for _, v := range values {
+			slower[size] = append(slower[size], 1.3*v)
+		}
+	}
+	if qualifyIndexPerformance(candidate, slower) == nil {
+		t.Fatal("consistent 30% regression under the same noise accepted")
 	}
 }
 

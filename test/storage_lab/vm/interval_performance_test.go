@@ -55,12 +55,28 @@ func pairedRatio(baseline, candidate []float64) float64 {
 	return median(ratios)
 }
 
+// regressed reports a candidate slower than limit times the baseline. Host
+// load only adds time and can fall on one side of a trial, so the paired
+// median alone reads a candidate-only slow stretch as a regression; a real one
+// also slows the candidate's fastest trial.
+func regressed(baseline, candidate []float64, limit float64) bool {
+	return pairedRatio(baseline, candidate) > limit && minimum(candidate)/minimum(baseline) > limit
+}
+
+func minimum(samples []float64) float64 {
+	m := samples[0]
+	for _, v := range samples[1:] {
+		m = math.Min(m, v)
+	}
+	return m
+}
+
 func qualifyIntervalPerformance(baseline, candidate map[string][]float64) error {
 	for _, size := range []string{"4096", "16384"} {
 		if len(baseline[size]) != 5 || len(candidate[size]) != 5 {
 			return fmt.Errorf("five independent samples required for %s", size)
 		}
-		if pairedRatio(baseline[size], candidate[size]) > 1.25 {
+		if regressed(baseline[size], candidate[size], 1.25) {
 			return fmt.Errorf("%s candidate regressed more than 25%%", size)
 		}
 	}

@@ -43,16 +43,28 @@ func median(samples []float64) float64 {
 	return copyOf[len(copyOf)/2]
 }
 
+// pairedRatio is the median of candidate/baseline over trials. The two
+// binaries run back to back in each trial, so a change in host load hits both
+// samples of a trial; comparing per-side medians lets a slowdown that starts
+// mid-run land on one side only.
+func pairedRatio(baseline, candidate []float64) float64 {
+	ratios := make([]float64, len(baseline))
+	for i := range baseline {
+		ratios[i] = candidate[i] / baseline[i]
+	}
+	return median(ratios)
+}
+
 func qualifyIntervalPerformance(baseline, candidate map[string][]float64) error {
 	for _, size := range []string{"4096", "16384"} {
 		if len(baseline[size]) != 5 || len(candidate[size]) != 5 {
 			return fmt.Errorf("five independent samples required for %s", size)
 		}
-		if median(candidate[size]) > 1.25*median(baseline[size]) {
+		if pairedRatio(baseline[size], candidate[size]) > 1.25 {
 			return fmt.Errorf("%s candidate regressed more than 25%%", size)
 		}
 	}
-	if median(candidate["16384"])/median(candidate["4096"]) >= 8 {
+	if pairedRatio(candidate["4096"], candidate["16384"]) >= 8 {
 		return fmt.Errorf("4x writes must take less than 8x time; quadratic interval tracking detected")
 	}
 	return nil

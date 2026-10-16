@@ -117,7 +117,11 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 			t.Fatalf("created dangling target: %q %v", got, err)
 		}
 	})
-	t.Run("cross_volume_rejected", func(t *testing.T) {
+	// A pod sees its volume at a container path (C:\data) that neither the
+	// driver nor the mount can map back to the volume, so an absolute
+	// drive-letter target is kept as written and resolved by the reader, as
+	// NTFS does, instead of being denied.
+	t.Run("cross_volume_preserved", func(t *testing.T) {
 		external := filepath.Join(t.TempDir(), "external.bin")
 		if err := writeAndSync(external, payload); err != nil {
 			t.Fatal(err)
@@ -130,11 +134,27 @@ func TestWindowsSymlinkTargets(t *testing.T) {
 		}
 		link := filepath.Join(root, "cross-volume")
 		defer os.Remove(link)
-		if err := os.Symlink(external, link); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			t.Fatalf("cross-volume target must remain denied: %v", err)
+		if err := os.Symlink(external, link); err != nil {
+			t.Fatalf("cross-volume symlink: %v", err)
+		}
+		if got, err := os.Readlink(link); err != nil || !strings.EqualFold(got, external) {
+			t.Fatalf("cross-volume target must read back as written: %q %v", got, err)
+		}
+		if got, err := os.ReadFile(link); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("cross-volume link read: %q %v", got, err)
+		}
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
 		}
 		if got, err := os.ReadFile(external); err != nil || !bytes.Equal(got, payload) {
-			t.Fatalf("rejected symlink damaged external target: %q %v", got, err)
+			t.Fatalf("removing symlink damaged external target: %q %v", got, err)
+		}
+	})
+	t.Run("cross_volume_unc_rejected", func(t *testing.T) {
+		link := filepath.Join(root, "cross-volume-unc")
+		defer os.Remove(link)
+		if err := os.Symlink(`\\localhost\C$\Windows\win.ini`, link); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			t.Fatalf("UNC target outside the volume must remain denied: %v", err)
 		}
 	})
 }

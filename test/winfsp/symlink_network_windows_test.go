@@ -119,6 +119,28 @@ func TestWindowsNetworkSymlinkTargets(t *testing.T) {
 		}
 	})
 
+	t.Run("unc_own_volume_in_volume", func(t *testing.T) {
+		share, err := os.Readlink(*mountPoint)
+		if err != nil || !strings.HasPrefix(share, `\\`) {
+			t.Fatalf("network volume share: %q %v", share, err)
+		}
+		rel, err := filepath.Rel(*mountPoint, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "unc-own")
+		if err := os.Symlink(filepath.Join(share, rel), link); err != nil {
+			t.Fatalf("a UNC target on this volume must be accepted: %v", err)
+		}
+		defer os.Remove(link)
+		if got, want := storedSymlinkTarget(t, link), "/"+filepath.ToSlash(rel); got != want {
+			t.Fatalf("stored target %q, want volume-relative %q", got, want)
+		}
+		if got, err := os.ReadFile(link); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("link read: %q %v", got, err)
+		}
+	})
+
 	// Every WinFsp network volume shares one MUP provider, which the signed
 	// driver takes as proof that the target is on this volume.
 	t.Run("unc_other_volume_rejected", func(t *testing.T) {

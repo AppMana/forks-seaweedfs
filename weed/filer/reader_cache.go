@@ -21,6 +21,7 @@ type CacheInvalidator interface {
 type fetchChunkDataFnType func(ctx context.Context, buffer []byte, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, fileId string, refreshUrls util_http.RefreshUrlsFunc) (n int, err error)
 
 type ReaderCache struct {
+	root             *ReaderCache
 	chunkCache       chunk_cache.ChunkCache
 	lookupFileIdFn   wdclient.LookupFileIdFunctionType
 	cacheInvalidator CacheInvalidator
@@ -44,6 +45,8 @@ type SingleChunkCacher struct {
 	left             int32 // set once the last pinning stream moved on
 	sync.Mutex
 	parent         *ReaderCache
+	scope          *ReaderCache
+	budget         *ReaderCacheBudget
 	chunkFileId    string
 	data           []byte
 	err            error
@@ -72,6 +75,57 @@ func NewReaderCache(limit int, chunkCache chunk_cache.ChunkCache, lookupFileIdFn
 	}
 }
 
+func (rc *ReaderCache) rootOrSelf() *ReaderCache {
+	if rc != nil && rc.root != nil {
+		return rc.root
+	}
+	return rc
+}
+
+// NewRequestScope creates a per-request / per-session ReaderCache view that
+// shares the parent whole-cache downloaders map, ChunkCache, and whole-cache
+// budget while enforcing per-request downloader slot and memory budget limits.
+func (rc *ReaderCache) NewRequestScope(requestLimit int, requestBudgetBytes int64) *ReaderCache {
+	if rc == nil {
+		return nil
+	}
+	root := rc.rootOrSelf()
+	if requestLimit <= 0 || (root.limit > 0 && requestLimit > root.limit) {
+		requestLimit = root.limit
+	}
+	var scopeBudget *ReaderCacheBudget
+	if root.budget != nil || requestBudgetBytes > 0 {
+		scopeBudget = NewScopedReaderCacheBudget(root.budget, requestBudgetBytes)
+	}
+	return &ReaderCache{
+		root:             root,
+		limit:            requestLimit,
+		budget:           scopeBudget,
+		chunkCache:       root.chunkCache,
+		lookupFileIdFn:   root.lookupFileIdFn,
+		cacheInvalidator: root.cacheInvalidator,
+		fetchChunkDataFn: root.fetchChunkDataFn,
+		downloaders:      root.downloaders,
+		keepUntilEvicted: rc.keepUntilEvicted,
+	}
+}
+
+// Budget returns the ReaderCacheBudget governing this cache or scope.
+func (rc *ReaderCache) Budget() *ReaderCacheBudget {
+	if rc == nil {
+		return nil
+	}
+	return rc.budget
+}
+
+// ChunkCache returns the underlying ChunkCache.
+func (rc *ReaderCache) ChunkCache() chunk_cache.ChunkCache {
+	if rc == nil {
+		return nil
+	}
+	return rc.rootOrSelf().chunkCache
+}
+
 // KeepUntilEvicted makes the cache retain chunk buffers that were fully read
 // or left by every stream until slot or budget eviction removes them.
 func (rc *ReaderCache) KeepUntilEvicted() *ReaderCache {
@@ -79,11 +133,52 @@ func (rc *ReaderCache) KeepUntilEvicted() *ReaderCache {
 	return rc
 }
 
+func (rc *ReaderCache) scopeDownloaderCountLocked() int {
+	root := rc.rootOrSelf()
+	if rc == root {
+		return len(root.downloaders)
+	}
+	count := 0
+	for _, d := range root.downloaders {
+		if d.scope == rc {
+			count++
+		}
+	}
+	return count
+}
+
+func (rc *ReaderCache) pickOldestVictimLocked(onlyScope *ReaderCache) string {
+	root := rc.rootOrSelf()
+	oldestFid, oldestTime := "", time.Now().UnixNano()
+	pinnedFid, pinnedTime := "", int64(0)
+	for fid, downloader := range root.downloaders {
+		if onlyScope != nil && downloader.scope != onlyScope {
+			continue
+		}
+		completedTime := atomic.LoadInt64(&downloader.completedTimeNew)
+		if completedTime <= 0 {
+			continue
+		}
+		if atomic.LoadInt32(&downloader.pins) == 0 {
+			if completedTime < oldestTime {
+				oldestFid, oldestTime = fid, completedTime
+			}
+		} else if pinnedFid == "" || completedTime < pinnedTime {
+			pinnedFid, pinnedTime = fid, completedTime
+		}
+	}
+	if oldestFid == "" {
+		oldestFid = pinnedFid
+	}
+	return oldestFid
+}
+
 // MaybeCache prefetches up to 'count' chunks ahead in parallel.
 // This improves read throughput for sequential reads by keeping the
 // network pipeline full with parallel chunk fetches.
 func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
-	if rc.lookupFileIdFn == nil {
+	root := rc.rootOrSelf()
+	if root.lookupFileIdFn == nil {
 		return
 	}
 	if count <= 0 {
@@ -97,25 +192,25 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 		}
 	}()
 
-	rc.Lock()
-	defer rc.Unlock()
+	root.Lock()
+	defer root.Unlock()
 
-	if len(rc.downloaders) >= rc.limit {
+	if len(root.downloaders) >= root.limit || rc.scopeDownloaderCountLocked() >= rc.limit {
 		return
 	}
 
 	cached := 0
 	for x := chunkViews; x != nil && cached < count; x = x.Next {
 		chunkView := x.Value
-		if _, found := rc.downloaders[chunkView.FileId]; found {
+		if _, found := root.downloaders[chunkView.FileId]; found {
 			continue
 		}
-		if rc.chunkCache.IsInCache(chunkView.FileId, true) {
+		if root.chunkCache.IsInCache(chunkView.FileId, true) {
 			glog.V(4).Infof("%s is in cache", chunkView.FileId)
 			continue
 		}
 
-		if len(rc.downloaders) >= rc.limit {
+		if len(root.downloaders) >= root.limit || rc.scopeDownloaderCountLocked() >= rc.limit {
 			// abort when slots are filled
 			return
 		}
@@ -130,10 +225,10 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 
 		// glog.V(4).Infof("prefetch %s offset %d", chunkView.FileId, chunkView.ViewOffset)
 		// cache this chunk if not yet
-		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= rc.chunkCache.GetMaxFilePartSizeInCache()
-		cacher := newSingleChunkCacher(rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
+		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= root.chunkCache.GetMaxFilePartSizeInCache()
+		cacher := newSingleChunkCacher(root, rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
 		cacher.wg.Add(1) // the fetch, so destroy() waits even before the goroutine runs
-		rc.downloaders[chunkView.FileId] = cacher
+		root.downloaders[chunkView.FileId] = cacher
 		go cacher.startCaching()
 		started = append(started, cacher)
 		cached++
@@ -147,13 +242,14 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 // goes through fetchChunkDataFn so tests observe range fetches the same way
 // they observe whole-chunk downloads.
 func (rc *ReaderCache) fetchChunkRange(ctx context.Context, buffer []byte, chunkView *ChunkView, offset int64) (int, error) {
-	urlStrings, err := rc.lookupFileIdFn(ctx, chunkView.FileId)
+	root := rc.rootOrSelf()
+	urlStrings, err := root.lookupFileIdFn(ctx, chunkView.FileId)
 	if err != nil {
 		glog.ErrorfCtx(ctx, "operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
 		return 0, err
 	}
-	return rc.fetchChunkDataFn(ctx, buffer, urlStrings, chunkView.CipherKey, chunkView.IsGzipped, false, offset, chunkView.FileId,
-		refreshUrls(ctx, rc.cacheInvalidator, rc.lookupFileIdFn, chunkView.FileId))
+	return root.fetchChunkDataFn(ctx, buffer, urlStrings, chunkView.CipherKey, chunkView.IsGzipped, false, offset, chunkView.FileId,
+		refreshUrls(ctx, root.cacheInvalidator, root.lookupFileIdFn, chunkView.FileId))
 }
 
 // chunkStream is one sequential reader's position in a shared ReaderCache.
@@ -170,12 +266,13 @@ func (rc *ReaderCache) ReadChunkAt(ctx context.Context, buffer []byte, fileId st
 }
 
 func (rc *ReaderCache) readChunkAt(ctx context.Context, stream *chunkStream, buffer []byte, fileId string, cipherKey []byte, isGzipped bool, offset int64, chunkSize int, shouldCache bool) (int, error) {
+	root := rc.rootOrSelf()
 retry:
-	rc.RLock()
-	if cacher, found := rc.downloaders[fileId]; found {
+	root.RLock()
+	if cacher, found := root.downloaders[fileId]; found {
 		if cacher.hasCompletedError() {
-			rc.RUnlock()
-			rc.remove(cacher)
+			root.RUnlock()
+			root.remove(cacher)
 			goto retry
 		}
 		// Count this read on the cacher before releasing the map lock, so a
@@ -184,7 +281,7 @@ retry:
 		cacher.wg.Add(1)
 		atomic.AddInt32(&cacher.readers, 1)
 		previous := stream.pin(cacher)
-		rc.RUnlock()
+		root.RUnlock()
 		n, err := rc.readFromCacher(ctx, stream, cacher, previous, buffer, offset, chunkSize)
 		if n > 0 || err != nil {
 			return n, err
@@ -192,11 +289,11 @@ retry:
 		// If n=0 and err=nil, the cacher couldn't provide data for this offset.
 		// Fall through to try chunkCache.
 	} else {
-		rc.RUnlock()
+		root.RUnlock()
 	}
 
-	if shouldCache || rc.lookupFileIdFn == nil {
-		n, err := rc.chunkCache.ReadChunkAt(buffer, fileId, uint64(offset))
+	if shouldCache || root.lookupFileIdFn == nil {
+		n, err := root.chunkCache.ReadChunkAt(buffer, fileId, uint64(offset))
 		if n > 0 {
 			// Served from the chunk cache: the stream has left its pinned chunk.
 			rc.unpin(stream.detach(nil))
@@ -204,48 +301,43 @@ retry:
 		}
 	}
 
-	rc.Lock()
+	root.Lock()
 	// A downloader may have registered between the read lock and this one.
-	if cacher, found := rc.downloaders[fileId]; found {
+	if cacher, found := root.downloaders[fileId]; found {
 		if cacher.hasCompletedError() {
-			delete(rc.downloaders, fileId)
-			rc.Unlock()
+			delete(root.downloaders, fileId)
+			root.Unlock()
 			cacher.destroy()
 			goto retry
 		}
 		cacher.wg.Add(1)
 		atomic.AddInt32(&cacher.readers, 1)
 		previous := stream.pin(cacher)
-		rc.Unlock()
+		root.Unlock()
 		n, err := rc.readFromCacher(ctx, stream, cacher, previous, buffer, offset, chunkSize)
 		return n, err
 	}
 
-	// clean up old downloaders; prefer one no stream is positioned in, but
-	// fall back to a pinned one so abandoned pins cannot bypass the limit
-	if len(rc.downloaders) >= rc.limit {
-		oldestFid, oldestTime := "", time.Now().UnixNano()
-		pinnedFid, pinnedTime := "", int64(0)
-		for fid, downloader := range rc.downloaders {
-			completedTime := atomic.LoadInt64(&downloader.completedTimeNew)
-			if completedTime <= 0 {
-				continue
-			}
-			if atomic.LoadInt32(&downloader.pins) == 0 {
-				if completedTime < oldestTime {
-					oldestFid, oldestTime = fid, completedTime
-				}
-			} else if pinnedFid == "" || completedTime < pinnedTime {
-				pinnedFid, pinnedTime = fid, completedTime
-			}
+	// Enforce per-request / per-session slot limit first so a noisy request
+	// evicts its own completed chunks before affecting other concurrent streams.
+	if rc != root && rc.scopeDownloaderCountLocked() >= rc.limit {
+		if oldestFid := rc.pickOldestVictimLocked(rc); oldestFid != "" {
+			oldDownloader := root.downloaders[oldestFid]
+			delete(root.downloaders, oldestFid)
+			root.Unlock()
+			oldDownloader.destroy()
+			goto retry
 		}
-		if oldestFid == "" {
-			oldestFid = pinnedFid
-		}
-		if oldestFid != "" {
-			oldDownloader := rc.downloaders[oldestFid]
-			delete(rc.downloaders, oldestFid)
-			rc.Unlock()
+	}
+
+	// Clean up old downloaders at the whole-cache level; prefer one no stream
+	// is positioned in, but fall back to a pinned one so abandoned pins cannot
+	// bypass the limit.
+	if len(root.downloaders) >= root.limit {
+		if oldestFid := rc.pickOldestVictimLocked(nil); oldestFid != "" {
+			oldDownloader := root.downloaders[oldestFid]
+			delete(root.downloaders, oldestFid)
+			root.Unlock()
 			oldDownloader.destroy()
 			goto retry
 		}
@@ -253,12 +345,12 @@ retry:
 
 	// glog.V(4).Infof("cache1 %s", fileId)
 
-	cacher := newSingleChunkCacher(rc, fileId, cipherKey, isGzipped, chunkSize, shouldCache)
+	cacher := newSingleChunkCacher(root, rc, fileId, cipherKey, isGzipped, chunkSize, shouldCache)
 	cacher.wg.Add(2) // the fetch plus this read, so destroy() waits even before the goroutine runs
 	atomic.AddInt32(&cacher.readers, 1)
-	rc.downloaders[fileId] = cacher
+	root.downloaders[fileId] = cacher
 	previous := stream.pin(cacher)
-	rc.Unlock()
+	root.Unlock()
 	go cacher.startCaching()
 	<-cacher.cacheStartedCh
 	n, err := rc.readFromCacher(ctx, stream, cacher, previous, buffer, offset, chunkSize)
@@ -338,22 +430,24 @@ func (rc *ReaderCache) unpin(downloader *SingleChunkCacher) {
 }
 
 func (rc *ReaderCache) UnCache(fileId string) {
-	rc.Lock()
-	downloader := rc.downloaders[fileId]
-	delete(rc.downloaders, fileId)
-	rc.Unlock()
+	root := rc.rootOrSelf()
+	root.Lock()
+	downloader := root.downloaders[fileId]
+	delete(root.downloaders, fileId)
+	root.Unlock()
 	if downloader != nil {
 		downloader.destroy()
 	}
 }
 
 func (rc *ReaderCache) remove(downloader *SingleChunkCacher) {
-	rc.Lock()
-	removed := rc.downloaders[downloader.chunkFileId] == downloader
+	root := rc.rootOrSelf()
+	root.Lock()
+	removed := root.downloaders[downloader.chunkFileId] == downloader
 	if removed {
-		delete(rc.downloaders, downloader.chunkFileId)
+		delete(root.downloaders, downloader.chunkFileId)
 	}
-	rc.Unlock()
+	root.Unlock()
 	if removed {
 		downloader.destroy()
 	}
@@ -363,13 +457,14 @@ func (rc *ReaderCache) remove(downloader *SingleChunkCacher) {
 // Budget eviction picks its victim under the budget lock, so the pin check
 // and the map removal must happen together under the ReaderCache lock.
 func (rc *ReaderCache) removeUnpinned(downloader *SingleChunkCacher) (removed bool) {
-	rc.Lock()
-	removed = rc.downloaders[downloader.chunkFileId] == downloader &&
+	root := rc.rootOrSelf()
+	root.Lock()
+	removed = root.downloaders[downloader.chunkFileId] == downloader &&
 		atomic.LoadInt32(&downloader.pins) == 0
 	if removed {
-		delete(rc.downloaders, downloader.chunkFileId)
+		delete(root.downloaders, downloader.chunkFileId)
 	}
-	rc.Unlock()
+	root.Unlock()
 	if removed {
 		downloader.destroy()
 	}
@@ -386,25 +481,33 @@ func (s *SingleChunkCacher) consumable() bool {
 		(atomic.LoadInt32(&s.consumed) != 0 || atomic.LoadInt32(&s.left) != 0)
 }
 
+func (s *SingleChunkCacher) shouldKeepUntilEvicted() bool {
+	if s.scope != nil && s.scope.keepUntilEvicted {
+		return true
+	}
+	return s.parent != nil && s.parent.keepUntilEvicted
+}
+
 // removeConsumed drops a cacher once its buffer was fully read, or the
 // streams positioned in it have left, and no readers remain attached or
 // pinned. The checks run under the ReaderCache lock so a reader attaching
 // at the same time either wins (the cacher stays and that reader's detach
 // retries the removal) or misses the map and refetches.
 func (rc *ReaderCache) removeConsumed(downloader *SingleChunkCacher) {
-	if rc.keepUntilEvicted || !downloader.consumable() {
+	if downloader.shouldKeepUntilEvicted() || !downloader.consumable() {
 		return
 	}
-	rc.Lock()
-	removed := rc.removeConsumedLocked(downloader)
-	rc.Unlock()
+	root := rc.rootOrSelf()
+	root.Lock()
+	removed := root.removeConsumedLocked(downloader)
+	root.Unlock()
 	if removed {
 		downloader.destroy()
 	}
 }
 
 func (rc *ReaderCache) removeConsumedLocked(downloader *SingleChunkCacher) (removed bool) {
-	if rc.keepUntilEvicted {
+	if downloader.shouldKeepUntilEvicted() {
 		return false
 	}
 	if rc.downloaders[downloader.chunkFileId] == downloader && downloader.consumable() {
@@ -415,18 +518,92 @@ func (rc *ReaderCache) removeConsumedLocked(downloader *SingleChunkCacher) (remo
 }
 
 func (rc *ReaderCache) destroy() {
-	rc.Lock()
-	downloaders := rc.downloaders
-	rc.downloaders = make(map[string]*SingleChunkCacher)
-	rc.Unlock()
-	for _, downloader := range downloaders {
+	if rc == nil {
+		return
+	}
+	root := rc.rootOrSelf()
+	if rc == root {
+		root.Lock()
+		downloaders := root.downloaders
+		root.downloaders = make(map[string]*SingleChunkCacher)
+		root.Unlock()
+		for _, downloader := range downloaders {
+			downloader.destroy()
+		}
+		return
+	}
+
+	// Scoped ReaderCache: only destroy downloaders created by this scope that
+	// are not currently read or pinned by another concurrent scope. If another
+	// scope is actively reading/pinning a downloader, release this child
+	// scope's budget reservation and transfer ownership to the root cache.
+	var toDestroy []*SingleChunkCacher
+	root.Lock()
+	for fid, downloader := range root.downloaders {
+		if downloader.scope != rc {
+			continue
+		}
+		if atomic.LoadInt32(&downloader.readers) == 0 && atomic.LoadInt32(&downloader.pins) == 0 {
+			delete(root.downloaders, fid)
+			toDestroy = append(toDestroy, downloader)
+		} else {
+			if rc.budget != nil && rc.budget != root.budget {
+				rc.budget.releaseSelf(downloader)
+			}
+			downloader.scope = root
+			downloader.budget = root.budget
+		}
+	}
+	root.Unlock()
+	for _, downloader := range toDestroy {
 		downloader.destroy()
 	}
 }
 
-func newSingleChunkCacher(parent *ReaderCache, fileId string, cipherKey []byte, isGzipped bool, chunkSize int, shouldCache bool) *SingleChunkCacher {
+// ReleaseScope detaches a finished request/session scope from the shared root
+// ReaderCache. Any completed chunks that should be retained in the shared root
+// cache (when KeepUntilEvicted is enabled on the root cache) have their child
+// scope budget reservation released while remaining tracked in the root budget;
+// unpinned consumable chunks are cleaned up immediately.
+func (rc *ReaderCache) ReleaseScope() {
+	if rc == nil {
+		return
+	}
+	root := rc.rootOrSelf()
+	if rc == root {
+		return
+	}
+	var toDestroy []*SingleChunkCacher
+	root.Lock()
+	for fid, downloader := range root.downloaders {
+		if downloader.scope != rc {
+			continue
+		}
+		if !root.keepUntilEvicted && downloader.consumable() {
+			delete(root.downloaders, fid)
+			toDestroy = append(toDestroy, downloader)
+			continue
+		}
+		if rc.budget != nil && rc.budget != root.budget {
+			rc.budget.releaseSelf(downloader)
+		}
+		downloader.scope = root
+		downloader.budget = root.budget
+	}
+	root.Unlock()
+	for _, downloader := range toDestroy {
+		downloader.destroy()
+	}
+}
+
+func newSingleChunkCacher(parent *ReaderCache, scope *ReaderCache, fileId string, cipherKey []byte, isGzipped bool, chunkSize int, shouldCache bool) *SingleChunkCacher {
+	if scope == nil {
+		scope = parent
+	}
 	return &SingleChunkCacher{
 		parent:         parent,
+		scope:          scope,
+		budget:         scope.budget,
 		chunkFileId:    fileId,
 		cipherKey:      cipherKey,
 		isGzipped:      isGzipped,
@@ -447,12 +624,12 @@ func (s *SingleChunkCacher) startCaching() {
 		if s.hasCompletedError() {
 			s.parent.remove(s)
 		} else {
-			s.parent.budget.complete(s)
+			s.budget.complete(s)
 		}
 	}()
 
 	s.cacheStartedCh <- struct{}{}
-	if err := s.parent.budget.reserve(s); err != nil {
+	if err := s.budget.reserve(s); err != nil {
 		s.setError(err)
 		return
 	}
@@ -512,7 +689,11 @@ func (s *SingleChunkCacher) fetchChunkData(ctx context.Context, urlStrings []str
 	// Allocate buffer and download without holding the lock.
 	// This allows multiple downloads to proceed in parallel.
 	data := mem.Allocate(s.chunkSize)
-	_, fetchErr := s.parent.fetchChunkDataFn(ctx, data, urlStrings, s.cipherKey, s.isGzipped, true, 0, s.chunkFileId, refreshUrls(ctx, s.parent.cacheInvalidator, s.parent.lookupFileIdFn, s.chunkFileId))
+	fetchFn := s.parent.fetchChunkDataFn
+	if s.scope != nil && s.scope.fetchChunkDataFn != nil {
+		fetchFn = s.scope.fetchChunkDataFn
+	}
+	_, fetchErr := fetchFn(ctx, data, urlStrings, s.cipherKey, s.isGzipped, true, 0, s.chunkFileId, refreshUrls(ctx, s.parent.cacheInvalidator, s.parent.lookupFileIdFn, s.chunkFileId))
 	if fetchErr != nil {
 		mem.Free(data)
 		return nil, fetchErr
@@ -542,7 +723,7 @@ func (s *SingleChunkCacher) destroy() {
 		s.data = nil
 	}
 	s.Unlock()
-	s.parent.budget.release(s)
+	s.budget.release(s)
 }
 
 // readChunkAt reads data from the cached chunk.

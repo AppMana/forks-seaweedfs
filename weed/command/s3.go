@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/mux"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -30,6 +31,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
@@ -82,8 +84,14 @@ type S3Options struct {
 	cipher                    *bool
 	externalUrl               *string
 	defaultFileMode           *string
+	cacheDir                  *string
 	cacheSizeMB               *int64
+	wholeCacheSizeMB          *int64
 	readerCacheSizeMB         *int64
+	sessionReaderCacheSizeMB  *int64
+	sharedChunkCache          chunk_cache.ChunkCache
+	sharedReaderCacheBudget   *filer.ReaderCacheBudget
+	sharedReaderCache         *filer.ReaderCache
 
 	allowUntrustedRemoteEndpoints *bool
 	// shutdownCtx, when non-nil, tells startS3Server to gracefully shut down
@@ -134,8 +142,11 @@ func init() {
 	s3StandaloneOptions.cipher = cmdS3.Flag.Bool("encryptVolumeData", false, "encrypt data on volume servers")
 	s3StandaloneOptions.externalUrl = cmdS3.Flag.String("externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	s3StandaloneOptions.defaultFileMode = cmdS3.Flag.String("defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
-	s3StandaloneOptions.cacheSizeMB = cmdS3.Flag.Int64("cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	s3StandaloneOptions.cacheDir = cmdS3.Flag.String("cacheDir", "", "local directory for shared on-disk nearside chunk cache across S3, Filer, WebDAV, and mounts")
+	s3StandaloneOptions.cacheSizeMB = cmdS3.Flag.Int64("cacheCapacityMB", 0, "chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	s3StandaloneOptions.wholeCacheSizeMB = cmdS3.Flag.Int64("wholeCacheCapacityMB", 0, "whole-node shared on-disk chunk cache capacity in MB across all modalities")
 	s3StandaloneOptions.readerCacheSizeMB = cmdS3.Flag.Int64("readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
+	s3StandaloneOptions.sessionReaderCacheSizeMB = cmdS3.Flag.Int64("sessionReaderCacheSizeMB", 0, "per-request/session memory budget in MiB for an individual S3 GET stream (0 defaults to 1/4 of readerCacheSizeMB)")
 	s3StandaloneOptions.allowUntrustedRemoteEndpoints = cmdS3.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 }
 
@@ -280,6 +291,9 @@ func (s3opt *S3Options) resolvePaths() {
 	*s3opt.tlsPrivateKey = util.ResolvePath(*s3opt.tlsPrivateKey)
 	*s3opt.tlsCACertificate = util.ResolvePath(*s3opt.tlsCACertificate)
 	*s3opt.auditLogConfig = util.ResolvePath(*s3opt.auditLogConfig)
+	if s3opt.cacheDir != nil {
+		*s3opt.cacheDir = util.ResolvePath(*s3opt.cacheDir)
+	}
 }
 
 func (s3opt *S3Options) startS3Server() bool {
@@ -394,8 +408,14 @@ func (s3opt *S3Options) startS3Server() bool {
 		GrpcPort:                  *s3opt.portGrpc,
 		ExternalUrl:               s3opt.resolveExternalUrl(),
 		DefaultFileMode:           defaultFileMode,
+		CacheDir:                  peerStringOrEmpty(s3opt.cacheDir),
 		CacheSizeMB:               *s3opt.cacheSizeMB,
+		WholeCacheSizeMB:          wholeCacheSizeOrZero(s3opt.wholeCacheSizeMB),
 		ReaderCacheSizeMB:         readerCacheSizeMB,
+		SessionReaderCacheSizeMB:  wholeCacheSizeOrZero(s3opt.sessionReaderCacheSizeMB),
+		SharedChunkCache:          s3opt.sharedChunkCache,
+		SharedReaderCacheBudget:   s3opt.sharedReaderCacheBudget,
+		SharedReaderCache:         s3opt.sharedReaderCache,
 		MaxMB:                     filerMaxMB,
 
 		AllowUntrustedRemoteEndpoints: *s3opt.allowUntrustedRemoteEndpoints,

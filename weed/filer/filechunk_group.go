@@ -50,6 +50,10 @@ func NewChunkGroup(lookupFn wdclient.LookupFileIdFunctionType, chunkCache chunk_
 }
 
 func NewChunkGroupWithMode(lookupFn wdclient.LookupFileIdFunctionType, chunkCache chunk_cache.ChunkCache, chunks []*filer_pb.FileChunk, concurrentReaders int, readerCacheMode ReaderCacheMode, cacheInvalidator CacheInvalidator, manifestCache *ChunkManifestCache, budgets ...*ReaderCacheBudget) (*ChunkGroup, error) {
+	return NewChunkGroupWithReaderCache(lookupFn, nil, chunkCache, chunks, concurrentReaders, readerCacheMode, cacheInvalidator, manifestCache, 0, budgets...)
+}
+
+func NewChunkGroupWithReaderCache(lookupFn wdclient.LookupFileIdFunctionType, parentReaderCache *ReaderCache, chunkCache chunk_cache.ChunkCache, chunks []*filer_pb.FileChunk, concurrentReaders int, readerCacheMode ReaderCacheMode, cacheInvalidator CacheInvalidator, manifestCache *ChunkManifestCache, perGroupBudgetBytes int64, budgets ...*ReaderCacheBudget) (*ChunkGroup, error) {
 	if concurrentReaders <= 0 {
 		concurrentReaders = 16
 	}
@@ -61,10 +65,24 @@ func NewChunkGroupWithMode(lookupFn wdclient.LookupFileIdFunctionType, chunkCach
 	if readerCacheLimit < 32 {
 		readerCacheLimit = 32
 	}
+	var rc *ReaderCache
+	if parentReaderCache != nil {
+		rc = parentReaderCache.NewRequestScope(readerCacheLimit, perGroupBudgetBytes).KeepUntilEvicted()
+	} else {
+		var budget *ReaderCacheBudget
+		if len(budgets) > 0 && budgets[0] != nil {
+			if perGroupBudgetBytes > 0 {
+				budget = budgets[0].NewScope(perGroupBudgetBytes)
+			} else {
+				budget = budgets[0]
+			}
+		}
+		rc = NewReaderCache(readerCacheLimit, chunkCache, lookupFn, cacheInvalidator, budget).KeepUntilEvicted()
+	}
 	group := &ChunkGroup{
 		lookupFn:          lookupFn,
 		sections:          make(map[SectionIndex]*FileChunkSection),
-		readerCache:       NewReaderCache(readerCacheLimit, chunkCache, lookupFn, cacheInvalidator, budgets...).KeepUntilEvicted(),
+		readerCache:       rc,
 		concurrentReaders: concurrentReaders,
 		readerCacheMode:   readerCacheMode,
 		cacheInvalidator:  cacheInvalidator,

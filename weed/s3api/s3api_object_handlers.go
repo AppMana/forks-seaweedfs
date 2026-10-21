@@ -1276,7 +1276,16 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 	// WebDAV and mount read paths.
 	tStreamPrep := time.Now()
 	chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, offset, size)
-	reader := filer.NewChunkReaderAtFromClient(ctx, s3a.readerCache, chunkViews, totalSize, filer.DefaultPrefetchCount)
+	sessionBudgetBytes := int64(64 << 20)
+	if s3a.option != nil && s3a.option.SessionReaderCacheSizeMB > 0 {
+		sessionBudgetBytes = s3a.option.SessionReaderCacheSizeMB << 20
+	} else if s3a.option != nil && s3a.option.ReaderCacheSizeMB > 0 {
+		wholeBytes := s3a.option.ReaderCacheSizeMB << 20
+		sessionBudgetBytes = min(max(wholeBytes/4, int64(32<<20)), wholeBytes)
+	}
+	reqReaderCache := s3a.readerCache.NewRequestScope(32, sessionBudgetBytes)
+	defer reqReaderCache.ReleaseScope()
+	reader := filer.NewChunkReaderAtFromClient(ctx, reqReaderCache, chunkViews, totalSize, filer.DefaultPrefetchCount)
 	defer reader.ReleaseStream()
 	streamPrepTime = time.Since(tStreamPrep)
 

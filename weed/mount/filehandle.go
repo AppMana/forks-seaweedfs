@@ -132,7 +132,23 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 			_ = fh.entryChunkGroup.Close()
 		}
 		var resolveManifestErr error
-		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroupWithMode(fh.wfs.LookupFn(), fh.wfs.chunkCache, entry.Chunks, fh.wfs.option.ConcurrentReaders, fh.wfs.option.ReaderCacheMode, fh.wfs.CacheInvalidator(), fh.wfs.manifestCache, fh.wfs.readerCacheBudget)
+		perHandleBudget := int64(0)
+		if fh.wfs.option != nil && fh.wfs.option.ReaderCacheSizeMB > 0 {
+			wholeBudget := fh.wfs.option.ReaderCacheSizeMB << 20
+			perHandleBudget = min(max(wholeBudget/4, int64(64<<20)), wholeBudget)
+		}
+		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroupWithReaderCache(
+			fh.wfs.LookupFn(),
+			fh.wfs.readerCache,
+			fh.wfs.chunkCache,
+			entry.Chunks,
+			fh.wfs.option.ConcurrentReaders,
+			fh.wfs.option.ReaderCacheMode,
+			fh.wfs.CacheInvalidator(),
+			fh.wfs.manifestCache,
+			perHandleBudget,
+			fh.wfs.readerCacheBudget,
+		)
 		if resolveManifestErr != nil {
 			glog.Warningf("failed to resolve manifest chunks in %+v", entry)
 		}

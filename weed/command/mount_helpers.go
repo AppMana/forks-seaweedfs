@@ -110,3 +110,10 @@ func peerStringOrEmpty(p *string) string {
 	}
 	return *p
 }
+
+func wholeCacheSizeOrZero(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}

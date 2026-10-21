@@ -12,12 +12,14 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 )
 
 var (
@@ -34,9 +36,14 @@ type WebDavOption struct {
 	disk           *string
 	tlsPrivateKey  *string
 	tlsCertificate *string
-	cacheDir       *string
-	cacheSizeMB    *int64
-	maxMB          *int
+	cacheDir                *string
+	cacheSizeMB             *int64
+	wholeCacheSizeMB        *int64
+	readerCacheSizeMB       *int64
+	sharedChunkCache        chunk_cache.ChunkCache
+	sharedReaderCacheBudget *filer.ReaderCacheBudget
+	sharedReaderCache       *filer.ReaderCache
+	maxMB                   *int
 	// shutdownCtx, when non-nil, tells startWebDav to gracefully shut down the
 	// HTTP server once the ctx is cancelled. Used by weed mini; nil for
 	// standalone weed webdav.
@@ -55,6 +62,8 @@ func init() {
 	webDavStandaloneOptions.tlsCertificate = cmdWebDav.Flag.String("cert.file", "", "path to the TLS certificate file")
 	webDavStandaloneOptions.cacheDir = cmdWebDav.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks")
 	webDavStandaloneOptions.cacheSizeMB = cmdWebDav.Flag.Int64("cacheCapacityMB", 0, "local cache capacity in MB")
+	webDavStandaloneOptions.wholeCacheSizeMB = cmdWebDav.Flag.Int64("wholeCacheCapacityMB", 0, "whole-node shared on-disk cache capacity in MB across all modalities")
+	webDavStandaloneOptions.readerCacheSizeMB = cmdWebDav.Flag.Int64("readerCacheSizeMB", 0, "in-memory reader cache budget in MiB")
 	webDavStandaloneOptions.maxMB = cmdWebDav.Flag.Int("maxMB", 4, "split files larger than the limit")
 	webDavStandaloneOptions.filerRootPath = cmdWebDav.Flag.String("filer.path", "/", "use this remote path from filer server")
 }
@@ -137,9 +146,14 @@ func (wo *WebDavOption) startWebDav() bool {
 		Uid:            uid,
 		Gid:            gid,
 		Cipher:         cipher,
-		CacheDir:       *wo.cacheDir,
-		CacheSizeMB:    *wo.cacheSizeMB,
-		MaxMB:          *wo.maxMB,
+		CacheDir:                *wo.cacheDir,
+		CacheSizeMB:             *wo.cacheSizeMB,
+		WholeCacheSizeMB:        wholeCacheSizeOrZero(wo.wholeCacheSizeMB),
+		ReaderCacheSizeMB:       wholeCacheSizeOrZero(wo.readerCacheSizeMB),
+		SharedChunkCache:        wo.sharedChunkCache,
+		SharedReaderCacheBudget: wo.sharedReaderCacheBudget,
+		SharedReaderCache:       wo.sharedReaderCache,
+		MaxMB:                   *wo.maxMB,
 	})
 	if webdavServer_err != nil {
 		glog.Fatalf("WebDav Server startup error: %v", webdavServer_err)

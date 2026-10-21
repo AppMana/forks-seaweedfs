@@ -282,6 +282,37 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		// Matches S3 API behavior. Request context (ctx) is used for metadata operations above.
 		streamCtx, streamCancel := context.WithCancel(context.WithoutCancel(ctx))
 
+		if fs.readerCache != nil && fs.option.DownloadMaxBytesPs == 0 && (fs.option.CacheSizeMBForRead > 0 || fs.option.ReaderCacheSizeMB > 0) {
+			visibleIntervals, err := filer.NonOverlappingVisibleIntervals(streamCtx, fs.filer.MasterClient.GetLookupFileIdFunction(), chunks, offset, offset+size)
+			if err != nil {
+				streamCancel()
+				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+				glog.ErrorfCtx(ctx, "failed to resolve chunks %s: %v", r.URL, err)
+				return nil, err
+			}
+			chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, offset, size)
+			sessionBudgetBytes := int64(64 << 20)
+			if fs.option.ReaderCacheSizeMB > 0 {
+				wholeBytes := fs.option.ReaderCacheSizeMB << 20
+				sessionBudgetBytes = min(max(wholeBytes/4, int64(32<<20)), wholeBytes)
+			}
+			reqReaderCache := fs.readerCache.NewRequestScope(32, sessionBudgetBytes)
+			reader := filer.NewChunkReaderAtFromClient(streamCtx, reqReaderCache, chunkViews, totalSize, filer.DefaultPrefetchCount)
+			return func(writer io.Writer) error {
+				defer streamCancel()
+				defer reader.ReleaseStream()
+				defer reqReaderCache.ReleaseScope()
+				sectionReader := io.NewSectionReader(reader, offset, size)
+				buf := make([]byte, 128*1024)
+				_, err := io.CopyBuffer(writer, sectionReader, buf)
+				if err != nil {
+					stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+					glog.ErrorfCtx(ctx, "failed to stream content %s: %v", r.URL, err)
+				}
+				return err
+			}, nil
+		}
+
 		streamFn, err := filer.PrepareStreamContentWithPrefetch(streamCtx, fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs, 4)
 		if err != nil {
 			streamCancel()

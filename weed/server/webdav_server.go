@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,10 +39,15 @@ type WebDavOption struct {
 	DiskType       string
 	Uid            uint32
 	Gid            uint32
-	Cipher         bool
-	CacheDir       string
-	CacheSizeMB    int64
-	MaxMB          int
+	Cipher                  bool
+	CacheDir                string
+	CacheSizeMB             int64
+	WholeCacheSizeMB        int64
+	ReaderCacheSizeMB       int64
+	SharedChunkCache        chunk_cache.ChunkCache
+	SharedReaderCacheBudget *filer.ReaderCacheBudget
+	SharedReaderCache       *filer.ReaderCache
+	MaxMB                   int
 }
 
 type WebDavServer struct {
@@ -88,7 +94,7 @@ func NewWebDavServer(option *WebDavOption) (ws *WebDavServer, err error) {
 
 type WebDavFileSystem struct {
 	option      *WebDavOption
-	chunkCache  *chunk_cache.TieredChunkCache
+	chunkCache  chunk_cache.ChunkCache
 	readerCache *filer.ReaderCache
 	filerClient *wdclient.FilerClient
 	signature   int32
@@ -130,18 +136,33 @@ type WebDavFile struct {
 	off              int64
 	entry            *filer_pb.Entry
 	visibleIntervals *filer.IntervalList[*filer.VisibleInterval]
+	reqReaderCache   *filer.ReaderCache
 	reader           *filer.ChunkReadAt
 	bufWriter        *buffered_writer.BufferedWriteCloser
 	ctx              context.Context
 }
 
 func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
-
-	cacheUniqueId := util.Md5String([]byte("webdav" + string(option.Filer) + version.Version()))[0:8]
-	cacheDir := path.Join(option.CacheDir, cacheUniqueId)
-
-	os.MkdirAll(cacheDir, os.FileMode(0755))
-	chunkCache := chunk_cache.NewTieredChunkCache(256, cacheDir, option.CacheSizeMB, 1024*1024)
+	var chunkCache chunk_cache.ChunkCache
+	if option.SharedChunkCache != nil {
+		chunkCache = option.SharedChunkCache
+	} else if option.CacheSizeMB > 0 {
+		wholeCacheMB := option.WholeCacheSizeMB
+		if wholeCacheMB <= 0 {
+			wholeCacheMB = max(option.CacheSizeMB*4, 16384)
+			if option.CacheSizeMB < 64 {
+				wholeCacheMB = option.CacheSizeMB * 2
+			}
+		}
+		sharedChunksDir := filepath.Join(option.CacheDir, "chunks")
+		if option.CacheDir == "" {
+			cacheUniqueId := util.Md5String([]byte("webdav" + string(option.Filer) + version.Version()))[0:8]
+			sharedChunksDir = path.Join(os.TempDir(), cacheUniqueId, "chunks")
+		}
+		chunkCache = chunk_cache.NewSharedTieredChunkCache(256, sharedChunksDir, "webdav", option.CacheSizeMB, wholeCacheMB, 1024*1024)
+	} else {
+		chunkCache = (*chunk_cache.TieredChunkCache)(nil)
+	}
 	t := &WebDavFileSystem{
 		option:     option,
 		chunkCache: chunkCache,
@@ -153,7 +174,15 @@ func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
 	// looks the volume up again instead of retrying a server that has moved or
 	// died.
 	t.filerClient = wdclient.NewFilerClient([]pb.ServerAddress{option.Filer}, option.GrpcDialOption, "")
-	t.readerCache = filer.NewReaderCache(32, chunkCache, t.filerClient.GetLookupFileIdFunction(), t.filerClient)
+	if option.SharedReaderCache != nil {
+		t.readerCache = option.SharedReaderCache
+	} else {
+		budget := option.SharedReaderCacheBudget
+		if budget == nil && option.ReaderCacheSizeMB > 0 {
+			budget = filer.NewReaderCacheBudget(option.ReaderCacheSizeMB << 20)
+		}
+		t.readerCache = filer.NewReaderCache(32, chunkCache, t.filerClient.GetLookupFileIdFunction(), t.filerClient, budget)
+	}
 	return t, nil
 }
 
@@ -540,6 +569,10 @@ func (f *WebDavFile) Close() error {
 	if f.reader != nil {
 		f.reader.ReleaseStream()
 	}
+	if f.reqReaderCache != nil {
+		f.reqReaderCache.ReleaseScope()
+		f.reqReaderCache = nil
+	}
 	if f.bufWriter == nil {
 		return nil
 	}
@@ -579,7 +612,10 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 	}
 	if f.reader == nil {
 		chunkViews := filer.ViewFromVisibleIntervals(f.visibleIntervals, 0, fileSize)
-		f.reader = filer.NewChunkReaderAtFromClient(f.ctx, f.fs.readerCache, chunkViews, fileSize, filer.DefaultPrefetchCount)
+		if f.reqReaderCache == nil {
+			f.reqReaderCache = f.fs.readerCache.NewRequestScope(16, 64<<20)
+		}
+		f.reader = filer.NewChunkReaderAtFromClient(f.ctx, f.reqReaderCache, chunkViews, fileSize, filer.DefaultPrefetchCount)
 	}
 
 	readSize, err = f.reader.ReadAt(p, f.off)

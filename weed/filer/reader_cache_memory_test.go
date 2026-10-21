@@ -421,3 +421,69 @@ func TestReaderCacheReReadAfterEviction(t *testing.T) {
 		t.Fatalf("fetchCount=%d, want 3 (a, b, a-re-read)", got)
 	}
 }
+
+// TestReaderCachePerRequestAndWholeCacheScoping verifies two-level scoping:
+//  1. A request scope that exceeds its own per-request budget evicts its own
+//     chunks first without evicting another request scope's retained chunks.
+//  2. Both scopes share the whole-cache downloaders map and ChunkCache, so
+//     reading a chunk already cached by another scope hits the shared cache
+//     without re-downloading.
+//  3. Whole-cache budget bounds total memory across all active scopes.
+func TestReaderCachePerRequestAndWholeCacheScoping(t *testing.T) {
+	wholeBudget := NewReaderCacheBudget(12 << 10) // fits three 4 KiB pooled chunks in total
+	root := NewReaderCache(32, newMockChunkCacheForReaderCache(), func(context.Context, string) ([]string, error) {
+		return []string{"unused"}, nil
+	}, nil, wholeBudget).KeepUntilEvicted()
+	defer root.destroy()
+
+	var fetchCount int32
+	root.fetchChunkDataFn = func(_ context.Context, buffer []byte, _ []string, _ []byte, _ bool, _ bool, _ int64, _ string, _ util_http.RefreshUrlsFunc) (int, error) {
+		n := atomic.AddInt32(&fetchCount, 1)
+		buffer[0] = byte(n)
+		return len(buffer), nil
+	}
+
+	// Scope A can hold at most 1 chunk (4 KiB), Scope B can hold at most 2 chunks (8 KiB).
+	scopeA := root.NewRequestScope(4, 4<<10).KeepUntilEvicted()
+	defer scopeA.destroy()
+	scopeB := root.NewRequestScope(4, 8<<10).KeepUntilEvicted()
+	defer scopeB.destroy()
+
+	buf := make([]byte, 1)
+	// Scope B reads chunk "b1": cached in root and reserved in scopeB + wholeBudget.
+	if _, err := scopeB.ReadChunkAt(context.Background(), buf, "b1", nil, false, 0, 4<<10, false); err != nil {
+		t.Fatal(err)
+	}
+	// Scope A reads "a1", then "a2": because scopeA's per-request limit is 4 KiB,
+	// reading "a2" must evict "a1" (scopeA's own chunk) and leave "b1" intact!
+	if _, err := scopeA.ReadChunkAt(context.Background(), buf, "a1", nil, false, 0, 4<<10, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scopeA.ReadChunkAt(context.Background(), buf, "a2", nil, false, 0, 4<<10, false); err != nil {
+		t.Fatal(err)
+	}
+
+	root.RLock()
+	_, b1Present := root.downloaders["b1"]
+	_, a1Present := root.downloaders["a1"]
+	_, a2Present := root.downloaders["a2"]
+	root.RUnlock()
+	if !b1Present {
+		t.Fatal("scopeA's per-request eviction evicted scopeB's chunk 'b1'")
+	}
+	if a1Present {
+		t.Fatal("scopeA did not evict its own older chunk 'a1' when exceeding per-request budget")
+	}
+	if !a2Present {
+		t.Fatal("scopeA's newest chunk 'a2' should remain cached")
+	}
+
+	// Scope A reading "b1" must hit the shared whole cache without a new download.
+	beforeFetches := atomic.LoadInt32(&fetchCount)
+	if _, err := scopeA.ReadChunkAt(context.Background(), buf, "b1", nil, false, 0, 4<<10, false); err != nil {
+		t.Fatal(err)
+	}
+	if afterFetches := atomic.LoadInt32(&fetchCount); afterFetches != beforeFetches {
+		t.Fatalf("cross-scope read of 'b1' triggered a download (%d -> %d)", beforeFetches, afterFetches)
+	}
+}

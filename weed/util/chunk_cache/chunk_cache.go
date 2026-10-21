@@ -30,8 +30,10 @@ type ChunkCache interface {
 
 // a global cache for recently accessed file chunks
 type TieredChunkCache struct {
-	memCache   *ChunkCacheInMemory
-	diskCaches []*OnDiskCacheLayer
+	memCache     *ChunkCacheInMemory
+	diskCaches   []*OnDiskCacheLayer
+	sharedDisk   *SharedDiskCacheLayer
+	onCacheChunk func(fileId string)
 	sync.RWMutex
 	onDiskCacheSizeLimit0  uint64
 	onDiskCacheSizeLimit1  uint64
@@ -56,6 +58,34 @@ func NewTieredChunkCache(maxEntries int64, dir string, diskSizeInUnit int64, uni
 	c.maxFilePartSizeInCache = uint64(unitSize*diskSizeInUnit) / 4
 
 	return c
+}
+
+// NewSharedTieredChunkCache creates a TieredChunkCache backed by an atomic, lock-free
+// SharedDiskCacheLayer that can be safely shared across multiple mounts and modalities
+// (FUSE mounts, S3, Filer HTTP, WebDAV) on the same host with both per-scope and whole-cache
+// disk limits.
+func NewSharedTieredChunkCache(maxEntries int64, sharedDir string, scopeID string, scopeSizeInUnit int64, wholeSizeInUnit int64, unitSize int64) *TieredChunkCache {
+	if wholeSizeInUnit < scopeSizeInUnit {
+		wholeSizeInUnit = scopeSizeInUnit
+	}
+	c := &TieredChunkCache{
+		memCache:               NewChunkCacheInMemory(maxEntries),
+		sharedDisk:             NewSharedDiskCacheLayer(sharedDir, scopeID, scopeSizeInUnit*unitSize, wholeSizeInUnit*unitSize),
+		onDiskCacheSizeLimit0:  uint64(unitSize),
+		onDiskCacheSizeLimit1:  4 * uint64(unitSize),
+		onDiskCacheSizeLimit2:  8 * uint64(unitSize),
+		maxFilePartSizeInCache: uint64(unitSize*scopeSizeInUnit) / 4,
+	}
+	return c
+}
+
+func (c *TieredChunkCache) SetOnCacheChunk(fn func(fileId string)) {
+	if c == nil {
+		return
+	}
+	c.Lock()
+	defer c.Unlock()
+	c.onCacheChunk = fn
 }
 
 func (c *TieredChunkCache) GetMaxFilePartSizeInCache() (answer uint64) {
@@ -85,6 +115,10 @@ func (c *TieredChunkCache) IsInCache(fileId string, lockNeeded bool) (answer boo
 	if err != nil {
 		glog.V(4).Infof("failed to parse file id %s", fileId)
 		return false
+	}
+
+	if c.sharedDisk != nil {
+		return c.sharedDisk.hasChunk(fid)
 	}
 
 	// Check disk cache with volume ID and cookie validation
@@ -135,6 +169,10 @@ func (c *TieredChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64
 		return 0, nil
 	}
 
+	if c.sharedDisk != nil {
+		return c.sharedDisk.readChunkAt(data, fid, offset)
+	}
+
 	// Try disk caches with volume ID and cookie validation
 	if minSize <= c.onDiskCacheSizeLimit0 {
 		n, err = c.readChunkAtWithHeaderValidation(data, fid, offset, 0)
@@ -164,15 +202,20 @@ func (c *TieredChunkCache) SetChunk(fileId string, data []byte) {
 		return
 	}
 	c.Lock()
-	defer c.Unlock()
-
 	glog.V(4).Infof("SetChunk %s size %d\n", fileId, len(data))
 	if c.IsInCache(fileId, false) {
 		glog.V(4).Infof("fileId %s is already in cache", fileId)
+		c.Unlock()
 		return
 	}
 
 	c.doSetChunk(fileId, data)
+	onCache := c.onCacheChunk
+	c.Unlock()
+
+	if onCache != nil {
+		onCache(fileId)
+	}
 }
 
 func (c *TieredChunkCache) doSetChunk(fileId string, data []byte) {
@@ -199,6 +242,11 @@ func (c *TieredChunkCache) doSetChunk(fileId string, data []byte) {
 	types.CookieToBytes(headerBytes[4:8], fid.Cookie)
 	dataWithHeader := append(headerBytes, data...)
 
+	if c.sharedDisk != nil {
+		c.sharedDisk.setChunk(fid, dataWithHeader)
+		return
+	}
+
 	// Store with volume ID and cookie header in disk cache
 	if len(data) <= int(c.onDiskCacheSizeLimit0) {
 		c.diskCaches[0].setChunk(fid.Key, dataWithHeader)
@@ -216,6 +264,9 @@ func (c *TieredChunkCache) Shutdown() {
 	}
 	c.Lock()
 	defer c.Unlock()
+	if c.sharedDisk != nil {
+		c.sharedDisk.shutdown()
+	}
 	for _, diskCache := range c.diskCaches {
 		diskCache.shutdown()
 	}

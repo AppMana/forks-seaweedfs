@@ -55,7 +55,9 @@ type Option struct {
 	ReaderCacheMode             filer.ReaderCacheMode
 	ReaderCacheSizeMB           int64
 	CacheDirForRead             string
+	SharedChunkCacheDir         string
 	CacheSizeMBForRead          int64
+	WholeCacheSizeMBForRead     int64
 	CacheDirForWrite            string
 	WriteBufferSizeMB           int64
 	CacheMetaTTlSec             int
@@ -144,6 +146,7 @@ type Option struct {
 
 	uniqueCacheDirForRead  string
 	uniqueCacheDirForWrite string
+	sharedChunkCacheDir    string
 }
 
 type inodeNotifier interface {
@@ -161,6 +164,7 @@ type WFS struct {
 	stats                 statsCache
 	chunkCache            *chunk_cache.TieredChunkCache
 	readerCacheBudget     *filer.ReaderCacheBudget
+	readerCache           *filer.ReaderCache
 	manifestCache         *filer.ChunkManifestCache
 	writeBufferAccountant *page_writer.WriteBufferAccountant
 	signature             int32
@@ -331,8 +335,37 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 	wfs.option.filerIndex = int32(rand.IntN(len(option.FilerAddresses)))
 	wfs.option.setupUniqueCacheDirectory()
 	if option.CacheSizeMBForRead > 0 {
-		wfs.chunkCache = chunk_cache.NewTieredChunkCache(256, option.getUniqueCacheDirForRead(), option.CacheSizeMBForRead, 1024*1024)
+		wholeCacheMB := option.WholeCacheSizeMBForRead
+		if wholeCacheMB <= 0 {
+			wholeCacheMB = max(option.CacheSizeMBForRead*4, 16384)
+			if option.CacheSizeMBForRead < 64 {
+				wholeCacheMB = option.CacheSizeMBForRead * 2
+			}
+		}
+		scopeID := option.FilerMountRootPath
+		if scopeID == "" || scopeID == "/" {
+			scopeID = option.MountDirectory
+		}
+		wfs.chunkCache = chunk_cache.NewSharedTieredChunkCache(
+			256,
+			option.getSharedChunkCacheDir(),
+			scopeID,
+			option.CacheSizeMBForRead,
+			wholeCacheMB,
+			1024*1024,
+		)
 	}
+	wholeReaderLimit := option.ConcurrentReaders * 2
+	if wholeReaderLimit < 32 {
+		wholeReaderLimit = 32
+	}
+	wfs.readerCache = filer.NewReaderCache(
+		wholeReaderLimit,
+		wfs.chunkCache,
+		wfs.LookupFn(),
+		wfs.CacheInvalidator(),
+		wfs.readerCacheBudget,
+	)
 	if option.WriteBufferSizeMB > 0 {
 		wfs.writeBufferAccountant = page_writer.NewWriteBufferAccountant(option.WriteBufferSizeMB * 1024 * 1024)
 		wfs.writeBufferAccountant.SetEvictor(wfs.evictOneWritableChunk)
@@ -481,6 +514,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 					wfs.peerAnnouncer.SetCachePresence(func(fid string) bool {
 						return cache.IsInCache(fid, true)
 					})
+					wfs.chunkCache.SetOnCacheChunk(wfs.peerAnnouncer.EnqueueAnnounce)
 				}
 				wfs.peerAnnouncer.Start()
 			}
@@ -1308,6 +1342,36 @@ func (option *Option) setupUniqueCacheDirectory() {
 	os.MkdirAll(option.uniqueCacheDirForRead, os.FileMode(0777)&^option.Umask)
 	option.uniqueCacheDirForWrite = filepath.Join(path.Join(option.CacheDirForWrite, cacheUniqueId), "swap")
 	os.MkdirAll(option.uniqueCacheDirForWrite, os.FileMode(0777)&^option.Umask)
+
+	sharedDir := option.SharedChunkCacheDir
+	if sharedDir == "" && option.CacheDirForRead != "" {
+		cleanReadDir := filepath.Clean(option.CacheDirForRead)
+		base := filepath.Base(cleanReadDir)
+		if filepath.Base(filepath.Dir(cleanReadDir)) == "volumes" {
+			sharedDir = filepath.Join(filepath.Dir(filepath.Dir(cleanReadDir)), "chunks")
+		} else if isHexHashDir(base) {
+			sharedDir = filepath.Join(filepath.Dir(cleanReadDir), "chunks")
+		} else {
+			sharedDir = filepath.Join(cleanReadDir, "chunks")
+		}
+	}
+	option.sharedChunkCacheDir = sharedDir
+	if option.sharedChunkCacheDir != "" {
+		os.MkdirAll(option.sharedChunkCacheDir, os.FileMode(0777)&^option.Umask)
+	}
+}
+
+func isHexHashDir(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (option *Option) getUniqueCacheDirForWrite() string {
@@ -1315,5 +1379,12 @@ func (option *Option) getUniqueCacheDirForWrite() string {
 }
 
 func (option *Option) getUniqueCacheDirForRead() string {
+	return option.uniqueCacheDirForRead
+}
+
+func (option *Option) getSharedChunkCacheDir() string {
+	if option.sharedChunkCacheDir != "" {
+		return option.sharedChunkCacheDir
+	}
 	return option.uniqueCacheDirForRead
 }

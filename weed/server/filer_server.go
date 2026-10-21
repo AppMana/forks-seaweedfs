@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -101,6 +103,12 @@ type FilerOption struct {
 	// RemoteCacheEvictThreshold is the disk usage fraction at which the filer
 	// evicts remote-mounted cached chunks; 0 disables eviction.
 	RemoteCacheEvictThreshold float64
+
+	// Nearside read cache options shared across Filer HTTP, embedded S3, and embedded WebDAV.
+	CacheDirForRead         string
+	CacheSizeMBForRead      int64
+	WholeCacheSizeMBForRead int64
+	ReaderCacheSizeMB       int64
 }
 
 type FilerServer struct {
@@ -110,11 +118,14 @@ type FilerServer struct {
 	inFlightDataLimitCond *sync.Cond
 
 	filer_pb.UnimplementedSeaweedFilerServer
-	option         *FilerOption
-	filer          *filer.Filer
-	filerGuard     *security.Guard
-	volumeGuard    *security.Guard
-	grpcDialOption grpc.DialOption
+	option            *FilerOption
+	filer             *filer.Filer
+	filerGuard        *security.Guard
+	volumeGuard       *security.Guard
+	grpcDialOption    grpc.DialOption
+	chunkCache        chunk_cache.ChunkCache
+	readerCacheBudget *filer.ReaderCacheBudget
+	readerCache       *filer.ReaderCache
 
 	// metrics read from the master
 	metricsAddress     string
@@ -282,6 +293,31 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	}
 	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec)
+
+	if option.CacheSizeMBForRead > 0 {
+		maxEntries := max(option.CacheSizeMBForRead/4, int64(64))
+		if option.CacheDirForRead != "" {
+			wholeCacheMB := option.WholeCacheSizeMBForRead
+			if wholeCacheMB <= 0 {
+				wholeCacheMB = max(option.CacheSizeMBForRead*4, int64(16384))
+				if option.CacheSizeMBForRead < 64 {
+					wholeCacheMB = option.CacheSizeMBForRead * 2
+				}
+			}
+			sharedChunksDir := filepath.Join(option.CacheDirForRead, "chunks")
+			fs.chunkCache = chunk_cache.NewSharedTieredChunkCache(maxEntries, sharedChunksDir, "filer", option.CacheSizeMBForRead, wholeCacheMB, 1024*1024)
+			glog.V(0).Infof("filer nearside chunk cache enabled: shared disk (%s, scope=%dMB, whole=%dMB) + in-memory (%d chunks)", sharedChunksDir, option.CacheSizeMBForRead, wholeCacheMB, maxEntries)
+		} else {
+			fs.chunkCache = chunk_cache.NewChunkCacheInMemory(maxEntries)
+			glog.V(0).Infof("filer nearside chunk cache enabled: in-memory (%d chunks)", maxEntries)
+		}
+	} else {
+		fs.chunkCache = (*chunk_cache.TieredChunkCache)(nil)
+	}
+	if option.ReaderCacheSizeMB > 0 {
+		fs.readerCacheBudget = filer.NewReaderCacheBudget(option.ReaderCacheSizeMB << 20)
+	}
+	fs.readerCache = filer.NewReaderCache(256, fs.chunkCache, fs.filer.MasterClient.GetLookupFileIdFunction(), fs.filer.MasterClient, fs.readerCacheBudget)
 
 	fs.checkWithMaster()
 
@@ -613,4 +649,25 @@ func (fs *FilerServer) Reload() {
 		v.GetInt("jwt.signing.read.expires_after_seconds"),
 	)
 	util_http.ReloadJwtSigningReadConfig()
+}
+
+func (fs *FilerServer) ChunkCache() chunk_cache.ChunkCache {
+	if fs == nil {
+		return nil
+	}
+	return fs.chunkCache
+}
+
+func (fs *FilerServer) ReaderCacheBudget() *filer.ReaderCacheBudget {
+	if fs == nil {
+		return nil
+	}
+	return fs.readerCacheBudget
+}
+
+func (fs *FilerServer) ReaderCache() *filer.ReaderCache {
+	if fs == nil {
+		return nil
+	}
+	return fs.readerCache
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -73,7 +74,13 @@ type S3ApiServerOption struct {
 	GrpcPort                  int
 	ExternalUrl               string // external URL clients use, tried first during signature verification behind a reverse proxy
 	DefaultFileMode           uint32 // default file permission mode for S3 uploads (e.g. 0660, 0644)
-	CacheSizeMB               int64  // in-memory chunk cache capacity in MB for the shared ReaderCache; 0 disables
+	CacheDir                  string // optional on-disk directory for shared nearside chunk caching across modalities
+	CacheSizeMB               int64  // chunk cache capacity in MB for the shared ReaderCache; 0 disables
+	WholeCacheSizeMB          int64  // whole-cache on-disk quota in MB across all modalities sharing CacheDir
+	SessionReaderCacheSizeMB  int64  // per-request / per-session memory budget in MiB for an individual S3 GET stream
+	SharedChunkCache          chunk_cache.ChunkCache
+	SharedReaderCacheBudget   *filer.ReaderCacheBudget
+	SharedReaderCache         *filer.ReaderCache
 	// SurfaceEmptyDirectories makes a listing whose prefix ends in "/" report a
 	// real but empty directory as a zero-byte directory marker, so clients that
 	// probe "<dir>/" to test existence (hadoop-aws getFileStatus, Spark) can see
@@ -330,8 +337,13 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	if option.CacheSizeMB < 0 {
 		return nil, fmt.Errorf("invalid -s3.cacheCapacityMB %d: must be >= 0", option.CacheSizeMB)
 	}
+	if option.ReaderCacheSizeMB < 0 || option.ReaderCacheSizeMB > math.MaxInt64>>20 {
+		return nil, fmt.Errorf("invalid readerCacheSizeMB %d: must be non-negative and fit in an int64 byte budget", option.ReaderCacheSizeMB)
+	}
 	var chunkCache chunk_cache.ChunkCache
-	if option.CacheSizeMB > 0 {
+	if option.SharedChunkCache != nil {
+		chunkCache = option.SharedChunkCache
+	} else if option.CacheSizeMB > 0 {
 		// ccache sizes entries by count; convert the configured byte budget
 		// via the assumed chunk size. Clamp to a floor so tiny caches still
 		// function.
@@ -339,22 +351,32 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		if maxEntries < 8 {
 			maxEntries = 8
 		}
-		chunkCache = chunk_cache.NewChunkCacheInMemory(maxEntries)
-		// Log the effective capacity after the floor clamp, not the configured
-		// value — a user passing `-s3.cacheCapacityMB=1` actually gets 8 entries
-		// ≈ 32 MiB because of the floor.
-		glog.V(0).Infof("s3 chunk cache enabled: in-memory, ~%dMB (%d chunks of ~%dMB)", maxEntries*s3ChunkCacheChunkSizeMB, maxEntries, s3ChunkCacheChunkSizeMB)
+		if option.CacheDir != "" {
+			wholeCacheMB := option.WholeCacheSizeMB
+			if wholeCacheMB <= 0 {
+				wholeCacheMB = max(option.CacheSizeMB*4, 16384)
+				if option.CacheSizeMB < 64 {
+					wholeCacheMB = option.CacheSizeMB * 2
+				}
+			}
+			sharedChunksDir := filepath.Join(option.CacheDir, "chunks")
+			chunkCache = chunk_cache.NewSharedTieredChunkCache(maxEntries, sharedChunksDir, "s3", option.CacheSizeMB, wholeCacheMB, 1024*1024)
+			glog.V(0).Infof("s3 nearside chunk cache enabled: shared disk (%s, scope=%dMB, whole=%dMB) + in-memory (%d chunks)", sharedChunksDir, option.CacheSizeMB, wholeCacheMB, maxEntries)
+		} else {
+			chunkCache = chunk_cache.NewChunkCacheInMemory(maxEntries)
+			glog.V(0).Infof("s3 chunk cache enabled: in-memory, ~%dMB (%d chunks of ~%dMB)", maxEntries*s3ChunkCacheChunkSizeMB, maxEntries, s3ChunkCacheChunkSizeMB)
+		}
 	} else {
 		chunkCache = (*chunk_cache.TieredChunkCache)(nil)
 	}
-	if option.ReaderCacheSizeMB < 0 || option.ReaderCacheSizeMB > math.MaxInt64>>20 {
-		return nil, fmt.Errorf("invalid readerCacheSizeMB %d: must be non-negative and fit in an int64 byte budget", option.ReaderCacheSizeMB)
-	}
-	var readerCacheBudget *filer.ReaderCacheBudget
-	if option.ReaderCacheSizeMB > 0 {
+	readerCacheBudget := option.SharedReaderCacheBudget
+	if readerCacheBudget == nil && option.ReaderCacheSizeMB > 0 {
 		readerCacheBudget = filer.NewReaderCacheBudget(option.ReaderCacheSizeMB << 20)
 	}
-	readerCache := filer.NewReaderCache(s3ReaderCacheDownloaderLimit, chunkCache, filerClient.GetLookupFileIdFunction(), filerClient, readerCacheBudget)
+	readerCache := option.SharedReaderCache
+	if readerCache == nil {
+		readerCache = filer.NewReaderCache(s3ReaderCacheDownloaderLimit, chunkCache, filerClient.GetLookupFileIdFunction(), filerClient, readerCacheBudget)
+	}
 
 	s3ApiServer = &S3ApiServer{
 		option:                option,

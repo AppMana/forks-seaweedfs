@@ -91,6 +91,10 @@ type FilerOptions struct {
 
 	allowUntrustedRemoteEndpoints *bool
 	remoteCacheEvictThreshold     *float64
+	cacheDirForRead               *string
+	cacheSizeMB                   *int64
+	wholeCacheSizeMB              *int64
+	readerCacheSizeMB             *int64
 	// shutdownCtx, when non-nil, tells startFiler to gracefully shut down its
 	// HTTP/gRPC servers once the ctx is cancelled. Used by integration tests
 	// and by weed mini; nil for standalone weed filer.
@@ -137,6 +141,10 @@ func init() {
 	f.tusSessionExpiry = cmdFiler.Flag.Duration("tusSessionExpiry", 24*time.Hour, "incomplete TUS upload sessions are cleaned up after this duration, e.g. \"48h\", \"7h30m\"")
 	f.allowUntrustedRemoteEndpoints = cmdFiler.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	f.remoteCacheEvictThreshold = cmdFiler.Flag.Float64("remoteCacheEvictThreshold", 0.9, "evict remote-cached objects (oldest first) when any volume disk exceeds this usage fraction; 0 disables")
+	f.cacheDirForRead = cmdFiler.Flag.String("cacheDirForRead", "", "shared on-disk nearside chunk cache directory across Filer HTTP, embedded S3, WebDAV, and mounts")
+	f.cacheSizeMB = cmdFiler.Flag.Int64("cacheCapacityMB", 0, "nearside chunk cache capacity in MB for Filer/S3/WebDAV reads (0 disables)")
+	f.wholeCacheSizeMB = cmdFiler.Flag.Int64("wholeCacheCapacityMB", 0, "whole-node shared on-disk chunk cache capacity in MB across all modalities")
+	f.readerCacheSizeMB = cmdFiler.Flag.Int64("readerCacheSizeMB", 0, "whole-process memory budget in MiB for downloaded and in-flight reader buffers across Filer/S3/WebDAV")
 
 	// start s3 on filer
 	filerStartS3 = cmdFiler.Flag.Bool("s3", false, "whether to start S3 gateway")
@@ -171,8 +179,11 @@ func init() {
 	filerS3Options.portLance = cmdFiler.Flag.Int("s3.port.lance", 9101, "Lance Namespace server listen port (0 to disable)")
 	filerS3Options.externalUrl = cmdFiler.Flag.String("s3.externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	filerS3Options.defaultFileMode = cmdFiler.Flag.String("s3.defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
-	filerS3Options.cacheSizeMB = cmdFiler.Flag.Int64("s3.cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	filerS3Options.cacheDir = cmdFiler.Flag.String("s3.cacheDir", "", "shared on-disk nearside chunk cache directory for S3 GETs")
+	filerS3Options.cacheSizeMB = cmdFiler.Flag.Int64("s3.cacheCapacityMB", 0, "chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	filerS3Options.wholeCacheSizeMB = cmdFiler.Flag.Int64("s3.wholeCacheCapacityMB", 0, "whole-node shared on-disk chunk cache capacity in MB across all modalities")
 	filerS3Options.readerCacheSizeMB = cmdFiler.Flag.Int64("s3.readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
+	filerS3Options.sessionReaderCacheSizeMB = cmdFiler.Flag.Int64("s3.sessionReaderCacheSizeMB", 0, "per-request/session memory budget in MiB for an individual S3 GET stream")
 	filerS3Options.allowUntrustedRemoteEndpoints = cmdFiler.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 
 	// start webdav on filer
@@ -384,6 +395,23 @@ func (fo *FilerOptions) startFiler() {
 	}
 
 	announce := make(chan struct{})
+	cacheDirForRead := peerStringOrEmpty(fo.cacheDirForRead)
+	if cacheDirForRead == "" && filerS3Options.cacheDir != nil && *filerS3Options.cacheDir != "" {
+		cacheDirForRead = *filerS3Options.cacheDir
+	}
+	cacheSizeMBForRead := wholeCacheSizeOrZero(fo.cacheSizeMB)
+	if filerS3Options.cacheSizeMB != nil && *filerS3Options.cacheSizeMB > cacheSizeMBForRead {
+		cacheSizeMBForRead = *filerS3Options.cacheSizeMB
+	}
+	wholeCacheSizeMB := wholeCacheSizeOrZero(fo.wholeCacheSizeMB)
+	if filerS3Options.wholeCacheSizeMB != nil && *filerS3Options.wholeCacheSizeMB > wholeCacheSizeMB {
+		wholeCacheSizeMB = *filerS3Options.wholeCacheSizeMB
+	}
+	readerCacheSizeMB := wholeCacheSizeOrZero(fo.readerCacheSizeMB)
+	if filerS3Options.readerCacheSizeMB != nil && *filerS3Options.readerCacheSizeMB > readerCacheSizeMB {
+		readerCacheSizeMB = *filerS3Options.readerCacheSizeMB
+	}
+
 	fs, nfs_err := weed_server.NewFilerServer(defaultMux, publicVolumeMux, &weed_server.FilerOption{
 		Masters:                   fo.masters,
 		AnnounceCh:                announce,
@@ -414,9 +442,21 @@ func (fo *FilerOptions) startFiler() {
 
 		AllowUntrustedRemoteEndpoints: *fo.allowUntrustedRemoteEndpoints,
 		RemoteCacheEvictThreshold:     *fo.remoteCacheEvictThreshold,
+		CacheDirForRead:               cacheDirForRead,
+		CacheSizeMBForRead:            cacheSizeMBForRead,
+		WholeCacheSizeMBForRead:       wholeCacheSizeMB,
+		ReaderCacheSizeMB:             readerCacheSizeMB,
 	})
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)
+	}
+	if cacheSizeMBForRead > 0 || readerCacheSizeMB > 0 {
+		filerS3Options.sharedChunkCache = fs.ChunkCache()
+		filerS3Options.sharedReaderCacheBudget = fs.ReaderCacheBudget()
+		filerS3Options.sharedReaderCache = fs.ReaderCache()
+		filerWebDavOptions.sharedChunkCache = fs.ChunkCache()
+		filerWebDavOptions.sharedReaderCacheBudget = fs.ReaderCacheBudget()
+		filerWebDavOptions.sharedReaderCache = fs.ReaderCache()
 	}
 
 	// Serve "//" and ".." paths at their cleaned form instead of letting the mux

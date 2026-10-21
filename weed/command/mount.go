@@ -30,8 +30,10 @@ type MountOptions struct {
 	cacheMetaTtlSec      *int
 	cacheDirMaxEntries   *int
 	cacheDirForRead      *string
+	sharedChunkCacheDir  *string
 	cacheDirForWrite     *string
 	cacheSizeMBForRead   *int64
+	wholeCacheSizeMB     *int64
 	writeBufferSizeMB    *int64
 	dataCenter           *string
 	allowOthers          *bool
@@ -124,7 +126,9 @@ func init() {
 	mountOptions.memoryLimitMB = cmdMount.Flag.Int64("memoryLimitMB", 0, "soft Go runtime memory limit in MiB; 0 preserves GOMEMLIMIT; leave headroom below the container limit")
 	mountOptions.readerCacheSizeMB = cmdMount.Flag.Int64("readerCacheSizeMB", 256, "memory budget in MiB for downloaded and in-flight reader buffers across all files; must fit the largest pooled chunk buffer")
 	mountOptions.cacheDirForRead = cmdMount.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks and meta data")
-	mountOptions.cacheSizeMBForRead = cmdMount.Flag.Int64("cacheCapacityMB", 128, "file chunk read cache capacity in MB")
+	mountOptions.sharedChunkCacheDir = cmdMount.Flag.String("sharedChunkCacheDir", "", "shared node-wide directory for read chunk caching across mounts and modalities (defaults to <cacheDir>/chunks)")
+	mountOptions.cacheSizeMBForRead = cmdMount.Flag.Int64("cacheCapacityMB", 128, "per-mount file chunk read cache capacity in MB")
+	mountOptions.wholeCacheSizeMB = cmdMount.Flag.Int64("wholeCacheCapacityMB", 0, "whole-node shared file chunk read cache capacity in MB across all mounts and modalities (0 defaults to max(4*cacheCapacityMB, 16384))")
 	mountOptions.cacheDirForWrite = cmdMount.Flag.String("cacheDirWrite", "", "buffer writes mostly for large files")
 	mountOptions.writeBufferSizeMB = cmdMount.Flag.Int64("writeBufferSizeMB", 0, "global cap on the per-mount write buffer (memory + swap) in MB, 0 means unlimited. Bounds /tmp growth when volume uploads stall")
 	mountOptions.cacheMetaTtlSec = cmdMount.Flag.Int("cacheMetaTtlSec", 60, "metadata cache validity seconds")

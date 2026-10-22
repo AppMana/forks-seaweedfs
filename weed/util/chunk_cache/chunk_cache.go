@@ -152,6 +152,9 @@ func (c *TieredChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64
 	c.RLock()
 	defer c.RUnlock()
 
+	if offset > ^uint64(0)-uint64(len(data)) {
+		return 0, ErrorOutOfBounds
+	}
 	minSize := offset + uint64(len(data))
 	if minSize <= c.onDiskCacheSizeLimit0 {
 		n, err = c.memCache.readChunkAt(data, fileId, offset)

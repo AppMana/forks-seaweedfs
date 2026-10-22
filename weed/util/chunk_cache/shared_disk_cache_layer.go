@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,24 @@ func (l *SharedDiskCacheLayer) chunkFullPath(fid *needle.FileId) string {
 	return filepath.Join(l.dir, l.chunkRelPath(fid))
 }
 
+// Only the canonical files emitted by this cache belong to its eviction domain.
+// In particular, legacy indexed cache volumes must never be treated as chunks.
+func isManagedChunkPath(shard, name string) bool {
+	if !strings.HasSuffix(name, ".dat") {
+		return false
+	}
+	parts := strings.Split(strings.TrimSuffix(name, ".dat"), "_")
+	if len(parts) != 3 {
+		return false
+	}
+	volume, e1 := strconv.ParseUint(parts[0], 10, 32)
+	key, e2 := strconv.ParseUint(parts[1], 16, 64)
+	cookie, e3 := strconv.ParseUint(parts[2], 16, 32)
+	return e1 == nil && e2 == nil && e3 == nil &&
+		shard == fmt.Sprintf("%02x", uint8(key)) &&
+		name == fmt.Sprintf("%d_%x_%x.dat", volume, key, cookie)
+}
+
 func (l *SharedDiskCacheLayer) hasChunk(fid *needle.FileId) bool {
 	fullPath := l.chunkFullPath(fid)
 	f, err := os.Open(fullPath)
@@ -119,9 +138,12 @@ func (l *SharedDiskCacheLayer) readChunkAt(buffer []byte, fid *needle.FileId, of
 		return 0, nil
 	}
 
-	wanted := min(len(buffer), int(payloadSize)-int(offset))
-	if wanted < 0 {
+	if offset > uint64(payloadSize) {
 		return 0, ErrorOutOfBounds
+	}
+	wanted := len(buffer)
+	if remaining := uint64(payloadSize) - offset; remaining < uint64(wanted) {
+		wanted = int(remaining)
 	}
 	readOffset := int64(cacheHeaderSize) + int64(offset)
 	n, err = f.ReadAt(buffer[:wanted], readOffset)
@@ -160,7 +182,7 @@ func (l *SharedDiskCacheLayer) setChunk(fid *needle.FileId, dataWithHeader []byt
 
 	// If another process already wrote the exact chunk, adopt/touch it without
 	// rewriting the bytes on disk.
-	if st, err := os.Stat(fullPath); err == nil && st.Size() == size {
+	if st, err := os.Stat(fullPath); err == nil && st.Size() == size && l.hasChunk(fid) {
 		now := time.Now()
 		_ = os.Chtimes(fullPath, now, now)
 		l.recordScopeEntry(relPath, size, now, false)
@@ -265,13 +287,13 @@ func (l *SharedDiskCacheLayer) scanWholeCacheLocked() {
 				continue
 			}
 			name := e.Name()
-			if strings.Contains(name, ".tmp.") {
+			if stem, _, temporary := strings.Cut(name, ".tmp."); temporary && isManagedChunkPath(shard.Name(), stem) {
 				if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > 5*time.Minute {
 					_ = os.Remove(filepath.Join(shardPath, name))
 				}
 				continue
 			}
-			if !strings.HasSuffix(name, ".dat") {
+			if !isManagedChunkPath(shard.Name(), name) {
 				continue
 			}
 			if info, err := e.Info(); err == nil {
@@ -305,7 +327,7 @@ func (l *SharedDiskCacheLayer) evictWholeCacheLocked(targetBytes int64) {
 			continue
 		}
 		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".dat") {
+			if e.IsDir() || !isManagedChunkPath(shard.Name(), e.Name()) {
 				continue
 			}
 			info, err := e.Info()

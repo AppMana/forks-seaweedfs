@@ -58,10 +58,10 @@ func (c *ChunkCacheInMemory) readChunkAt(buffer []byte, fileId string, offset ui
 	}
 	data := item.Value().([]byte)
 	item.Extend(time.Hour)
-	wanted := min(len(buffer), len(data)-int(offset))
-	if wanted < 0 {
+	if offset > uint64(len(data)) {
 		return 0, ErrorOutOfBounds
 	}
+	wanted := min(len(buffer), len(data)-int(offset))
 	n := copy(buffer, data[offset:int(offset)+wanted])
 	return n, nil
 }

@@ -14,6 +14,7 @@ var Commands = []*Command{
 	cmdUnautocomplete,
 	cmdBackup,
 	cmdBenchmark,
+	cmdCacheMigrate,
 	cmdCompact,
 	cmdDownload,
 	cmdExport,

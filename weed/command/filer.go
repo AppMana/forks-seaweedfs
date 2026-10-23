@@ -95,6 +95,7 @@ type FilerOptions struct {
 	cacheSizeMB                   *int64
 	wholeCacheSizeMB              *int64
 	readerCacheSizeMB             *int64
+	sessionReaderCacheSizeMB      *int64
 	// shutdownCtx, when non-nil, tells startFiler to gracefully shut down its
 	// HTTP/gRPC servers once the ctx is cancelled. Used by integration tests
 	// and by weed mini; nil for standalone weed filer.
@@ -145,6 +146,7 @@ func init() {
 	f.cacheSizeMB = cmdFiler.Flag.Int64("cacheCapacityMB", 0, "nearside chunk cache capacity in MB for Filer/S3/WebDAV reads (0 disables)")
 	f.wholeCacheSizeMB = cmdFiler.Flag.Int64("wholeCacheCapacityMB", 0, "whole-node shared on-disk chunk cache capacity in MB across all modalities")
 	f.readerCacheSizeMB = cmdFiler.Flag.Int64("readerCacheSizeMB", 0, "whole-process memory budget in MiB for downloaded and in-flight reader buffers across Filer/S3/WebDAV")
+	f.sessionReaderCacheSizeMB = cmdFiler.Flag.Int64("sessionReaderCacheSizeMB", 0, "per-request Filer HTTP reader memory budget in MiB (0 derives from the whole-process budget)")
 
 	// start s3 on filer
 	filerStartS3 = cmdFiler.Flag.Bool("s3", false, "whether to start S3 gateway")
@@ -446,14 +448,17 @@ func (fo *FilerOptions) startFiler() {
 		CacheSizeMBForRead:            cacheSizeMBForRead,
 		WholeCacheSizeMBForRead:       wholeCacheSizeMB,
 		ReaderCacheSizeMB:             readerCacheSizeMB,
+		SessionReaderCacheSizeMB:      wholeCacheSizeOrZero(fo.sessionReaderCacheSizeMB),
 	})
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)
 	}
 	if cacheSizeMBForRead > 0 || readerCacheSizeMB > 0 {
-		filerS3Options.sharedChunkCache = fs.ChunkCache()
 		filerS3Options.sharedReaderCacheBudget = fs.ReaderCacheBudget()
-		filerS3Options.sharedReaderCache = fs.ReaderCache()
+		if !configureEmbeddedS3Scope(&filerS3Options, cacheDirForRead, wholeCacheSizeMB) {
+			filerS3Options.sharedChunkCache = fs.ChunkCache()
+			filerS3Options.sharedReaderCache = fs.ReaderCache()
+		}
 		filerWebDavOptions.sharedChunkCache = fs.ChunkCache()
 		filerWebDavOptions.sharedReaderCacheBudget = fs.ReaderCacheBudget()
 		filerWebDavOptions.sharedReaderCache = fs.ReaderCache()

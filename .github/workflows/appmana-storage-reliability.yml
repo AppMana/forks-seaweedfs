@@ -50,7 +50,9 @@ jobs:
   large-disk-regressions:
     # 22.04's Bubblewrap lacks --size; never drop the bounded-tmpfs guard.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Cold builds plus sequential isolated process tests can exhaust 30 minutes.
+    # Keep the individual test deadlines; allow the full gate to finish.
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: seaweedfs

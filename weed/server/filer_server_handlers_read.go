@@ -291,11 +291,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 				return nil, err
 			}
 			chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, offset, size)
-			sessionBudgetBytes := int64(64 << 20)
-			if fs.option.ReaderCacheSizeMB > 0 {
-				wholeBytes := fs.option.ReaderCacheSizeMB << 20
-				sessionBudgetBytes = min(max(wholeBytes/4, int64(32<<20)), wholeBytes)
-			}
+			sessionBudgetBytes := filerSessionReaderBudget(fs.option.ReaderCacheSizeMB, fs.option.SessionReaderCacheSizeMB)
 			reqReaderCache := fs.readerCache.NewRequestScope(32, sessionBudgetBytes)
 			reader := filer.NewChunkReaderAtFromClient(streamCtx, reqReaderCache, chunkViews, totalSize, filer.DefaultPrefetchCount)
 			return func(writer io.Writer) error {

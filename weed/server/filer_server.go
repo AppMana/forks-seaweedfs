@@ -105,10 +105,11 @@ type FilerOption struct {
 	RemoteCacheEvictThreshold float64
 
 	// Nearside read cache options shared across Filer HTTP, embedded S3, and embedded WebDAV.
-	CacheDirForRead         string
-	CacheSizeMBForRead      int64
-	WholeCacheSizeMBForRead int64
-	ReaderCacheSizeMB       int64
+	CacheDirForRead          string
+	CacheSizeMBForRead       int64
+	WholeCacheSizeMBForRead  int64
+	ReaderCacheSizeMB        int64
+	SessionReaderCacheSizeMB int64
 }
 
 type FilerServer struct {

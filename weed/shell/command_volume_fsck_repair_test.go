@@ -3,6 +3,7 @@ package shell
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -158,5 +159,48 @@ func TestFsckRepairFailsOnWriteError(t *testing.T) {
 	}
 	if _, _, err := c.repairMissingFromReplicas(volumes); err == nil {
 		t.Fatal("a failed repair write must fail the run")
+	}
+}
+
+// Each replica index is an in-memory LevelDB with its own goroutines and
+// write buffer. A whole-cluster repair walks ~1300 volumes; holding every
+// volume's indexes until the run ends exhausted a 4 GiB job on 2026-10-23.
+// A volume's indexes must be closed before the next volume's are loaded.
+func TestFsckRepairReleasesEachVolumeIndexesBeforeTheNext(t *testing.T) {
+	tempFolder := t.TempDir()
+	volumes := map[string]map[uint32]VInfo{"dnA": {}, "dnB": {}}
+	const count = 20
+	for vid := uint32(1); vid <= count; vid++ {
+		writeReplicaIdx(t, tempFolder, "dnA", vid, 1, 2)
+		writeReplicaIdx(t, tempFolder, "dnB", vid, 1)
+		writeFilerRefs(t, tempFolder, vid, map[string]uint64{"/buckets/b/two": 2})
+		volumes["dnA"][vid] = VInfo{server: "a:8080", collection: "b"}
+		volumes["dnB"][vid] = VInfo{server: "b:8080", collection: "b"}
+	}
+
+	goroutines := map[uint32]int{}
+	verbose := false
+	c := &commandVolumeFsck{
+		writer:     &bytes.Buffer{},
+		tempFolder: tempFolder,
+		verbose:    &verbose,
+		readNeedleBlob: func(_ pb.ServerAddress, vid uint32, _ needle_map.NeedleValue) ([]byte, error) {
+			goroutines[vid] = runtime.NumGoroutine()
+			return []byte("blob"), nil
+		},
+		writeNeedleBlobIfAbsent: func(pb.ServerAddress, uint32, needle_map.NeedleValue, []byte) error {
+			return nil
+		},
+	}
+	repaired, _, err := c.repairMissingFromReplicas(volumes)
+	if err != nil || repaired != count {
+		t.Fatalf("repaired %d, err %v", repaired, err)
+	}
+	// An open index runs six goroutines. A closed one keeps only its pool
+	// drainer, for up to a second after Close, so each finished volume may
+	// leave at most one per replica.
+	if growth := goroutines[count] - goroutines[1]; growth > 2*(count-1) {
+		t.Fatalf("goroutines while repairing volume 1: %d, volume %d: %d; earlier volumes' indexes are still open",
+			goroutines[1], count, goroutines[count])
 	}
 }

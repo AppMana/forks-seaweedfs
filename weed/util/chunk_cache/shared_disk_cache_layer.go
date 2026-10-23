@@ -86,7 +86,7 @@ func isManagedChunkPath(shard, name string) bool {
 	key, e2 := strconv.ParseUint(parts[1], 16, 64)
 	cookie, e3 := strconv.ParseUint(parts[2], 16, 32)
 	return e1 == nil && e2 == nil && e3 == nil &&
-		shard == fmt.Sprintf("%02x", uint8(key)) &&
+		shard == fmt.Sprintf("%02x", key&0xff) &&
 		name == fmt.Sprintf("%d_%x_%x.dat", volume, key, cookie)
 }
 

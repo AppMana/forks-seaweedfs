@@ -22,7 +22,7 @@ import (
 // cannot establish once a replica has been compacted. Writes go through
 // WriteNeedleBlobIfAbsent, which refuses any existing entry, tombstones
 // included, so nothing is overwritten or undeleted.
-func (c *commandVolumeFsck) repairMissingFromReplicas(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo) (repaired, lost int, err error) {
+func (c *commandVolumeFsck) repairMissingFromReplicas(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, refsFile func(tempFolder string, vid uint32) string) (repaired, lost int, err error) {
 	byVolume := make(map[uint32][]fsckReplica)
 	for dataNodeId, volumes := range dataNodeVolumeIdToVInfo {
 		for vid, info := range volumes {
@@ -36,7 +36,7 @@ func (c *commandVolumeFsck) repairMissingFromReplicas(dataNodeVolumeIdToVInfo ma
 	sort.Slice(vids, func(i, j int) bool { return vids[i] < vids[j] })
 
 	for _, vid := range vids {
-		volumeRepaired, volumeLost, volumeErr := c.repairVolumeFromReplicas(vid, byVolume[vid])
+		volumeRepaired, volumeLost, volumeErr := c.repairVolumeFromReplicas(vid, byVolume[vid], refsFile)
 		repaired += volumeRepaired
 		lost += volumeLost
 		if volumeErr != nil {
@@ -54,7 +54,7 @@ type fsckReplica struct {
 // repairVolumeFromReplicas repairs one volume. Its replica indexes are closed
 // on return, before the next volume's are loaded: a whole-cluster run walks
 // every volume, and each index is an in-memory LevelDB.
-func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsckReplica) (repaired, lost int, err error) {
+func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsckReplica, refsFile func(tempFolder string, vid uint32) string) (repaired, lost int, err error) {
 	sort.Slice(replicas, func(i, j int) bool { return replicas[i].dataNodeId < replicas[j].dataNodeId })
 	if replicas[0].info.isEcVolume {
 		fmt.Fprintf(c.writer, "volume %d is erasure coded; not repairing\n", vid)
@@ -68,7 +68,7 @@ func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsck
 			return repaired, lost, fmt.Errorf("load volume %d index of %s: %w", vid, r.dataNodeId, err)
 		}
 	}
-	err = c.readFilerFileIdFile(vid, func(needleId types.NeedleId, itemPath util.FullPath) error {
+	err = c.readFidFile(refsFile, vid, func(needleId types.NeedleId, itemPath util.FullPath) error {
 		var source *needle_map.NeedleValue
 		var sourceServer pb.ServerAddress
 		var lacking []int

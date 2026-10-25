@@ -78,6 +78,7 @@ type commandVolumeFsck struct {
 	// Repair transport for -repairMissingFromReplicas; tests replace it.
 	readNeedleBlob          func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue) ([]byte, error)
 	writeNeedleBlobIfAbsent func(server pb.ServerAddress, volumeId uint32, n needle_map.NeedleValue, blob []byte) error
+	walkFiler               func(path string, genFn func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) error, saveFn func(outputChan chan interface{}) error) error
 	purgedDirsLock          sync.Mutex
 	purgedDirs              map[util.FullPath]struct{}
 }
@@ -282,20 +283,41 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		return err
 	}
 
+	return c.checkVolumes(dataNodeVolumeIdToVInfo, fsckChecks{
+		applyPurging:   *applyPurging,
+		purgeAbsent:    *purgeAbsent,
+		repair:         *repairFromReplicas,
+		modifyFromAtNs: collectModifyFromAtNs,
+		cutoffFromAtNs: collectCutoffFromAtNs,
+	})
+}
+
+// fsckChecks are the parsed actions for checkVolumes.
+type fsckChecks struct {
+	applyPurging   bool
+	purgeAbsent    bool
+	repair         bool
+	modifyFromAtNs int64
+	cutoffFromAtNs int64
+}
+
+// checkVolumes walks the filer once, the volume indexes having been copied
+// into the temp folder, then runs the requested checks against them.
+func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, checks fsckChecks) (err error) {
 	if *c.findMissingChunksInFiler {
 		// collect all filer file ids and paths
 
-		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, *purgeAbsent, collectModifyFromAtNs, collectCutoffFromAtNs); err != nil {
+		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, checks.purgeAbsent, checks.modifyFromAtNs, checks.cutoffFromAtNs); err != nil {
 			return fmt.Errorf("collectFilerFileIdAndPaths: %w", err)
 		}
-		if *repairFromReplicas {
+		if checks.repair {
 			repaired, lost, repairErr := c.repairMissingFromReplicas(dataNodeVolumeIdToVInfo)
 			fmt.Fprintf(c.writer, "repaired %d missing replica needle(s); %d referenced needle(s) on no replica\n", repaired, lost)
 			return repairErr
 		}
 		for dataNodeId, volumeIdToVInfo := range dataNodeVolumeIdToVInfo {
 			// for each volume, check filer file ids
-			if err = c.findFilerChunksMissingInVolumeServers(volumeIdToVInfo, dataNodeId, *applyPurging || *purgeAbsent); err != nil {
+			if err = c.findFilerChunksMissingInVolumeServers(volumeIdToVInfo, dataNodeId, checks.applyPurging || checks.purgeAbsent); err != nil {
 				return fmt.Errorf("findFilerChunksMissingInVolumeServers: %w", err)
 			}
 		}
@@ -310,14 +332,14 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		// delete live data referenced only via the unresolved manifest, so
 		// disable -reallyDeleteFromVolume for this run and tell the operator
 		// to fix the broken entries first.
-		applyPurgingEffective := *applyPurging
+		applyPurgingEffective := checks.applyPurging
 		if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 && applyPurgingEffective {
 			fmt.Fprintf(c.writer, "WARNING: %d entry(ies) had unresolvable chunk manifests; refusing to apply -reallyDeleteFromVolume to avoid deleting live sub-chunks. Fix the entries listed above (e.g. delete or repair them) and re-run.\n",
 				unresolved)
 			applyPurgingEffective = false
 		}
 		// volume file ids subtract filer file ids
-		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(collectModifyFromAtNs), uint64(collectCutoffFromAtNs)); err != nil {
+		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(checks.modifyFromAtNs), uint64(checks.cutoffFromAtNs)); err != nil {
 			return fmt.Errorf("findExtraChunksInVolumeServers: %w", err)
 		}
 		if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 {
@@ -352,7 +374,7 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 		}
 	}()
 
-	return doTraverseBfsAndSaving(c.env, c.writer, c.getCollectFilerFilePath(), false, false,
+	return c.traverseFiler(c.getCollectFilerFilePath(),
 		func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
 			if *c.verbose && entry.Entry.IsDirectory {
 				fmt.Fprintf(c.writer, "checking directory %s\n", util.NewFullPath(entry.Dir, entry.Entry.Name))
@@ -453,6 +475,14 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 			}
 			return nil
 		})
+}
+
+// traverseFiler walks the filer namespace under path; tests replace walkFiler.
+func (c *commandVolumeFsck) traverseFiler(path string, genFn func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) error, saveFn func(outputChan chan interface{}) error) error {
+	if c.walkFiler != nil {
+		return c.walkFiler(path, genFn, saveFn)
+	}
+	return doTraverseBfsAndSaving(c.env, c.writer, path, false, false, genFn, saveFn)
 }
 
 func (c *commandVolumeFsck) findFilerChunksMissingInVolumeServers(volumeIdToVInfo map[uint32]VInfo, dataNodeId string, applyPurging bool) error {

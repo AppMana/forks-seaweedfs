@@ -99,7 +99,7 @@ func TestFsckRepairsFilerReferencedNeedlesFromAnotherReplica(t *testing.T) {
 		"dnRO": {volumeId: {server: "ro:8080", collection: "b", isReadOnly: true}},
 	}
 
-	repaired, lost, err := c.repairMissingFromReplicas(volumes)
+	repaired, lost, err := c.repairMissingFromReplicas(volumes, getFilerFileIdFile)
 	if err != nil {
 		t.Fatalf("repair: %v\n%s", err, out.String())
 	}
@@ -157,7 +157,7 @@ func TestFsckRepairFailsOnWriteError(t *testing.T) {
 		"dnA": {volumeId: {server: "a:8080", collection: "b"}},
 		"dnB": {volumeId: {server: "b:8080", collection: "b"}},
 	}
-	if _, _, err := c.repairMissingFromReplicas(volumes); err == nil {
+	if _, _, err := c.repairMissingFromReplicas(volumes, getFilerFileIdFile); err == nil {
 		t.Fatal("a failed repair write must fail the run")
 	}
 }
@@ -192,7 +192,7 @@ func TestFsckRepairReleasesEachVolumeIndexesBeforeTheNext(t *testing.T) {
 			return nil
 		},
 	}
-	repaired, _, err := c.repairMissingFromReplicas(volumes)
+	repaired, _, err := c.repairMissingFromReplicas(volumes, getFilerFileIdFile)
 	if err != nil || repaired != count {
 		t.Fatalf("repaired %d, err %v", repaired, err)
 	}

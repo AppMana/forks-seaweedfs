@@ -108,6 +108,12 @@ func (c *commandVolumeFsck) Help() string {
 	copied to that replica from one holding it. The filer reference is the
 	proof it is a missed write rather than a deletion; the copy uses an
 	absent-only write, so existing needles and tombstones are never replaced.
+	Without -findMissingChunksInFiler the same filer walk then reports, and
+	with -reallyDeleteFromVolume purges, A subtract B: one walk does both.
+
+	-maxOrphanPercent refuses -reallyDeleteFromVolume when orphans exceed that
+	share of all entries: a walk that missed part of the namespace reports
+	live chunks as orphans.
 
 	-cutoffTimeAgo is used to only check chunks older than the cutoff time.
 	This is important because:
@@ -137,7 +143,8 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	cutoffTimeAgo := fsckCommand.Duration("cutoffTimeAgo", 5*time.Hour, "only include entries on volume servers before this cutoff time to check orphan chunks")
 	modifyTimeAgo := fsckCommand.Duration("modifyTimeAgo", 0, "only include entries after this modify time to check orphan chunks")
 	c.verifyNeedle = fsckCommand.Bool("verifyNeedles", false, "check needles status from volume server")
-	repairFromReplicas := fsckCommand.Bool("repairMissingFromReplicas", false, "with -findMissingChunksInFiler: copy each filer-referenced needle a replica lacks from a replica that holds it, never overwriting or undeleting")
+	repairFromReplicas := fsckCommand.Bool("repairMissingFromReplicas", false, "copy each filer-referenced needle a replica lacks from a replica that holds it, never overwriting or undeleting; without -findMissingChunksInFiler the orphan check follows in the same filer walk")
+	maxOrphanPercent := fsckCommand.Float64("maxOrphanPercent", 100, "with -reallyDeleteFromVolume: purge nothing and fail when orphans exceed this percentage of all entries")
 
 	if err = fsckCommand.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -145,8 +152,11 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		}
 		return err
 	}
-	if *repairFromReplicas && (!*c.findMissingChunksInFiler || *applyPurging || *purgeAbsent) {
-		return fmt.Errorf("-repairMissingFromReplicas needs -findMissingChunksInFiler and cannot be combined with -reallyDeleteFromVolume or -reallyDeleteFilerEntries")
+	if *repairFromReplicas && *c.findMissingChunksInFiler && (*applyPurging || *purgeAbsent) {
+		return fmt.Errorf("-findMissingChunksInFiler -repairMissingFromReplicas cannot be combined with -reallyDeleteFromVolume or -reallyDeleteFilerEntries, which would delete filer entries")
+	}
+	if *maxOrphanPercent < 0 || *maxOrphanPercent > 100 {
+		return fmt.Errorf("-maxOrphanPercent %v is not between 0 and 100", *maxOrphanPercent)
 	}
 
 	// The command struct is a singleton registered in init(), so any state
@@ -284,11 +294,12 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	}
 
 	return c.checkVolumes(dataNodeVolumeIdToVInfo, fsckChecks{
-		applyPurging:   *applyPurging,
-		purgeAbsent:    *purgeAbsent,
-		repair:         *repairFromReplicas,
-		modifyFromAtNs: collectModifyFromAtNs,
-		cutoffFromAtNs: collectCutoffFromAtNs,
+		applyPurging:     *applyPurging,
+		purgeAbsent:      *purgeAbsent,
+		repair:           *repairFromReplicas,
+		modifyFromAtNs:   collectModifyFromAtNs,
+		cutoffFromAtNs:   collectCutoffFromAtNs,
+		maxOrphanPercent: *maxOrphanPercent,
 	})
 }
 
@@ -299,6 +310,17 @@ type fsckChecks struct {
 	repair         bool
 	modifyFromAtNs int64
 	cutoffFromAtNs int64
+	// with applyPurging: purge only when orphans are at most this share
+	// of all entries
+	maxOrphanPercent float64
+}
+
+// referenceProvesWrite reports whether a filer reference written at
+// modifiedTsNs is old enough to prove its chunk was written, rather than
+// uploaded and still awaiting the metadata commit.
+func (checks fsckChecks) referenceProvesWrite(modifiedTsNs int64) bool {
+	return (checks.cutoffFromAtNs == 0 || modifiedTsNs <= checks.cutoffFromAtNs) &&
+		(checks.modifyFromAtNs == 0 || modifiedTsNs >= checks.modifyFromAtNs)
 }
 
 // checkVolumes walks the filer once, the volume indexes having been copied
@@ -307,13 +329,11 @@ func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[
 	if *c.findMissingChunksInFiler {
 		// collect all filer file ids and paths
 
-		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, checks.purgeAbsent, checks.modifyFromAtNs, checks.cutoffFromAtNs); err != nil {
+		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, checks, true); err != nil {
 			return fmt.Errorf("collectFilerFileIdAndPaths: %w", err)
 		}
 		if checks.repair {
-			repaired, lost, repairErr := c.repairMissingFromReplicas(dataNodeVolumeIdToVInfo)
-			fmt.Fprintf(c.writer, "repaired %d missing replica needle(s); %d referenced needle(s) on no replica\n", repaired, lost)
-			return repairErr
+			return c.repairAndReport(dataNodeVolumeIdToVInfo, getFilerFileIdFile)
 		}
 		for dataNodeId, volumeIdToVInfo := range dataNodeVolumeIdToVInfo {
 			// for each volume, check filer file ids
@@ -323,9 +343,15 @@ func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[
 		}
 		c.purgeEmptyDirectories()
 	} else {
-		// collect all filer file ids
-		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, false, 0, 0); err != nil {
+		// collect all filer file ids: any reference, however new, keeps
+		// its needle; only those old enough to prove a write are repaired
+		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, checks, false); err != nil {
 			return fmt.Errorf("failed to collect file ids from filer: %w", err)
+		}
+		if checks.repair {
+			if err = c.repairAndReport(dataNodeVolumeIdToVInfo, getFilerRepairFileIdFile); err != nil {
+				return err
+			}
 		}
 		// If any entry's manifest could not be resolved, our in-use fid set
 		// is missing the sub-chunks behind it. Purging orphans now would
@@ -339,7 +365,7 @@ func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[
 			applyPurgingEffective = false
 		}
 		// volume file ids subtract filer file ids
-		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(checks.modifyFromAtNs), uint64(checks.cutoffFromAtNs)); err != nil {
+		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(checks.modifyFromAtNs), uint64(checks.cutoffFromAtNs), checks.maxOrphanPercent); err != nil {
 			return fmt.Errorf("findExtraChunksInVolumeServers: %w", err)
 		}
 		if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 {
@@ -350,12 +376,33 @@ func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[
 	return nil
 }
 
-func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, purgeAbsent bool, collectModifyFromAtNs int64, cutoffFromAtNs int64) error {
+func (c *commandVolumeFsck) repairAndReport(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, refsFile func(tempFolder string, vid uint32) string) error {
+	repaired, lost, err := c.repairMissingFromReplicas(dataNodeVolumeIdToVInfo, refsFile)
+	fmt.Fprintf(c.writer, "repaired %d missing replica needle(s); %d referenced needle(s) on no replica\n", repaired, lost)
+	return err
+}
+
+// collectFilerFileIdAndPaths writes each volume's filer references to its
+// .fid file. With onlyProvenWrites, references too new to prove a write are
+// left out; otherwise they are all kept, and with checks.repair the proven
+// ones are also written to the volume's .repair.fid file.
+func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, checks fsckChecks, onlyProvenWrites bool) error {
+	purgeAbsent := checks.purgeAbsent
+	repairRefs := checks.repair && !onlyProvenWrites
 	if *c.verbose {
 		fmt.Fprintf(c.writer, "checking each file from filer path %s...\n", c.getCollectFilerFilePath())
 	}
 
 	files := make(map[uint32]*os.File)
+	repairFiles := make(map[uint32]*os.File)
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+		for _, f := range repairFiles {
+			f.Close()
+		}
+	}()
 	for _, volumeIdToServer := range dataNodeVolumeIdToVInfo {
 		for vid := range volumeIdToServer {
 			if _, ok := files[vid]; ok {
@@ -366,13 +413,15 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 				return fmt.Errorf("failed to create file %s: %v", getFilerFileIdFile(c.tempFolder, vid), openErr)
 			}
 			files[vid] = dst
+			if repairRefs {
+				dst, openErr = os.OpenFile(getFilerRepairFileIdFile(c.tempFolder, vid), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+				if openErr != nil {
+					return fmt.Errorf("failed to create file %s: %v", getFilerRepairFileIdFile(c.tempFolder, vid), openErr)
+				}
+				repairFiles[vid] = dst
+			}
 		}
 	}
-	defer func() {
-		for _, f := range files {
-			f.Close()
-		}
-	}()
 
 	return c.traverseFiler(c.getCollectFilerFilePath(),
 		func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
@@ -404,18 +453,17 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 			}
 			dataChunks = append(dataChunks, manifestChunks...)
 			for _, chunk := range dataChunks {
-				if cutoffFromAtNs != 0 && chunk.ModifiedTsNs > cutoffFromAtNs {
-					continue
-				}
-				if collectModifyFromAtNs != 0 && chunk.ModifiedTsNs < collectModifyFromAtNs {
+				provesWrite := checks.referenceProvesWrite(chunk.ModifiedTsNs)
+				if onlyProvenWrites && !provesWrite {
 					continue
 				}
 				select {
 				case outputChan <- &Item{
-					vid:     chunk.Fid.VolumeId,
-					fileKey: chunk.Fid.FileKey,
-					cookie:  chunk.Fid.Cookie,
-					path:    util.NewFullPath(entry.Dir, entry.Entry.Name),
+					vid:         chunk.Fid.VolumeId,
+					fileKey:     chunk.Fid.FileKey,
+					cookie:      chunk.Fid.Cookie,
+					path:        util.NewFullPath(entry.Dir, entry.Entry.Name),
+					provesWrite: provesWrite,
 				}:
 				case <-ctx.Done():
 					return ctx.Err()
@@ -457,6 +505,14 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 					if _, err := f.Write([]byte(i.path)); err != nil {
 						return err
 					}
+					if rf := repairFiles[i.vid]; rf != nil && i.provesWrite {
+						if _, err := rf.Write(buffer); err != nil {
+							return err
+						}
+						if _, err := rf.Write([]byte(i.path)); err != nil {
+							return err
+						}
+					}
 				} else if *c.findMissingChunksInFiler {
 					// check if the volume matches the filter
 					if len(c.volumeIds) > 0 {
@@ -496,7 +552,7 @@ func (c *commandVolumeFsck) findFilerChunksMissingInVolumeServers(volumeIdToVInf
 	return nil
 }
 
-func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, applyPurging bool, modifyFrom, cutoffFrom uint64) error {
+func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, applyPurging bool, modifyFrom, cutoffFrom uint64, maxOrphanPercent float64) error {
 
 	var totalInUseCount, totalOrphanChunkCount, totalOrphanDataSize uint64
 	// map[volumeId]map[fid]replicaCount — counts how many replicas reported
@@ -550,6 +606,18 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 		}
 	}
 
+	var pct float64
+	if totalCount := totalOrphanChunkCount + totalInUseCount; totalCount > 0 {
+		pct = float64(totalOrphanChunkCount) * 100 / (float64(totalCount))
+	}
+	fmt.Fprintf(c.writer, "\nTotal\t\tentries:%d\torphan:%d\t%.2f%%\t%dB\n",
+		totalOrphanChunkCount+totalInUseCount, totalOrphanChunkCount, pct, totalOrphanDataSize)
+	if applyPurging && pct > maxOrphanPercent {
+		fmt.Fprintf(c.writer, "%d orphans of %d entries exceed -maxOrphanPercent %v; purging nothing\n",
+			totalOrphanChunkCount, totalOrphanChunkCount+totalInUseCount, maxOrphanPercent)
+		return fmt.Errorf("orphans are %.2f%% of entries, above -maxOrphanPercent %v; no purge was authorized", pct, maxOrphanPercent)
+	}
+
 	// Phase 2: purge. At most one call to purgeFileIdsForOneVolume per
 	// volume — that helper already fans out to all replica locations via
 	// MasterClient.GetLocations, so iterating per replica here (as the old
@@ -583,15 +651,6 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 	}
 
 	if !applyPurging {
-		var pct float64
-
-		if totalCount := totalOrphanChunkCount + totalInUseCount; totalCount > 0 {
-			pct = float64(totalOrphanChunkCount) * 100 / (float64(totalCount))
-		}
-
-		fmt.Fprintf(c.writer, "\nTotal\t\tentries:%d\torphan:%d\t%.2f%%\t%dB\n",
-			totalOrphanChunkCount+totalInUseCount, totalOrphanChunkCount, pct, totalOrphanDataSize)
-
 		fmt.Fprintf(c.writer, "This could be normal if multiple filers or no filers are used.\n")
 	}
 
@@ -693,14 +752,19 @@ func (c *commandVolumeFsck) collectOneVolumeFileIds(dataNodeId string, volumeId 
 }
 
 type Item struct {
-	vid     uint32
-	fileKey uint64
-	cookie  uint32
-	path    util.FullPath
+	vid         uint32
+	fileKey     uint64
+	cookie      uint32
+	path        util.FullPath
+	provesWrite bool
 }
 
 func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleId types.NeedleId, itemPath util.FullPath) error) error {
-	fp, err := os.Open(getFilerFileIdFile(c.tempFolder, volumeId))
+	return c.readFidFile(getFilerFileIdFile, volumeId, fn)
+}
+
+func (c *commandVolumeFsck) readFidFile(refsFile func(tempFolder string, vid uint32) string, volumeId uint32, fn func(needleId types.NeedleId, itemPath util.FullPath) error) error {
+	fp, err := os.Open(refsFile(c.tempFolder, volumeId))
 	if err != nil {
 		return err
 	}
@@ -1210,6 +1274,10 @@ func getVolumeFileIdFile(tempFolder string, dataNodeid string, vid uint32) strin
 
 func getFilerFileIdFile(tempFolder string, vid uint32) string {
 	return filepath.Join(tempFolder, fmt.Sprintf("%d.fid", vid))
+}
+
+func getFilerRepairFileIdFile(tempFolder string, vid uint32) string {
+	return filepath.Join(tempFolder, fmt.Sprintf("%d.repair.fid", vid))
 }
 
 func writeToFile(bytes []byte, fileName string) error {

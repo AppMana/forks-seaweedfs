@@ -193,7 +193,7 @@ func (f *Filer) CollectLogFileRefs(ctx context.Context, startPosition log_buffer
 			break
 		}
 
-		hourMinuteEntries, _, listErr := f.ListDirectoryEntries(ctx, util.NewFullPath(SystemLogDir, dayEntry.Name()), "", false, math.MaxInt32, "", "", "")
+		hourMinuteEntries, _, listErr := f.listLogMinuteFiles(ctx, dayEntry.Name(), startDate, startHourMinute)
 		if listErr != nil {
 			return nil, 0, fmt.Errorf("fail to list log %s: %w", dayEntry.Name(), listErr)
 		}
@@ -233,6 +233,19 @@ func (f *Filer) CollectLogFileRefs(ctx context.Context, startPosition log_buffer
 	}
 	lastTsNs = clampLogRefsCursor(lastTsNs, startPosition.Time.UnixNano())
 	return
+}
+
+// listLogMinuteFiles lists a day's "HH-MM.<filerId>" log files. On the scan's
+// start day the listing begins at the start minute: the names are fixed-width
+// and sort by minute, so this returns exactly the files the callers keep, and a
+// caught-up subscriber re-reading on every flush lists a few files instead of
+// the whole day.
+func (f *Filer) listLogMinuteFiles(ctx context.Context, day, startDate, startHourMinute string) ([]*Entry, bool, error) {
+	from := ""
+	if day == startDate {
+		from = startHourMinute
+	}
+	return f.ListDirectoryEntries(ctx, util.NewFullPath(SystemLogDir, day), from, true, math.MaxInt32, "", "", "")
 }
 
 // clampLogRefsCursor keeps a chunk-ref read from moving the subscriber's cursor
@@ -409,7 +422,7 @@ func (c *LogFileEntryCollector) collectMore(v *OrderedLogVisitor) (err error) {
 		}
 	}
 
-	hourMinuteEntries, _, listHourMinuteErr := c.f.ListDirectoryEntries(context.Background(), util.NewFullPath(SystemLogDir, dayEntry.Name()), "", false, math.MaxInt32, "", "", "")
+	hourMinuteEntries, _, listHourMinuteErr := c.f.listLogMinuteFiles(context.Background(), dayEntry.Name(), c.startDate, c.startHourMinute)
 	if listHourMinuteErr != nil {
 		return fmt.Errorf("fail to list log %s by day: %v", dayEntry.Name(), listHourMinuteErr)
 	}

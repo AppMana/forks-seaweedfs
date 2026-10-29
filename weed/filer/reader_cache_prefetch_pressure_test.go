@@ -2,6 +2,7 @@ package filer
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,5 +40,51 @@ func TestPrefetchDoesNotEvictCurrentChunkForBudget(t *testing.T) {
 				t.Error("prefetch evicted pinned current chunk")
 			}
 		})
+	}
+}
+
+// A consumer may join prefetch while it is waiting for admission. Declining
+// speculation must not turn that consumer's demand read into an error.
+func TestDemandJoiningDeclinedPrefetchRetries(t *testing.T) {
+	const size = 64 << 10
+	budget := NewReaderCacheBudget(size)
+	rc := newStreamTestReaderCache((*chunk_cache.TieredChunkCache)(nil))
+	rc.budget = budget
+	defer rc.destroy()
+	stream := &chunkStream{}
+	defer rc.releaseStream(stream)
+	if _, err := rc.readChunkAt(context.Background(), stream, make([]byte, 1), "current", nil, false, 0, size, false); err != nil {
+		t.Fatal(err)
+	}
+	budget.Lock()
+	rc.MaybeCache(&Interval[*ChunkView]{Value: &ChunkView{FileId: "next", ChunkSize: size, ViewSize: size}}, 1)
+	result := make(chan error, 1)
+	go func() {
+		_, err := rc.ReadChunkAt(context.Background(), make([]byte, 1), "next", nil, false, 0, size, false)
+		result <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	joined := false
+	for time.Now().Before(deadline) {
+		rc.RLock()
+		cacher := rc.downloaders["next"]
+		joined = cacher != nil && atomic.LoadInt32(&cacher.readers) > 0
+		rc.RUnlock()
+		if joined {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	budget.Unlock()
+	if !joined {
+		t.Error("demand did not join waiting prefetch")
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("demand failed to make progress")
 	}
 }

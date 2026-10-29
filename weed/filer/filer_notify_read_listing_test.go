@@ -174,3 +174,134 @@ func TestPersistedLogReadsUseUTCRegardlessOfStartPositionTimezone(t *testing.T) 
 		}
 	}
 }
+
+func TestPersistedLogReadsAcrossDayBoundaries(t *testing.T) {
+	t.Run("midnight scan start when previous day has no 23-59 file", func(t *testing.T) {
+		f, _ := newTestFilerWithStubStore()
+		ctx := context.Background()
+		for _, dir := range []string{
+			SystemLogDir,
+			SystemLogDir + "/2026-10-27",
+			SystemLogDir + "/2026-10-28",
+		} {
+			if err := f.Store.InsertEntry(ctx, &Entry{FullPath: util.FullPath(dir), Attr: Attr{Mode: 0o755 | 1<<31}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Previous day's last flush was 23-58; no 23-59 file exists on 2026-10-27.
+		if err := f.Store.InsertEntry(ctx, &Entry{
+			FullPath: util.NewFullPath(SystemLogDir+"/2026-10-27", "23-58.filerA"),
+			Chunks:   []*filer_pb.FileChunk{{FileId: "1,0prev", Size: 1}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Store.InsertEntry(ctx, &Entry{
+			FullPath: util.NewFullPath(SystemLogDir+"/2026-10-28", "00-00.filerA"),
+			Chunks:   []*filer_pb.FileChunk{{FileId: "1,0curr", Size: 1}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		start := time.Date(2026, 10, 28, 0, 0, 30, 0, time.UTC)
+		wantTsNs := time.Date(2026, 10, 28, 0, 0, 45, 0, time.UTC).UnixNano()
+
+		origLoad := loadLogFileEntriesFn
+		loadLogFileEntriesFn = func(_ *wdclient.MasterClient, c *filer_pb.FileChunk) ([]*filer_pb.LogEntry, bool, error) {
+			if c.GetFileIdString() == "1,0curr" {
+				return []*filer_pb.LogEntry{{TsNs: wantTsNs}}, true, nil
+			}
+			return nil, true, nil
+		}
+		defer func() { loadLogFileEntriesFn = origLoad }()
+
+		visitor, err := f.collectPersistedLogBuffer(log_buffer.NewMessagePosition(start.UnixNano(), 0), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer visitor.Close()
+
+		entry, err := visitor.GetNext()
+		if err != nil || entry.GetTsNs() != wantTsNs {
+			t.Fatalf("GetNext() = (%v, %v), want TsNs=%d", entry, err, wantTsNs)
+		}
+	})
+
+	t.Run("filer absent on intermediate day resumes on later day", func(t *testing.T) {
+		f, _ := newTestFilerWithStubStore()
+		ctx := context.Background()
+		for _, dir := range []string{
+			SystemLogDir,
+			SystemLogDir + "/2026-10-27",
+			SystemLogDir + "/2026-10-28",
+			SystemLogDir + "/2026-10-29",
+		} {
+			if err := f.Store.InsertEntry(ctx, &Entry{FullPath: util.FullPath(dir), Attr: Attr{Mode: 0o755 | 1<<31}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		type seededFile struct {
+			day, name, chunkId string
+			tsNs               int64
+		}
+		tA1 := time.Date(2026, 10, 27, 10, 0, 10, 0, time.UTC).UnixNano()
+		tB1 := time.Date(2026, 10, 27, 10, 0, 20, 0, time.UTC).UnixNano()
+		tB2 := time.Date(2026, 10, 27, 10, 1, 20, 0, time.UTC).UnixNano()
+		tB3 := time.Date(2026, 10, 28, 10, 0, 20, 0, time.UTC).UnixNano()
+		tB4 := time.Date(2026, 10, 28, 10, 1, 20, 0, time.UTC).UnixNano()
+		tA2 := time.Date(2026, 10, 29, 10, 0, 10, 0, time.UTC).UnixNano()
+
+		files := []seededFile{
+			{"2026-10-27", "10-00.filerA", "1,0a1", tA1},
+			{"2026-10-27", "10-00.filerB", "1,0b1", tB1},
+			{"2026-10-27", "10-01.filerB", "1,0b2", tB2},
+			{"2026-10-28", "10-00.filerB", "1,0b3", tB3},
+			{"2026-10-28", "10-01.filerB", "1,0b4", tB4},
+			{"2026-10-29", "10-00.filerA", "1,0a2", tA2},
+		}
+		byChunk := map[string]int64{}
+		for _, sf := range files {
+			byChunk[sf.chunkId] = sf.tsNs
+			if err := f.Store.InsertEntry(ctx, &Entry{
+				FullPath: util.NewFullPath(SystemLogDir+"/"+sf.day, sf.name),
+				Chunks:   []*filer_pb.FileChunk{{FileId: sf.chunkId, Size: 1}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		origLoad := loadLogFileEntriesFn
+		loadLogFileEntriesFn = func(_ *wdclient.MasterClient, c *filer_pb.FileChunk) ([]*filer_pb.LogEntry, bool, error) {
+			if ts, ok := byChunk[c.GetFileIdString()]; ok {
+				return []*filer_pb.LogEntry{{TsNs: ts}}, true, nil
+			}
+			return nil, true, nil
+		}
+		defer func() { loadLogFileEntriesFn = origLoad }()
+
+		start := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
+		visitor, err := f.collectPersistedLogBuffer(log_buffer.NewMessagePosition(start.UnixNano(), 0), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer visitor.Close()
+
+		var got []int64
+		for {
+			entry, err := visitor.GetNext()
+			if err != nil {
+				break
+			}
+			got = append(got, entry.GetTsNs())
+		}
+		want := []int64{tA1, tB1, tB2, tB3, tB4, tA2}
+		if len(got) != len(want) {
+			t.Fatalf("got %d entries %v, want %d %v", len(got), got, len(want), want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("entry[%d] = %d, want %d", i, got[i], want[i])
+			}
+		}
+	})
+}

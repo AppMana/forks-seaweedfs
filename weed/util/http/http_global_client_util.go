@@ -659,6 +659,7 @@ func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []stri
 			if strings.Contains(urlString, "%") {
 				urlString = url.PathEscape(urlString)
 			}
+			done := beginReplicaRead(ctx, hostOf(urlString))
 			shouldRetry, err = ReadUrlAsStream(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), string(jwt), cipherKey, isGzipped, isFullChunk, offset, len(buffer), func(data []byte) {
 				// Check for context cancellation during data processing
 				select {
@@ -673,6 +674,7 @@ func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []stri
 					n += x
 				}
 			})
+			done(n, err)
 			if !shouldRetry {
 				break
 			}
@@ -736,7 +738,10 @@ func retriedFetchChunkDataDirect(ctx context.Context, buffer []byte, urlStrings 
 			// path serves only unencrypted, uncompressed whole chunks, whose
 			// replicas are byte-identical, so a retry asks for the remainder
 			// instead of the whole chunk again.
+			done := beginReplicaRead(ctx, hostOf(urlString))
+			before := n
 			n, shouldRetry, err = readUrlDirectToBufferFrom(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), jwt, buffer, n)
+			done(n-before, err)
 			if err == nil {
 				if failed && refreshUrls != nil {
 					refreshUrls()

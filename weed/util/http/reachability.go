@@ -46,9 +46,9 @@ func ReachableFirst(urls []string) []string {
 		}
 	}
 	if probe == nil && unanswered == nil {
-		return urls
+		return byReplicaLoad(urls)
 	}
-	return append(append(probe, reachable...), unanswered...)
+	return append(append(probe, byReplicaLoad(reachable)...), unanswered...)
 }
 
 func hostOf(rawUrl string) string {

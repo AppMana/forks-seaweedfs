@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -156,7 +155,7 @@ func (f *Filer) collectPersistedLogBuffer(startPosition log_buffer.MessagePositi
 	scanFrom := persistedLogScanStart(startPosition.Time)
 	startDate := fmt.Sprintf("%04d-%02d-%02d", scanFrom.Year(), scanFrom.Month(), scanFrom.Day())
 
-	dayEntries, _, listDayErr := f.ListDirectoryEntries(context.Background(), SystemLogDir, startDate, true, math.MaxInt32, "", "", "")
+	dayEntries, listDayErr := f.listAllLogEntries(context.Background(), SystemLogDir, startDate, true)
 	if listDayErr != nil {
 		return nil, fmt.Errorf("fail to list log by day: %w", listDayErr)
 	}
@@ -183,7 +182,7 @@ func (f *Filer) CollectLogFileRefs(ctx context.Context, startPosition log_buffer
 		stopHourMinute = fmt.Sprintf("%02d-%02d", stopTime.Hour(), stopTime.Minute())
 	}
 
-	dayEntries, _, listDayErr := f.ListDirectoryEntries(ctx, SystemLogDir, startDate, true, math.MaxInt32, "", "", "")
+	dayEntries, listDayErr := f.listAllLogEntries(ctx, SystemLogDir, startDate, true)
 	if listDayErr != nil {
 		return nil, 0, fmt.Errorf("fail to list log by day: %w", listDayErr)
 	}
@@ -245,7 +244,36 @@ func (f *Filer) listLogMinuteFiles(ctx context.Context, day, startDate, startHou
 	if day == startDate {
 		from = startHourMinute
 	}
-	return f.ListDirectoryEntries(ctx, util.NewFullPath(SystemLogDir, day), from, true, math.MaxInt32, "", "", "")
+	entries, err := f.listAllLogEntries(ctx, util.NewFullPath(SystemLogDir, day), from, true)
+	return entries, false, err
+}
+
+// listAllLogEntries explicitly paginates because some stores cap a single
+// directory-list request below the requested limit. FoundationDB, for example,
+// returns at most 1000 rows, while one filer alone creates 1440 minute files in
+// a full day. Relying on ListDirectoryEntries' hasMore result cannot detect a
+// store-side cap smaller than that method's requested limit.
+func (f *Filer) listAllLogEntries(ctx context.Context, dir util.FullPath, startFileName string, includeStartFile bool) ([]*Entry, error) {
+	const pageSize int64 = 1000
+
+	var entries []*Entry
+	for {
+		page, _, err := f.ListDirectoryEntries(ctx, dir, startFileName, includeStartFile, pageSize, "", "", "")
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, page...)
+		if len(page) < int(pageSize) {
+			return entries, nil
+		}
+
+		next := page[len(page)-1].Name()
+		if next <= startFileName {
+			return nil, fmt.Errorf("log listing for %s did not advance past %q", dir, startFileName)
+		}
+		startFileName = next
+		includeStartFile = false
+	}
 }
 
 // clampLogRefsCursor keeps a chunk-ref read from moving the subscriber's cursor

@@ -41,7 +41,7 @@ func logFileMayContainAfter(fileTsNs, startTsNs int64) bool {
 // filtered against the exact cursor afterwards, so widening the file scan only
 // costs a little extra reading and never re-delivers.
 func persistedLogScanStart(t time.Time) time.Time {
-	return t.Add(-LogFlushInterval)
+	return t.UTC().Add(-LogFlushInterval)
 }
 
 // LastShippedLogEntryTsNsForFiler mirrors the client's reader across one
@@ -263,7 +263,8 @@ func clampLogRefsCursor(lastTsNs, startTsNs int64) int64 {
 }
 
 func (f *Filer) HasPersistedLogFiles(startPosition log_buffer.MessagePosition) (bool, error) {
-	startDate := fmt.Sprintf("%04d-%02d-%02d", startPosition.Time.Year(), startPosition.Time.Month(), startPosition.Time.Day())
+	startTime := startPosition.Time.UTC()
+	startDate := fmt.Sprintf("%04d-%02d-%02d", startTime.Year(), startTime.Month(), startTime.Day())
 	dayEntries, _, listDayErr := f.ListDirectoryEntries(context.Background(), SystemLogDir, startDate, true, 1, "", "", "")
 
 	if listDayErr != nil {

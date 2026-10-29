@@ -3,6 +3,8 @@ package filer
 import (
 	"context"
 	"fmt"
+	"io"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -38,27 +40,44 @@ func (s *countingListStore) ListDirectoryPrefixedEntries(ctx context.Context, di
 	return s.stubFilerStore.ListDirectoryPrefixedEntries(ctx, dirPath, startFileName, includeStartFile, limit, prefix, s.count(dirPath, each))
 }
 
-// seedFullDayOfLogs writes one minute file per minute per filer for a whole day.
-func seedFullDayOfLogs(t *testing.T, f *Filer, day string, filerIds ...string) {
+// seedFullDayOfLogs writes one minute file per minute per filer for a whole day
+// and returns the map of chunkID -> entries along with all seeded timestamps.
+// Each minute file holds a window starting 50s into that minute and spanning
+// 50s (within LogFlushInterval) into the next minute.
+func seedFullDayOfLogs(t *testing.T, f *Filer, day string, filerIds ...string) (map[string][]*filer_pb.LogEntry, []int64) {
 	t.Helper()
 	ctx := context.Background()
+	dayStart, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, dir := range []string{SystemLogDir, SystemLogDir + "/" + day} {
 		if err := f.Store.InsertEntry(ctx, &Entry{FullPath: util.FullPath(dir), Attr: Attr{Mode: 0o755 | 1<<31}}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	chunksByID := make(map[string][]*filer_pb.LogEntry, 24*60*len(filerIds))
+	var allTsNs []int64
 	for m := 0; m < 24*60; m++ {
-		for _, id := range filerIds {
+		minuteStart := dayStart.Add(time.Duration(m) * time.Minute)
+		for i, id := range filerIds {
 			name := fmt.Sprintf("%02d-%02d.%s", m/60, m%60, id)
+			chunkID := "1,0" + name
 			entry := &Entry{
 				FullPath: util.NewFullPath(SystemLogDir+"/"+day, name),
-				Chunks:   []*filer_pb.FileChunk{{FileId: "1,0" + name, Size: 1}},
+				Chunks:   []*filer_pb.FileChunk{{FileId: chunkID, Size: 1}},
 			}
 			if err := f.Store.InsertEntry(ctx, entry); err != nil {
 				t.Fatal(err)
 			}
+			firstTs := minuteStart.Add(50*time.Second + time.Duration(i)*time.Nanosecond).UnixNano()
+			secondTs := minuteStart.Add(100*time.Second + time.Duration(i)*time.Nanosecond).UnixNano()
+			chunksByID[chunkID] = []*filer_pb.LogEntry{{TsNs: firstTs}, {TsNs: secondTs}}
+			allTsNs = append(allTsNs, firstTs, secondTs)
 		}
 	}
+	slices.Sort(allTsNs)
+	return chunksByID, allTsNs
 }
 
 // A caught-up subscriber re-reads the persisted log on every flush. The read must
@@ -72,13 +91,26 @@ func TestPersistedLogReadsListOnlyFromTheScanStartMinute(t *testing.T) {
 	f.Store = NewFilerStoreWrapper(store)
 
 	day := "2026-10-28"
-	seedFullDayOfLogs(t, f, day, "filerA", "filerB", "filerC")
+	chunksByID, allTsNs := seedFullDayOfLogs(t, f, day, "filerA", "filerB", "filerC")
 	dayDir := SystemLogDir + "/" + day
+
+	origLoad := loadLogFileEntriesFn
+	loadLogFileEntriesFn = func(_ *wdclient.MasterClient, c *filer_pb.FileChunk) ([]*filer_pb.LogEntry, bool, error) {
+		return chunksByID[c.GetFileIdString()], true, nil
+	}
+	defer func() { loadLogFileEntriesFn = origLoad }()
 
 	start := time.Date(2026, 10, 28, 23, 58, 30, 0, time.UTC)
 	scanFrom := persistedLogScanStart(start)
 	// Files whose minute is at or after the scan start minute, for three filers.
 	want := 3 * (24*60 - (scanFrom.Hour()*60 + scanFrom.Minute()))
+
+	var wantTsNs []int64
+	for _, ts := range allTsNs {
+		if ts > start.UnixNano() {
+			wantTsNs = append(wantTsNs, ts)
+		}
+	}
 
 	t.Run("CollectLogFileRefs", func(t *testing.T) {
 		store.yields = map[string]int{}
@@ -92,6 +124,20 @@ func TestPersistedLogReadsListOnlyFromTheScanStartMinute(t *testing.T) {
 		if got := store.yields[dayDir]; got != want {
 			t.Fatalf("listed %d minute files from %s, want %d", got, dayDir, want)
 		}
+		var gotTsNs []int64
+		for _, ref := range refs {
+			for _, chunk := range ref.GetChunks() {
+				for _, entry := range chunksByID[chunk.GetFileIdString()] {
+					if entry.GetTsNs() > start.UnixNano() {
+						gotTsNs = append(gotTsNs, entry.GetTsNs())
+					}
+				}
+			}
+		}
+		slices.Sort(gotTsNs)
+		if !slices.Equal(gotTsNs, wantTsNs) {
+			t.Fatalf("refs covered %d entries %v, want all %d entries after start %v", len(gotTsNs), gotTsNs, len(wantTsNs), wantTsNs)
+		}
 	})
 
 	t.Run("collectPersistedLogBuffer", func(t *testing.T) {
@@ -103,6 +149,20 @@ func TestPersistedLogReadsListOnlyFromTheScanStartMinute(t *testing.T) {
 		defer visitor.Close()
 		if got := store.yields[dayDir]; got != want {
 			t.Fatalf("listed %d minute files from %s, want %d", got, dayDir, want)
+		}
+		var gotTsNs []int64
+		for {
+			entry, err := visitor.GetNext()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotTsNs = append(gotTsNs, entry.GetTsNs())
+		}
+		if !slices.Equal(gotTsNs, wantTsNs) {
+			t.Fatalf("read %d entries %v, want all %d entries after start %v", len(gotTsNs), gotTsNs, len(wantTsNs), wantTsNs)
 		}
 	})
 }

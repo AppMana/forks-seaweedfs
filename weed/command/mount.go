@@ -87,8 +87,9 @@ type MountOptions struct {
 	fuseCongestionThreshold *int
 
 	// Upper bounds on how long a FUSE request may go unanswered
-	fuseRequestTimeout       *time.Duration
-	fuseKernelRequestTimeout *time.Duration
+	fuseRequestTimeout         *time.Duration
+	fuseKernelRequestTimeout   *time.Duration
+	fuseMetadataRequestTimeout *time.Duration
 
 	// macOS-specific FUSE options
 	novncache *bool
@@ -189,6 +190,7 @@ func init() {
 
 	mountOptions.fuseRequestTimeout = cmdMount.Flag.Duration("fuse.requestTimeout", 60*time.Second, "answer a FUSE request with EIO when it is still unanswered after this long, so no process waits on the mount indefinitely; 0 disables. Must be below -fuse.kernelRequestTimeout")
 	mountOptions.fuseKernelRequestTimeout = cmdMount.Flag.Duration("fuse.kernelRequestTimeout", 90*time.Second, "ask the kernel (Linux 6.14+) to abort the mount's connection when a request stays unanswered this long, whatever the mount process is doing; whole seconds, 0 disables")
+	mountOptions.fuseMetadataRequestTimeout = cmdMount.Flag.Duration("fuse.metadataRequestTimeout", 25*time.Second, "answer a namespace request (lookup, attributes, create, rename, readdir) with EIO after this long; the kernel can chain several under one directory lock, so their sum must stay below the 120 s hung-task window. 0 uses -fuse.requestTimeout; must not exceed it")
 
 	// macOS-specific FUSE options
 	mountOptions.novncache = cmdMount.Flag.Bool("sys.novncache", false, "(macOS only) disable vnode name caching to avoid stale data")

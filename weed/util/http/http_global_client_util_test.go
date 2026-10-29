@@ -218,6 +218,7 @@ func TestRetriedFetchChunkDataRefreshesLocationsAfterPartialFailure(t *testing.T
 	dead.Close()
 
 	for _, isFullChunk := range []bool{true, false} {
+		forgetReplicaLoad(t) // each case must attempt the deliberately failed first replica
 		forgetUnreachable(t)
 		refreshed := 0
 		refresh := func() []string {

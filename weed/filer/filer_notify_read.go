@@ -41,7 +41,7 @@ func logFileMayContainAfter(fileTsNs, startTsNs int64) bool {
 // filtered against the exact cursor afterwards, so widening the file scan only
 // costs a little extra reading and never re-delivers.
 func persistedLogScanStart(t time.Time) time.Time {
-	return t.Add(-LogFlushInterval)
+	return t.UTC().Add(-LogFlushInterval)
 }
 
 // LastShippedLogEntryTsNsForFiler mirrors the client's reader across one
@@ -263,7 +263,8 @@ func clampLogRefsCursor(lastTsNs, startTsNs int64) int64 {
 }
 
 func (f *Filer) HasPersistedLogFiles(startPosition log_buffer.MessagePosition) (bool, error) {
-	startDate := fmt.Sprintf("%04d-%02d-%02d", startPosition.Time.Year(), startPosition.Time.Month(), startPosition.Time.Day())
+	startTime := startPosition.Time.UTC()
+	startDate := fmt.Sprintf("%04d-%02d-%02d", startTime.Year(), startTime.Month(), startTime.Day())
 	dayEntries, _, listDayErr := f.ListDirectoryEntries(context.Background(), SystemLogDir, startDate, true, 1, "", "", "")
 
 	if listDayErr != nil {
@@ -320,15 +321,25 @@ func NewOrderedLogVisitor(f *Filer, startPosition log_buffer.MessagePosition, st
 		pq:                    pq,
 		logFileEntryCollector: NewLogFileEntryCollector(f, startPosition, stopTsNs, dayEntries),
 	}
-	if err := t.logFileEntryCollector.collectMore(t); err != nil && err != io.EOF {
-		return nil, err
+	for t.pq.Len() == 0 {
+		if err := t.logFileEntryCollector.collectMore(t); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
 	}
 	return t, nil
 }
 
 func (o *OrderedLogVisitor) GetNext() (logEntry *filer_pb.LogEntry, err error) {
-	if o.pq.Len() == 0 {
-		return nil, io.EOF
+	for o.pq.Len() == 0 {
+		if err := o.logFileEntryCollector.collectMore(o); err != nil {
+			if err == io.EOF {
+				return nil, io.EOF
+			}
+			return nil, err
+		}
 	}
 	item := heap.Pop(o.pq).(*LogEntryItem)
 	filerId := item.filer
@@ -337,6 +348,7 @@ func (o *OrderedLogVisitor) GetNext() (logEntry *filer_pb.LogEntry, err error) {
 	it := o.perFilerIteratorMap[filerId]
 	next, nextErr := it.getNext(o)
 	if nextErr != nil {
+		it.active = false
 		if nextErr == io.EOF {
 			// do nothing since the filer has no more log entries
 		} else {
@@ -411,83 +423,94 @@ func NewLogFileEntryCollector(f *Filer, startPosition log_buffer.MessagePosition
 }
 
 func (c *LogFileEntryCollector) collectMore(v *OrderedLogVisitor) (err error) {
-	dayEntry := c.dayEntryQueue.Dequeue()
-	if dayEntry == nil {
-		return io.EOF
-	}
-	// println("dequeue day entry", dayEntry.Name())
-	if c.stopDate != "" {
-		if strings.Compare(dayEntry.Name(), c.stopDate) > 0 {
+	for {
+		dayEntry := c.dayEntryQueue.Dequeue()
+		if dayEntry == nil {
 			return io.EOF
 		}
-	}
+		// println("dequeue day entry", dayEntry.Name())
+		if c.stopDate != "" {
+			if strings.Compare(dayEntry.Name(), c.stopDate) > 0 {
+				return io.EOF
+			}
+		}
 
-	hourMinuteEntries, _, listHourMinuteErr := c.f.listLogMinuteFiles(context.Background(), dayEntry.Name(), c.startDate, c.startHourMinute)
-	if listHourMinuteErr != nil {
-		return fmt.Errorf("fail to list log %s by day: %v", dayEntry.Name(), listHourMinuteErr)
-	}
-	freshFilerIds := make(map[string]string)
-	for _, hourMinuteEntry := range hourMinuteEntries {
-		// println("checking hh-mm", hourMinuteEntry.FullPath)
-		hourMinute := util.FileNameBase(hourMinuteEntry.Name())
-		if dayEntry.Name() == c.startDate {
-			if strings.Compare(hourMinute, c.startHourMinute) < 0 {
+		hourMinuteEntries, _, listHourMinuteErr := c.f.listLogMinuteFiles(context.Background(), dayEntry.Name(), c.startDate, c.startHourMinute)
+		if listHourMinuteErr != nil {
+			return fmt.Errorf("fail to list log %s by day: %v", dayEntry.Name(), listHourMinuteErr)
+		}
+		freshFilerIds := make(map[string]string)
+		enqueued := false
+		for _, hourMinuteEntry := range hourMinuteEntries {
+			// println("checking hh-mm", hourMinuteEntry.FullPath)
+			hourMinute := util.FileNameBase(hourMinuteEntry.Name())
+			if dayEntry.Name() == c.startDate {
+				if strings.Compare(hourMinute, c.startHourMinute) < 0 {
+					continue
+				}
+			}
+			if dayEntry.Name() == c.stopDate {
+				if strings.Compare(hourMinute, c.stopHourMinute) > 0 {
+					break
+				}
+			}
+
+			tsMinute := fmt.Sprintf("%s-%s", dayEntry.Name(), hourMinute)
+			// println("  enqueue", tsMinute)
+			t, parseErr := time.Parse("2006-01-02-15-04", tsMinute)
+			if parseErr != nil {
+				glog.Errorf("failed to parse %s: %v", tsMinute, parseErr)
 				continue
 			}
-		}
-		if dayEntry.Name() == c.stopDate {
-			if strings.Compare(hourMinute, c.stopHourMinute) > 0 {
-				break
+			filerId := getFilerId(hourMinuteEntry.Name())
+			if filerId == "" {
+				glog.Warningf("Invalid log file name format: %s", hourMinuteEntry.Name())
+				continue // Skip files with invalid format
 			}
-		}
-
-		tsMinute := fmt.Sprintf("%s-%s", dayEntry.Name(), hourMinute)
-		// println("  enqueue", tsMinute)
-		t, parseErr := time.Parse("2006-01-02-15-04", tsMinute)
-		if parseErr != nil {
-			glog.Errorf("failed to parse %s: %v", tsMinute, parseErr)
-			continue
-		}
-		filerId := getFilerId(hourMinuteEntry.Name())
-		if filerId == "" {
-			glog.Warningf("Invalid log file name format: %s", hourMinuteEntry.Name())
-			continue // Skip files with invalid format
-		}
-		iter, found := v.perFilerIteratorMap[filerId]
-		if !found {
-			iter = newLogFileQueueIterator(c.f.MasterClient, c.f.persistedLogCache, util.NewQueue[*LogFileEntry](), c.startTsNs, c.stopTsNs)
-			v.perFilerIteratorMap[filerId] = iter
-			freshFilerIds[filerId] = hourMinuteEntry.Name()
-		}
-		iter.q.Enqueue(&LogFileEntry{
-			TsNs:      t.UnixNano(),
-			FileEntry: hourMinuteEntry,
-		})
-	}
-
-	// fill the pq with the next log entry if it is a new filer
-	for filerId, entryName := range freshFilerIds {
-		iter, found := v.perFilerIteratorMap[filerId]
-		if !found {
-			glog.Errorf("Unexpected! failed to find iterator for filer %s", filerId)
-			continue
-		}
-		next, nextErr := iter.getNext(v)
-		if nextErr != nil {
-			if nextErr == io.EOF {
-				// do nothing since the filer has no more log entries
-			} else {
-				return fmt.Errorf("failed to get next log entry for %v: %w", entryName, nextErr)
+			iter, found := v.perFilerIteratorMap[filerId]
+			if !found {
+				iter = newLogFileQueueIterator(c.f.MasterClient, c.f.persistedLogCache, util.NewQueue[*LogFileEntry](), c.startTsNs, c.stopTsNs)
+				v.perFilerIteratorMap[filerId] = iter
 			}
-		} else {
-			heap.Push(v.pq, &LogEntryItem{
-				Entry: next,
-				filer: filerId,
+			if !iter.active {
+				iter.active = true
+				freshFilerIds[filerId] = hourMinuteEntry.Name()
+			}
+			iter.q.Enqueue(&LogFileEntry{
+				TsNs:      t.UnixNano(),
+				FileEntry: hourMinuteEntry,
 			})
+			enqueued = true
 		}
-	}
+		if !enqueued {
+			continue
+		}
 
-	return nil
+		// fill the pq with the next log entry if it is a new or newly-reactivated filer
+		for filerId, entryName := range freshFilerIds {
+			iter, found := v.perFilerIteratorMap[filerId]
+			if !found {
+				glog.Errorf("Unexpected! failed to find iterator for filer %s", filerId)
+				continue
+			}
+			next, nextErr := iter.getNext(v)
+			if nextErr != nil {
+				iter.active = false
+				if nextErr == io.EOF {
+					// do nothing since the filer has no more log entries
+				} else {
+					return fmt.Errorf("failed to get next log entry for %v: %w", entryName, nextErr)
+				}
+			} else {
+				heap.Push(v.pq, &LogEntryItem{
+					Entry: next,
+					filer: filerId,
+				})
+			}
+		}
+
+		return nil
+	}
 }
 
 // ----------
@@ -499,6 +522,7 @@ type LogFileQueueIterator struct {
 	startTsNs           int64
 	stopTsNs            int64
 	currentFileIterator *LogFileIterator
+	active              bool
 }
 
 func newLogFileQueueIterator(masterClient *wdclient.MasterClient, cache *persistedLogCache, q *util.Queue[*LogFileEntry], startTsNs, stopTsNs int64) *LogFileQueueIterator {

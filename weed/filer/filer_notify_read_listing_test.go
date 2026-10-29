@@ -23,6 +23,27 @@ type countingListStore struct {
 	yields map[string]int
 }
 
+// cappedListStore mirrors stores such as FoundationDB which enforce a smaller
+// maximum than the caller's requested directory-list limit.
+type cappedListStore struct {
+	*stubFilerStore
+	max int64
+}
+
+func (s *cappedListStore) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, each ListEachEntryFunc) (string, error) {
+	if limit > s.max {
+		limit = s.max
+	}
+	return s.stubFilerStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, each)
+}
+
+func (s *cappedListStore) ListDirectoryPrefixedEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, each ListEachEntryFunc) (string, error) {
+	if limit > s.max {
+		limit = s.max
+	}
+	return s.stubFilerStore.ListDirectoryPrefixedEntries(ctx, dirPath, startFileName, includeStartFile, limit, prefix, each)
+}
+
 func (s *countingListStore) count(dirPath util.FullPath, each ListEachEntryFunc) ListEachEntryFunc {
 	return func(entry *Entry) (bool, error) {
 		s.mu.Lock()
@@ -163,6 +184,56 @@ func TestPersistedLogReadsListOnlyFromTheScanStartMinute(t *testing.T) {
 		}
 		if !slices.Equal(gotTsNs, wantTsNs) {
 			t.Fatalf("read %d entries %v, want all %d entries after start %v", len(gotTsNs), gotTsNs, len(wantTsNs), wantTsNs)
+		}
+	})
+}
+
+func TestPersistedLogReadsPaginateStoreCappedListings(t *testing.T) {
+	stub := newStubFilerStore()
+	store := &cappedListStore{stubFilerStore: stub, max: 1000}
+	f, _ := newTestFilerWithStubStore()
+	f.Store = NewFilerStoreWrapper(store)
+
+	day := "2026-10-28"
+	chunksByID, allTsNs := seedFullDayOfLogs(t, f, day, "filerA")
+	start := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+
+	origLoad := loadLogFileEntriesFn
+	loadLogFileEntriesFn = func(_ *wdclient.MasterClient, c *filer_pb.FileChunk) ([]*filer_pb.LogEntry, bool, error) {
+		return chunksByID[c.GetFileIdString()], true, nil
+	}
+	defer func() { loadLogFileEntriesFn = origLoad }()
+
+	t.Run("CollectLogFileRefs", func(t *testing.T) {
+		refs, _, err := f.CollectLogFileRefs(context.Background(), log_buffer.NewMessagePosition(start.UnixNano(), 0), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := len(refs), 24*60; got != want {
+			t.Fatalf("refs = %d, want all %d minute files", got, want)
+		}
+	})
+
+	t.Run("collectPersistedLogBuffer", func(t *testing.T) {
+		visitor, err := f.collectPersistedLogBuffer(log_buffer.NewMessagePosition(start.UnixNano(), 0), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer visitor.Close()
+
+		var got []int64
+		for {
+			entry, err := visitor.GetNext()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, entry.GetTsNs())
+		}
+		if !slices.Equal(got, allTsNs) {
+			t.Fatalf("read %d entries, want all %d entries", len(got), len(allTsNs))
 		}
 	})
 }

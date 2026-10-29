@@ -24,6 +24,22 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
 
+// fuseMetadataRequestTimeout returns the deadline for namespace requests. It
+// may not exceed the general request deadline it shortens.
+func fuseMetadataRequestTimeout(option *MountOptions, request time.Duration) (time.Duration, error) {
+	var metadata time.Duration
+	if option.fuseMetadataRequestTimeout != nil {
+		metadata = *option.fuseMetadataRequestTimeout
+	}
+	if metadata < 0 {
+		return 0, fmt.Errorf("-fuse.metadataRequestTimeout %v must not be negative", metadata)
+	}
+	if request > 0 && metadata > request {
+		return 0, fmt.Errorf("-fuse.metadataRequestTimeout %v must not exceed -fuse.requestTimeout %v", metadata, request)
+	}
+	return metadata, nil
+}
+
 // fuseRequestTimeouts returns the mount's own deadline for answering a FUSE
 // request and the timeout it negotiates with the kernel. The mount must answer
 // first: the kernel's timeout aborts the whole connection.
@@ -61,6 +77,11 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 	requestTimeout, kernelRequestTimeout, err := fuseRequestTimeouts(option)
+	if err != nil {
+		fmt.Println(err.Error())
+		return false
+	}
+	metadataRequestTimeout, err := fuseMetadataRequestTimeout(option, requestTimeout)
 	if err != nil {
 		fmt.Println(err.Error())
 		return false
@@ -225,6 +246,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 
 	fuseMountOptions.RequestTimeout = requestTimeout
 	fuseMountOptions.KernelRequestTimeout = kernelRequestTimeout
+	fuseMountOptions.MetadataRequestTimeout = metadataRequestTimeout
 
 	if option.writebackCache != nil {
 		fuseMountOptions.EnableWriteback = *option.writebackCache

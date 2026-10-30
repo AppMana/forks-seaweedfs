@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"strings"
 
@@ -730,17 +731,58 @@ func (a *winfspFS) Fsyncdir(path string, datasync bool, fh uint64) int {
 }
 
 func (a *winfspFS) Setxattr(path string, name string, value []byte, flags int) int {
-	return -cgofuse.ENOSYS
+	ino, st := a.resolveInode(path)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	// cgofuse and the raw filesystem number XATTR_CREATE and XATTR_REPLACE
+	// the same; TestXattrFlagValues pins both sides.
+	in := &fuse.SetXAttrIn{InHeader: a.header(ino), Flags: uint32(flags), Size: uint32(len(value))}
+	return toWinErrno(a.wfs.SetXAttr(nil, in, name, value))
 }
 
+// xattrBufferSize is the largest attribute value or name listing one reply
+// carries; MAX_XATTR_VALUE_SIZE bounds what SetXAttr accepts.
+const xattrBufferSize = 64 * 1024
+
 func (a *winfspFS) Getxattr(path string, name string) (int, []byte) {
-	return -cgofuse.ENOSYS, nil
+	ino, st := a.resolveInode(path)
+	if st != fuse.OK {
+		return toWinErrno(st), nil
+	}
+	header := a.header(ino)
+	dest := make([]byte, xattrBufferSize)
+	size, st := a.wfs.GetXAttr(nil, &header, name, dest)
+	if st != fuse.OK {
+		return toWinErrno(st), nil
+	}
+	return 0, dest[:size]
 }
 
 func (a *winfspFS) Removexattr(path string, name string) int {
-	return -cgofuse.ENOSYS
+	ino, st := a.resolveInode(path)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	header := a.header(ino)
+	return toWinErrno(a.wfs.RemoveXAttr(nil, &header, name))
 }
 
 func (a *winfspFS) Listxattr(path string, fill func(name string) bool) int {
-	return -cgofuse.ENOSYS
+	ino, st := a.resolveInode(path)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	header := a.header(ino)
+	dest := make([]byte, xattrBufferSize)
+	size, st := a.wfs.ListXAttr(nil, &header, dest)
+	if st != fuse.OK {
+		return toWinErrno(st)
+	}
+	for _, name := range bytes.Split(dest[:size], []byte{0}) {
+		if len(name) > 0 && !fill(string(name)) {
+			break
+		}
+	}
+	return 0
 }

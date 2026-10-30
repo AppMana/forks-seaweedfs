@@ -166,10 +166,8 @@ func cachedLink(t *testing.T, wfs *WFS, path util.FullPath) *filer.Entry {
 // links leave one name that no other part of Link() writes and that only the
 // sibling sync visits.
 //
-// The source is written outside a mount, so it persists Attributes.Inode 0,
-// the number Link() used to key the sync by. GetAllPaths(0) yields nothing,
-// which is what the second half of this test pins down: the sync has to be
-// keyed by the kernel node id, the number inodeToPath is indexed by.
+// When the source is written outside a mount it persists Attributes.Inode 0, so
+// sibling sync must be keyed by the kernel node id rather than Attributes.Inode.
 func TestLinkSyncsHardLinkSiblingsOnThirdLink(t *testing.T) {
 	wfs, testServer := newCreateTestWFS(t)
 

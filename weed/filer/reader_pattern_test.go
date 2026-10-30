@@ -7,32 +7,8 @@ import (
 	"testing"
 )
 
-// These tests characterize ReaderPattern's sequential/random detection under
-// realistic FUSE read traffic, not just the idealized "one goroutine calling
-// MonitorReadAt in strict offset order" case the original implementation
-// assumed.
-//
-// Two distinct, independently real access patterns can defeat a bare
-// lastOffset == offset equality check even when the underlying file access
-// is not actually random:
-//
-//  1. Windowed reads whose start/stop offsets don't land exactly back to
-//     back, e.g. kernel page-fault-around/readahead windowing over a file
-//     accessed in roughly-forward but not byte-contiguous order (this is
-//     what safetensors' mmap-based, dict-order tensor reads produce).
-//  2. Concurrent, out-of-order-completing reads on the same handle (FUSE
-//     serves Read() requests under a shared, not exclusive, per-handle
-//     lock -- see weed/mount/weedfs_file_read.go -- so this is a normal,
-//     expected condition, not an edge case).
-//
-// A detector that can't tell "not actually random" apart from "genuinely
-// random" in either of these cases is a real bug: it silently disables
-// whole-chunk caching (see reader_at.go's IsRandomMode() branches) for
-// access that would otherwise have been served efficiently.
-
-// TestMonitorReadAt_StrictSequential is the baseline: a single goroutine
-// issuing back-to-back, exactly-contiguous reads must never be classified
-// as random. This should pass both before and after the fix.
+// TestMonitorReadAt_StrictSequential verifies that contiguous sequential reads
+// remain in sequential mode.
 func TestMonitorReadAt_StrictSequential(t *testing.T) {
 	rp := NewReaderPattern()
 	offset := int64(0)
@@ -47,14 +23,8 @@ func TestMonitorReadAt_StrictSequential(t *testing.T) {
 }
 
 // TestMonitorReadAt_WindowedNonContiguous simulates kernel fault-around /
-// readahead windowing: each request is a window of readSize bytes, and
-// consecutive windows advance by a similar but not always identical amount
-// (mirroring how safetensors' non-byte-contiguous tensor access, combined
-// with the kernel's own independent readahead heuristic, produces windows
-// whose boundaries don't align exactly). This is still, from the
-// application's perspective, "roughly forward-moving, locally clustered"
-// access -- not the shuffled-whole-file pattern of genuine random reads --
-// and should not be classified as random.
+// readahead windowing where consecutive windows advance forward with small
+// overlaps or gaps.
 func TestMonitorReadAt_WindowedNonContiguous(t *testing.T) {
 	rp := NewReaderPattern()
 	const windowSize = 64 * 1024
@@ -62,10 +32,6 @@ func TestMonitorReadAt_WindowedNonContiguous(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	for i := 0; i < 200; i++ {
 		rp.MonitorReadAt(offset, windowSize)
-		// Advance by a window that overlaps or gaps slightly instead of
-		// landing exactly at offset+windowSize -- this is what a
-		// non-byte-contiguous but still forward-moving access pattern
-		// produces once windowed by kernel readahead.
 		jitter := int64(rng.Intn(4096)) - 2048
 		offset += windowSize + jitter
 	}
@@ -74,24 +40,9 @@ func TestMonitorReadAt_WindowedNonContiguous(t *testing.T) {
 	}
 }
 
-// TestMonitorReadAt_ConcurrentOutOfOrderCompletion simulates FUSE's shared
-// (not exclusive) per-handle lock allowing multiple concurrent Read()
-// requests on one handle. Each of N logical streams is itself a strictly
-// sequential run of small requests, but because MonitorReadAt is called at
-// request *completion* time -- and concurrent completions can arrive in any
-// order -- the calls actually reaching MonitorReadAt can interleave across
-// streams. This is not genuinely random access: every individual stream's
-// own requests are perfectly contiguous. It should not be classified as
-// random after the fix.
-//
-// The interleaving here is driven deterministically (fixed round-robin
-// across streams) rather than via real goroutine scheduling, because
-// relying on the Go scheduler to actually race N goroutines produces a
-// flaky test: whether true interleaving happens at all is scheduler-timing
-// dependent, so a run that happens not to interleave silently passes
-// without exercising the bug. Deterministic interleaving reproduces the
-// actual failure mode -- calls arriving at MonitorReadAt in an order that
-// doesn't match any single stream's logical offset sequence -- reliably.
+// TestMonitorReadAt_ConcurrentOutOfOrderCompletion simulates concurrent Read()
+// completions arriving interleaved across streams within a handle's readahead
+// window.
 func TestMonitorReadAt_ConcurrentOutOfOrderCompletion(t *testing.T) {
 	rp := NewReaderPattern()
 	const readSize = 4096
@@ -145,12 +96,8 @@ func TestMonitorReadAt_ConcurrentOutOfOrderCompletion(t *testing.T) {
 	}
 }
 
-// TestMonitorReadAt_ConcurrentOutOfOrderCompletion_RealGoroutines is a
-// companion, non-deterministic race-detector-friendly variant using real
-// goroutines and -race, kept separate from the deterministic test above so
-// CI failures are unambiguous about which property broke. Not required to
-// reliably trip pre-fix (scheduler-dependent), but must never trip random
-// mode post-fix even when it does interleave.
+// TestMonitorReadAt_ConcurrentOutOfOrderCompletion_RealGoroutines exercises
+// MonitorReadAt concurrently across real goroutines under the race detector.
 func TestMonitorReadAt_ConcurrentOutOfOrderCompletion_RealGoroutines(t *testing.T) {
 	rp := NewReaderPattern()
 	const readSize = 4096

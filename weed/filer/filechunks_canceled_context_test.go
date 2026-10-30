@@ -14,20 +14,20 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
-// checkpointChunks is the shape of the CreateEntry that took down a filer:
-// 301 plain 2 MiB chunks, the first one overwritten by a later write.
+// checkpointChunks builds 301 plain 2 MiB chunks with the first chunk
+// overwritten by a later write.
 func checkpointChunks() []*filer_pb.FileChunk {
 	const chunkSize = 2 << 20
 	chunks := make([]*filer_pb.FileChunk, 0, 301)
 	for i := 0; i < 300; i++ {
 		chunks = append(chunks, &filer_pb.FileChunk{
-			FileId:       fmt.Sprintf("68257,%x", i+1),
+			FileId:       fmt.Sprintf("1,%x", i+1),
 			Offset:       int64(i) * chunkSize,
 			Size:         chunkSize,
 			ModifiedTsNs: int64(i + 1),
 		})
 	}
-	return append(chunks, &filer_pb.FileChunk{FileId: "68257,overwrite", Offset: 0, Size: chunkSize, ModifiedTsNs: 1000})
+	return append(chunks, &filer_pb.FileChunk{FileId: "1,overwrite", Offset: 0, Size: chunkSize, ModifiedTsNs: 1000})
 }
 
 func canceledContext() context.Context {

@@ -27,16 +27,10 @@ const (
 	// requests at or above this size gain nothing from buffering
 	readAheadBypassSize = 256 << 10
 	// readAheadOffsetTolerance bounds how far an incoming offset may lag
-	// b.seqEnd and still count as "sequential enough" to keep using the
-	// window. WinFsp's default dispatcher runs multiple worker threads, so
-	// concurrent Read calls on the same handle (e.g. an mmap-backed reader
-	// touching several pages at once) can complete out of order; a bare
-	// ofst == b.seqEnd check (like reader_pattern.go's original bug, see
-	// that file) would then misclassify genuinely-local access as random
-	// and permanently forgo the read-ahead window for it. The fallback path
-	// (readDirect -> wfs.Read -> reader_at.go) is always correct and cache-
-	// safe either way -- this only affects whether the window speedup is
-	// used, not correctness.
+	// b.seqEnd and still count as sequential. WinFsp runs multiple worker
+	// threads, so concurrent Read calls on the same handle can complete out of
+	// order; a tolerance window keeps locally clustered reads in the read-ahead
+	// window.
 	readAheadOffsetTolerance = 256 << 10
 )
 
@@ -130,9 +124,6 @@ func (c *readAheadCache) Read(fh, inode uint64, dst []byte, ofst int64, fetch fu
 	// would make any forward jump trivially "within tolerance" of itself.
 	b.seqEnd = ofst + int64(len(dst))
 	if !sequential {
-		// genuinely random access (far from the frontier): do not pollute
-		// the window, but the fallback below always goes through the
-		// shared, cache-safe wfs.Read path -- see readAheadOffsetTolerance.
 		return fetch(dst, ofst)
 	}
 

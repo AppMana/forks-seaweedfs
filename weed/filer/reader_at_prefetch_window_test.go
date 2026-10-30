@@ -15,13 +15,9 @@ import (
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-// A sequential reader issuing small reads against slow volume servers (a
-// saturated link) must fetch every chunk once. The prefetch on each read
-// used to start prefetchCount more chunks beyond those already in flight, so
-// the window grew to the request's slot limit, the only completed chunk left
-// to evict was the one being read, and each 32 KiB read downloaded its whole
-// chunk again: Harbor pulls fetched every 4 MiB chunk ~130 times on
-// 2026-10-29.
+// A sequential reader issuing small reads against slow volume servers must
+// fetch each chunk once without prefetching past the active window and evicting
+// the chunk currently being read.
 func TestSequentialSmallReadsFetchEachChunkOnceOnSlowServers(t *testing.T) {
 	const chunkSize = 256 << 10
 	const chunkCount = 40

@@ -428,8 +428,8 @@ func TestHardLinkUnsupported(t *testing.T) {
 	}
 }
 
-// Symlinks are refused rather than half-supported: WinFsp needs a reparse
-// point to follow one, and an entry it cannot follow reads back empty.
+// Same-volume symlinks resolve to their target and unlinking the link leaves
+// the target intact.
 func TestSymlinkUnlinkPreservesTarget(t *testing.T) {
 	dir := testRoot(t)
 	target := filepath.Join(dir, "target.txt")

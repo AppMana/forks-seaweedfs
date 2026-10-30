@@ -312,11 +312,11 @@ func TestWindowsBasicAccessDenial(t *testing.T) {
 	}
 }
 
-// Retain individual samples for matched-build lab comparisons. No absolute
+// Retain individual samples for matched-build comparisons. No absolute
 // wall-clock threshold: guest scheduling differs across hosts. Each timed path
 // validates data, so a failed/short read cannot masquerade as a speedup.
-// Use QPC, not time.Now: the latter rounded an entire 4096-read sample to
-// zero on the Windows Server 2022 VM. Keep timer calls outside the read loop.
+// Use QPC rather than time.Now for sub-millisecond resolution, and keep timer
+// calls outside the read loop.
 func TestWindowsAccessPerformance(t *testing.T) {
 	clock, frequency := windowsPerformanceCounter(t)
 	name := filepath.Join(testRoot(t), "access-perf.bin")

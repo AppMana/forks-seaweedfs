@@ -11,38 +11,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
-// Regression tests for the third of the three bugs behind the 2026-07-16
-// production mmap hang (fork release post.9). The other two -- the
-// false-random detector (reader_pattern.go) and the random-mode chunk-cache
-// bypass (reader_at.go) -- are covered by reader_pattern_test.go and
-// reader_at_random_mode_cache_test.go respectively. This one had no test.
-//
-// The bug: readChunkSliceAt tracked the previously-read chunk in a plain
-// `lastChunkFid string` field and, on a chunk transition, called
-// readerCache.UnCache(lastChunkFid) to evict it. Both halves are wrong under
-// concurrency, and WFS.Read holds only a SHARED per-handle lock, so
-// readChunkSliceAt genuinely runs in parallel for different chunks (mmap page
-// faults resolving on separate goroutines):
-//
-//   a) the plain string field is a data race (caught by -race);
-//   b) lastChunkFid is then "whatever some other goroutine last stored", not
-//      "the chunk this stream just finished with", so the UnCache destroyed a
-//      DIFFERENT, still-in-use chunk's downloader out from under the reader
-//      that owned it -- forcing an endless re-fetch storm.
-//
-// The fix made the field an atomic.Pointer[string] and deleted the UnCache
-// call outright, leaving capacity-based LRU eviction in
-// ReaderCache.ReadChunkAt as the only reclamation path.
-//
-// IMPORTANT for future merges: upstream has never touched reader_at.go (4.36
-// is byte-identical to 4.23 there) and still carries both halves of this bug.
-// It is pure fork divergence, so a future merge that DOES touch this file can
-// silently reintroduce it. These tests are the guard.
-
 // newMultiChunkFixture builds a ChunkReadAt over numChunks distinct chunks,
 // backed by a request-counting server, with a ReaderCache large enough that
-// capacity eviction never fires -- so any re-fetch observed is caused by an
-// explicit eviction, not by the cache running out of room.
+// capacity eviction never fires.
 func newMultiChunkFixture(t *testing.T, numChunks, chunkSize int) (*ChunkReadAt, *int64, func()) {
 	t.Helper()
 
@@ -92,17 +63,9 @@ func newMultiChunkFixture(t *testing.T, numChunks, chunkSize int) (*ChunkReadAt,
 	return readerAt, requestCount, server.Close
 }
 
-// TestConcurrentChunkTransitionsDoNotEvictEachOther is the regression test for
-// the eviction race. Several goroutines each read repeatedly from their OWN
-// chunk, always starting at OffsetInChunk == 0 so every read takes the chunk-
-// transition branch. Because each goroutine sees a lastChunkFid written by a
-// different goroutine, the pre-fix code called UnCache on a chunk another
-// goroutine was actively using, destroying its downloader and forcing a
-// re-fetch -- every round, forever.
-//
-// Post-fix each chunk is downloaded exactly once and served from the
-// downloader map thereafter, so the backend request count stays pinned near
-// numChunks regardless of how many rounds run.
+// TestConcurrentChunkTransitionsDoNotEvictEachOther verifies that concurrent
+// goroutines reading from distinct chunks at OffsetInChunk == 0 do not evict
+// each other's active downloaders.
 func TestConcurrentChunkTransitionsDoNotEvictEachOther(t *testing.T) {
 	const numChunks = 6
 	const chunkSize = 64 * 1024
@@ -113,13 +76,8 @@ func TestConcurrentChunkTransitionsDoNotEvictEachOther(t *testing.T) {
 	defer closeFn()
 	defer readerAt.readerCache.destroy()
 
-	// Drive the goroutines in lockstep rounds. Without a barrier the Go
-	// scheduler happily runs each goroutine's whole loop back to back, so
-	// lastChunkFid stays equal to that goroutine's own chunk and the
-	// transition branch never fires -- the test would pass even against the
-	// buggy code. Stepping every chunk through round r before anyone starts
-	// r+1 guarantees that each goroutine observes a lastChunkFid written by a
-	// different chunk, which is precisely the production condition.
+	// Step every chunk through round r before starting r+1 so each goroutine
+	// observes a lastChunkFid written by a different chunk.
 	starts := make([]chan struct{}, numChunks)
 	for i := range starts {
 		starts[i] = make(chan struct{})
@@ -170,10 +128,8 @@ func TestConcurrentChunkTransitionsDoNotEvictEachOther(t *testing.T) {
 	}
 }
 
-// TestLastChunkFidConcurrentAccessIsRaceFree drives the same field from many
-// goroutines with no assertion beyond "did not race or crash". Its value is
-// under `go test -race`, where the pre-fix plain-string field is reported as a
-// write/write and read/write data race on ChunkReadAt.lastChunkFid.
+// TestLastChunkFidConcurrentAccessIsRaceFree exercises concurrent chunk
+// transitions across goroutines under -race.
 func TestLastChunkFidConcurrentAccessIsRaceFree(t *testing.T) {
 	const numChunks = 4
 	const chunkSize = 32 * 1024
@@ -204,12 +160,9 @@ func TestLastChunkFidConcurrentAccessIsRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
-// The eviction-on-transition call must stay deleted. A single-threaded
-// sequential walk across chunks and back re-reads chunk 0 at the end; if the
-// transition still evicted the previous chunk, that re-read would cost a
-// second backend fetch. This is the single-threaded canary for the same fix --
-// it fails fast and deterministically, without depending on goroutine
-// interleaving.
+// TestChunkTransitionDoesNotEvictPreviousChunk verifies that walking across
+// chunks and re-reading chunk 0 serves chunk 0 from the cache without a second
+// backend fetch.
 func TestChunkTransitionDoesNotEvictPreviousChunk(t *testing.T) {
 	const numChunks = 4
 	const chunkSize = 32 * 1024

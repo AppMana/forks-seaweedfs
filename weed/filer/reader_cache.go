@@ -236,7 +236,7 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 		window++
 		chunkAlloc := int64(mem.AllocationSize(int(chunkView.ChunkSize)))
 		if existing, found := root.downloaders[chunkView.FileId]; found {
-			if atomic.LoadInt32(&existing.pins) == 0 || (rc != root && existing.scope != rc) {
+			if (atomic.LoadInt32(&existing.pins) == 0 && atomic.LoadInt32(&existing.readers) == 0) || (rc != root && existing.scope != rc) {
 				windowBytes += chunkAlloc
 			}
 			continue

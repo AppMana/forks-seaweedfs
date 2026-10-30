@@ -76,8 +76,8 @@ func (f *fakeRefs) total() int {
 	return n
 }
 
-func newTestPathCache(refs *fakeRefs, capacity int) *winfspPathCache {
-	return newWinfspPathCache(time.Second, time.Minute, capacity, refs.retain, refs.forget, refs.isBusy)
+func newTestPathCache(refs *fakeRefs, capacity int) *winfspPathCache[int] {
+	return newWinfspPathCache[int](time.Second, time.Minute, capacity, refs.retain, refs.forget, refs.isBusy)
 }
 
 func TestWinfspPathCacheHoldsOneReferencePerEntry(t *testing.T) {
@@ -254,5 +254,80 @@ func TestWinfspPathCacheConcurrentUse(t *testing.T) {
 	c.sweep(start.Add(time.Hour * 24))
 	if refs.total() != 0 || c.size() != 0 {
 		t.Fatalf("references left after the final sweep: %d (cache %d)", refs.total(), c.size())
+	}
+}
+
+func TestWinfspPathCacheServesAttributesWithinTheirTTL(t *testing.T) {
+	refs := newFakeRefs()
+	c := newTestPathCache(refs, 16)
+	now := time.Now()
+
+	// Attributes for a path not cached yet enter it with a reference.
+	refs.lookup(5)
+	c.setStat("/f", 5, false, 42, c.generation(), now)
+	refs.forget(5)
+	if refs.count(5) != 1 {
+		t.Fatalf("references = %d, want the cache's own", refs.count(5))
+	}
+	if inode, stat, ok := c.stat("/f", now.Add(999*time.Millisecond)); !ok || inode != 5 || stat != 42 {
+		t.Fatalf("stat = %d, %d, %v within the TTL", inode, stat, ok)
+	}
+	if _, _, ok := c.stat("/f", now.Add(time.Second)); ok {
+		t.Fatal("attributes answered past their TTL")
+	}
+
+	c.setStat("/f", 5, false, 43, c.generation(), now)
+	c.forgetStat("/f")
+	if _, _, ok := c.stat("/f", now); ok {
+		t.Fatal("attributes answered after forgetStat")
+	}
+	if refs.count(5) != 1 {
+		t.Fatal("forgetStat returned the reference")
+	}
+}
+
+// Attributes read before a purge of their key must not be stored after it.
+func TestWinfspPathCacheDiscardsAttributesReadBeforeAPurge(t *testing.T) {
+	refs := newFakeRefs()
+	c := newTestPathCache(refs, 16)
+	now := time.Now()
+	refs.lookup(5)
+	c.adopt("/d/f", 5, false, now)
+
+	for _, purge := range []func(){
+		func() { c.forgetStat("/d/f") },
+		func() { c.purge("/d/f", false) },
+		func() { c.purge("/d", true) },
+	} {
+		gen := c.generation()
+		purge()
+		refs.lookup(5)
+		c.setStat("/d/f", 5, false, 1, gen, now)
+		refs.forget(5)
+		if _, _, ok := c.stat("/d/f", now); ok {
+			t.Fatal("attributes read before a purge were stored")
+		}
+	}
+
+	// A purge of another key does not.
+	gen := c.generation()
+	c.forgetStat("/d/g")
+	c.purge("/dd", true)
+	refs.lookup(5)
+	c.setStat("/d/f", 5, false, 2, gen, now)
+	refs.forget(5)
+	if _, stat, ok := c.stat("/d/f", now); !ok || stat != 2 {
+		t.Fatal("an unrelated purge discarded attributes")
+	}
+
+	// Past the remembered window every older read is discarded.
+	gen = c.generation()
+	for i := 0; i <= winfspMaxRecentPurges; i++ {
+		c.forgetStat(util.FullPath(fmt.Sprintf("/other/%d", i)))
+	}
+	c.forgetStat("/d/f")
+	c.setStat("/d/f", 5, false, 3, gen, now)
+	if _, _, ok := c.stat("/d/f", now); ok {
+		t.Fatal("a read older than the purge window was stored")
 	}
 }

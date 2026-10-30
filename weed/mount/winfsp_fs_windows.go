@@ -34,7 +34,7 @@ type winfspFS struct {
 	cgofuse.FileSystemBase
 	wfs              *WFS
 	readAhead        *readAheadCache
-	paths            *winfspPathCache
+	paths            *winfspPathCache[cgofuse.Stat_t]
 	caseSensitive    bool
 	identityError    error
 	basicPermissions bool
@@ -63,7 +63,7 @@ func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
 		fileHandle:    make(map[uint64]*winfspHandleRef),
 		dirHandle:     make(map[uint64]*winfspHandleRef),
 	}
-	a.paths = newWinfspPathCache(winfspCacheTTL, wfs.dirIdleEvict, winfspMaxCachedPaths,
+	a.paths = newWinfspPathCache[cgofuse.Stat_t](winfspCacheTTL, wfs.dirIdleEvict, winfspMaxCachedPaths,
 		func(inode uint64) bool { return wfs.inodeToPath.IncrementNlookup(inode) },
 		a.release, a.inodeBusy)
 	return a
@@ -80,12 +80,37 @@ func (a *winfspFS) expireReferences(now time.Time) {
 // directory its subtree's. A name that appeared replaces whatever was cached
 // under it.
 func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {
+	// Every event outdates the attributes of its path, of the inode's other
+	// names (a hard link's nlink and contents), and of the parent directory.
+	if ino, found := a.wfs.inodeToPath.GetInode(event.Path); found {
+		a.forgetInodeStat(ino)
+	}
+	a.forgetStatWithParent(event.Path)
+	if event.RenamedTo != "" {
+		a.forgetStatWithParent(event.RenamedTo)
+	}
 	if event.Entry != nil && event.PreviousEntry != nil {
 		return // an update in place keeps the name
 	}
 	a.paths.purge(event.Path, event.Entry == nil && event.WasDirectory)
 	if event.RenamedTo != "" {
 		a.paths.purge(event.RenamedTo, false)
+	}
+}
+
+// forgetStatWithParent drops the attributes cached for key and for its
+// directory, whose mtime a change of the name moves.
+func (a *winfspFS) forgetStatWithParent(key util.FullPath) {
+	a.paths.forgetStat(key)
+	if dir, _ := key.DirAndName(); dir != string(key) {
+		a.paths.forgetStat(util.FullPath(dir))
+	}
+}
+
+// forgetInodeStat drops the attributes cached under every name of ino.
+func (a *winfspFS) forgetInodeStat(ino uint64) {
+	for _, path := range a.wfs.inodeToPath.GetAllPaths(ino) {
+		a.paths.forgetStat(path)
 	}
 }
 
@@ -410,29 +435,57 @@ func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
 	return 0
 }
 
+// Getattr answers from the path cache's attributes the way the kernel's
+// attribute cache answers on the unix mounts. A file with an open handle, or
+// a flush still pending, is excluded: its live size is on the handle.
 func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 	defer track(opGetattr)()
 	if a.identityError != nil {
 		return -cgofuse.EIO
 	}
-	in := fuse.GetAttrIn{}
 	if ino, ok := a.inodeFromFh(fh); ok {
-		in.InHeader = a.header(ino)
-	} else {
-		ino, status := a.resolve(path)
-		if status != fuse.OK {
-			return toWinErrno(status)
-		}
-		defer a.release(ino)
-		in.InHeader = a.header(ino)
+		return a.getattrInode(path, ino, fh, st)
 	}
+	now := time.Now()
+	full := a.fullPath(path)
+	if ino, cached, ok := a.paths.stat(full, now); ok && !a.inodeBusy(ino) {
+		if current, found := a.wfs.inodeToPath.GetInode(full); found && current == ino {
+			*st = cached
+			return 0
+		}
+	}
+	gen := a.paths.generation()
+	ino, canonical, status := a.walk(strings.Trim(path, "/"))
+	if status != fuse.OK {
+		return toWinErrno(status)
+	}
+	defer a.release(ino)
+	if code := a.getattrInode(path, ino, fh, st); code != 0 {
+		return code
+	}
+	if ino > 1 && !a.inodeBusy(ino) {
+		a.paths.setStat(a.fullPath("/"+canonical), ino, st.Mode&cgofuse.S_IFMT == cgofuse.S_IFDIR, *st, gen, now)
+	}
+	return 0
+}
+
+func (a *winfspFS) getattrInode(path string, ino, fh uint64, st *cgofuse.Stat_t) int {
+	in := fuse.GetAttrIn{InHeader: a.header(ino)}
 	var out fuse.AttrOut
 	if status := a.wfs.GetAttr(nil, &in, &out); status != fuse.OK {
-		glog.V(1).Infof("winfsp getattr failed: path=%q inode=%d fh=%d status=%v", path, in.NodeId, fh, status)
+		glog.V(1).Infof("winfsp getattr failed: path=%q inode=%d fh=%d status=%v", path, ino, fh, status)
 		return toWinErrno(status)
 	}
 	attrToStat(&out.Attr, st)
-	return a.getattrWindowsFlags(in.NodeId, st)
+	return a.getattrWindowsFlags(ino, st)
+}
+
+// forgetChildStat drops the attributes cached for name under parent and for
+// parent itself, after a mutation of the name.
+func (a *winfspFS) forgetChildStat(parent uint64, name string) {
+	if key, keyed := a.childKey(parent, name); keyed {
+		a.forgetStatWithParent(key)
+	}
 }
 
 // childKey is the cached path of name under a referenced parent.
@@ -464,6 +517,7 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 	var out fuse.EntryOut
 	in := fuse.MkdirIn{InHeader: a.creationHeader(parent), Mode: mode & 07777}
 	status := a.wfs.Mkdir(nil, &in, name, &out)
+	a.forgetChildStat(parent, name)
 	if status == fuse.OK {
 		// The new directory is about to be filled; keep its reference.
 		a.park(out.NodeId, true)
@@ -498,6 +552,7 @@ func (a *winfspFS) Mknod(path string, mode uint32, device uint64) int {
 	in := fuse.MknodIn{InHeader: a.creationHeader(parent), Mode: mode, Rdev: uint32(device)}
 	var out fuse.EntryOut
 	status = a.wfs.Mknod(nil, &in, name, &out)
+	a.forgetChildStat(parent, name)
 	if status == fuse.OK {
 		a.park(out.NodeId, false)
 	}
@@ -517,6 +572,7 @@ func (a *winfspFS) Rmdir(path string) int {
 	key, keyed := a.childKey(parent, name)
 	hdr := a.header(parent)
 	status := a.wfs.Rmdir(nil, &hdr, name)
+	a.forgetChildStat(parent, name)
 	if status == fuse.OK && keyed {
 		a.paths.purge(key, true)
 	}
@@ -534,8 +590,14 @@ func (a *winfspFS) Unlink(path string) int {
 	}
 	defer a.release(parent)
 	key, keyed := a.childKey(parent, name)
+	// The inode's other names lose a link.
+	ino, tracked := a.wfs.inodeToPath.GetInode(key)
 	hdr := a.header(parent)
 	status := a.wfs.Unlink(nil, &hdr, name)
+	if tracked {
+		a.forgetInodeStat(ino)
+	}
+	a.forgetChildStat(parent, name)
 	if status == fuse.OK && keyed {
 		a.paths.purge(key, false)
 	}
@@ -593,6 +655,8 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 	}
 	stage = "core rename"
 	status := a.wfs.Rename(nil, &in, oldName, newName)
+	a.forgetChildStat(oldParent, oldName)
+	a.forgetChildStat(newParent, newName)
 	if status == fuse.OK {
 		// A directory carries its subtree's names with it, and the rename may
 		// have replaced whatever held the destination.
@@ -625,6 +689,7 @@ func (a *winfspFS) Symlink(target string, newpath string) int {
 	var out fuse.EntryOut
 	hdr := a.creationHeader(parent)
 	status := a.wfs.Symlink(nil, &hdr, a.wfs.mountRootTarget(target), name, &out)
+	a.forgetChildStat(parent, name)
 	if status == fuse.OK {
 		a.park(out.NodeId, false)
 	}
@@ -669,6 +734,8 @@ func (a *winfspFS) Link(oldpath string, newpath string) int {
 	var out fuse.EntryOut
 	in := fuse.LinkIn{InHeader: a.header(parent), Oldnodeid: oldIno}
 	status := a.wfs.Link(nil, &in, name, &out)
+	a.forgetInodeStat(oldIno)
+	a.forgetChildStat(parent, name)
 	if status == fuse.OK {
 		a.park(out.NodeId, false)
 	}
@@ -684,7 +751,9 @@ func (a *winfspFS) setAttr(path string, common fuse.SetAttrInCommon) int {
 	defer a.release(ino)
 	common.InHeader = a.header(ino)
 	var out fuse.AttrOut
-	return toWinErrno(a.wfs.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: common}, &out))
+	status := a.wfs.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: common}, &out)
+	a.forgetInodeStat(ino)
+	return toWinErrno(status)
 }
 
 func (a *winfspFS) Chmod(path string, mode uint32) int {
@@ -778,7 +847,9 @@ func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
 		Mode:     mode & 07777,
 	}
 	var out fuse.CreateOut
-	if status := a.wfs.Create(nil, &in, name, &out); status != fuse.OK {
+	status := a.wfs.Create(nil, &in, name, &out)
+	a.forgetChildStat(parent, name)
+	if status != fuse.OK {
 		return toWinErrno(status), invalidFh
 	}
 	// Create grants a reference on the inode; the handle carries it.
@@ -827,6 +898,7 @@ func (a *winfspFS) Truncate(path string, size int64, fh uint64) int {
 	common.InHeader = a.header(ino)
 	var out fuse.AttrOut
 	code := toWinErrno(a.wfs.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: common}, &out))
+	a.forgetInodeStat(ino)
 	if code == 0 {
 		a.readAhead.Invalidate(ino)
 	}
@@ -910,6 +982,8 @@ func (a *winfspFS) Release(path string, fh uint64) int {
 		a.readAhead.Release(fh)
 	}
 	if ino := a.releaseHandle(a.fileHandle, fh); ino != 0 {
+		// Whatever was cached before the open predates its writes.
+		a.forgetInodeStat(ino)
 		// WinFsp reports the path the handle was opened with, which a
 		// rename since then has changed; park under the inode's own path.
 		// A writeback flush may still be draining: the cache holds the
@@ -1028,7 +1102,9 @@ func (a *winfspFS) Setxattr(path string, name string, value []byte, flags int) i
 	// cgofuse and the raw filesystem number XATTR_CREATE and XATTR_REPLACE
 	// the same; TestXattrFlagValues pins both sides.
 	in := &fuse.SetXAttrIn{InHeader: a.header(ino), Flags: uint32(flags), Size: uint32(len(value))}
-	return toWinErrno(a.wfs.SetXAttr(nil, in, name, value))
+	status := a.wfs.SetXAttr(nil, in, name, value)
+	a.forgetInodeStat(ino)
+	return toWinErrno(status)
 }
 
 // xattrBufferSize is the largest attribute value or name listing one reply
@@ -1060,7 +1136,9 @@ func (a *winfspFS) Removexattr(path string, name string) int {
 	}
 	defer a.release(ino)
 	header := a.header(ino)
-	return toWinErrno(a.wfs.RemoveXAttr(nil, &header, name))
+	status := a.wfs.RemoveXAttr(nil, &header, name)
+	a.forgetInodeStat(ino)
+	return toWinErrno(status)
 }
 
 func (a *winfspFS) Listxattr(path string, fill func(name string) bool) int {

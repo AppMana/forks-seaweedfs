@@ -65,6 +65,7 @@ func (a *winfspFS) updateWindowsMetadata(path string, update func(*filer_pb.Entr
 		return toWinErrno(status)
 	}
 	defer a.release(ino)
+	defer a.forgetInodeStat(ino)
 	fullPath, fh, entry, status := a.wfs.maybeReadEntry(context.Background(), ino)
 	if status != fuse.OK {
 		return toWinErrno(status)

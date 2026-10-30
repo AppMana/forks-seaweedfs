@@ -37,9 +37,15 @@ type scriptedHTTPClient struct {
 
 type contextWaitingHTTPClient struct{}
 
+var errCleanupContextNotCanceled = errors.New("cleanup request context was not canceled")
+
 func (contextWaitingHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	<-req.Context().Done()
-	return nil, req.Context().Err()
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-time.After(200 * time.Millisecond):
+		return nil, errCleanupContextNotCanceled
+	}
 }
 
 func (c *scriptedHTTPClient) Do(req *http.Request) (*http.Response, error) {

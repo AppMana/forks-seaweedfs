@@ -26,10 +26,13 @@ developer binary and needs the WinFsp MSI on the host; see
 
 **Mount (Linux and Windows)**
 
-- Every FUSE request is answered within `-fuse.requestTimeout`; the kernel is
-  asked to abort the connection after `-fuse.kernelRequestTimeout` if the
-  mount process itself stops answering. A stopped filer or volume server, or
-  a deleted cache directory, returns EIO instead of hanging callers.
+- Every FUSE request is answered within `-fuse.requestTimeout`, and namespace
+  requests (lookup, attributes, create, rename, readdir, xattrs) within the
+  shorter `-fuse.metadataRequestTimeout`, because the kernel can chain several
+  of them under one directory lock. The kernel is asked to abort the
+  connection after `-fuse.kernelRequestTimeout` if the mount process itself
+  stops answering. A stopped filer or volume server, or a deleted cache
+  directory, returns EIO instead of hanging callers.
 - Chunk uploads are bounded per attempt; the metadata commit deadline starts
   after the data upload, so a large `close()` over a slow link no longer
   fails after its data was stored.
@@ -63,9 +66,10 @@ developer binary and needs the WinFsp MSI on the host; see
   overwrites are ordered after observed chunk versions.
 - A metadata store that cannot apply an event degrades to read-through
   instead of serving stale entries.
-- The on-disk read cache uses disk as chunks are cached instead of reserving
-  its whole limit at start, and recreates a cache directory removed
-  underneath it.
+- The on-disk read cache is one content-addressed chunk directory shared by
+  every mount on the node, with a quota per mount and one for the whole
+  directory. It uses disk as chunks are cached instead of reserving its limit
+  at start, and recreates a cache directory removed underneath it.
 - Swap and buffered-write failures are reported, never acknowledged as
   written; deferred creates survive cache eviction and flush serially.
 - Sequential/random read detection no longer misclassifies concurrent or
@@ -111,10 +115,13 @@ symlinks; opt-in basic permissions. Details in [WINDOWS_PORT.md](WINDOWS_PORT.md
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `-cacheCapacityMB` | 128 | On-disk read cache per mount, in three tiers (1/8, 3/8 and 1/2 of the limit). Disk is used as chunks are cached, up to the limit. `0` disables it. |
-| `-cacheDir` | system temp | Parent of the mount's cache. The mount keeps its cache and write swap in `<cacheDir>/<id>`, where `<id>` hashes the mount directory, filer, filer path and weed version: a different version starts a new directory and leaves the old one, which nothing removes. |
+| `-cacheCapacityMB` | 128 | This mount's quota in the shared on-disk chunk cache. Disk is used as chunks are cached, up to the quota. `0` disables the disk cache. |
+| `-wholeCacheCapacityMB` | 0 | Quota of the whole shared chunk directory across all mounts. `0` means `max(4 * cacheCapacityMB, 16384)`, or `2 * cacheCapacityMB` when that is under 64. |
+| `-sharedChunkCacheDir` | derived | The shared chunk directory. By default `<cacheDir>/chunks`; when `cacheDir` is itself a 64 hex digit hash directory (as the CSI driver passes) or sits under a `volumes/` directory, the `chunks` directory beside them. |
+| `-cacheDir` | system temp | Parent of the mount's metadata cache and write swap, kept in `<cacheDir>/<id>`, where `<id>` hashes the mount directory, filer, filer path and weed version: a different version starts a new directory and leaves the old one, which nothing removes. |
 | `-writeBufferSizeMB` | 0 (no cap) | Cap on the mount's dirty data, memory plus swap. Writers wait for uploads when it is full, so `close()` drains at most this much. |
 | `-fuse.requestTimeout` | 60 s | A request still unanswered after this long gets EIO and is cancelled. Must be below the kernel timeout. `0` disables. |
+| `-fuse.metadataRequestTimeout` | 25 s | The same for namespace requests. Several can run in sequence under one directory lock, so their sum must stay below the kernel's 120 s hung task window. `0` uses `-fuse.requestTimeout`; it must not exceed it. |
 | `-fuse.kernelRequestTimeout` | 90 s | Negotiated at `FUSE_INIT` on Linux 6.14+: the kernel aborts the connection if a request stays unanswered this long. Whole seconds; `0` disables. |
 | `-readerCacheMode` | `auto` | `sequential` caches whole chunks always (mmap-heavy reads such as model loading); `random` never. |
 | `-winfspOptions`, `-winfspCaseSensitive`, `-winfspBasicPermissions`, `-volumeLabel` | | Windows mounts only; see [WINDOWS_PORT.md](WINDOWS_PORT.md). |
@@ -127,8 +134,9 @@ after a flush 30 s after the data upload finished. A listing or negative
 lookup in a cached directory waits up to 1 s for an in-flight event, and
 serves the cache after 5 s when the filer is unreachable.
 
-A mount's disk use is bounded by `cacheCapacityMB + writeBufferSizeMB` in its
-current cache directory. Size `writeBufferSizeMB` so that it drains well
+A mount's disk use is bounded by its `cacheCapacityMB` share of the chunk
+cache plus `writeBufferSizeMB` of swap; the node's chunk directory as a whole
+by `wholeCacheCapacityMB`. Size `writeBufferSizeMB` so that it drains well
 inside the request timeout at the node's uplink rate (512 MiB at 46 MB/s is
 about 11 s).
 
@@ -168,42 +176,33 @@ and every difference below is within it.
 | list_5k | 202436 ops/s | 200478 ops/s | -1.0% |
 | walk_5k | 279237 ops/s | 280711 ops/s | +0.5% |
 
-## How CI builds and qualifies
+## CI
 
 | Workflow | Trigger | Does |
 | --- | --- | --- |
-| [`appmana-server-images.yml`](.github/workflows/appmana-server-images.yml) | push to the default branch (`weed/**`, `go.mod`, docker inputs) | Tests and builds native amd64 and arm64 large-disk servers, publishes `ghcr.io/appmana/seaweedfs:sha-<commit>_large_disk` as one two-platform manifest. A candidate only: qualification is separate. |
-| [`appmana-storage-reliability.yml`](.github/workflows/appmana-storage-reliability.yml) | push to `merge/**`, pull requests, dispatch | Race-tested unit suites, real FUSE gates, maintenance, packaged-image, etcd-restore, isolated lab and rollback gates on hosted runners; VM fault, hung-task and native Windows gates on a self-hosted KVM runner. |
-| [`appmana-weed-windows.yml`](.github/workflows/appmana-weed-windows.yml) | push to `merge/**`, pull requests | Cross-compile and native `weed.exe` builds, WinFsp mount smoke, conformance and mount benchmarks. |
+| [`appmana-server-images.yml`](.github/workflows/appmana-server-images.yml) | push to `merge/upstream-4.51` touching `weed/**`, `go.mod`, `go.sum` or the docker inputs; dispatch | Tests and builds native amd64 and arm64 large-disk servers and publishes `ghcr.io/appmana/seaweedfs:sha-<commit>_large_disk` as one two-platform manifest. |
+| [`appmana-storage-reliability.yml`](.github/workflows/appmana-storage-reliability.yml) | push to `master`, `main` or `merge/**`, pull requests, dispatch | Race-tested unit suites, real FUSE gates, mutant controls, maintenance, packaged-image, etcd-restore, isolated lab and rollback gates on hosted runners; VM fault, hung-task and native Windows gates on a self-hosted KVM runner (pushes and dispatch only). |
+| [`appmana-weed-windows.yml`](.github/workflows/appmana-weed-windows.yml) | push to `merge/**`, pull requests into `merge/**` | Cross-compile and native `weed.exe` builds, WinFsp mount smoke, Cuzz schedule fuzzing, WinFsp conformance (advisory) and mount benchmarks. |
 
 Mount images are built by the CSI fork's `build-images.yml` from the commit
-its `SEAWEEDFS_COMMIT` pins. Deploy only CI-built images, by digest.
+it pins. Deploy only CI-built images, by digest.
 
-Qualify a change locally the way CI does:
+Repository variables the workflows read (full commit SHAs unless noted):
 
-```sh
-# unit and race
-GOWORK=off go test -short -tags 5BytesOffset -race -count=1 ./weed/mount/... ./weed/filer/... ./weed/storage/... ./weed/util/chunk_cache/...
-python3 -m unittest discover -s test/storage_lab -v
+| Variable | Use |
+| --- | --- |
+| `SEAWEEDFS_RELIABILITY_GO_FUSE_REF` | `AppMana/forks-go-fuse` commit checked out beside the repo for the `go.mod` replace. Required by the server image and reliability workflows. |
+| `SEAWEEDFS_RELIABILITY_BASELINE_REF` | Previous deployed commit; the upgrade, rollback and migration gates run it against the candidate. Must differ from the candidate. |
+| `SEAWEEDFS_PERFORMANCE_BASELINE_REF` | Vanilla upstream commit for the interval and index startup performance comparison. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_REF` | `AppMana/labcontainers` commit; must match the SDK pinned in `test/storage_lab/vm/go.mod`. |
+| `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE`, `SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` | Linux and Windows Server VM images as `name@sha256:…`, the Linux one labelled with the Labcontainers revision. A repository secret of the same name takes precedence and keeps a private registry name out of public logs. |
+| `SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH`/`_SHA256`, `SEAWEEDFS_RELIABILITY_GIT_INSTALLER_PATH`/`_SHA256` | Optional offline installers on the lab runner; unset, CI downloads the pinned releases and checks their digests. |
+| `SEAWEEDFS_RELIABILITY_GIT_LFS_PATH`/`_SHA256` | Optional Git LFS binary for client comparison in the Windows VM. |
+| `SEAWEEDFS_ETCD_TEST_IMAGE` | Optional etcd image by digest for the restore gate. |
 
-# real FUSE mounts on this host; WEED_BINARY selects the binary under test
-go build -tags 5BytesOffset -o /abs/weed ./weed
-(cd test/fuse_integration && WEED_BINARY=/abs/weed go test -count=1 -v -timeout=20m . \
-  -run '^(TestUnresponsiveBackendAnswersWithinRequestTimeout|TestLargeSequentialWriteClosesWithinWriteBufferDrainTime|TestWriteBufferCap|TestCrossMountCloseToOpenVisibility|TestCloseSucceedsWhenAnAssignedVolumeServerStalls|TestSlowButProgressingUploadsClose)$')
-
-# disposable-VM gates (guest panics on hung tasks); needs KVM and Labcontainers
-SEAWEEDFS_STUCK_LAB_LIVE=1 SEAWEEDFS_NOTIFY_LAB_LIVE=1 SEAWEEDFS_LINUX_WEED=/abs/weed \
-LABCONTAINERS_LABD=/abs/labd LABCONTAINERS_VM_IMAGE=<pinned image> \
-GOWORK=off go test ./test/storage_lab/vm -run '^(TestFuseStuckBackendLab|TestFuseReverseInvalidationLab)$' -v -timeout 90m
-```
-
-The [storage lab README](test/storage_lab/README.md) covers the four-VM
-fault, Windows and mixed-OS scenarios and their inputs. CI takes the
-Labcontainers VM image (`name@sha256:…`, labelled with `LABCONTAINERS_REF`)
-from the repository secret `SEAWEEDFS_RELIABILITY_LABCONTAINERS_VM_IMAGE`, or
-the variable of the same name, and the Windows Server image from
-`SEAWEEDFS_RELIABILITY_LABCONTAINERS_WINDOWS_IMAGE` the same way; a secret
-keeps a private registry's name out of public logs.
+[AGENTS.md](AGENTS.md) describes how to build, test and merge locally. The
+[storage lab README](test/storage_lab/README.md) describes the isolated
+runners and VM scenarios.
 
 ## Branches
 
@@ -211,10 +210,9 @@ keeps a private registry's name out of public logs.
 | --- | --- |
 | `merge/upstream-4.51` | Default branch: the maintained 4.51 line. Fork fixes merge here without rebasing; server and mount builds target this line. |
 | `merge/upstream-4.48` | Previous line, no longer updated; every commit on it is in `merge/upstream-4.51`. |
-| `merge/upstream-<next>` | Next upstream release merged into the default branch. It becomes the default once qualified; the server image workflow's branch filter moves with it. |
-| `release/<change>-<base>` | Short-lived ship branch: a deployed commit plus only the change being rolled out. It merges back into the default branch and is then deleted. |
+| `merge/upstream-<next>` | Next upstream release merged into the default branch. It becomes the default once it passes the gates; the server image workflow's branch filter moves with it. |
 
-The default branch advances only by merges: fork fixes, ship branches merged
-back, and upstream releases merged in on the next `merge/upstream-*` branch.
+The default branch advances only by merges: fork fixes and upstream releases
+merged in on the next `merge/upstream-*` branch.
 
 [Upstream](https://github.com/seaweedfs/seaweedfs)

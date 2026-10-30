@@ -168,7 +168,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	if *repairFromReplicas && *c.findMissingChunksInFiler && (*applyPurging || *purgeAbsent) {
 		return fmt.Errorf("-findMissingChunksInFiler -repairMissingFromReplicas cannot be combined with -reallyDeleteFromVolume or -reallyDeleteFilerEntries, which would delete filer entries")
 	}
-	if *maxOrphanPercent < 0 || *maxOrphanPercent > 100 {
+	if math.IsNaN(*maxOrphanPercent) || *maxOrphanPercent < 0 || *maxOrphanPercent > 100 {
 		return fmt.Errorf("-maxOrphanPercent %v is not between 0 and 100", *maxOrphanPercent)
 	}
 

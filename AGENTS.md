@@ -122,8 +122,9 @@ Mount images are built in
 [forks-seaweedfs-csi-driver](https://github.com/AppMana/forks-seaweedfs-csi-driver)
 from a pinned commit of this repository, and the Synology package in
 [spk-seaweedfs](https://github.com/AppMana/spk-seaweedfs) downloads the source
-archive of a pinned commit. Pinned commits must stay reachable: never rewrite
-published history on `merge/**` branches.
+archive of a pinned commit. Pinned commits must stay reachable. Pins of old
+commits stay valid after a history rewrite because release tags and
+`archive/*` tags keep them reachable.
 
 ## Merging upstream
 

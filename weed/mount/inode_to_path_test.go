@@ -208,3 +208,35 @@ func TestMovePathWithNoSourceLeavesTheTarget(t *testing.T) {
 		t.Errorf("/a/g.txt resolves to %d (found %v), want %d", got, found, inode)
 	}
 }
+
+// A hard link's second name, first seen through Lookup, shares the inode. The
+// table has to record it with that inode, or the last forget leaves the name
+// mapped to an inode the table no longer has.
+func TestLookupRecordsHardLinkAliasWithItsInode(t *testing.T) {
+	table := NewInodeToPath(util.FullPath("/"), 0)
+	table.Lookup("/Original", 1, false, true, 42, true)
+	table.Lookup("/Alias", 1, false, true, 42, true)
+	if got := table.GetAllPaths(42); len(got) != 2 || got[0] != "/Original" || got[1] != "/Alias" {
+		t.Fatalf("paths of the inode = %v, want [/Original /Alias]", got)
+	}
+
+	table.Lookup("/Alias", 1, false, true, 42, true)
+	if got := table.GetAllPaths(42); len(got) != 2 {
+		t.Fatalf("a repeated lookup recorded the alias twice: %v", got)
+	}
+
+	table.RemovePath("/Original", nil)
+	if path, status := table.GetPath(42); status != fuse.OK || path != "/Alias" {
+		t.Fatalf("after removing the first name GetPath = %q, %v; want the alias", path, status)
+	}
+
+	table.Forget(42, 3, nil, nil)
+	for _, p := range []util.FullPath{"/Original", "/Alias"} {
+		if table.HasPath(p) {
+			t.Fatalf("%s is still mapped after the inode's last forget", p)
+		}
+	}
+	if table.HasInode(42) {
+		t.Fatal("inode survived its last forget")
+	}
+}

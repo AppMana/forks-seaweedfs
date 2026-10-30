@@ -16,6 +16,7 @@ import (
 	cgofuse "github.com/winfsp/cgofuse/fuse"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -28,6 +29,7 @@ type treeFiler struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	mu   sync.Mutex
 	dirs map[string]map[string]*filer_pb.Entry
+	tsNs int64
 }
 
 func newTreeFiler() *treeFiler {
@@ -53,6 +55,25 @@ func (s *treeFiler) remove(dir, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.dirs[dir], name)
+}
+
+// UpdateEntry stores the entry and answers with its event, as the filer does.
+func (s *treeFiler) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
+	s.mu.Lock()
+	old := s.dirs[req.Directory][req.Entry.Name]
+	s.tsNs++
+	tsNs := s.tsNs
+	s.mu.Unlock()
+	if old == nil {
+		return nil, filer_pb.ErrNotFound
+	}
+	s.add(req.Directory, proto.Clone(req.Entry).(*filer_pb.Entry))
+	return &filer_pb.UpdateEntryResponse{MetadataEvent: &filer_pb.SubscribeMetadataResponse{
+		Directory: req.Directory, TsNs: tsNs,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: old, NewEntry: req.Entry, NewParentPath: req.Directory, Signatures: req.Signatures,
+		},
+	}}, nil
 }
 
 func (s *treeFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {

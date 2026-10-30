@@ -511,9 +511,17 @@ func (a *winfspFS) Utimens(path string, tmsp []cgofuse.Timespec) int {
 		InHeader: a.header(ino),
 	}}
 	if len(tmsp) >= 2 {
-		in.Valid = fuse.FATTR_ATIME | fuse.FATTR_MTIME
-		in.Atime, in.Atimensec = uint64(tmsp[0].Sec), uint32(tmsp[0].Nsec)
-		in.Mtime, in.Mtimensec = uint64(tmsp[1].Sec), uint32(tmsp[1].Nsec)
+		if winfspTimeApplies(tmsp[0].Sec, tmsp[0].Nsec) {
+			in.Valid |= fuse.FATTR_ATIME
+			in.Atime, in.Atimensec = uint64(tmsp[0].Sec), uint32(tmsp[0].Nsec)
+		}
+		if winfspTimeApplies(tmsp[1].Sec, tmsp[1].Nsec) {
+			in.Valid |= fuse.FATTR_MTIME
+			in.Mtime, in.Mtimensec = uint64(tmsp[1].Sec), uint32(tmsp[1].Nsec)
+		}
+		if in.Valid == 0 {
+			return 0
+		}
 	} else {
 		now := cgofuse.Now()
 		in.Valid = fuse.FATTR_ATIME | fuse.FATTR_MTIME | fuse.FATTR_ATIME_NOW | fuse.FATTR_MTIME_NOW

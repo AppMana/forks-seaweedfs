@@ -157,10 +157,7 @@ func listNames(t *testing.T, dir string) []string {
 
 // A file another mount has closed is committed on the filer, so a listing or
 // lookup that starts afterwards on this mount must show it, and must no longer
-// show one the other mount has unlinked: close-to-open across mounts. A
-// pipeline-parallel trainer depends on it, each stage writing its checkpoint
-// file from its own node and rank 0 listing the directory once every stage has
-// passed a barrier (2026-10-09, 2 of 4 stage files listed).
+// show one the other mount has unlinked: close-to-open across mounts.
 func TestCrossMountCloseToOpenVisibility(t *testing.T) {
 	config := DefaultTestConfig()
 	fw := NewFuseTestFramework(t, config)
@@ -388,12 +385,9 @@ func (f *FuseTestFramework) startPeerFiler(t *testing.T, masterPort int, adverti
 }
 
 // A mount's own close says nothing about another mount's earlier close that
-// reached the cluster through another filer: the checkpoint barrier of a
-// pipeline-parallel trainer, rank 0 creating the staging directory and its own
-// stage file through one filer while rank 1's stage file, closed first through
-// another filer, is still being relayed (2026-10-15, 1 of 2 stage files
-// listed). Each round, B creates its file, A writes and closes its own through
-// the peer filer, then B closes its file and lists at once; B must list both.
+// reached the cluster through another filer. Each round, B creates its file, A
+// writes and closes its own through the peer filer, then B closes its file and
+// lists at once; B must list both.
 func TestCrossMountListingAfterOwnCloseSeesPeerFilerClose(t *testing.T) {
 	config := DefaultTestConfig()
 	masterPort := freePort(t)

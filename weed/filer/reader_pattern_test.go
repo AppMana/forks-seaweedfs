@@ -96,12 +96,8 @@ func TestMonitorReadAt_ConcurrentOutOfOrderCompletion(t *testing.T) {
 	}
 }
 
-// TestMonitorReadAt_ConcurrentOutOfOrderCompletion_RealGoroutines is a
-// companion, non-deterministic race-detector-friendly variant using real
-// goroutines and -race, kept separate from the deterministic test above so
-// CI failures are unambiguous about which property broke. Not required to
-// reliably trip pre-fix (scheduler-dependent), but must never trip random
-// mode post-fix even when it does interleave.
+// TestMonitorReadAt_ConcurrentOutOfOrderCompletion_RealGoroutines exercises
+// MonitorReadAt concurrently across real goroutines under the race detector.
 func TestMonitorReadAt_ConcurrentOutOfOrderCompletion_RealGoroutines(t *testing.T) {
 	rp := NewReaderPattern()
 	const readSize = 4096

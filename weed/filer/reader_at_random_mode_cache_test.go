@@ -57,14 +57,9 @@ func createCountingMockVolumeServer(t *testing.T, chunkData map[string][]byte) (
 	return server, &count
 }
 
-// TestRandomModeStillCachesWholeChunk is the primary regression test for the
-// reader_at.go fix: under IsRandomMode() == true, many small reads scattered
-// within a single chunk must still result in ~1 backend fetch for that
-// chunk, not one fetch per read. Before the fix, readChunkSliceAt's random-mode
-// branch bypassed ReaderCache.ReadChunkAt (the single-flight, whole-chunk
-// cache) entirely and called fetchChunkRange directly on every miss --
-// this test fails against that code (confirmed via `git stash` below in
-// comments for anyone re-verifying) and passes against the fix.
+// TestRandomModeStillCachesWholeChunk verifies that under IsRandomMode() == true,
+// small reads scattered within a single chunk share the whole-chunk ReaderCache
+// download (~1 backend fetch for that chunk rather than one fetch per read).
 func TestRandomModeStillCachesWholeChunk(t *testing.T) {
 	const chunkSize = 256 * 1024
 	const numReads = 40
@@ -107,21 +102,15 @@ func TestRandomModeStillCachesWholeChunk(t *testing.T) {
 		ctx:           ctx,
 	}
 
-	// Force random mode, matching how a real mmap/page-fault-driven access
-	// pattern trips the (now-fixed, but assume-worst-case-tripped-anyway)
-	// detector -- this test is specifically about the cache-bypass bug,
-	// independent of whether the detector itself is correct.
-	const farApart = 10 * 1024 * 1024 // comfortably beyond reader_pattern.go's tolerance window
+	const farApart = 10 * 1024 * 1024 // beyond reader_pattern.go's tolerance window
 	for i := 0; i < ModeChangeLimit+1; i++ {
-		readerAt.readerPattern.MonitorReadAt(int64(i)*farApart, readSize) // far-apart offsets: genuinely non-sequential
+		readerAt.readerPattern.MonitorReadAt(int64(i)*farApart, readSize)
 	}
 	if !readerAt.readerPattern.IsRandomMode() {
 		t.Fatalf("test setup failed to force random mode")
 	}
 
-	// Many small reads scattered within the single chunk, as mmap page
-	// faults touching different tensors within one 2MB-class chunk would
-	// produce.
+	// Small reads scattered within the single chunk.
 	rng := rand.New(rand.NewSource(4))
 	buf := make([]byte, readSize)
 	for i := 0; i < numReads; i++ {
@@ -141,16 +130,8 @@ func TestRandomModeStillCachesWholeChunk(t *testing.T) {
 	}
 
 	finalCount := atomic.LoadInt64(requestCount)
-	// One fetch for the whole chunk is the expected/desired behavior. Allow
-	// a small constant for retries/edge effects, but the whole point of the
-	// fix is that this does NOT scale with numReads (40): pre-fix,
-	// readChunkSliceAt's random-mode branch calls chunkCache.ReadChunkAt
-	// (always a miss here) and falls straight through to a raw,
-	// uncoalesced fetchChunkRange on every single read -- numReads backend
-	// requests for one chunk. Post-fix, every read goes through
-	// ReaderCache.ReadChunkAt, whose in-flight/completed downloader map is
-	// checked and reused for repeat reads of the same fileId regardless of
-	// detected pattern -- one real fetch total.
+	// Repeated reads of the same fileId reuse the whole-chunk downloader in
+	// ReaderCache.ReadChunkAt regardless of detected pattern.
 	if finalCount > 3 {
 		t.Fatalf("expected ~1 backend request for the whole chunk under random mode, got %d for %d reads -- random-mode reads are not sharing the whole-chunk cache", finalCount, numReads)
 	}

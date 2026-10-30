@@ -494,3 +494,59 @@ func TestReaderCachePerRequestAndWholeCacheScoping(t *testing.T) {
 		t.Fatalf("cross-scope read of 'b1' triggered a download (%d -> %d)", beforeFetches, afterFetches)
 	}
 }
+
+// A download waiting for budget skips a completed chunk while a read is still
+// copying out of it. When that read ends it must wake the waiter: otherwise
+// nothing else signals the budget and the waiting download never starts.
+func TestBudgetWaiterWakesWhenTheLastReaderOfAChunkLeaves(t *testing.T) {
+	budget := NewReaderCacheBudget(4 << 10)
+	fetch := func(_ context.Context, buffer []byte, _ []string, _ []byte, _ bool, _ bool, _ int64, _ string, _ util_http.RefreshUrlsFunc) (int, error) {
+		buffer[0] = 42
+		return len(buffer), nil
+	}
+	first := NewReaderCache(256, newMockChunkCacheForReaderCache(), func(context.Context, string) ([]string, error) { return []string{"unused"}, nil }, nil, budget)
+	defer first.destroy()
+	first.fetchChunkDataFn = fetch
+	buffer := make([]byte, 1)
+	if n, err := first.ReadChunkAt(context.Background(), buffer, "a", nil, false, 0, 3<<10, false); err != nil || n != 1 {
+		t.Fatalf("read a: n=%d err=%v", n, err)
+	}
+
+	// Hold a read open on chunk a, the only chunk the budget can evict.
+	first.Lock()
+	held := first.downloaders["a"]
+	if held == nil {
+		first.Unlock()
+		t.Skip("chunk a was not retained after its read")
+	}
+	held.wg.Add(1)
+	atomic.AddInt32(&held.readers, 1)
+	first.Unlock()
+
+	second := NewReaderCache(256, newMockChunkCacheForReaderCache(), func(context.Context, string) ([]string, error) { return []string{"unused"}, nil }, nil, budget)
+	defer second.destroy()
+	second.fetchChunkDataFn = fetch
+	read := make(chan error, 1)
+	go func() {
+		b := make([]byte, 1)
+		_, err := second.ReadChunkAt(context.Background(), b, "b", nil, false, 0, 3<<10, false)
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		t.Fatalf("chunk b was read while chunk a was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if _, err := held.readChunkAt(context.Background(), make([]byte, 1), 0); err != nil {
+		t.Fatalf("held read: %v", err)
+	}
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("read b: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("download waiting for budget was not woken when the last read of chunk a ended")
+	}
+}

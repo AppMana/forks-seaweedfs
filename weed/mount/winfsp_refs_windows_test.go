@@ -147,6 +147,8 @@ func newWinfspTreeWFS(t *testing.T, fake *treeFiler) (*WFS, *winfspFS) {
 		fhMap: NewFileHandleToInode(), dhMap: NewDirectoryHandleToInode(),
 		fhLockTable: util.NewLockTable[FileHandleId](), hardLinkLockTable: util.NewLockTable[string](),
 		atimeMap: make(map[uint64]time.Time), pendingAsyncFlush: make(map[uint64]chan struct{}),
+		// As a mount does by default: idle directory listings go after a while.
+		dirIdleEvict: defaultDirIdleEvict,
 	}
 	wfs.metaCache = meta_cache.NewMetaCache(
 		filepath.Join(t.TempDir(), "meta"), uidGidMapper, root, false,
@@ -380,5 +382,62 @@ func TestWinfspRemoteRenameAndDeleteReturnReferences(t *testing.T) {
 	a.expireReferences(time.Now().Add(time.Hour))
 	if size := inodeTableSize(wfs.inodeToPath); size != 1 {
 		t.Fatalf("inode table holds %d entries after the remote changes: %v", size, trackedPaths(wfs))
+	}
+}
+
+// Concurrent walkers, closes and sweeps must balance every reference.
+func TestWinfspConcurrentWalksReturnEveryReference(t *testing.T) {
+	_, wfs, a := newWalkedTree(t)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				a.expireReferences(time.Now())
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				path := fmt.Sprintf("/tree/d%02d/f%03d", (worker+i)%20, (worker*7+i)%50)
+				var stat cgofuse.Stat_t
+				if status := a.Getattr(path, &stat, invalidFh); status != 0 {
+					t.Errorf("getattr %s: %d", path, status)
+					return
+				}
+				status, fh := a.Open(path, cgofuse.O_RDONLY)
+				if status != 0 {
+					t.Errorf("open %s: %d", path, status)
+					return
+				}
+				if status, got := a.Getpath(strings.ToUpper(path), invalidFh); status != 0 || got != path {
+					t.Errorf("Getpath(%s) = %d, %q", strings.ToUpper(path), status, got)
+				}
+				a.Release(path, fh)
+				if i%50 == 0 {
+					dir := fmt.Sprintf("/tree/d%02d", (worker+i)%20)
+					status, dh := a.Opendir(dir)
+					if status != 0 {
+						t.Errorf("opendir %s: %d", dir, status)
+						return
+					}
+					a.Readdir(dir, func(string, *cgofuse.Stat_t, int64) bool { return true }, 0, dh)
+					a.Releasedir(dir, dh)
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(stop)
+	a.expireReferences(time.Now().Add(time.Hour))
+	if size := inodeTableSize(wfs.inodeToPath); size != 1 {
+		t.Fatalf("inode table holds %d entries after concurrent walks: %v", size, trackedPaths(wfs))
 	}
 }

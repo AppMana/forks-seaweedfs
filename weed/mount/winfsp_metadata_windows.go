@@ -60,10 +60,11 @@ func (a *winfspFS) Setcrtime(path string, timestamp cgofuse.Timespec) int {
 }
 
 func (a *winfspFS) updateWindowsMetadata(path string, update func(*filer_pb.Entry)) int {
-	ino, status := a.resolveInode(path)
+	ino, status := a.resolve(path)
 	if status != fuse.OK {
 		return toWinErrno(status)
 	}
+	defer a.release(ino)
 	fullPath, fh, entry, status := a.wfs.maybeReadEntry(context.Background(), ino)
 	if status != fuse.OK {
 		return toWinErrno(status)

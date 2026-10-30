@@ -240,6 +240,24 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 	return true
 }
 
+// AcquirePath takes one more reference on the inode path maps to, reporting
+// false when the table does not have the path. Checking and taking happen
+// under one lock, so a concurrent Forget cannot release the inode in between.
+func (i *InodeToPath) AcquirePath(path util.FullPath) (uint64, bool) {
+	i.Lock()
+	defer i.Unlock()
+	inode, found := i.path2inode[path]
+	if !found {
+		return 0, false
+	}
+	entry, found := i.inode2path[inode]
+	if !found {
+		return 0, false
+	}
+	entry.nlookup++
+	return inode, true
+}
+
 // InodeForListing returns the inode number a readdir should report for path
 // without entering it in the table. Nothing is reserved, so the collision probe
 // Lookup does is skipped: the worst case is a repeated st_ino in one listing.

@@ -248,7 +248,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
-	host := mount.NewWinFspHost(seaweedFileSystem, *option.winfspCaseSensitive, *option.winfspPermissions)
+	host := mount.NewWinFspHost(seaweedFileSystem, *option.winfspCaseSensitive, *option.winfspPermissions, *option.readOnly)
 	winFspHost = host
 	// Both CTRL_C_EVENT and CTRL_BREAK_EVENT are delivered as
 	// os.Interrupt by the Go runtime; the CSI mount supervisor stops this
@@ -286,12 +286,6 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 				extraOptions = append(extraOptions, "-o", opt)
 			}
 		}
-	}
-	if *option.readOnly {
-		// WinFsp cannot enforce read-only at the volume level for FUSE
-		// filesystems in all paths; the WFS handlers reject writes when
-		// the kernel does not. Surface intent via the FUSE option.
-		extraOptions = append(extraOptions, "-o", "ro")
 	}
 
 	// Register the directory mount point with the Windows mount manager

@@ -8,7 +8,6 @@ import (
 const gib = int64(1) << 30
 
 func TestPlanVolumeMemoryFromCgroup(t *testing.T) {
-	// The production DAS volume container: 5 GiB limit, no GOMEMLIMIT, auto admission.
 	plan := PlanVolumeMemory(VolumeMemoryInput{
 		AvailableBytes: 5 * gib,
 		RuntimeLimit:   math.MaxInt64,

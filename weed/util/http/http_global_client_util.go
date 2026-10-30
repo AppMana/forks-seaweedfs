@@ -557,10 +557,8 @@ func StatusError(fileUrl string, r *http.Response) error {
 const maxResponseDrain = 64 * 1024
 
 // CloseResponse releases resp. A short remainder is drained so the keep-alive
-// connection goes back to the pool; a long one is abandoned. Draining without
-// a bound made every failed or abandoned chunk read (a failed copy, a
-// cancelled GET) pull the rest of the chunk from the volume server first,
-// adding load to a server that was usually slow already.
+// connection goes back to the pool; a longer one is closed unread so the server
+// stops streaming an unneeded chunk.
 func CloseResponse(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return

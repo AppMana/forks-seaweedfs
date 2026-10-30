@@ -11,15 +11,14 @@ import (
 	"testing"
 )
 
-// Opt-in: exercise the published binary, not just the library or command handler.
-// Build this test with the same 5BytesOffset format as production cache indexes.
+// Opt-in: exercise a published binary, not just the library or command handler.
 func TestPublishedImageMigratesLegacyCache(t *testing.T) {
 	image := os.Getenv("SEAWEEDFS_CACHE_MIGRATION_IMAGE")
 	if image == "" {
 		t.Skip("requires an explicit published candidate image")
 	}
-	if !strings.HasPrefix(image, "ghcr.io/appmana/seaweedfs@sha256:") {
-		t.Fatal("digest-pinned AppMana image required")
+	if !strings.Contains(image, "@sha256:") {
+		t.Fatal("digest-pinned image required")
 	}
 	source, target := t.TempDir(), t.TempDir()
 	old := NewTieredChunkCache(0, source, 8, 1<<20)

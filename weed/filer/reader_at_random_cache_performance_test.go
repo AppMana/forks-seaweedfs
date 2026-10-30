@@ -101,17 +101,8 @@ func newRandomCachePerfFixture(t *testing.T, chunks int, latency time.Duration) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This fixture measures what the *cache* does once the reader is already in
-	// random mode; the classifier itself is covered by reader_pattern_test.go.
-	// Pin the mode explicitly rather than priming the heuristic with far-apart
-	// reads: priming leaves the read frontier parked at the far end of the file
-	// while the scenario below walks offsets 0..N upward toward it, so the
-	// measured reads drift back inside the tolerance window and silently
-	// re-classify as sequential partway through the run. That made the fixture
-	// depend on the exact value of the tolerance constant -- it broke when the
-	// 4.36 merge adopted upstream's 8 MiB SeqTolerance in place of the fork's
-	// 4 MiB offsetTolerance, with the last few chunks flipping to whole-chunk
-	// caching. The explicit override is what -readerCacheMode=random exists for.
+	// Pin random mode explicitly so the scenario measures cache promotion in
+	// random mode without depending on the sequential-tolerance window.
 	f.reader = NewChunkReaderAtFromClientWithMode(context.Background(), NewReaderCache(chunks+1, f.cache, lookup, nil), views, int64(chunks*randomCachePerfChunkSize), 0, ReaderCacheModeRandom)
 
 	if !f.reader.readerPattern.IsRandomMode() {
@@ -187,9 +178,8 @@ func TestRandomCachePromotesOnlyAfterReuse(t *testing.T) {
 	})
 }
 
-// TestRandomCachePerformanceCharacterization is an A/B harness for the
-// random-read whole-chunk caching change. Run it at 3f4c8a188^ and at the
-// desired revision to expose the latency/bandwidth tradeoff directly.
+// TestRandomCachePerformanceCharacterization exercises sparse, moderate, and
+// heavy chunk-reuse random read workloads.
 func TestRandomCachePerformanceCharacterization(t *testing.T) {
 	t.Run("SparseOneReadPerChunk", func(t *testing.T) {
 		runRandomCachePerfScenario(t, 32, 1)

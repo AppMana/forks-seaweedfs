@@ -13,11 +13,7 @@ import (
 )
 
 // A slow stream copying its current chunk out in slices must keep that chunk
-// while faster streams fill the shared memory budget with other chunks. The
-// S3 gateway reads 2-4 MiB chunks in small slices; when the budget was full,
-// the slow stream's completed chunk counted as idle and was evicted between
-// two slices, so every slice re-downloaded the whole chunk. Production saw a
-// gateway fetch 31 chunks 166 times to deliver 5 MB of one object.
+// while faster streams fill the shared memory budget with other chunks.
 func TestSlowStreamKeepsItsChunkUnderBudgetPressure(t *testing.T) {
 	const chunkSize = 64 << 10
 	const sliceSize = 8 << 10

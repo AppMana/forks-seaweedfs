@@ -23,6 +23,10 @@ const (
 	// replicaCostFloor stands in for an unmeasured replica and keeps the
 	// in-flight factor meaningful for very cheap ones.
 	replicaCostFloor = float64(time.Millisecond)
+	// replicaUnmeasuredInflightCost penalizes an unmeasured replica while its
+	// initial probe read is in flight, preventing concurrent reads from herding
+	// onto an unmeasured slow host before its first measurement completes.
+	replicaUnmeasuredInflightCost = float64(100 * time.Millisecond)
 )
 
 type replicaLoad struct {
@@ -46,7 +50,7 @@ func loadOf(host string) *replicaLoad {
 
 // recordReadCost folds one read of bytes that took elapsed into host's cost.
 func recordReadCost(host string, elapsed time.Duration, bytes int) {
-	mib := math.Max(1, float64(bytes)/(1<<20))
+	mib := math.Max(1.0/16.0, float64(bytes)/(1<<20))
 	cost := float64(elapsed) / mib
 	l := loadOf(host)
 	l.mu.Lock()
@@ -67,16 +71,22 @@ func (l *replicaLoad) fadedLocked(now time.Time) float64 {
 	return l.costNs * math.Exp2(-float64(age)/float64(replicaCostHalfLife))
 }
 
+// BeginReplicaRead counts a read to rawUrl's host as in flight; the returned
+// function ends it and records its cost when the read succeeds.
+func BeginReplicaRead(ctx context.Context, rawUrl string) func(bytes int, err error) {
+	return beginReplicaRead(ctx, hostOf(rawUrl))
+}
+
 // beginReplicaRead counts a read to host as in flight; the returned function
-// ends it and records its cost. A read the caller cancelled says nothing about
-// the replica and is not recorded.
+// ends it and records its cost. A read the caller cancelled or that failed /
+// returned no bytes says nothing about the replica's throughput and is not recorded.
 func beginReplicaRead(ctx context.Context, host string) func(bytes int, err error) {
 	l := loadOf(host)
 	l.inflight.Add(1)
 	start := time.Now()
 	return func(bytes int, err error) {
 		l.inflight.Add(-1)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || err != nil || bytes <= 0 {
 			return
 		}
 		recordReadCost(host, time.Since(start), bytes)
@@ -92,8 +102,16 @@ func replicaScore(host string, now time.Time) float64 {
 	l := v.(*replicaLoad)
 	l.mu.Lock()
 	cost := l.fadedLocked(now)
+	unmeasured := l.at.IsZero()
 	l.mu.Unlock()
-	return (math.Max(cost, replicaCostFloor)) * float64(1+l.inflight.Load())
+	inflight := l.inflight.Load()
+	if unmeasured {
+		if inflight == 0 {
+			return replicaCostFloor
+		}
+		return replicaUnmeasuredInflightCost * float64(inflight)
+	}
+	return (math.Max(cost, replicaCostFloor)) * float64(1+inflight)
 }
 
 // byReplicaLoad orders urls cheapest first; equal scores keep their order,

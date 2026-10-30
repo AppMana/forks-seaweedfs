@@ -199,14 +199,11 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 		return
 	}
 
-	// The window is the next count chunks, whether already downloading,
-	// cached or started here. Skipping present chunks without counting them
-	// let every read on a slow link start count more, until the prefetch
-	// filled the request's slots and evicted the chunk being read.
-	window := 0
-	for x := chunkViews; x != nil && window < count; x = x.Next {
+	// The window is the next count chunks, whether or not a download for them
+	// is already running: counting only newly started downloads would push the
+	// window count chunks further on every call.
+	for x, i := chunkViews, 0; x != nil && i < count; x, i = x.Next, i+1 {
 		chunkView := x.Value
-		window++
 		if _, found := root.downloaders[chunkView.FileId]; found {
 			continue
 		}

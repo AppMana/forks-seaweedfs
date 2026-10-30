@@ -6,7 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
@@ -17,7 +18,7 @@ func CreateVolumeFile(fileName string, preallocate int64, memoryMapSizeMB uint32
 		return nil, e
 	}
 	if preallocate != 0 {
-		if err := syscall.Fallocate(int(file.Fd()), 1, 0, preallocate); err != nil {
+		if err := unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, preallocate); err != nil {
 			cleanupErr := errors.Join(file.Close(), os.Remove(fileName))
 			return nil, errors.Join(
 				fmt.Errorf("preallocate %d bytes for %s: %w", preallocate, fileName, err),

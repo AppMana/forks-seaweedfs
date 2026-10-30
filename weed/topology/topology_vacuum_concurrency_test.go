@@ -19,7 +19,7 @@ func TestVacuumOwnershipCancellationAndAutomaticCoalescing(t *testing.T) {
 			atomic.StoreInt64(&topo.vacuumLockCounter, owner)
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			if err := topo.VacuumWithContext(ctx, nil, .1, 1, 0, "", 0, false, 0); !errors.Is(err, context.Canceled) {
+			if err := topo.VacuumWithContext(ctx, nil, .1, 1, 0, 0, "", 0, false, 0); !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled request: %v", err)
 			}
 			if atomic.LoadInt64(&topo.vacuumLockCounter) != owner {
@@ -27,11 +27,11 @@ func TestVacuumOwnershipCancellationAndAutomaticCoalescing(t *testing.T) {
 			}
 			ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			if err := topo.VacuumWithContext(ctx, nil, .1, 1, 0, "", 0, true, 0); err != nil {
+			if err := topo.VacuumWithContext(ctx, nil, .1, 1, 0, 0, "", 0, true, 0); err != nil {
 				t.Fatalf("automatic sweep should not wait: %v", err)
 			}
 			if busy {
-				if err := topo.VacuumWithContext(ctx, nil, .1, 1, 0, "", 0, false, 0); !errors.Is(err, context.DeadlineExceeded) {
+				if err := topo.VacuumWithContext(ctx, nil, .1, 1, 0, 0, "", 0, false, 0); !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("busy manual request must honor deadline: %v", err)
 				}
 			}
@@ -49,7 +49,7 @@ func TestManualVacuumDoesNotSilentlySkipBusyTopology(t *testing.T) {
 	atomic.StoreInt64(&topo.vacuumLockCounter, 1)
 	done := make(chan struct{})
 	go func() {
-		topo.Vacuum(nil, .1, 1, 0, "requested-collection", 0, false, 0)
+		topo.Vacuum(nil, .1, 1, 0, 0, "requested-collection", 0, false, 0)
 		close(done)
 	}()
 	select {

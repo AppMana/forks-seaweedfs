@@ -1,6 +1,6 @@
 # SeaweedFS fork: Windows mounts and bounded FUSE mounts
 
-SeaweedFS 4.48 with a WinFsp `weed mount` for Windows, FUSE mounts that
+SeaweedFS 4.51 with a WinFsp `weed mount` for Windows, FUSE mounts that
 always answer the kernel, and fixes for allocation, vacuum and recovery,
 memory use, S3 copies and cross-mount coherence. Every change carries a
 regression test that fails without it.

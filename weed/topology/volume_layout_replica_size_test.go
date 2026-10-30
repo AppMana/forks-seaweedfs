@@ -18,7 +18,7 @@ func TestReplicaSizeAccountingDuringRollingCompaction(t *testing.T) {
 		dn.Ip = string(dn.Id())
 		v := storage.VolumeInfo{Id: 1, Size: 9500, ReplicaPlacement: rp, Ttl: needle.EMPTY_TTL}
 		dn.AddOrUpdateVolume(v)
-		vl.RegisterVolume(&v, dn)
+		vl.RegisterVolume(&v, dn, nil)
 	}
 	for i, dn := range nodes {
 		v := storage.VolumeInfo{Id: 1, Size: 2000, CompactRevision: 1, ReplicaPlacement: rp, Ttl: needle.EMPTY_TTL}

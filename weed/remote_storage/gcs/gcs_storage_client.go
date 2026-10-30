@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
@@ -21,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/protobuf/proto"
@@ -347,6 +349,16 @@ func (gcs *gcsRemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocatio
 		wc.ContentType = entry.Attributes.Mime
 	}
 	wc.ContentEncoding = remote_storage.EntryContentEncoding(entry)
+	// A Writer reserves a buffer of ChunkSize bytes (16 MiB by default) so a
+	// failed request can be retried. An object below that size takes a buffer
+	// of its own size plus one 256 KiB unit, the SDK's granularity: a burst of
+	// small uploads in flight does not hold 16 MiB each, every upload keeps
+	// its retry buffer, and the object stays below ChunkSize so it goes in one
+	// request rather than a resumable session. The size counts the chunks,
+	// not only the attribute, which some write paths leave at zero.
+	if size := filer.FileSize(entry); size < uint64(googleapi.DefaultUploadChunkSize) {
+		wc.ChunkSize = int((size/googleapi.MinUploadChunkSize + 1) * googleapi.MinUploadChunkSize)
+	}
 	if _, err = io.Copy(wc, reader); err != nil {
 		return nil, fmt.Errorf("upload to gcs %s/%s%s: %v", loc.Name, loc.Bucket, loc.Path, err)
 	}
@@ -374,9 +386,9 @@ func toMetadata(attributes map[string][]byte) map[string]string {
 	return metadata
 }
 
-func (gcs *gcsRemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (err error) {
+func (gcs *gcsRemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (remoteEntry *filer_pb.RemoteEntry, err error) {
 	if reflect.DeepEqual(oldEntry.Extended, newEntry.Extended) {
-		return nil
+		return nil, nil
 	}
 	attrsToUpdate := storage.ObjectAttrsToUpdate{}
 	if metadata := toMetadata(newEntry.Extended); len(metadata) > 0 {
@@ -389,11 +401,14 @@ func (gcs *gcsRemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStora
 	}
 
 	if attrsToUpdate.Metadata == nil && attrsToUpdate.ContentEncoding == nil {
-		return nil
+		return nil, nil
 	}
 	key := loc.Path[1:]
-	_, err = gcs.client.Bucket(loc.Bucket).Object(key).Update(context.Background(), attrsToUpdate)
-	return
+	attr, err := gcs.client.Bucket(loc.Bucket).Object(key).Update(context.Background(), attrsToUpdate)
+	if err != nil {
+		return nil, err
+	}
+	return gcs.toRemoteEntry(attr), nil
 }
 func (gcs *gcsRemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error) {
 	key := loc.Path[1:]
@@ -404,6 +419,38 @@ func (gcs *gcsRemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocati
 		return fmt.Errorf("gcs delete %s%s: %v", loc.Bucket, key, err)
 	}
 	return
+}
+
+// DeleteFileIfUnchanged deletes the object only while it is still the one the
+// stat describes, enforced with a generation precondition. A replacement that
+// lands between the stat and the delete gets a new generation and fails the
+// precondition instead of being deleted.
+func (gcs *gcsRemoteStorageClient) DeleteFileIfUnchanged(loc *remote_pb.RemoteStorageLocation, stamp *filer_pb.RemoteEntry) (bool, error) {
+	key := loc.Path[1:]
+	object := gcs.client.Bucket(loc.Bucket).Object(key)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGCSOpTimeout)
+	defer cancel()
+	attr, err := object.Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return true, nil
+		}
+		return false, fmt.Errorf("stat gcs %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+	if !remote_storage.StillCurrent(stamp, gcs.toRemoteEntry(attr)) {
+		return false, nil
+	}
+	if err := object.If(storage.Conditions{GenerationMatch: attr.Generation}).Delete(ctx); err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return true, nil
+		}
+		var gerr *googleapi.Error
+		if errors.As(err, &gerr) && gerr.Code == http.StatusPreconditionFailed {
+			return false, nil
+		}
+		return false, fmt.Errorf("gcs delete %s%s: %w", loc.Bucket, key, err)
+	}
+	return true, nil
 }
 
 func (gcs *gcsRemoteStorageClient) ListBuckets() (buckets []*remote_storage.Bucket, err error) {

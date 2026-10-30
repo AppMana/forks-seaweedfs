@@ -181,8 +181,10 @@ func (s3a *S3ApiServer) parseAndValidateRange(w http.ResponseWriter, r *http.Req
 		return 0, totalSize, false, nil
 	}
 
-	// Empty directory: 404. A file promoted to a directory keeps its data and stays retrievable.
-	if entry.IsDirectory && totalSize == 0 {
+	// Empty directory: 404. A file promoted to a directory keeps its data and
+	// stays retrievable, and a stored directory-key marker is an object, not a
+	// missing key — an unsatisfiable range answers 416.
+	if entry.IsDirectory && totalSize == 0 && !entry.IsDirectoryKeyObject() {
 		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
 		return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("directory object %s/%s cannot be retrieved", bucket, object))
 	}
@@ -533,6 +535,24 @@ func (s3a *S3ApiServer) serveDirectoryContent(w http.ResponseWriter, r *http.Req
 	if r.Method == http.MethodHead && len(entry.Chunks) > 0 {
 		contentLength = int64(entry.Attributes.FileSize)
 	}
+	statusCode := http.StatusOK
+	if r.Header.Get("Range") != "" && requestedPartNumber(r) == 0 {
+		// A ranged request answers like the object path does: 206 with its
+		// Content-Range and the range's length, served on GET, reported on HEAD.
+		totalSize := contentLength
+		offset, size, isRangeRequest, rangeErr := s3a.parseAndValidateRange(w, r, entry, totalSize, bucket, object)
+		if rangeErr != nil {
+			return
+		}
+		if isRangeRequest {
+			contentLength = size
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+			statusCode = http.StatusPartialContent
+			if r.Method != http.MethodHead {
+				content = content[offset : offset+size]
+			}
+		}
+	}
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 
 	// Set last modified
@@ -545,12 +565,12 @@ func (s3a *S3ApiServer) serveDirectoryContent(w http.ResponseWriter, r *http.Req
 
 	// For HEAD requests, don't write body
 	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(statusCode)
 		return
 	}
 
 	// Write content
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(statusCode)
 	if len(content) > 0 {
 		if _, err := w.Write(content); err != nil {
 			glog.Errorf("serveDirectoryContent: failed to write response: %v", err)
@@ -663,7 +683,7 @@ func (s3a *S3ApiServer) handleDirectoryObjectRequest(w http.ResponseWriter, r *h
 	} else if isDirectoryObject {
 		// Directory object but doesn't exist
 		glog.V(2).Infof("%s: directory object %s/%s not found", handlerName, bucket, object)
-		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 		return true // Request was handled (with not found)
 	}
 
@@ -688,11 +708,16 @@ func newListEntry(s3a *S3ApiServer, entry *filer_pb.Entry, key string, dir strin
 	// Determine ETag: prioritize ExtETagKey for versioned objects (supports multipart ETags),
 	// then fall back to filer.ETag() which uses Md5 attribute or calculates from chunks
 	etag := s3a.getObjectETag(entry)
+	size := int64(filer.FileSize(entry))
+	if isDirectory && size == 0 {
+		// A trailing-slash key keeps its body inline in the directory entry, with no FileSize.
+		size = int64(len(entry.Content))
+	}
 	listEntry = ListEntry{
 		Key:          key,
 		LastModified: time.Unix(entry.Attributes.Mtime, 0).UTC(),
 		ETag:         etag,
-		Size:         int64(filer.FileSize(entry)),
+		Size:         size,
 		StorageClass: StorageClass(storageClass),
 	}
 	if fetchOwner {
@@ -765,17 +790,68 @@ func (s3a *S3ApiServer) processConditionalHeaders(w http.ResponseWriter, r *http
 			w.Header().Set("ETag", result.ETag)
 		}
 
-		s3err.WriteErrorResponse(w, r, result.ErrorCode)
+		s3a.writeConditionalCheckError(w, r, bucket, object, handlerName, result)
 		return result, true // request handled
 	}
 	return result, false // request not handled
+}
+
+// writeConditionalCheckError answers a failed conditional-header check. A
+// missing-key answer still carries the delete marker's headers when the
+// condition failed against one, so a resuming client can tell a deleted key
+// from one that never existed.
+func (s3a *S3ApiServer) writeConditionalCheckError(w http.ResponseWriter, r *http.Request, bucket, object, handlerName string, result ConditionalHeaderResult) {
+	if result.ErrorCode == s3err.ErrNoSuchKey && result.DeleteMarker != nil {
+		s3a.writeDeleteMarkerResponse(w, r, bucket, object, handlerName, result.DeleteMarker, "", "")
+		return
+	}
+	if result.ErrorCode == s3err.ErrNoSuchKey || result.ErrorCode == s3err.ErrNoSuchBucket {
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, result.ErrorCode)
+		return
+	}
+	s3err.WriteErrorResponse(w, r, result.ErrorCode)
+}
+
+// writeDeleteMarkerResponse answers a GET or HEAD that resolved to a delete
+// marker as S3 does: x-amz-delete-marker and the marker's version id, with
+// 404 NoSuchKey for the current version and 405 MethodNotAllowed when the
+// marker itself was requested by versionId. Anonymous reads never get a
+// delete marker (authorizeAnonymousObjectRead), so they keep the plain miss.
+func (s3a *S3ApiServer) writeDeleteMarkerResponse(w http.ResponseWriter, r *http.Request, bucket, object, handlerName string, entry *filer_pb.Entry, markerVersionId, requestedVersionId string) {
+	if isAnonymousObjectRead(r) {
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+		return
+	}
+	if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), entry.Extended, handlerName); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	// The entry's own version id wins: markers written outside the normal PUT
+	// path may lack the attribute yet still carry it in the v_<id> file name.
+	if versionId := versionIdFromEntry(entry); versionId != "" {
+		markerVersionId = versionId
+	}
+	if markerVersionId == "" {
+		markerVersionId = "null"
+	}
+	w.Header().Set(s3_constants.AmzDeleteMarker, "true")
+	w.Header().Set("x-amz-version-id", markerVersionId)
+	if requestedVersionId == "" {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		return
+	}
+	w.Header().Set("Allow", "DELETE")
+	if entry.Attributes != nil {
+		w.Header().Set("Last-Modified", time.Unix(entry.Attributes.Mtime, 0).UTC().Format(http.TimeFormat))
+	}
+	s3err.WriteErrorResponse(w, r, s3err.ErrMethodNotAllowed)
 }
 
 func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request) {
 
 	bucket, object := s3_constants.GetBucketAndObject(r)
 	glog.V(3).Infof("GetObjectHandler %s %s", bucket, object)
-	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
+	if _, err := s3a.validateTableBucketObjectPathOrVerify(bucket, object); err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
 		return
 	}
@@ -836,7 +912,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 	versioningConfigured, err = s3a.isVersioningConfigured(bucket)
 	if err != nil {
 		if err == filer_pb.ErrNotFound {
-			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchBucket)
 			return
 		}
 		glog.Errorf("Error checking versioning status for bucket %s: %v", bucket, err)
@@ -853,9 +929,21 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 			glog.V(3).Infof("GetObject: requesting specific version %s for %s/%s", versionId, bucket, object)
 			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
 			if err != nil {
+				if versionId == "null" && errors.Is(err, filer_pb.ErrNotFound) {
+					marker, markerErr := s3a.nullDeleteMarkerEntry(bucket, object)
+					if markerErr != nil {
+						glog.Errorf("GetObject: failed to look up null delete marker for %s/%s: %v", bucket, object, markerErr)
+						s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+						return
+					}
+					if marker != nil {
+						s3a.writeDeleteMarkerResponse(w, r, bucket, object, "GetObjectHandler", marker, "null", versionId)
+						return
+					}
+				}
 				glog.Errorf("Failed to get specific version %s: %v", versionId, err)
 				if errors.Is(err, filer_pb.ErrNotFound) {
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchVersion)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchVersion)
 				} else {
 					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 				}
@@ -881,7 +969,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 				entry, err = s3a.getLatestObjectVersion(bucket, object)
 				if err != nil {
 					glog.Errorf("GetObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
@@ -895,7 +983,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 				} else {
 					// No object at regular path either - object doesn't exist
 					glog.V(3).Infof("GetObject: object not found at regular path or .versions for %s/%s", bucket, object)
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			} else {
@@ -904,7 +992,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 				entry, err = s3a.getLatestObjectVersion(bucket, object)
 				if err != nil {
 					glog.Errorf("GetObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			}
@@ -925,7 +1013,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 		// Check if this is a delete marker
 		if entry.Extended != nil {
 			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
-				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				s3a.writeDeleteMarkerResponse(w, r, bucket, object, "GetObjectHandler", entry, targetVersionId, versionId)
 				return
 			}
 		}
@@ -970,7 +1058,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			if objectEntryForSSE == nil {
-				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 				return
 			}
 		}
@@ -987,7 +1075,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 	// A bare directory path is not an object: 404 like AWS instead of an empty 200,
 	// so Hadoop-style clients fall back to LIST discovery. HEAD and ranged GET already 404.
 	if !strings.HasSuffix(object, "/") && isBareDirectory(objectEntryForSSE) {
-		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 		return
 	}
 
@@ -1493,16 +1581,6 @@ func (s3a *S3ApiServer) streamRangeToClient(w io.Writer, r *http.Request, reader
 		return cw.written, copyErr
 	}
 	return cw.written, nil
-}
-
-// Shared HTTP client for volume server requests (connection pooling)
-var volumeServerHTTPClient = &http.Client{
-	Timeout: 5 * time.Minute,
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-	},
 }
 
 // createLookupFileIdFunction creates a reusable lookup function for resolving volume URLs
@@ -2207,8 +2285,12 @@ func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offse
 		return nil, fmt.Errorf("failed to lookup chunk %s: %w", fileId, err)
 	}
 
-	// Use the first URL (already contains complete URL with fileId)
-	chunkUrl := urlStrings[0]
+	// Use the first URL (already contains complete URL with fileId). The lookup returns http:// URLs; when
+	// [https.client] is configured the volume servers only speak TLS, so take the global client's scheme.
+	chunkUrl, err := util_http.NormalizeUrl(urlStrings[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to normalize chunk URL %s: %w", fileId, err)
+	}
 
 	// Generate JWT for volume server authentication (uses config loaded once at startup)
 	jwt := filer.JwtForVolumeServer(fileId)
@@ -2229,15 +2311,17 @@ func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offse
 		req.Header.Set("Authorization", security.BearerPrefix+jwt)
 	}
 
-	// Use shared HTTP client with connection pooling
-	resp, err := volumeServerHTTPClient.Do(req)
+	// Use the global HTTP client: it carries the [https.client] TLS configuration (CA and client
+	// certificate) that HTTPS volume servers require; a bare http.Client cannot reach them.
+	resp, err := util_http.GetGlobalHttpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chunk: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		err = util_http.StatusError(chunkUrl, resp)
 		resp.Body.Close()
-		return nil, fmt.Errorf("unexpected status code %d for chunk %s", resp.StatusCode, fileId)
+		return nil, err
 	}
 
 	return resp.Body, nil
@@ -2385,23 +2469,29 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 	// Set custom headers from entry.Extended (user metadata)
 	// Use direct map assignment to preserve original header casing (matches proxy behavior)
 	if entry.Extended != nil {
+		extAmzPrefixLower := strings.ToLower(s3_constants.ExtAmzPrefix)
+		taggingPrefixLower := strings.ToLower(s3_constants.AmzObjectTaggingPrefix)
 		for k, v := range entry.Extended {
-			// Skip internal SeaweedFS headers
-			if !strings.HasPrefix(k, "xattr-") && !s3_constants.IsSeaweedFSInternalHeader(k) {
-				// Support backward compatibility: migrate old non-canonical format to canonical format
-				// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
-				headerKey := k
-				if len(k) >= 11 && strings.EqualFold(k[:11], "x-amz-meta-") {
-					// Normalize to AWS S3 format: "X-Amz-Meta-" prefix with lowercase suffix
-					// AWS S3 returns user metadata with the suffix in lowercase
-					suffix := k[len("x-amz-meta-"):]
-					headerKey = s3_constants.AmzUserMetaPrefix + strings.ToLower(suffix)
-					if glog.V(4) && k != headerKey {
-						glog.Infof("Normalizing user metadata header %q to %q in response", k, headerKey)
-					}
-				}
-				w.Header()[headerKey] = []string{string(v)}
+			// Skip internal SeaweedFS headers, and the stored tag/ACL/lock
+			// metadata that belongs behind its own API (GetObjectTagging,
+			// GetObjectAcl, GetObjectRetention) instead of every reader.
+			lowerKey := strings.ToLower(k)
+			if strings.HasPrefix(lowerKey, "xattr-") || strings.HasPrefix(lowerKey, extAmzPrefixLower) || strings.HasPrefix(lowerKey, taggingPrefixLower) || s3_constants.IsSeaweedFSInternalHeader(lowerKey) {
+				continue
 			}
+			// Support backward compatibility: migrate old non-canonical format to canonical format
+			// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
+			headerKey := k
+			if len(k) >= 11 && strings.EqualFold(k[:11], "x-amz-meta-") {
+				// Normalize to AWS S3 format: "X-Amz-Meta-" prefix with lowercase suffix
+				// AWS S3 returns user metadata with the suffix in lowercase
+				suffix := k[len("x-amz-meta-"):]
+				headerKey = s3_constants.AmzUserMetaPrefix + strings.ToLower(suffix)
+				if glog.V(4) && k != headerKey {
+					glog.Infof("Normalizing user metadata header %q to %q in response", k, headerKey)
+				}
+			}
+			w.Header()[headerKey] = []string{string(v)}
 		}
 	}
 
@@ -2439,8 +2529,10 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 	// Apply S3 passthrough headers from query parameters
 	// AWS S3 supports overriding response headers via query parameters like:
 	// ?response-cache-control=no-cache&response-content-type=application/json
-	// This allows presigned URLs to control how browsers handle the downloaded content
-	if r != nil {
+	// This allows presigned URLs to control how browsers handle the downloaded content.
+	// AWS requires the request to be signed; anonymous requests must not influence
+	// how the stored object is served.
+	if r != nil && getRequestAuthType(r) != authTypeAnonymous {
 		for queryParam, headerValue := range r.URL.Query() {
 			if normalizedHeader, ok := s3_constants.PassThroughHeaders[strings.ToLower(queryParam)]; ok && len(headerValue) > 0 && headerValue[0] != "" {
 				w.Header().Set(normalizedHeader, headerValue[0])
@@ -2482,7 +2574,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 
 	bucket, object := s3_constants.GetBucketAndObject(r)
 	glog.V(3).Infof("HeadObjectHandler %s %s", bucket, object)
-	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
+	if _, err := s3a.validateTableBucketObjectPathOrVerify(bucket, object); err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
 		return
 	}
@@ -2525,7 +2617,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 	versioningConfigured, err = s3a.isVersioningConfigured(bucket)
 	if err != nil {
 		if err == filer_pb.ErrNotFound {
-			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchBucket)
 			return
 		}
 		glog.Errorf("Error checking versioning status for bucket %s: %v", bucket, err)
@@ -2541,9 +2633,21 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			glog.V(2).Infof("HeadObject: requesting specific version %s for %s/%s", versionId, bucket, object)
 			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
 			if err != nil {
+				if versionId == "null" && errors.Is(err, filer_pb.ErrNotFound) {
+					marker, markerErr := s3a.nullDeleteMarkerEntry(bucket, object)
+					if markerErr != nil {
+						glog.Errorf("HeadObject: failed to look up null delete marker for %s/%s: %v", bucket, object, markerErr)
+						s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+						return
+					}
+					if marker != nil {
+						s3a.writeDeleteMarkerResponse(w, r, bucket, object, "HeadObjectHandler", marker, "null", versionId)
+						return
+					}
+				}
 				glog.Errorf("Failed to get specific version %s for %s/%s: %v", versionId, bucket, object, err)
 				if errors.Is(err, filer_pb.ErrNotFound) {
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchVersion)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchVersion)
 				} else {
 					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 				}
@@ -2569,7 +2673,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 				entry, err = s3a.getLatestObjectVersion(bucket, object)
 				if err != nil {
 					glog.Errorf("HeadObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
@@ -2583,7 +2687,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 				} else {
 					// No object at regular path either - object doesn't exist
 					glog.V(3).Infof("HeadObject: object not found at regular path or .versions for %s/%s", bucket, object)
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			} else {
@@ -2592,7 +2696,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 				entry, err = s3a.getLatestObjectVersion(bucket, object)
 				if err != nil {
 					glog.Errorf("HeadObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			}
@@ -2613,7 +2717,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 		// Check if this is a delete marker
 		if entry.Extended != nil {
 			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
-				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				s3a.writeDeleteMarkerResponse(w, r, bucket, object, "HeadObjectHandler", entry, targetVersionId, versionId)
 				return
 			}
 		}
@@ -2651,7 +2755,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 				return
 			}
 			if objectEntryForSSE == nil {
-				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 				return
 			}
 		}
@@ -2717,7 +2821,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			isZeroByteFile := objectEntryForSSE.Attributes.FileSize == 0 && !objectEntryForSSE.IsDirectory
 			// A directory with data (a promoted file) is retrievable; empty directories 404 for LIST fallback.
 			if isBareDirectory(objectEntryForSSE) {
-				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 				return
 			}
 			if isZeroByteFile {
@@ -2725,7 +2829,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 				if s3a.hasChildren(r.Context(), bucket, object) {
 					// This is an implicit directory with children
 					// Return 404 to force clients (like s3fs) to use LIST-based discovery
-					s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
 					return
 				}
 			}
@@ -2748,6 +2852,17 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startOffset, endOffset, totalSize))
 		statusCode = http.StatusPartialContent
 		glog.V(3).Infof("HeadObject: part %d is bytes %d-%d/%d", partNumber, startOffset, endOffset, totalSize)
+	} else if r.Header.Get("Range") != "" {
+		// A ranged HEAD reports the range like GET does: 206 with its Content-Range and length
+		offset, size, isRangeRequest, rangeErr := s3a.parseAndValidateRange(w, r, objectEntryForSSE, totalSize, bucket, object)
+		if rangeErr != nil {
+			return
+		}
+		if isRangeRequest {
+			responseSize = size
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+			statusCode = http.StatusPartialContent
+		}
 	}
 
 	s3a.setResponseHeaders(w, r, objectEntryForSSE, responseSize)

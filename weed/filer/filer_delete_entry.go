@@ -80,6 +80,27 @@ func keepsRemoteObject(ctx context.Context) bool {
 	return ctx.Value(keepRemoteObjectKey{}) != nil
 }
 
+// emptyFolderDeleteContext makes deleting a folder that is empty in the filer
+// metadata-only when it is under a remote mount. A mount is populated lazily,
+// so the folder can still hold remote objects never read, and removing its
+// remote directory deletes every object under that prefix.
+func (f *Filer) emptyFolderDeleteContext(ctx context.Context, dirPath util.FullPath) context.Context {
+	if f.IsUnderRemoteMount(dirPath) {
+		return WithKeepRemoteObject(ctx)
+	}
+	return ctx
+}
+
+// IsUnderRemoteMount reports whether p is a remote mount directory or lies under one.
+func (f *Filer) IsUnderRemoteMount(p util.FullPath) bool {
+	if f.RemoteStorage == nil {
+		return false
+	}
+	// Mount rules are keyed with a trailing slash, so this also matches the mount directory itself.
+	_, remoteLoc := f.RemoteStorage.FindMountDirectory(util.FullPath(string(p) + "/"))
+	return remoteLoc != nil
+}
+
 func deleteEventEntry(ctx context.Context, entry *Entry) *Entry {
 	if !keepsRemoteObject(ctx) {
 		return entry
@@ -101,12 +122,17 @@ func (f *Filer) DeleteEntryMetaAndData(ctx context.Context, p util.FullPath, isR
 		return nil
 	}
 
+	ctx = f.syncWriteContext(ctx, p)
+
 	entry, findErr := f.FindEntry(ctx, p)
 	if findErr != nil {
 		return findErr
 	}
 	if ifNotModifiedAfter > 0 && entry.Attr.Mtime.Unix() > ifNotModifiedAfter {
 		return nil
+	}
+	if !isRecursive && entry.IsDirectory() {
+		ctx = f.emptyFolderDeleteContext(ctx, p)
 	}
 	isDeleteCollection := f.IsBucket(entry)
 	collectionName := ""
@@ -172,7 +198,7 @@ func (f *Filer) DeleteEntryMetaAndData(ctx context.Context, p util.FullPath, isR
 func (f *Filer) doBatchDeleteFolderMetaAndData(ctx context.Context, entry *Entry, isRecursive, ignoreRecursiveError, shouldDeleteChunks, isDeletingBucket, isFromOtherCluster bool, signatures []int32, onHardLinkIdsFn OnHardLinkIdsFunc) (err error) {
 
 	var dirTombstoneTs int64
-	if isRecursive {
+	if isRecursive && !keepsRemoteObject(ctx) {
 		// Tombstone the directory before its children: when the store drops
 		// the subtree without listing it, or a child error aborts the walk,
 		// the ancestor tombstone still covers every descendant.
@@ -207,7 +233,9 @@ func (f *Filer) doBatchDeleteFolderMetaAndData(ctx context.Context, entry *Entry
 
 			for _, sub := range entries {
 				lastFileName = sub.Name()
-				f.noteRemoteDeletion(sub.FullPath, sub.IsDirectory(), time.Now().UnixNano())
+				if !keepsRemoteObject(ctx) {
+					f.noteRemoteDeletion(sub.FullPath, sub.IsDirectory(), time.Now().UnixNano())
+				}
 				if sub.IsDirectory() {
 					subIsDeletingBucket := f.IsBucket(sub)
 					err = f.doBatchDeleteFolderMetaAndData(ctx, sub, isRecursive, ignoreRecursiveError, shouldDeleteChunks, subIsDeletingBucket, isFromOtherCluster, nil, onHardLinkIdsFn)
@@ -227,6 +255,9 @@ func (f *Filer) doBatchDeleteFolderMetaAndData(ctx context.Context, entry *Entry
 					if len(sub.HardLinkId) != 0 {
 						// hard link chunk data are deleted separately
 						err = onHardLinkIdsFn([]HardLinkId{sub.HardLinkId})
+						if shouldDeleteChunks && f.hardLinkIsOrphaned(ctx, sub.HardLinkId) {
+							chunksToDelete = append(chunksToDelete, sub.GetChunks()...)
+						}
 					} else if _, mayBeShared := f.sharedChunksGroupFor(sub); mayBeShared {
 						sharedChildren = append(sharedChildren, sub)
 					} else {
@@ -283,7 +314,10 @@ func (f *Filer) doDeleteEntryMetaAndData(ctx context.Context, entry *Entry, shou
 		}
 	}
 
-	f.noteRemoteDeletion(entry.FullPath, entry.IsDirectory(), time.Now().UnixNano())
+	// A metadata-only delete owes the remote nothing, so lazy reads stay open.
+	if !keepsRemoteObject(ctx) {
+		f.noteRemoteDeletion(entry.FullPath, entry.IsDirectory(), time.Now().UnixNano())
+	}
 
 	if storeDeletionErr := f.Store.DeleteOneEntry(ctx, entry); storeDeletionErr != nil {
 		return fmt.Errorf("filer store delete: %w", storeDeletionErr)
@@ -400,4 +434,11 @@ func (f *Filer) maybeDeleteHardLinks(ctx context.Context, hardLinkIds []HardLink
 			glog.ErrorfCtx(ctx, "delete hard link id %d : %v", hardLinkId, err)
 		}
 	}
+}
+
+// hardLinkIsOrphaned reports whether the shared inode record for hardLinkId
+// is gone, meaning the removed link was the last owner of its chunks.
+func (f *Filer) hardLinkIsOrphaned(ctx context.Context, hardLinkId HardLinkId) bool {
+	_, err := f.Store.KvGet(ctx, hardLinkId)
+	return errors.Is(err, ErrKvNotFound)
 }

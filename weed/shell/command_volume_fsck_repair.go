@@ -68,7 +68,7 @@ func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsck
 			return repaired, lost, fmt.Errorf("load volume %d index of %s: %w", vid, r.dataNodeId, err)
 		}
 	}
-	err = c.readFidFile(refsFile, vid, func(needleId types.NeedleId, itemPath util.FullPath) error {
+	err = c.readFidFile(refsFile, vid, func(needleId types.NeedleId, itemPath util.FullPath, _ []byte) error {
 		var source *needle_map.NeedleValue
 		var sourceServer pb.ServerAddress
 		var lacking []int

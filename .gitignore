@@ -146,3 +146,4 @@ telemetry/server/telemetry-server
 /seaweed-volume/docs
 weed.exe
 /artifacts/
+__pycache__/

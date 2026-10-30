@@ -677,3 +677,90 @@ func TestUploadReaderInChunksAppendsFsyncWhenAssigned(t *testing.T) {
 		t.Errorf("Expected the upload URL to carry ?fsync=true when the assignment says fsync, got %q", gotUploadUrl)
 	}
 }
+
+// A holder that stalls past the assignment JWT's expiry answers the rollback
+// delete with 401; the cleanup renews the token instead of leaking the copy.
+func TestDeleteChunkFromHoldersRenewsExpiredJwt(t *testing.T) {
+	var staleDeletes, freshDeletes int32
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		switch r.Header.Get("Authorization") {
+		case "Bearer fresh-jwt":
+			atomic.AddInt32(&freshDeletes, 1)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			atomic.AddInt32(&staleDeletes, 1)
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"error":"wrong jwt"}`)
+		}
+	}))
+	defer holder.Close()
+
+	lookups := 0
+	deleteChunkFromHolders(
+		[]string{strings.TrimPrefix(holder.URL, "http://")},
+		"1,0a0b0c0d",
+		"stale-jwt",
+		&ChunkedUploadOption{
+			LookupJwtFunc: func(ctx context.Context, fileId string) security.EncodedJwt {
+				lookups++
+				return "fresh-jwt"
+			},
+		},
+	)
+
+	if lookups != 1 {
+		t.Fatalf("expected one jwt renewal, got %d", lookups)
+	}
+	if atomic.LoadInt32(&freshDeletes) != 1 {
+		t.Fatalf("expected the delete retried with the fresh jwt, got %d fresh deletes", freshDeletes)
+	}
+}
+
+// A later holder that rejects the renewed token can trigger another renewal:
+// the one-retry limit is per holder, not per cleanup pass.
+func TestDeleteChunkFromHoldersRenewsPerHolder(t *testing.T) {
+	var acceptedDeletes int32
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer jwt-2" {
+			atomic.AddInt32(&acceptedDeletes, 1)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":"wrong jwt"}`)
+	}))
+	defer holder.Close()
+
+	tokens := []security.EncodedJwt{"jwt-1", "jwt-2"}
+	lookups := 0
+	deleteChunkFromHolders(
+		[]string{
+			strings.TrimPrefix(holder.URL, "http://"),
+			strings.TrimPrefix(holder.URL, "http://"),
+		},
+		"1,0a0b0c0d",
+		"stale-jwt",
+		&ChunkedUploadOption{
+			LookupJwtFunc: func(ctx context.Context, fileId string) security.EncodedJwt {
+				token := tokens[lookups]
+				lookups++
+				return token
+			},
+		},
+	)
+
+	if lookups != 2 {
+		t.Fatalf("expected a renewal per rejecting holder, got %d", lookups)
+	}
+	if atomic.LoadInt32(&acceptedDeletes) != 1 {
+		t.Fatalf("expected the second holder's retried delete to land, got %d", acceptedDeletes)
+	}
+}

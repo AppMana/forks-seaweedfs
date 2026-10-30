@@ -97,6 +97,15 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 		}
 	}
 
+	// An explicit ACL on initiate applies to the completed object and requires
+	// s3:PutObjectAcl, same as PUT. The validated grants ride on the upload
+	// entry so CompleteMultipartUpload cannot be handed forged internal headers.
+	r, aclCode := s3a.preparePutObjectACL(r, bucket)
+	if aclCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, aclCode)
+		return
+	}
+
 	createMultipartUploadInput := &s3.CreateMultipartUploadInput{
 		Bucket:   aws.String(bucket),
 		Key:      objectKey(aws.String(object)),
@@ -251,10 +260,16 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	prefix, keyMarker, uploadIDMarker, delimiter, maxUploads, encodingType := getBucketMultipartResources(r.URL.Query())
+	prefix, multipartKeyMarker, uploadIDMarker, delimiter, maxUploads, encodingType := getBucketMultipartResources(r.URL.Query())
 	if maxUploads < 0 {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidMaxUploads)
 		return
+	}
+	// The decode mirrors the response encoding: under encoding-type=url the
+	// markers go out url-escaped, otherwise they carry the token form.
+	keyMarker := decodeListContinuationToken(multipartKeyMarker)
+	if encodingType == s3.EncodingTypeUrl {
+		keyMarker = decodeEscapedEcho(multipartKeyMarker, true, urlQueryEscape)
 	}
 	if keyMarker != "" {
 		// Marker not common with prefix is not implemented.
@@ -280,8 +295,6 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
-
-	// TODO handle encodingType
 
 	writeSuccessResponseXML(w, r, response)
 }

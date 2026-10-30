@@ -871,8 +871,8 @@ type fastHostMark struct {
 // proved bps: the time the body needs at an uploadStallSlowFactor of that
 // rate, with a floor so a fast conn is not raced on small bodies.
 func uploadStallTimeout(size, bps int64) time.Duration {
-	if bps > 0 {
-		if d := time.Duration(size/bps) * time.Duration(uploadStallSlowFactor) * time.Second; d > uploadStallMinWait {
+	if bps > 0 && size > 0 {
+		if d := time.Duration(float64(size) * float64(uploadStallSlowFactor) / float64(bps) * float64(time.Second)); d > uploadStallMinWait {
 			return d
 		}
 	}

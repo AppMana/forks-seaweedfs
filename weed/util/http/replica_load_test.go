@@ -108,3 +108,21 @@ func TestRetriedFetchChunkDataAvoidsTheSlowReplica(t *testing.T) {
 		t.Fatalf("slow replica served %d of 40 reads, want at most 3", got)
 	}
 }
+
+// A fast error response (0 bytes read, err != nil) must not be recorded as a
+// cheap 1 MiB read that makes a failing replica look faster than healthy peers.
+func TestFailedReplicaReadDoesNotLowerLoadScore(t *testing.T) {
+	forgetUnreachable(t)
+	forgetReplicaLoad(t)
+	urls := []string{"http://failing:8080/3,x", "http://healthy:8080/3,x"}
+	recordReadCost("failing:8080", 500*time.Millisecond, 8<<20)
+	recordReadCost("healthy:8080", 80*time.Millisecond, 8<<20)
+
+	for i := 0; i < 10; i++ {
+		done := beginReplicaRead(context.Background(), "failing:8080")
+		done(0, http.ErrServerClosed)
+	}
+
+	assertOrder(t, ReachableFirst(urls), urls[1], urls[0])
+}
+

@@ -83,3 +83,39 @@ func TestSharedTieredChunkCacheCrossMountAndTwoLevelScoping(t *testing.T) {
 		t.Fatalf("expected newest chunk fid5 to remain in cache")
 	}
 }
+
+func TestSharedTieredChunkCacheAdoptsCrossProcessChunkIntoScope(t *testing.T) {
+	sharedDir := t.TempDir()
+
+	mountA := NewSharedTieredChunkCache(0, sharedDir, "mount-a", 4, 8, 1024)
+	defer mountA.Shutdown()
+	mountB := NewSharedTieredChunkCache(0, sharedDir, "mount-b", 4, 8, 1024)
+	defer mountB.Shutdown()
+
+	fid := "1,0100000001"
+	chunk := bytes.Repeat([]byte("X"), 900)
+
+	// Process A writes the chunk to the shared disk directory.
+	mountA.SetChunk(fid, chunk)
+
+	// Process B also calls SetChunk for the same chunk; it must adopt the chunk
+	// into its own scopeEntries rather than returning early in TieredChunkCache.SetChunk.
+	mountB.SetChunk(fid, chunk)
+
+	mountB.sharedDisk.mu.Lock()
+	scopeCount := len(mountB.sharedDisk.scopeEntries)
+	mountB.sharedDisk.mu.Unlock()
+	if scopeCount != 1 {
+		t.Fatalf("mountB scopeEntries count = %d after adopting cross-process chunk, want 1", scopeCount)
+	}
+}
+
+func TestSharedTieredChunkCacheWholeLimitOnlyHasNonZeroMaxPartSize(t *testing.T) {
+	sharedDir := t.TempDir()
+	cache := NewSharedTieredChunkCache(0, sharedDir, "s3", 0, 1024, 1024*1024)
+	defer cache.Shutdown()
+
+	if got := cache.GetMaxFilePartSizeInCache(); got == 0 {
+		t.Fatalf("GetMaxFilePartSizeInCache() = 0 when scopeSizeInUnit=0 and wholeSizeInUnit=1024, want > 0")
+	}
+}

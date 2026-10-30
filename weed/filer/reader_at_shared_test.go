@@ -595,3 +595,65 @@ func TestChunkGroupSequentialAcrossSectionBoundaryStaysSequential(t *testing.T) 
 		t.Errorf("sec1-first at 64 MiB boundary fetched %d times, want 1", fetches["sec1-first"])
 	}
 }
+
+// shouldCache must compare the chunk's own size (ChunkSize) against
+// GetMaxFilePartSizeInCache(), not ViewOffset + ChunkSize. Adding ViewOffset
+// (the chunk's file offset in the object) disabled disk/memory chunk caching
+// for every chunk past 512 MiB in an object even with -cacheCapacityMB=2048
+// -wholeCacheCapacityMB=51200 (and past 8 MiB with ChunkCacheInMemory).
+func TestShouldCacheChecksChunkSizeNotFileOffset(t *testing.T) {
+	const chunkSize = 1 << 20      // 1 MiB chunk (well below 8 MiB GetMaxFilePartSizeInCache)
+	const highFileOffset = 600 << 20 // 600 MiB file offset (> 512 MiB and > 8 MiB)
+
+	var fetches atomic.Int32
+	memChunkCache := chunk_cache.NewChunkCacheInMemory(32)
+	rc := NewReaderCache(32, memChunkCache, func(context.Context, string) ([]string, error) {
+		return []string{"unused"}, nil
+	}, nil)
+	defer rc.destroy()
+	rc.fetchChunkDataFn = func(_ context.Context, buffer []byte, _ []string, _ []byte, _ bool, _ bool, _ int64, _ string, _ util_http.RefreshUrlsFunc) (int, error) {
+		fetches.Add(1)
+		for i := range buffer {
+			buffer[i] = 0x5a
+		}
+		return len(buffer), nil
+	}
+
+	fid := "7,0123456789"
+	newHighOffsetReader := func() *ChunkReadAt {
+		views := NewIntervalList[*ChunkView]()
+		views.AppendInterval(&Interval[*ChunkView]{
+			StartOffset: highFileOffset,
+			StopOffset:  highFileOffset + chunkSize,
+			Value: &ChunkView{
+				FileId:     fid,
+				ViewSize:   chunkSize,
+				ViewOffset: highFileOffset,
+				ChunkSize:  chunkSize,
+			},
+		})
+		return NewChunkReaderAtFromClient(context.Background(), rc, views, highFileOffset+chunkSize, DefaultPrefetchCount)
+	}
+
+	r1 := newHighOffsetReader()
+	buf := make([]byte, chunkSize)
+	if n, err := r1.ReadAt(buf, highFileOffset); (err != nil && err != io.EOF) || n != chunkSize {
+		t.Fatalf("first read at high offset: n=%d err=%v", n, err)
+	}
+	r1.ReleaseStream()
+
+	if !memChunkCache.IsInCache(fid, true) {
+		t.Fatalf("1 MiB chunk at file offset %d was not stored in chunkCache (GetMaxFilePartSizeInCache=%d)", highFileOffset, memChunkCache.GetMaxFilePartSizeInCache())
+	}
+
+	// Second read after chunk is consumed from ReaderCache must hit chunkCache.
+	r2 := newHighOffsetReader()
+	if n, err := r2.ReadAt(buf, highFileOffset); (err != nil && err != io.EOF) || n != chunkSize {
+		t.Fatalf("second read at high offset: n=%d err=%v", n, err)
+	}
+	r2.ReleaseStream()
+
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("chunk at high file offset fetched %d times across two reads, want 1 (served from chunkCache)", got)
+	}
+}

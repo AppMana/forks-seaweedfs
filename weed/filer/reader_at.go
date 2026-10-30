@@ -411,7 +411,7 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 		// A promoted random read is not a stream position: pinning it would
 		// drop the chunk as soon as the next random read moved the pin, and
 		// every revisit would download it again.
-		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+		shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 		return c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 	}
 
@@ -421,7 +421,7 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 	// in the same chunk each paid a separate network round-trip. Promotion
 	// preserves that fix without forcing a whole-chunk transfer for a chunk
 	// that was touched only once.
-	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+	shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	// The previous chunk is released through the stream pin rather than
 	// UnCache: the buffer is shared, and other streams may still be reading it.
 	n, err = c.readerCache.readChunkAt(ctx, &c.stream, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
@@ -451,7 +451,7 @@ func (c *ChunkReadAt) readChunkSliceAtForParallel(ctx context.Context, buffer []
 		}
 		return c.readerCache.fetchChunkRange(ctx, buffer, chunkView, int64(offset))
 	}
-	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+	shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	return c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 }
 

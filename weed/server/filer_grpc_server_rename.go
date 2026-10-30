@@ -76,7 +76,7 @@ func (fs *FilerServer) AtomicRenameEntry(ctx context.Context, req *filer_pb.Atom
 	var metadataEvents []metadataEvent
 	var pendingChunkDeletes []*filer_pb.FileChunk
 	var pendingRemoteCopies []*pendingRemoteCopy
-	moveErr := fs.moveEntry(ctx, nil, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes, &pendingRemoteCopies)
+	moveErr := fs.moveEntry(ctx, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes, &pendingRemoteCopies)
 	if moveErr != nil {
 		releaseMetadataEventStamps(fs.filer, metadataEvents)
 		fs.filer.RollbackTransaction(ctx)
@@ -149,7 +149,7 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 	var metadataEvents []metadataEvent
 	var pendingChunkDeletes []*filer_pb.FileChunk
 	var pendingRemoteCopies []*pendingRemoteCopy
-	moveErr := fs.moveEntry(ctx, nil, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes, &pendingRemoteCopies)
+	moveErr := fs.moveEntry(ctx, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes, &pendingRemoteCopies)
 	if moveErr != nil {
 		releaseMetadataEventStamps(fs.filer, metadataEvents)
 		fs.filer.RollbackTransaction(ctx)
@@ -325,11 +325,11 @@ func deleteRenamedRemoteObject(f *filer.Filer, ctx context.Context, entry *filer
 	}
 }
 
-func (fs *FilerServer) moveEntry(ctx context.Context, stream filer_pb.SeaweedFiler_StreamRenameEntryServer, oldParent util.FullPath, entry *filer.Entry, newParent util.FullPath, newName string, signatures []int32, skipTargetLookup bool, metadataEvents *[]metadataEvent, pendingChunkDeletes *[]*filer_pb.FileChunk, pendingRemoteCopies *[]*pendingRemoteCopy) error {
+func (fs *FilerServer) moveEntry(ctx context.Context, oldParent util.FullPath, entry *filer.Entry, newParent util.FullPath, newName string, signatures []int32, skipTargetLookup bool, metadataEvents *[]metadataEvent, pendingChunkDeletes *[]*filer_pb.FileChunk, pendingRemoteCopies *[]*pendingRemoteCopy) error {
 
-	if err := fs.moveSelfEntry(ctx, stream, oldParent, entry, newParent, newName, func() error {
+	if err := fs.moveSelfEntry(ctx, oldParent, entry, newParent, newName, func() error {
 		if entry.IsDirectory() {
-			if err := fs.moveFolderSubEntries(ctx, stream, oldParent, entry, newParent, newName, signatures, metadataEvents, pendingChunkDeletes, pendingRemoteCopies); err != nil {
+			if err := fs.moveFolderSubEntries(ctx, oldParent, entry, newParent, newName, signatures, metadataEvents, pendingChunkDeletes, pendingRemoteCopies); err != nil {
 				return err
 			}
 		}
@@ -341,7 +341,7 @@ func (fs *FilerServer) moveEntry(ctx context.Context, stream filer_pb.SeaweedFil
 	return nil
 }
 
-func (fs *FilerServer) moveFolderSubEntries(ctx context.Context, stream filer_pb.SeaweedFiler_StreamRenameEntryServer, oldParent util.FullPath, entry *filer.Entry, newParent util.FullPath, newName string, signatures []int32, metadataEvents *[]metadataEvent, pendingChunkDeletes *[]*filer_pb.FileChunk, pendingRemoteCopies *[]*pendingRemoteCopy) error {
+func (fs *FilerServer) moveFolderSubEntries(ctx context.Context, oldParent util.FullPath, entry *filer.Entry, newParent util.FullPath, newName string, signatures []int32, metadataEvents *[]metadataEvent, pendingChunkDeletes *[]*filer_pb.FileChunk, pendingRemoteCopies *[]*pendingRemoteCopy) error {
 
 	currentDirPath := oldParent.Child(entry.Name())
 	newDirPath := newParent.Child(newName)
@@ -364,7 +364,7 @@ func (fs *FilerServer) moveFolderSubEntries(ctx context.Context, stream filer_pb
 			// println("processing", lastFileName)
 			newChildPath := newDirPath.Child(item.Name())
 			skipTarget := fs.filer.Store.SameActualStore(newDirPath, newChildPath)
-			err := fs.moveEntry(ctx, stream, currentDirPath, item, newDirPath, item.Name(), signatures, skipTarget, metadataEvents, pendingChunkDeletes, pendingRemoteCopies)
+			err := fs.moveEntry(ctx, currentDirPath, item, newDirPath, item.Name(), signatures, skipTarget, metadataEvents, pendingChunkDeletes, pendingRemoteCopies)
 			if err != nil {
 				return err
 			}
@@ -376,7 +376,7 @@ func (fs *FilerServer) moveFolderSubEntries(ctx context.Context, stream filer_pb
 	return nil
 }
 
-func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.SeaweedFiler_StreamRenameEntryServer, oldParent util.FullPath, entry *filer.Entry, newParent util.FullPath, newName string, moveFolderSubEntries func() error, signatures []int32, skipTargetLookup bool, metadataEvents *[]metadataEvent, pendingChunkDeletes *[]*filer_pb.FileChunk, pendingRemoteCopies *[]*pendingRemoteCopy) (retErr error) {
+func (fs *FilerServer) moveSelfEntry(ctx context.Context, oldParent util.FullPath, entry *filer.Entry, newParent util.FullPath, newName string, moveFolderSubEntries func() error, signatures []int32, skipTargetLookup bool, metadataEvents *[]metadataEvent, pendingChunkDeletes *[]*filer_pb.FileChunk, pendingRemoteCopies *[]*pendingRemoteCopy) (retErr error) {
 
 	oldPath, newPath := oldParent.Child(entry.Name()), newParent.Child(newName)
 

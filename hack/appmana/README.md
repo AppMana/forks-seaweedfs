@@ -8,13 +8,12 @@ contract failures before changing mount implementation code.
 
 `mount-smoke.ps1` supports four focused cases:
 
-- `NamespaceCoherence` reproduces the traced WinFsp failure: a file remains
+- `NamespaceCoherence` checks namespace coherence: a file remains
   directly readable while its parent enumeration omits it and rename returns
   `NAME NOT FOUND`.
 - `GitAtomicRename` runs `git init` on a fresh mount.
 - `GitAtomicRenamePrimed` first runs the metadata and rename-over-existing
-  sequence from the full smoke test, then runs `git init`. This is the exact
-  reduced workload for the observed stale `config.lock` failure.
+  sequence from the full smoke test, then runs `git init`. This checks `config.lock` handling after metadata changes.
 - `GitLfsTempMetadata` repeatedly runs `git status` over modified LFS assets.
   Its seed `git add` exercises Git LFS's temp-file sequence. Status can use
   cached metadata, so successful status iterations alone do not prove repeated

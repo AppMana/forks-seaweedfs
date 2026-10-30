@@ -134,8 +134,7 @@ about 11 s).
 
 ## Benchmarks
 
-Measured on the change that introduced each behavior; see that commit for the
-setup.
+Results for the scenarios below; timings depend on workload and host load.
 
 | Scenario | Result |
 | --- | --- |
@@ -147,11 +146,11 @@ setup.
 | 64 MiB write and `close()` with one of three volume servers stopped, holding 8 of 11 writable volumes (`TestCloseSucceedsWhenAnAssignedVolumeServerStalls`) | EIO after 60.0 s before; with retries drawing assignments at random, EIO after 60.0 s or `close()` 45.5 s (3 of 3 runs); asking the master to avoid it, `close()` 23.0 s (9 of 10), 29.4 s once |
 | 4 MiB write and `close()` through a 128 KiB/s link (`TestSlowButProgressingUploadsClose`) | EIO after 60 s with a 30 s response-header or absolute attempt bound; `close()` in 31.9 s progress-based |
 
-### 4.48 merge against the deployed 4.47 line
+### 4.48 and 4.47 comparison
 
 `test/mount_bench` on one Linux host (32 cores, NVMe), `weed mini` plus a
 default `weed mount` per binary, both built with `-tags 5BytesOffset`:
-0f3d7bec5 (deployed) against the 4.48 merge. Median of four rounds run in
+4.47 build 0f3d7bec5 against the 4.48 merge. Median of four rounds run in
 alternating order; round-to-round spread is up to about 8%, so every
 difference below is within noise.
 
@@ -210,7 +209,7 @@ keeps a private registry's name out of public logs.
 
 | Branch | Role |
 | --- | --- |
-| `merge/upstream-4.48` | Default branch and the deployed line; the only maintained branch. Every fix merges here (never rebased); server images are built from it. `merge/upstream-4.47` is fully merged into it and no longer maintained. |
+| `merge/upstream-4.51` | Maintained 4.51 line. Fork fixes merge here without rebasing; server and mount builds target this line. |
 | `merge/upstream-<next>` | Next upstream release merged into the default branch. It becomes the default once qualified; the server image workflow's branch filter moves with it. |
 | `release/<change>-<base>` | Short-lived ship branch: a deployed commit plus only the change being rolled out. It merges back into the default branch and is then deleted. |
 

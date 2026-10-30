@@ -108,7 +108,7 @@ MUTANT_LOG_DIR=/tmp/seaweedfs-mutant-logs test/storage_lab/verify_mutants.sh
 ```
 
 Linux preallocation has a separate native-filesystem negative control. It
-restores the historical ignored `fallocate` error in a build overlay, then
+ignores `fallocate` errors in a build overlay, then
 requires the guarded ENOSPC regression to fail while the adjacent compaction
 preservation test still passes:
 
@@ -159,26 +159,13 @@ scenario, timestamps, per-replica verified read digests, topology, and that
 production access was disabled. Results remain in the
 printed `/tmp/seaweedfs-vm-lab-results-*` directory.
 
-The crash gates now call Labcontainers `Crash`, which sends SIGKILL to the
-session's VM wrapper and QEMU.
-The vacuum gate runs a barrier on the victim that polls for its `.cpd` every
-millisecond, stops the volume server with SIGSTOP once the copy exists, and
-writes a marker only if the `.cpd` is still there after every thread stopped;
-a `wait_exec` timeline predicate on that marker then requests the crash. The
-copy is therefore still in progress when SIGKILL arrives, however fast the
-disk is: `-compactionMBps` does not throttle a copy that finishes within the
-throttler's first 100 ms window, and on XFS the 44 MB live set then compacts in
-about a quarter second, shorter than one host-side exec round trip. The
-manifest records the held copies as `vacuum_copy_held`. The migration gate is
-deliberately graceful and tests baseline → candidate → baseline → candidate one
-replica at a time; abrupt failure is tested separately. This matters for the
-4.40 baseline: a hard cut can expose its pre-fix acknowledged-index durability
-defect and is not a valid rollback procedure.
-
-The XFS/Btrfs image must
-include their formatting tools. CI runs six fresh Linux sessions: the four
-ext4 scenarios above, plus XFS and Btrfs `vacuum-power-loss`, so scenarios cannot
-contaminate one another. This is not all-phase or all-filesystem migration coverage.
+The crash gates call Labcontainers `Crash`, which kills the session's VM
+wrapper and QEMU. The vacuum gate polls for `.cpd`, stops the volume server,
+and confirms the copy is still present before requesting the crash. The
+manifest records `vacuum_copy_held`. This guest-side barrier prevents a fast
+copy from finishing between host RPCs. Migration is graceful and upgrades
+then rolls back one replica at a time; abrupt failure is a separate scenario.
+XFS and Btrfs guests need their formatting tools. Each scenario gets fresh VMs.
 
 ## Mixed Windows and Linux mounted workloads
 
@@ -265,13 +252,9 @@ LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE_AT_DIGEST" \
 go test ./test/storage_lab/vm -run '^TestWindowsMountXAttrLab$' -count=1 -v -timeout=20m
 ```
 
-The six-test inventory rejects omissions and skips. Windows and FreeBSD already
-return `ENOTSUP` for raw-mount xattrs; their tests require that result for set,
-get, list and remove, zero result lengths, unchanged retained metadata and
-unchanged output buffers. Supported platforms retain the original POSIX
-set/get/remove assertions. This does not implement Windows
-xattrs or weaken the Linux regression. The existing native Windows CI job runs
-these tests as part of `./weed/mount` in both CGO modes automatically.
+The inventory rejects omissions and skips. Raw-mount xattrs return `ENOTSUP`
+on Windows and FreeBSD; tests require unchanged metadata and output buffers.
+The Windows CI job runs these tests in both CGO modes.
 
 For WinFsp/Git runtime coverage in a disposable Windows VM, supply the candidate
 and offline installers from the host (the guest has no external network):
@@ -365,332 +348,33 @@ unchanged mounted, Git/LFS and conformance tests. Do not set both the native
 package and DLL-only inputs. These lab-signed packages must never be installed
 on cluster hosts; the existing CSI MSI pins remain unchanged.
 
-To reproduce a standalone-client comparison in Actions, configure the optional
-`SEAWEEDFS_RELIABILITY_GIT_LFS_PATH`/`SEAWEEDFS_RELIABILITY_GIT_LFS_SHA256` pair
-documented in the root README. Both must match the reviewed executable; omitting
-both deliberately uses bundled LFS and is reported in the job summary. The
-existing `SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC` runner input stages this executable
-even when it is an unmodified official release (the name is historical). Setup
-hash-checks installed copies, preserves Git's hard-linked launcher and records
-the actual LFS version.
-`SEAWEEDFS_WINDOWS_MOUNT_REPEATS` defaults to 1 and accepts 1..20 fresh scenario
-pairs within the existing 40-minute harness budget; raising the repeat count
-does not extend that budget. Verbosity defaults to 0 and accepts 0..4.
-For a targeted diagnostic run, `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO` selects either
-`GitAtomicRenamePrimed` or `GitLfsTempMetadata`; omit it for the complete gate.
-For low-level diagnosis, set `SEAWEEDFS_WINDOWS_MOUNT_TRACE=1` (or the Actions
-dispatch input `windows_trace`). The disposable VM enables WinFsp debug output
-and starts the checked-in `hack/appmana/seaweed-fileio.wprp` profile (a fixed
-16 MiB event ring, process identities, file names and I/O completions) before
-the workload. WPR is stopped in cleanup; a missing profile, busy recorder, or
-failed flush is a diagnostic failure, not a silent fallback. No existing WPR
-session is cancelled. Each scenario's binary `<scenario>-fileio.etl` is retrieved
-before VM destruction, in bounded chunks with size and SHA-256 verification;
-files over 128 MiB or incomplete transfers fail the run. The VM also runs
-`tracerpt` to preserve decoded XML in a ZIP and downloads the full WinFsp debug log,
-not just the ordinary last-2,000-lines summary. Open the ETL in
-Windows Performance Analyzer's File I/O tables and correlate process, path,
-operation, timestamp, and status with the WinFsp/SeaweedFS logs. Memory mode
-retains a bounded recent window; inspect trace loss before claiming complete
-history. Debug logging changes scheduling, so preserve untraced failures too.
-On a failed Git prerequisite, all Windows runs also retain read-only `mountvol`
-and `fsutil reparsepoint query` output before unmounting. These inspect the
-registered DOS paths and junction target; they never create/delete mappings
-or retry the failed Git command. Contract tests verify their ordering and
-ensure successful diagnostics cannot change the original failure into a pass.
-The ordinary gate leaves tracing off. Artifact-transfer negative tests run with
-`go test ./test/storage_lab/vm -run '^TestWindowsArtifact'` using the same Go
-workspace as the VM tests. ETLs contain paths and process information; keep
-their existing CI artifact access restrictions and 14-day retention.
+Optional Windows inputs select focused scenarios without changing the default
+gate. Set `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO` to the scenario implemented in
+`vm/windows_mount_test.go` and provide `SEAWEEDFS_WINDOWS_WINFSP_TEST` for native
+contract tests. Mount-manager lifecycle, process-crash and rollback scenarios
+exercise registration and cleanup; they are separate from storage durability.
+`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1` checks graceful same-path
+junction and volume mapping cleanup. All assertions remain strict: diagnostic
+queries do not retry or repair a failed mount assertion.
 
-For failure-only client instrumentation, set
-`SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC` to a host Windows `git-lfs.exe`. The runner
-replaces the installed copies only inside its fresh disposable VM, records the
-input SHA-256 and client version, and leaves the default bundled client unchanged
-when the variable is absent. This override can also select an official release
-for a controlled A/B run; label those results separately from instrumented runs.
-Keep the SeaweedFS binary, WinFsp installer, VM image, and workload fixed.
-Dependency setup records `C:\lab\dependency-install.log`, including installer
-stage timestamps and exit codes; the failure collector retains its tail when
-the guest agent is responsive. A setup timeout is an infrastructure failure,
-not a reproduced LFS failure or a passing qualification.
-Git for Windows hard-links `cmd/git-lfs.exe` to
-`cmd/git.exe`, so overwriting the former corrupted the latter. The lab override
-now unlinks only each installed LFS directory entry before copying, verifies
-all Git executable hashes remain unchanged, and verifies each replacement hash.
-`pwsh -NoProfile -File hack/appmana/install-lab-git-lfs-test.ps1` reproduces this
-with real hard links and runs in CI.
+`SEAWEEDFS_WINDOWS_MOUNT_REPEATS` accepts 1..20 repetitions within the existing
+40-minute budget. `SEAWEEDFS_WINDOWS_MOUNT_VERBOSITY` accepts 0..4. Set
+`SEAWEEDFS_WINDOWS_GIT_LFS_DIAGNOSTIC` to an offline Windows `git-lfs.exe` for
+client comparisons. The runner replaces it only in the guest, checks hashes,
+and preserves Git's hard-linked launcher by unlinking the LFS directory entry
+before copying. Dependency setup logs are retained on failure.
 
-To isolate the mount layer from both SeaweedFS metadata and Git, build the
-Windows `test/winfsp` executable and select
-`SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle` with
-`SEAWEEDFS_WINDOWS_WINFSP_TEST` pointing to that executable. The existing VM
-runner needs only the WinFsp MSI and native executable, installs WinFsp and
-executes `TestMountManagerDirectoryLifecycle`: 64 minimal cgofuse directory
-mounts, each checked 256 times for a DOS canonical path that reaches that
-cycle's unique virtual sentinel. Queries are separated by 10 ms to observe
-delayed registration changes over at least 2.56 seconds per mount. Readiness
-also requires the sentinel, so an underlying NTFS directory cannot satisfy the
-test. The first failed query fails the test; alternative path flags and mount
-listings are diagnostic only. This mode never starts weed or
-Git workloads, rejects skips/incomplete cycles, and retains `mount-manager.log`.
-It is a component-isolation experiment, not the full Windows qualification gate.
-For additional teardown coverage, set
-`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP=1` with a freshly built native
-executable. This reuses one exact mount path across all 64 cycles, checks with
-`Lstat` that the owned junction disappears after every graceful unmount, and
-verifies an unrelated sibling file byte-for-byte. After the canonicalization
-probes it records the volume GUID and requires the exact path in
-`GetVolumePathNamesForVolumeNameW`; after unmount that association must be absent
-(or the GUID no longer found). No localized `mountvol` output is parsed.
-The runner requires final junction and mapping cleanup markers, rejecting
-older executables that lack these checks. Run with both registration modes.
-This does not yet verify process-death cleanup or registration-failure rollback.
-Use `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerProcessCrash` for a separate
-process-death check (leave `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_CHECK_CLEANUP` unset).
-It launches eight owned child processes in turn at the same mount path. Each
-child completes the canonicalization and pre-unmount mapping oracle, signals a
-per-cycle readiness file, and waits without unmounting. The parent terminates
-only that child, checks junction/mapping removal and sibling bytes, and mounts
-the same path in the next cycle. Both registration modes are supported; test-side
-junction interventions are rejected. This is abrupt process termination, not VM
-power loss, and the synthetic filesystem cannot establish SeaweedFS durability.
-The parent creates a random ownership token and sibling fixture. Child mode
-requires that token, an absolute non-symlink root, intact sibling bytes and
-unused checkpoint/mount paths within that root; it never rewrites the sibling.
-Readiness is published by temporary-file rename. The reader permits Windows
-delete-sharing while the publisher closes its rename handle; a deterministic
-held-DELETE-handle regression runs before the crash cycles. This does not retry
-failed mount queries or cleanup assertions. Child-exit waits are bounded.
-Post-termination absence checks are immediate and strict, with no repair or
-retry of a failed mapping assertion.
-The existing storage-reliability Actions workflow exposes these intensive checks
-through the optional `windows_mount_cleanup` dispatch input. It runs graceful
-same-path cleanup and process-crash cleanup in fresh VMs for default and FSD
-registration, before the unchanged real Git/LFS gate, and retains each log.
-It uses the workflow's pinned MSI, not an implicitly substituted lab DLL.
-Ownership negative controls run in the Linux job on every matching workflow run;
-changes under `test/winfsp/` now trigger that workflow too.
-The Actions dispatch switch `windows_mount_manager_probe` runs it before (not
-instead of) the regular Windows qualification gate. It defaults off.
-For a lab-only comparison of WinFsp's user-mode and driver-side registration,
-set `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD=1` with this isolated scenario.
-The runner sets and verifies `MountUseMountmgrFromFSD` in the fresh VM before
-starting the unchanged probe. Other values and non-isolated scenarios are
-rejected. This is a diagnostic intervention, not a recommended deployment
-setting or a replacement qualification gate. With the variable unset the
-runner leaves the WinFsp default unchanged. `provenance.txt` retains the input
-artifact hashes, image reference, and selected experimental mode alongside
-the test results; the dependency transcript records the applied registry value.
-Another isolated comparison uses
-`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION=1`. Before the unchanged DOS
-queries, the native probe changes its own synthetic mount's junction target
-from the NT device name to the GUID path of that same volume. It verifies the
-original junction against the device identified through an open root handle
-and checks the virtual sentinel afterward. It does not re-register the mount,
-retry failed queries, or act on SeaweedFS data. The option is rejected outside
-the isolated scenario and cannot be combined with the driver-side comparison.
-This is a causal experiment, not an application fix or deployment guidance;
-its mode is retained in `provenance.txt` and each intervention is logged.
-Use the matched `SEAWEEDFS_WINDOWS_MOUNT_MANAGER_GUID_JUNCTION=nt-control`
-mode before attributing a pass to GUID targeting: it performs the same GUID/NT
-identity queries, reparse read, rewrite, readback, and sentinel check, but writes
-the original NT target. Both modes verify the exact substitute name after the
-write. This controls for query priming and effects of rewriting the junction;
-neither mode changes the first-failure behavior of the DOS path assertions.
-For source-level WinFsp experiments, run
-`bash hack/appmana/build-winfsp-lab-dll.sh /path/to/winfsp-v2.1` with Clang and
-the x86_64 MinGW compiler, headers, libraries, and resource compiler installed.
-The script pins the upstream source revision, writes into a new temporary
-directory, retains compiler output and the source diff, and prints the DLL hash.
-Clean sources are required by default; untracked files are rejected. For an
-explicit source candidate, set `WINFSP_LAB_ALLOW_TRACKED_PATCH=1`; staged and
-unstaged tracked changes are captured together. The pinned commit supplies
-`SOURCE_DATE_EPOCH`, and the linker fixes timestamps and the preferred image
-base (ASLR remains enabled).
-Its compatibility header adapts compiler/SDK declarations, not mount behavior;
-this unsigned user-mode DLL is lab-only, not a release artifact. The signed
-kernel driver still comes from the pinned WinFsp MSI. First reproduce RED with
-the unmodified source before comparing any source patch built the same way.
-Set `SEAWEEDFS_WINDOWS_WINFSP_DLL` to the built DLL with the isolated scenario
-and a freshly built native test. The runner stages it next to the test rather
-than replacing the installed DLL, and the native probe verifies its actual
-loaded module path. Missing verification or fallback to the installed DLL
-fails the run. Candidate DLL runs cannot be combined with test-side junction
-rewrites. The isolated native scenario also accepts explicit
-`SEAWEEDFS_WINDOWS_MOUNT_MANAGER_FROM_FSD=1` with a candidate DLL to cover the
-driver-side registration branch; mode selection and registry readback remain
-recorded, and this combination remains forbidden in real Git scenarios.
-It is configuration coverage, not a recommendation to enable that registry
-setting. Native success also requires a run-specific completion token.
-For real Git scenarios, the runner supplies
-`-ExpectedWinFspDll` to the smoke script, which inspects the actual SeaweedFS
-mount process's loaded modules before exercising Git. Missing, duplicate,
-uninspectable or wrong-path modules fail the run and invoke existing cleanup.
-Every scenario must emit the module-verification marker. Retain both
-the build directory and VM results as the provenance chain.
-Setup and each real-workload cycle also require their own run-specific terminal
-marker; a zero exit with an old readiness message or another cycle's output is
-not success. Setup output is retained in `setup.log`.
-The runner requires adjacent `.manifest.txt` and `.source.patch` files,
-validates the DLL/patch hashes and baseline/candidate distinction, and retains
-both with the VM results. The manifest records the source revision, recipe and
-shim hashes, epoch and tool versions; retain the build directory separately
-for full compiler output. Manifest consistency is not proof of provenance or
-cross-run equivalence: compare recipe, shim and tool versions between baseline
-and candidate, not just their source labels.
+For FileIO diagnostics, set `SEAWEEDFS_WINDOWS_MOUNT_TRACE=1` or dispatch Actions
+with `windows_trace`. The guest records the checked-in WPR profile and WinFsp
+logs. Cleanup stops only the recorder it started. ETL, decoded XML ZIP and full
+WinFsp logs are retrieved with size and SHA-256 checks. Missing or incomplete
+artifacts fail the run. Tracing changes scheduling; preserve untraced failures
+and inspect trace-loss counters before interpreting a capture.
 
-Select `SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerRegistrationRollback`
-with an explicit manifested `SEAWEEDFS_WINDOWS_WINFSP_DLL` and an amd64 native
-test executable for deterministic rollback injection. The test modifies only
-the loaded lab DLL's IAT in its own process, never the DLL file or global APIs.
-It fails `FindFirstVolumeW` or the second `FSCTL_SET_REPARSE_POINT`, requires exact
-hook counters and failed mounting, restores and verifies the original import,
-enumerates all volume paths to reject stale registration, and mounts the exact
-path normally. Sibling bytes must remain unchanged. Both registration modes are
-supported; junction interventions and the separate cleanup flag are rejected.
-PE-layout fixtures and live original-pointer checks guard the test-only hook.
-Callbacks resolve their original target before installation. If a failed mount
-times out, the harness waits for both Mount and Unmount to leave the DLL before
-restoring the hook. Failure to prove quiescence aborts the disposable native test
-process with exit 2, without running DLL restoration/unload cleanups underneath
-active calls. This is a failed test, never a successful rollback result.
-
-Release-build follow-up must use upstream's `build/VStudio/winfsp_dll.vcxproj`
-in `Release|x64`, with the compiler and SDK versions recorded. The pinned v2.1
-`build.version.props` targets Windows SDK `10.0.19041.0`; its build number and
-copyright year otherwise depend on the current date, so reproducible comparison
-requires explicit recorded overrides. Build only the user-mode DLL project for
-this fix; replacing or rebuilding the signed kernel driver is not part of it.
-The generic Labcontainers Windows image provisions drivers/QGA, not MSVC.
-Use its existing project-specific `provisioning_scripts` extension for a separate
-compiler-enabled image. Neither a MinGW lab pass nor a successful MSVC compile
-alone establishes deployment qualification: test the resulting exact artifact
-and its packaging/load path before release.
-The DLL manifest verifier accepts `build_toolchain=msvc` only with recorded
-`platform_toolset`, `vc_tools_version`, `windows_sdk_version`, `msbuild_version`,
-`version_build_number` and `version_copyright_year`, in addition to the existing
-source revision, source mode, source epoch, patch/DLL hashes and recipe hash.
-An MSVC manifest must not claim `build_shim_sha256`. Existing MinGW manifests
-(absent toolchain field or `build_toolchain=mingw`) still require that shim hash;
-unknown toolchains fail validation. These checks establish evidence consistency,
-not compiler trust, reproducibility, or a successful Windows-native build.
-`hack/appmana/build-winfsp-msvc.ps1` builds that DLL project only. In a disposable
-compiler-enabled Windows guest, use separate source checkouts and fresh output
-directories for baseline and candidate, for example:
-
-```powershell
-.\hack\appmana\build-winfsp-msvc.ps1 -SourceDirectory C:\lab\winfsp-candidate `
-  -OutputDirectory C:\lab\msvc-candidate -AllowTrackedPatch `
-  -MSBuildPath 'C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Current\Bin\MSBuild.exe' `
-  -VCToolsVersion 14.29.30133 -PlatformToolset v142 -WindowsSDKVersion 10.0.19041.0
-```
-
-The example compiler version/path are explicit inputs, not evidence that this
-toolchain is installed. Pin the same installed versions for both builds and omit
-`-AllowTrackedPatch` for the clean baseline. Source/output paths cannot contain
-spaces or shell metacharacters because upstream's `.pc` generation is unquoted.
-The recipe rejects preexisting outputs, fixes date-dependent version fields,
-retains diagnostic MSBuild output, a binary log, exact arguments and source patch,
-and writes the harness-compatible manifest only after successful compilation and
-a source-stability check. It never registers a DLL, replaces installed files,
-builds a driver or produces an installer. Its host-independent argument/error
-contracts run in the existing reliability workflow; a passing contract does not
-prove compilation or runtime behavior.
-Source mode and patch digest now come from the same captured patch bytes, not
-an earlier `git status`: a deterministic reproduction showed that an intervening
-edit could otherwise produce a nonempty patch labeled baseline. Empty captured
-patches remain baseline even with candidate opt-in; nonempty patches require
-that opt-in. The recipe hash is captured before build execution and must still
-match before manifest publication. Contract fixtures cover these cases and
-reject extra/combined build targets using an exact ordered argument vector.
-These are consistency checks, not an attestation against transient edits or a
-hostile build host. In particular, manifest compiler/SDK fields currently record
-requested versions; verifying effective compiler/linker/resource-tool paths,
-versions and hashes against the retained build logs remains required before
-calling an MSVC artifact provenance-qualified.
-WinFsp DLL builds and their qualification now live in the WinFsp fork
-(`AppMana/forks-winfsp-fixes`, branch `appmana-v2.1`, which carries the
-directory mount registration fix and its EWDK lab in `tools/lab`). This
-repository no longer builds WinFsp. SeaweedFS itself retargets its own
-mount-manager directory junction to the volume GUID path
-(`weed/mount/winfsp/junction_windows.go`), so the default stock WinFsp passes
-the repeated Git LFS gate without a patched DLL.
-Subsequent harness runs materialize auxiliary log tails in the guest and use the
-existing chunked, SHA-256-verified artifact transfer instead of one oversized
-exec response. `guest-logs.txt` contains the diagnostic text;
-`guest-logs-collection.txt` records collection status, byte count and SHA-256.
-The existing 2,000-line-per-file tail policy remains: this is not a full log
-archive. Collection has a separate two-minute deadline and now fails the harness
-on error rather than silently allowing missing auxiliary evidence. Unit coverage
-reproduces the old truncation failure with more than 3 MiB of diagnostic text.
-`hack/appmana/git-lfs-canonical-diagnostics.patch` applies to Git LFS v3.7.0,
-commit `92dddf560e62ef7dd25877d87ce072f7595aa52d`. In a disposable checkout of
-that exact source, apply the patch with `git apply`, then build:
-
-```sh
-GOTOOLCHAIN=go1.24.4 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-  go build -ldflags '-X github.com/git-lfs/git-lfs/v3/config.GitCommit=92dddf56-lab-diagnostics' \
-  -o /absolute/lab/artifacts/git-lfs-diagnostic.exe .
-```
-
-The patch distinguishes `filepath.Abs`, `CreateFile`, and
-`GetFinalPathNameByHandle` failures. Only after the last API fails does it query
-DOS/GUID/NT names, with normalized and opened-name flags, on the same handle.
-It always returns the original error: these probes are observations, not retries
-that turn a failed workload green. Do not deploy this diagnostic client.
-The optional native executable adds 512 create/chmod/write/close/mkdir/rename
-transactions per pair, including uppercase `.GIT` paths and exact final object
-content checks. The Actions gate builds and requires this executable, runs five
-pairs, and rejects skipped/missing native completion. A skipped opt-in
-test is not qualification. Pin installer hashes and VM image digests for release
-evidence; a local `latest` image run is exploratory only. The harness contract
-test (`pwsh -File hack/appmana/mount-smoke-contract-test.ps1`) injects prerequisite
-failures without starting a VM and runs in the existing Windows build workflow.
-
-Stale `config.lock` can follow a successful server rename.
-`TestStreamRenameAckSurvivesClockBehindMetadataFence`
-reproduces this cache failure deterministically when the monotonic metadata
-clock is ahead of wall time. Streaming rename replies must use the actual
-committed metadata events, not separately sampled wall-clock timestamps.
-`TestStreamRenameRepliesMatchCommittedLog` checks reply/log equality, both
-transports, overwrites, recursive moves, and data preservation on disconnect.
-An acknowledgment can be lost **after commit**: an RPC error alone does not
-prove the rename failed. Inspect source and destination before retrying; do not
-delete a destination or assume an old lock file is disposable based on that
-error.
-Deterministic regressions cover a separate cache failure:
-`TestSaveEntryNoChangeAckPreservesCaseFoldListing` exercises the real no-event
-`UpdateEntry` acknowledgment fallback, which previously deleted a live `.git`
-cache entry at an equal timestamp and made `.GIT` lookup fail. In-place updates
-must fence both halves as writes; only actual renames/deletes may remove the old
-path at its existing version. Directory updates with omitted `NewParentPath`
-must also preserve children.
-Failure-only `winfsp rename failed at`
-diagnostics at verbosity 1 identify which rename stage rejects a request.
-Verbosity 1 also
-records failed component resolution, case-fold lookup, and attribute reads to
-localize this earlier failure without retries or successful-path tracing.
-`TestGitLfsDirectoryCanonicalization` additionally exercises Git LFS 3.7.0's
-actual Windows directory `CreateFile` / `GetFinalPathNameByHandle` sequence,
-after config-file replacements and through both original and uppercase paths.
-The native smoke gate requires this test as well as the object-rename test;
-cross-compilation alone does not qualify either.
-Deployment must include both components: the committed-event acknowledgment
-fix runs in the **filer**, while the in-place update correction runs in the
-**mount**. A mount-only upgrade leaves old filer rename replies unchanged.
-Mixed-version operation needs its own qualification; these tests use the same
-candidate for the local filer and Windows mount and do not certify a rolling
-upgrade against older filers.
-
-The dedicated `vm-fault-gates` Actions job also runs this test with preloaded,
-hash-checked installers (variables are listed in the root README). Its pinned
-Labcontainers commit must include `ExecWithTimeout` (introduced in `6f89daa`),
-as well as crash and bridge restoration support. Guest scenarios have explicit
-eight-minute execution limits; a timeout remains a failure and triggers a
-bounded attempt to recover partial output before destroying the VM.
-The 40-minute parent context and 45-minute Go timeout accommodate readiness,
-installation, both scenarios, and cleanup; do not shorten only the outer timeout.
+The Actions workflow's `windows_mount_cleanup` input runs graceful cleanup and
+process-crash checks in fresh VMs for both registration modes. Native driver
+packages, DLL-only comparisons and stock MSI runs must retain distinct artifact
+identities. None qualifies a host installation or CSI deployment.
 
 The core regressions are normal Go tests under `weed/storage`, `weed/shell`, and
 `weed/storage/needle`; they run in the existing large-disk race suite even when
@@ -728,10 +412,9 @@ and install cluster credentials. They are **not approved by this runner**.
 Do not run them against the live NAS or assume their existing network is isolated.
 
 Process kills leave the host page cache intact. Tmpfs tests prove neither disk
-flush durability nor XFS/Btrfs behavior. The Labcontainers ext4 gate now requests
+flush durability nor XFS/Btrfs behavior. The Labcontainers ext4 gate requests
 abrupt VM loss and recreation; the `.dat`-before-index durability gap has
-separate regression coverage. Do not attribute earlier stop/restart results
-to this stronger fault model. It does not model drive/controller caches that lie about flushes, and
+separate regression coverage. It does not model drive/controller caches that lie about flushes, and
 broader XFS/Btrfs fault and migration tests remain outstanding. Never power-cut production.
 Restore drills use copied backups, new cluster identities, and blocked production
 networking. An etcd snapshot alone does not contain volume payloads.
@@ -779,7 +462,7 @@ same/cross-bucket copy, multipart copy, 40 MiB multipart completion and readback
 and aborting a replacement without changing the committed object. Missing tests,
 skips, test failures or a missing terminal PASS reject qualification. This is
 protocol/payload and image-entrypoint coverage, not disk power-loss, external
-metadata-store restore, a production Harbor workload or Windows qualification.
+metadata-store restore, a production registry workload or Windows qualification.
 Omitting `--s3-suite` runs only the volume startup/automatic-memory gate.
 
 ## Native Linux filesystem runner

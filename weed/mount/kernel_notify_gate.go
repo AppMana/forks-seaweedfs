@@ -18,7 +18,7 @@ import (
 // read holds its pages locked. A notification issued meanwhile cannot finish
 // until that reply is sent, so the notifying thread sleeps in state D for as
 // long as the request takes. A filer that stops answering turns that into a
-// hung task (appmana-008 and appmana-031 panicked on it), and a mount that
+// hung task, and a mount that
 // exits then cannot close /dev/fuse: the stuck thread keeps it open, so the
 // kernel never aborts the request and the caller and the mount wait forever.
 //

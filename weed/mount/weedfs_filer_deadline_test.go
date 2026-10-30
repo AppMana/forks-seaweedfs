@@ -98,10 +98,10 @@ func withinDeadline(t *testing.T, what string, fn func()) {
 	}
 }
 
-// Every FUSE request that waits on the filer must give up: the kernel holds
-// the caller's directory lock until we reply, so an unbounded wait is an
-// unbounded D-state hold (appmana-008's rename, 2026-10-08) and makes every
-// lock-taking notification for that directory wait behind it.
+// Every FUSE request that waits on the filer must give up within its deadline:
+// the kernel holds the caller's directory lock until we reply, so an unbounded
+// wait would hold the thread in state D and block lock-taking notifications
+// for that directory.
 func TestFilerRequestsGiveUpOnASilentFiler(t *testing.T) {
 	wfs := newSilentFilerWFS(t)
 	parent := wfs.inodeToPath.Lookup(util.FullPath("/dir"), time.Now().Unix(), true, false, 0, true)

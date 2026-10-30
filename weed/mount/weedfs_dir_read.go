@@ -444,15 +444,9 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 	return fuse.OK
 }
 
-// dirReadStatus maps a failed directory read to a FUSE status.
-//
-// A canceled read is retryable and must be reported as EINTR, never as EIO:
-// the kernel hands EIO from readdirent straight to the caller, and kubelet's
-// applyFSGroup then fails the volume mount instead of retrying. A cancellation
-// that arrives with the local context still alive belongs to a shared build
-// that another requester abandoned — the read itself can still be retried, and
-// a gRPC cancellation of the listing classifies the same way. Only real
-// failures are worth an error log; interruptions are ordinary.
+// dirReadStatus maps a failed directory read to a FUSE status. Canceled or
+// timed-out reads return EINTR so callers can retry; other errors log and
+// return EIO.
 func dirReadStatus(ctx context.Context, err error, format string, args ...any) fuse.Status {
 	if ctx.Err() != nil ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||

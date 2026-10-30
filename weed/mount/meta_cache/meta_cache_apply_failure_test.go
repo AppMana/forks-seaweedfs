@@ -52,12 +52,9 @@ func (dialFilerClient) GetDataCenter() string                          { return 
 
 const applyFailureChildEnv = "META_CACHE_APPLY_FAILURE_CHILD"
 
-// A mount's subscription used FatalOnError: one event its local metadata
-// store failed to write killed the whole mount. On appmana-031 (2026-10-08) a
-// full root disk made leveldb refuse a write and weed exited 255 at
-// filer_pb_tail.go:97, ending every pod's view of the volume. A store that
-// cannot apply an event must be handed to the mount, which can stop trusting
-// its cache, and the subscription must go on.
+// When the local metadata store fails to apply a subscribed event, the error
+// must be reported to the mount's handler so it can stop trusting its cache while
+// keeping the subscription alive instead of terminating the process.
 func TestSubscribedEventStoreFailureDoesNotExitTheMount(t *testing.T) {
 	if os.Getenv(applyFailureChildEnv) == "1" {
 		runApplyFailureChild()

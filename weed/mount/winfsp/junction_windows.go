@@ -9,14 +9,12 @@ import (
 )
 
 // WinFsp's mount-manager directory mount (\\.\C:\dir) writes a junction that
-// targets the volume's NT device name (\Device\Volume{X}\). The mount manager
-// later loses that directory's mapping, after which
+// targets the volume's NT device name (\Device\Volume{X}\). If the mount
+// manager later drops that directory's mapping,
 // GetFinalPathNameByHandle(VOLUME_NAME_DOS) under the mount fails with
-// ERROR_PATH_NOT_FOUND; git-lfs canonicalizes its .git directory that way and
-// fails. In the Windows lab a junction targeting the same volume's
-// mount-manager GUID path (\??\Volume{Y}\) kept every DOS lookup working over
-// 64 mount cycles, while a matched rewrite back to the NT name still failed
-// (test/storage_lab/README.md). WinFsp itself removes the junction at unmount.
+// ERROR_PATH_NOT_FOUND. Retargeting the junction to the volume's mount-manager
+// GUID path (\??\Volume{Y}\) keeps DOS path resolution working across mount
+// cycles. WinFsp itself removes the junction at unmount.
 
 // GetFinalPathNameByHandle flags (fileapi.h); x/sys/windows defines only
 // VOLUME_NAME_DOS and VOLUME_NAME_NONE.

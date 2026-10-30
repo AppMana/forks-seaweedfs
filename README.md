@@ -146,27 +146,27 @@ Results for the scenarios below; timings depend on workload and host load.
 | 64 MiB write and `close()` with one of three volume servers stopped, holding 8 of 11 writable volumes (`TestCloseSucceedsWhenAnAssignedVolumeServerStalls`) | EIO after 60.0 s before; with retries drawing assignments at random, EIO after 60.0 s or `close()` 45.5 s (3 of 3 runs); asking the master to avoid it, `close()` 23.0 s (9 of 10), 29.4 s once |
 | 4 MiB write and `close()` through a 128 KiB/s link (`TestSlowButProgressingUploadsClose`) | EIO after 60 s with a 30 s response-header or absolute attempt bound; `close()` in 31.9 s progress-based |
 
-### 4.48 and 4.47 comparison
+### 4.51 and 4.48 comparison
 
-`test/mount_bench` on one Linux host (32 cores, NVMe), `weed mini` plus a
-default `weed mount` per binary, both built with `-tags 5BytesOffset`:
-4.47 build 0f3d7bec5 against the 4.48 merge. Median of four rounds run in
-alternating order; round-to-round spread is up to about 8%, so every
-difference below is within noise.
+`test/mount_bench` on one Linux host (Ryzen 9 5950X, NVMe, btrfs), `weed mini`
+plus a default `weed mount` per binary, both built with `-tags 5BytesOffset`:
+4.48 (5919f7617) against 4.51 (1e3820260). Median of four rounds run in
+alternating order. The host was loaded, so round-to-round spread is 9 to 51%
+and every difference below is within it.
 
-| Phase | 4.47 fork (0f3d7bec5) | 4.48 merge | Change |
+| Phase | 4.48 | 4.51 | Change |
 | --- | --- | --- | --- |
-| seq_write 256 MiB | 251.0 MB/s | 251.1 MB/s | 0.0% |
-| seq_read 256 MiB | 1053 MB/s | 1028 MB/s | -2.4% |
-| rand_read 4 KiB x 500 | 1776 MB/s | 1914 MB/s | +7.8% |
-| small_write 64 KiB x 400 | 30.3 MB/s | 29.8 MB/s | -1.7% |
-| small_read 64 KiB x 400 | 105.9 MB/s | 106.1 MB/s | +0.2% |
-| stat_files | 112650 ops/s | 107687 ops/s | -4.4% |
-| list_dir | 2580 ops/s | 2382 ops/s | -7.7% |
-| overwrite | 41.9 MB/s | 41.4 MB/s | -1.1% |
-| delete | 2025 ops/s | 2019 ops/s | -0.3% |
-| list_5k | 224041 ops/s | 232973 ops/s | +4.0% |
-| walk_5k | 382720 ops/s | 358447 ops/s | -6.3% |
+| seq_write 256 MiB | 714.8 MB/s | 708.3 MB/s | -0.9% |
+| seq_read 256 MiB | 985.5 MB/s | 1034.6 MB/s | +5.0% |
+| rand_read 4 KiB x 500 | 1626.9 MB/s | 1526.6 MB/s | -6.2% |
+| small_write 64 KiB x 400 | 21.8 MB/s | 22.1 MB/s | +1.5% |
+| small_read 64 KiB x 400 | 296.0 MB/s | 336.5 MB/s | +13.7% |
+| stat_files | 82759 ops/s | 94426 ops/s | +14.1% |
+| list_dir | 1930 ops/s | 2117 ops/s | +9.7% |
+| overwrite | 29.3 MB/s | 29.7 MB/s | +1.3% |
+| delete | 1544 ops/s | 1622 ops/s | +5.1% |
+| list_5k | 202436 ops/s | 200478 ops/s | -1.0% |
+| walk_5k | 279237 ops/s | 280711 ops/s | +0.5% |
 
 ## How CI builds and qualifies
 
@@ -209,7 +209,8 @@ keeps a private registry's name out of public logs.
 
 | Branch | Role |
 | --- | --- |
-| `merge/upstream-4.51` | Maintained 4.51 line. Fork fixes merge here without rebasing; server and mount builds target this line. |
+| `merge/upstream-4.51` | Default branch: the maintained 4.51 line. Fork fixes merge here without rebasing; server and mount builds target this line. |
+| `merge/upstream-4.48` | Previous line, no longer updated; every commit on it is in `merge/upstream-4.51`. |
 | `merge/upstream-<next>` | Next upstream release merged into the default branch. It becomes the default once qualified; the server image workflow's branch filter moves with it. |
 | `release/<change>-<base>` | Short-lived ship branch: a deployed commit plus only the change being rolled out. It merges back into the default branch and is then deleted. |
 

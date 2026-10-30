@@ -213,9 +213,10 @@ func TestVolumeCopyReplacesReplicaAtSlotLimit(t *testing.T) {
 // errors out before sending anything in this test.
 type fakeVolumeCopyStream struct {
 	grpc.ServerStream
+	sendErr error
 }
 
-func (s *fakeVolumeCopyStream) Send(*volume_server_pb.VolumeCopyResponse) error { return nil }
+func (s *fakeVolumeCopyStream) Send(*volume_server_pb.VolumeCopyResponse) error { return s.sendErr }
 func (s *fakeVolumeCopyStream) Context() context.Context                        { return context.Background() }
 func (s *fakeVolumeCopyStream) SetHeader(metadata.MD) error                     { return nil }
 func (s *fakeVolumeCopyStream) SendHeader(metadata.MD) error                    { return nil }
@@ -288,3 +289,93 @@ func TestCopyTailHandlersRejectUntrustedSources(t *testing.T) {
 		}
 	}
 }
+
+// When a VolumeCopy fails after streaming its .dat (which settles the
+// reservation via commitCopy as bytes land), removing the staged files must
+// also restore the committed headroom on the destination DiskLocation so an
+// immediate retry does not fail with "no space left".
+func TestVolumeCopyRestoresCommittedHeadroomAfterPostStreamFailure(t *testing.T) {
+	const vid = needle.VolumeId(46)
+
+	sourceStore := newVolumeCopyTestStore(t, t.TempDir())
+	if err := sourceStore.AddVolume(vid, "", storage.NeedleMapInMemory, "000", "", 0,
+		needle.GetCurrentVersion(), 0, types.HardDriveType, 0); err != nil {
+		t.Fatalf("add source volume: %v", err)
+	}
+	srcVol := sourceStore.GetVolume(vid)
+	if srcVol == nil {
+		t.Fatal("missing source volume")
+	}
+	n := &needle.Needle{
+		Id:   1,
+		Data: make([]byte, 64*1024),
+	}
+	n.Checksum = needle.NewCRC(n.Data)
+	if _, err := sourceStore.WriteVolumeNeedle(vid, n, true, true); err != nil {
+		t.Fatalf("write source needle: %v", err)
+	}
+	datSize, _, _ := srcVol.FileStat()
+
+	source := &volumeCopyStatusServer{
+		delegate:       &VolumeServer{store: sourceStore},
+		failStatusCall: 2, // fail the post-copy VolumeStatus check on the first attempt
+		statusErr:      errors.New("source volume status unavailable after copy"),
+	}
+	port := serveGrpc(t, func(server *grpc.Server) {
+		volume_server_pb.RegisterVolumeServerServer(server, source)
+	})
+
+	targetDir := t.TempDir()
+	diskStat := stats.NewDiskStatus(targetDir)
+	// Leave headroom for slightly more than 1x datSize, but less than 2x datSize.
+	budget := datSize + datSize/2
+	var minFreeBytes uint64
+	if diskStat.Free > budget {
+		minFreeBytes = diskStat.Free - budget
+	} else {
+		t.Skipf("insufficient free disk space (%d) for test budget (%d)", diskStat.Free, budget)
+	}
+
+	targetStore := storage.NewStore(
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		"127.0.0.1", 0, 0, "", "test-store",
+		[]string{targetDir}, []int32{10},
+		[]util.MinFreeSpace{{Type: util.AsBytes, Bytes: minFreeBytes, Raw: fmt.Sprintf("%dB", minFreeBytes)}},
+		targetDir, storage.NeedleMapInMemory,
+		[]types.DiskType{types.HardDriveType}, [][]string{nil},
+		0, stats.DefaultDiskIOProbeConfig(),
+	)
+	t.Cleanup(targetStore.Close)
+	targetStore.Locations[0].AvailableSpace.Store(budget)
+
+	target := &VolumeServer{
+		store:                         targetStore,
+		grpcDialOption:                grpc.WithTransportCredentials(insecure.NewCredentials()),
+		AllowUntrustedRemoteEndpoints: true,
+	}
+	req := &volume_server_pb.VolumeCopyRequest{
+		VolumeId:       uint32(vid),
+		SourceDataNode: fmt.Sprintf("127.0.0.1:%d.%d", port-10000, port),
+	}
+
+	// First copy streams .dat (settling the reservation via commitCopy) and then
+	// fails on post-copy VolumeStatus.
+	if err := target.VolumeCopy(req, &fakeVolumeCopyStream{}); err == nil {
+		t.Fatal("expected first VolumeCopy to fail on post-copy VolumeStatus")
+	}
+	if got := targetStore.Locations[0].ReservedSpace.Load(); got != 0 {
+		t.Fatalf("ReservedSpace after failed copy = %d, want 0", got)
+	}
+	if got := targetStore.Locations[0].AvailableSpace.Load(); got <= datSize {
+		t.Fatalf("AvailableSpace after failed copy = %d, want > %d so retry can proceed", got, datSize)
+	}
+
+	// Immediate retry must succeed without waiting for the 1-minute disk space probe.
+	if err := target.VolumeCopy(req, &fakeVolumeCopyStream{}); err != nil {
+		t.Fatalf("retry VolumeCopy after failed attempt failed: %v", err)
+	}
+	if targetStore.GetVolume(vid) == nil {
+		t.Fatal("copied volume was not mounted on retry")
+	}
+}
+

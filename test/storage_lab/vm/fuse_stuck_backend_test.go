@@ -71,13 +71,9 @@ func parseStuckLab(output string) (stuckLabReport, error) {
 	return r, nil
 }
 
-// A mount whose backend stops answering must never leave a task in
-// uninterruptible sleep past the hung-task timeout: on the cluster's nodes
-// hung_task_panic=1 turns that into a node panic (appmana-031, 2026-10-09,
-// a SIGKILLed writer's FLUSH on a mount whose cache directory was deleted).
-// The guest runs with the same panic setting, so a regression loses the VM.
-// A large sequential write must also close within the write buffer cap's
-// drain time instead of draining an unbounded backlog at close().
+// A stopped backend must not leave requests in uninterruptible sleep.
+// The disposable guest panics on hung tasks. Capped writes must close
+// within the write buffer drain time.
 func TestFuseStuckBackendLab(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_STUCK_LAB_LIVE") != "1" {
 		t.Skip("set SEAWEEDFS_STUCK_LAB_LIVE=1")

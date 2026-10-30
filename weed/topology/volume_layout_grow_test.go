@@ -242,10 +242,7 @@ func TestPlanRackAwareGrowth_EvenDistributionAcrossUnevenDCs(t *testing.T) {
 	}
 }
 
-// A collection pinned to one data center (fs.configure -dataCenter) lives only
-// there, yet the scan used to plan growth for every data center in the
-// topology, spreading the collection's volumes across all of them. Data
-// centers hosting none of the layout's volumes are not the scan's to fill.
+// Background growth must respect the data centers hosting the layout.
 func TestPlanRackAwareGrowth_SkipsDataCentersWithoutLayoutVolumes(t *testing.T) {
 	layout := `
 {

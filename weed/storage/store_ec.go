@@ -299,12 +299,7 @@ func (s *Store) LoadEcShardAcrossDisks(collection string, vid needle.VolumeId, s
 	// EC distribute) so we still scan the rest of the disks.
 	ecxIdxDir, ecxFound := s.findEcxIdxDirForVolume(collection, vid)
 
-	// Collect failures so an all-disks-fail return reports every disk we
-	// tried rather than just the first one. Before this loop reordered
-	// itself to keep going after the first non-ENOENT error, a single
-	// shard-on-disk-without-.ecx situation would bail the loop and the
-	// operator saw "cannot open ec volume index" naming exactly one disk
-	// even when others held a valid index.
+	// Try every disk and report all failures if none has a valid index.
 	type diskError struct {
 		dir string
 		err error

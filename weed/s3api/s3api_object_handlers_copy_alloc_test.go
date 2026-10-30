@@ -12,25 +12,8 @@ import (
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-// TestDownloadChunkData_AllocationBound is a regression guard for
-// https://github.com/seaweedfs/seaweedfs/issues/6541.
-//
-// downloadChunkData previously accumulated streamed bytes via
-//
-//	var chunkData []byte
-//	... fn := func(data []byte) { chunkData = append(chunkData, data...) }
-//
-// The callback fires once per ReadUrlAsStream pump (256 KiB), so a 16 MiB
-// chunk grew the slice geometrically (256K -> 512K -> 1M -> ... -> 32M),
-// allocating ~2x the chunk size for every transferred byte. Combined with
-// the 4-way per-request concurrency in copyChunks/copyChunksForRange and
-// any number of in-flight UploadPartCopy calls (Harbor multipart assemble),
-// this produced the runaway RSS reported in the issue.
-//
-// We assert that downloading a chunkSize-byte chunk allocates at most
-// 1.5 * chunkSize bytes on the heap. The pre-fix nil-append pattern blows
-// past that bound; the fixed (`make([]byte, 0, sizeInt)`) version stays
-// well under it.
+// Downloading a chunk must allocate at most 1.5 times its size,
+// including streaming callback overhead.
 func TestDownloadChunkData_AllocationBound(t *testing.T) {
 	// downloadChunkData drives the package-level global HTTP client. Tests
 	// don't go through the normal `weed` startup that does this, so call it
@@ -96,7 +79,7 @@ func TestDownloadChunkData_AllocationBound(t *testing.T) {
 	// The output slice itself is chunkSize bytes; the streaming pump uses a
 	// pooled 256 KiB read buffer and doesn't otherwise accumulate. A 1.5x
 	// bound is comfortably above the steady-state cost and well below the
-	// pre-fix geometric-grow cost (~2x).
+	// geometric buffer growth cost (~2x).
 	maxAllowed := uint64(chunkSize) * 3 / 2
 	if allocated > maxAllowed {
 		t.Fatalf("downloadChunkData allocated %d bytes for a %d-byte chunk; bound is %d "+

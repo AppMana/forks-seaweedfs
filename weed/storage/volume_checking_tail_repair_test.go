@@ -592,10 +592,8 @@ func TestVolumeLoadRepairsTailOnCanDeleteVolume(t *testing.T) {
 	assertReadable(t, v, last)
 }
 
-// A torn record whose header advertises a positive size smaller than the
-// body's own 4-byte data-size field is damaged, not decodable — reading it
-// used to panic on the slice. As the last record it is kept, not cut, and the
-// volume stops taking writes and deletes.
+// A record smaller than its data-size field is malformed. Preserve its
+// bytes and load the volume read-only.
 func TestVolumeLoadKeepsDamagedSmallSizeTailOnCanDeleteVolume(t *testing.T) {
 	dir := t.TempDir()
 	v := newTornTailTestVolume(t, dir)

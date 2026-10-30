@@ -87,9 +87,8 @@ func reopenCountingVolume(t *testing.T, v *Volume) *Volume {
 	return reloaded
 }
 
-// A durable write reaching a stopping server used to silently drop its fsync,
-// so the ack promised durability the .dat did not have. It now flushes inline
-// instead of queueing on the batch worker that is winding down.
+// A durable write during shutdown must sync inline when the batch
+// worker is stopping.
 func TestWriteNeedle2FsyncsInlineWhileStopping(t *testing.T) {
 	v, counting := newCountingVolume(t)
 

@@ -109,11 +109,7 @@ func TestUploadThatStopsMovingIsAbandoned(t *testing.T) {
 	t.Logf("abandoned after %v: %v", took, err)
 }
 
-// The Synology volume server, measured 2026-10-12 after its SSD cache was
-// rebuilt, sustains about 80 MB/s and answers 2 MiB uploads at 16 in flight
-// with a p99 of 1.4 s and a maximum of 2.9 s. Such a server is slow but
-// healthy: with the mount's timeouts every upload must land on the first
-// attempt.
+// Slow uploads that keep progressing must succeed on their first attempt.
 func TestSlowHealthyNasShapedServerIsNotAbandoned(t *testing.T) {
 	const (
 		concurrent = 16

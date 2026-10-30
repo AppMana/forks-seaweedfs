@@ -80,6 +80,13 @@ func TestMatchesPrincipal(t *testing.T) {
 		{"AWS map wildcard", map[string]interface{}{"AWS": "arn:aws:iam::*:user/admin"}, "arn:aws:iam::123:user/admin", true},
 		{"AWS map array", map[string]interface{}{"AWS": []interface{}{"user1", "user2"}}, "user1", true},
 
+		// ARN statements do not reach normalized-name callers on the allow
+		// path: normalization drops the ARN's account and path, so the grant
+		// could land on a same-named caller the statement never verified.
+		{"arn spec exact caller", "arn:aws:iam::123456789012:user/bob", "bob", false},
+		{"arn spec wildcard caller", "arn:aws:iam::*:user/alice", "alice", false},
+		{"arn spec no match", "arn:aws:iam::123456789012:user/carol", "dan", false},
+
 		// Nil/empty cases
 		{"nil principal", nil, "user123", false},
 	}
@@ -298,6 +305,30 @@ func TestCheckTableOrBucketPermissionDenyVeto(t *testing.T) {
 	}
 }
 
+// A principal that merely normalizes to the admin id must not bypass policy
+// denies: when the caller's actions are known, the admin bypass requires an
+// admin action; transports carrying no action list keep it.
+func TestCheckPermissionAdminRequiresAdminAction(t *testing.T) {
+	denyAll := `{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:DeleteTable","Resource":"*"}]}`
+	arn := "arn:aws:s3tables:us-east-1:acct:bucket/b/table/ns/t"
+
+	reader := &PolicyContext{IdentityActions: []string{"Read"}}
+	if CheckPermissionWithContext("s3tables:DeleteTable", "admin", "admin", denyAll, arn, reader) {
+		t.Error("a name-only admin must not bypass an explicit deny")
+	}
+	admin := &PolicyContext{IdentityActions: []string{"Admin"}}
+	if !CheckPermissionWithContext("s3tables:DeleteTable", "admin", "admin", denyAll, arn, admin) {
+		t.Error("an identity holding the admin action keeps the bypass")
+	}
+	if !CheckPermissionWithContext("s3tables:DeleteTable", "admin", "admin", denyAll, arn, nil) {
+		t.Error("a caller with no action list keeps the trusted bypass")
+	}
+	empty := &PolicyContext{IdentityActions: []string{}}
+	if CheckPermissionWithContext("s3tables:DeleteTable", "admin", "admin", denyAll, arn, empty) {
+		t.Error("an identified admin with an empty action list must not bypass a deny")
+	}
+}
+
 func TestCheckTableOrBucketPermissionOwnerlessFailsClosed(t *testing.T) {
 	ctx := &PolicyContext{
 		IdentityActions: []string{"s3tables:*"},
@@ -426,5 +457,84 @@ func TestCheckPermissionLegacyPolicyPrincipalShapes(t *testing.T) {
 	allow := `{"Statement":[{"Effect":"Allow","Principal":["alice-sub"],"Action":"s3tables:GetTable"}]}`
 	if !CheckPermissionWithContext("GetTable", principal, other, allow, "arn", ctx) {
 		t.Error("legacy Allow with array principal must still match the scoped caller")
+	}
+}
+
+func TestValidatePolicyDocument(t *testing.T) {
+	valid := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:GetTable","Resource":"*"}]}`
+	if err := validatePolicyDocument(valid); err != nil {
+		t.Fatalf("valid policy rejected: %v", err)
+	}
+	if err := validatePolicyDocument("not-json"); err == nil {
+		t.Fatal("malformed policy should be rejected")
+	}
+	dead := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3vectors:PutVectors","Resource":"*"}]}`
+	if err := validatePolicyDocument(dead); err == nil {
+		t.Fatal("s3vectors action should be rejected")
+	}
+	deadList := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3tables:*","s3vectors:*"],"Resource":"*"}]}`
+	if err := validatePolicyDocument(deadList); err == nil {
+		t.Fatal("action list containing s3vectors should be rejected")
+	}
+	deadResource := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:*","Resource":"arn:aws:s3vectors:r:a:bucket/b"}]}`
+	if err := validatePolicyDocument(deadResource); err == nil {
+		t.Fatal("s3vectors resource should be rejected")
+	}
+	deadPartition := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:*","Resource":"arn:aws-cn:s3vectors:cn-1:a:bucket/b"}]}`
+	if err := validatePolicyDocument(deadPartition); err == nil {
+		t.Fatal("s3vectors resource in another partition should be rejected")
+	}
+	deadWildcard := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:*","Resource":"arn:*:s3vectors:r:a:bucket/b"}]}`
+	if err := validatePolicyDocument(deadWildcard); err == nil {
+		t.Fatal("s3vectors resource in a wildcard partition should be rejected")
+	}
+	deadMixed := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3tables:*","Resource":["arn:aws:s3tables:r:a:bucket/b","arn:aws:s3vectors:r:a:bucket/b"]}]}`
+	if err := validatePolicyDocument(deadMixed); err == nil {
+		t.Fatal("resource list containing s3vectors should be rejected")
+	}
+}
+
+// An ARN-scoped statement reaches a caller recorded under the ARN's trailing
+// name only for denies: normalization drops the account and path, so an allow
+// matched that way could grant a same-named caller the statement never
+// verified, while a deny that missed would let the caller duck the rule.
+func TestArnScopedPrincipalMatchesOnlyForDeny(t *testing.T) {
+	arn := "arn:aws:s3vectors:us-east-1:acct:bucket/b"
+	denyPolicy := `{"Statement":[{"Effect":"Deny","Principal":"arn:aws:iam::111:user/bob","Action":"s3vectors:DeleteVectors","Resource":"*"}]}`
+	allowPolicy := `{"Statement":[{"Effect":"Allow","Principal":"arn:aws:iam::111:user/bob","Action":"s3vectors:DeleteVectors","Resource":"*"}]}`
+
+	if CheckPermissionWithContext("s3vectors:DeleteVectors", "bob", "owner", denyPolicy, arn, &PolicyContext{}) {
+		t.Error("an ARN-scoped deny must still reach the normalized caller")
+	}
+	if CheckPermissionWithContext("s3vectors:DeleteVectors", "bob", "owner", allowPolicy, arn, &PolicyContext{}) {
+		t.Error("an ARN-scoped allow must not grant on the normalized name alone")
+	}
+}
+
+// A service wildcard administers only its own service: s3tables:* satisfies
+// the admin and identity grants for table operations but must not reach an
+// s3vectors operation.
+func TestServiceWildcardScopesToOwnService(t *testing.T) {
+	vectorOp := "s3vectors:DeleteVectors"
+	vectorArn := "arn:aws:s3vectors:us-east-1:acct:bucket/b"
+	tableOnly := &PolicyContext{IdentityActions: []string{"s3tables:*"}}
+
+	if CheckPermissionWithContext(vectorOp, "bob", "owner", "", vectorArn, tableOnly) {
+		t.Error("s3tables:* must not grant a vector operation")
+	}
+	if CheckPermissionWithContext(vectorOp, "admin", "owner", "", vectorArn, tableOnly) {
+		t.Error("s3tables:* must not fire the admin bypass for a vector operation")
+	}
+	if !CheckPermissionWithContext("GetTable", "bob", "owner", "", "arn:aws:s3tables:b", tableOnly) {
+		t.Error("s3tables:* keeps administering table operations")
+	}
+
+	vectorAdmin := &PolicyContext{IdentityActions: []string{"s3vectors:*"}}
+	if !CheckPermissionWithContext(vectorOp, "bob", "owner", "", vectorArn, vectorAdmin) {
+		t.Error("s3vectors:* administers vector operations")
+	}
+	global := &PolicyContext{IdentityActions: []string{"Admin"}}
+	if !CheckPermissionWithContext(vectorOp, "admin", "owner", "", vectorArn, global) {
+		t.Error("the global admin action keeps the bypass on vector operations")
 	}
 }

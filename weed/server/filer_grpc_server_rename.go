@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -452,8 +453,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 			false,
 			false,
 			signatures,
-			0,
-		); deleteErr != nil {
+			time.Time{}); deleteErr != nil {
 			return deleteErr
 		}
 	}
@@ -518,7 +518,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 	if existingTarget != nil {
 		toDelete, err := filer.MinusChunks(ctx, fs.filer.MasterClient.GetLookupFileIdFunction(), existingTarget.GetChunks(), newEntry.GetChunks(), fs.filer.MasterClient)
 		if err != nil {
-			glog.ErrorfCtx(ctx, "Failed to resolve overwrite target chunks during rename. new: %v, old: %v", newEntry.GetChunks(), existingTarget.GetChunks())
+			glog.ErrorfCtx(ctx, "Failed to resolve overwrite target chunks during rename. new: %v, old: %v", filer_pb.FileIdsString(newEntry.GetChunks()), filer_pb.FileIdsString(existingTarget.GetChunks()))
 		} else if len(toDelete) > 0 && !fs.filer.SharedChunksHeld(ctx, existingTarget, newEntry) {
 			// (a target sharing its chunks with other entries keeps them)
 			// Defer chunk deletion until after CommitTransaction so that a
@@ -559,7 +559,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 	if keepOldRemote {
 		deleteCtx = filer.WithKeepRemoteObject(deleteCtx)
 	}
-	deleteErr := fs.filer.DeleteEntryMetaAndData(deleteCtx, oldPath, false, false, false, false, signatures, 0)
+	deleteErr := fs.filer.DeleteEntryMetaAndData(deleteCtx, oldPath, false, false, false, false, signatures, time.Time{})
 	if deleteErr != nil {
 		return deleteErr
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -20,11 +21,33 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+// Which side holds an entry's content, and the two processors that keep the
+// remote in step with it.
+//
+// An entry with local data (chunks or inline content) is authoritative: the
+// update uploads it. A chunkless entry stamped with a RemoteEntry is
+// remote-only: its content is the remote object its stamp describes, so the
+// chunkless entry is never uploaded, since it would write zero bytes over
+// the only copy, and the object goes only while the stamp still describes it
+// (remote_storage.StillCurrent). While the entry carries a
+// filer.ExtRemoteRenameSourceKey marker the content is the object at the
+// renamed-from path, until the rename's copy or upload restamps the entry
+// and clears it. A dropped local copy (remote.uncache, eviction,
+// remote.meta.sync) keeps the remote object's size; a size that moved off
+// the stamp (a truncate) is new content and uploads.
+//
+// processUpdateEvent serves filer remote.sync over one mounted directory;
+// makeBucketedEventProcessor in filer_remote_gateway_buckets.go serves filer
+// remote.gateway over the bucketed space. They implement the same protocol
+// and must change together: a guard added to one and not the other is how
+// the zero-byte re-upload on remote.uncache happened.
 
 func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *source.FilerSource, mountedDir string) error {
 
@@ -193,6 +216,7 @@ func reshapeCrossMountRename(mountedDir string, resp *filer_pb.SubscribeMetadata
 			Directory:         message.NewParentPath,
 			EventNotification: &filer_pb.EventNotification{NewEntry: message.NewEntry, NewParentPath: message.NewParentPath, Signatures: message.Signatures},
 			TsNs:              resp.TsNs,
+			MutationTsNs:      resp.MutationTsNs,
 		}, true
 	case oldInMount:
 		if isRemoteOnly(message.OldEntry) {
@@ -204,6 +228,7 @@ func reshapeCrossMountRename(mountedDir string, resp *filer_pb.SubscribeMetadata
 			Directory:         resp.Directory,
 			EventNotification: &filer_pb.EventNotification{OldEntry: message.OldEntry, Signatures: message.Signatures},
 			TsNs:              resp.TsNs,
+			MutationTsNs:      resp.MutationTsNs,
 		}, true
 	default:
 		return nil, false
@@ -260,9 +285,9 @@ func processCreateEvent(
 	if !filer.HasData(message.NewEntry) && !(mustSend && !isDroppedLocalCopy(message.NewEntry)) {
 		return nil
 	}
-	glog.V(2).Infof("create: %+v", resp)
+	glog.V(2).Infof("create: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 	if !mustSend && !shouldSendToRemote(message.NewEntry) {
-		glog.V(2).Infof("skipping creating: %+v", resp)
+		glog.V(2).Infof("skipping creating: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 		return nil
 	}
 	// Rewrite internal versioning paths to the original S3 key
@@ -332,7 +357,7 @@ func processDeleteEvent(
 		glog.V(2).Infof("skipping remote delete of metadata-only delete: %s/%s", resp.Directory, message.OldEntry.Name)
 		return nil
 	}
-	glog.V(2).Infof("delete: %+v", resp)
+	glog.V(2).Infof("delete: %s/%s ts_ns=%d", resp.Directory, message.GetOldEntry().GetName(), resp.TsNs)
 	dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
 	if !message.OldEntry.IsDirectory {
 		// a deleted entry whose rename copy was still pending read its
@@ -456,7 +481,7 @@ func processUpdateEvent(
 		return fallback
 	}
 	if proto.Equal(oldDest, dest) && !shouldSendToRemote(message.NewEntry) {
-		glog.V(2).Infof("skipping updating: %+v", resp)
+		glog.V(2).Infof("skipping updating: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 		return nil
 	}
 	if message.NewEntry.IsDirectory {
@@ -465,14 +490,14 @@ func processUpdateEvent(
 	if isMetadataOnlyUpdate(resp.Directory, message) {
 		remoteEntry, err := liveRemoteEntry(filerClient, message.NewParentPath, message.NewEntry)
 		if errors.Is(err, filer_pb.ErrNotFound) {
-			glog.V(2).Infof("skipping updating deleted entry: %+v", resp)
+			glog.V(2).Infof("skipping updating deleted entry: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 			return nil
 		}
 		if err != nil {
 			return err
 		}
 		if remoteEntry != nil {
-			glog.V(2).Infof("update meta: %+v", resp)
+			glog.V(2).Infof("update meta: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 			updated, err := client.UpdateFileMetadata(dest, message.OldEntry, remoteWriteEntry(message.NewEntry, storageClass))
 			if err != nil {
 				return err
@@ -494,10 +519,10 @@ func processUpdateEvent(
 		// the entry as dirty when the remote mtime shares its second. The
 		// content is the object at this very key, and uploading the chunkless
 		// entry would replace it with zero bytes.
-		glog.V(2).Infof("skipping update of remote-only entry: %+v", resp)
+		glog.V(2).Infof("skipping update of remote-only entry: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 		return nil
 	}
-	glog.V(2).Infof("update: %+v", resp)
+	glog.V(2).Infof("update: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 	if !proto.Equal(oldDest, dest) {
 		// A renamed entry that holds no local data now (the snapshot was
 		// remote-only, or remote.uncache ran since) has its content only as a
@@ -913,18 +938,22 @@ func readRemoteStorageConf(filerClient filer_pb.FilerClient, storageName string)
 }
 
 // isSuperseded reports whether the filer has moved past the entry an event
-// described: it is deleted, or it no longer references every chunk the event
-// named. Those are the chunks the filer deletes when an entry is updated, so
-// they are gone from the volume servers, or about to be, and no retry of the
-// upload can succeed. Chunks are compared by file id, not content: a rewrite
-// stores even identical bytes under new ids and drops the old ones. A replay
-// from an earlier offset (-timeAgo) re-emits such events. Failing one holds the
-// sync offset before it, so every restart of the subscription replays it into
-// the same dead chunks, and progress on everything after it in the log is never
-// persisted. Skipping is safe: the event that superseded this one follows in
-// the log, and the delete removes the remote object or the rewrite uploads the
-// current content. A lookup that fails for any other reason keeps the write
-// failure, so the event is retried.
+// described: it is deleted, it no longer references every chunk the event
+// named, or it references chunks the event did not. Dropped chunks are the ones
+// the filer deletes when an entry is updated, so they are gone from the volume
+// servers, or about to be, and no retry of the upload can succeed. Added chunks
+// mean the event was a snapshot of a write still in progress. A mount flushes
+// metadata while it is still uploading chunks in parallel, so such a snapshot
+// can have holes, and the stream reader stops at the first one: every retry
+// sends a short body and fails the same way. Chunks are compared by file id,
+// not content: a rewrite stores even identical bytes under new ids and drops
+// the old ones. A replay from an earlier offset (-timeAgo) re-emits such
+// events. Failing one holds the sync offset before it, so every restart of the
+// subscription replays it into the same failure, and progress on everything
+// after it in the log is never persisted. Skipping is safe: the event that
+// superseded this one follows in the log, and the delete removes the remote
+// object or the later write uploads the current content. A lookup that fails
+// for any other reason keeps the write failure, so the event is retried.
 func isSuperseded(filerClient filer_pb.FilerClient, dir string, entry *filer_pb.Entry) bool {
 	current, _, _, err := filer_pb.GetEntry(context.Background(), filerClient, util.NewFullPath(dir, entry.Name))
 	if errors.Is(err, filer_pb.ErrNotFound) {
@@ -942,12 +971,39 @@ func isSuperseded(filerClient filer_pb.FilerClient, dir string, entry *filer_pb.
 	if len(entry.Content) > 0 || len(current.Content) > 0 {
 		return !bytes.Equal(entry.Content, current.Content)
 	}
-	return len(filer.DoMinusChunks(entry.GetChunks(), current.GetChunks())) > 0
+	return len(filer.DoMinusChunks(entry.GetChunks(), current.GetChunks())) > 0 ||
+		len(filer.DoMinusChunks(current.GetChunks(), entry.GetChunks())) > 0
 }
 
-// errSuperseded marks an upload that failed for an entry the filer has since
-// moved past (isSuperseded). The caller skips the event instead of failing it.
-var errSuperseded = errors.New("deleted or rewritten since the event was logged")
+// remoteUploadReader streams the entry's full declared size through
+// ChunkReadAt, which zero-fills any range no chunk view covers: a sparse
+// file, a mid-write snapshot flushed while its chunk uploads were still
+// running, and a chunkless entry all upload the bytes a read of the entry
+// returns. The chunk stream reader stops at the first gap instead, handing
+// the backend a short body on every retry — a hole that never fills wedges
+// the event, and a backend that does not verify the length publishes a
+// truncated object.
+func remoteUploadReader(filerClient filer_pb.FilerClient, entry *filer_pb.Entry) (reader io.Reader, closeFn func() error, err error) {
+	if len(entry.Content) > 0 {
+		return bytes.NewReader(entry.Content), nil, nil
+	}
+	size := int64(filer.FileSize(entry))
+	lookupFileIdFn := filer.LookupFn(filerClient)
+	chunkViews, err := filer.ViewFromChunks(context.Background(), lookupFileIdFn, entry.GetChunks(), 0, math.MaxInt64)
+	if err != nil {
+		return nil, nil, err
+	}
+	readerAt := filer.NewChunkReaderAtFromClient(context.Background(),
+		filer.NewReaderCache(8, chunk_cache.NewChunkCacheInMemory(8), lookupFileIdFn, nil),
+		chunkViews, size, filer.DefaultPrefetchCount)
+	return io.NewSectionReader(readerAt, 0, size), readerAt.Close, nil
+}
+
+// errSuperseded marks an upload that cannot produce the entry an event
+// described: the filer moved past it (isSuperseded). The caller skips the
+// event instead of failing it; the event carrying the entry's current chunks
+// follows in the log and uploads them.
+var errSuperseded = errors.New("superseded or incomplete since the event was logged")
 
 // retriedWriteFile uploads the entry, retrying transient failures. The filer is
 // asked whether the entry is superseded before the first attempt and after
@@ -964,7 +1020,16 @@ func retriedWriteFile(client remote_storage.RemoteStorageClient, filerSource fil
 	err = util.RetryOnError("writeFile", func(err error) bool {
 		return !errors.Is(err, errSuperseded) && util.IsTransientError(err)
 	}, func() error {
-		reader := filer.NewFileReader(filerSource, newEntry)
+		reader, closeFn, readerErr := remoteUploadReader(filerSource, newEntry)
+		if readerErr != nil {
+			if isSuperseded(filerSource, dir, newEntry) {
+				return fmt.Errorf("%s %w: %w", util.NewFullPath(dir, newEntry.Name), errSuperseded, readerErr)
+			}
+			return readerErr
+		}
+		if closeFn != nil {
+			defer closeFn()
+		}
 		glog.V(0).Infof("create %s", remote_storage.FormatLocation(dest))
 		var writeErr error
 		remoteEntry, writeErr = client.WriteFile(dest, newEntry, reader)

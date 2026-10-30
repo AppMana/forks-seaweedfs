@@ -296,21 +296,28 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	} else {
 		glog.V(3).InfofCtx(ctx, "CreateEntry %s: %v", filepath.Join(req.Directory, req.Entry.Name), createErr)
 		resp.Error = createErr.Error()
-		switch {
-		case errors.Is(createErr, filer_pb.ErrEntryNameTooLong):
-			resp.ErrorCode = filer_pb.FilerError_ENTRY_NAME_TOO_LONG
-		case errors.Is(createErr, filer_pb.ErrParentIsFile):
-			resp.ErrorCode = filer_pb.FilerError_PARENT_IS_FILE
-		case errors.Is(createErr, filer_pb.ErrExistingIsDirectory):
-			resp.ErrorCode = filer_pb.FilerError_EXISTING_IS_DIRECTORY
-		case errors.Is(createErr, filer_pb.ErrExistingIsFile):
-			resp.ErrorCode = filer_pb.FilerError_EXISTING_IS_FILE
-		case errors.Is(createErr, filer_pb.ErrEntryAlreadyExists):
-			resp.ErrorCode = filer_pb.FilerError_ENTRY_ALREADY_EXISTS
-		}
+		resp.ErrorCode = filerErrorCode(createErr)
 	}
 
 	return
+}
+
+// filerErrorCode maps a filer error to its proto code so a client can match it
+// with errors.Is against the sentinels instead of parsing the message.
+func filerErrorCode(err error) filer_pb.FilerError {
+	switch {
+	case errors.Is(err, filer_pb.ErrEntryNameTooLong):
+		return filer_pb.FilerError_ENTRY_NAME_TOO_LONG
+	case errors.Is(err, filer_pb.ErrParentIsFile):
+		return filer_pb.FilerError_PARENT_IS_FILE
+	case errors.Is(err, filer_pb.ErrExistingIsDirectory):
+		return filer_pb.FilerError_EXISTING_IS_DIRECTORY
+	case errors.Is(err, filer_pb.ErrExistingIsFile):
+		return filer_pb.FilerError_EXISTING_IS_FILE
+	case errors.Is(err, filer_pb.ErrEntryAlreadyExists):
+		return filer_pb.FilerError_ENTRY_ALREADY_EXISTS
+	}
+	return filer_pb.FilerError_OK
 }
 
 // ObjectTransaction applies an ordered list of entry mutations atomically with
@@ -350,6 +357,7 @@ func (fs *FilerServer) ObjectTransaction(ctx context.Context, req *filer_pb.Obje
 			IsMoved:            true,
 			RequestId:          req.RequestId,
 			ConditionAltKey:    req.ConditionAltKey,
+			ConditionPreferAlt: req.ConditionPreferAlt,
 		}
 		var resp *filer_pb.ObjectTransactionResponse
 		handled, err := fs.forwardToWriteOwner(ctx, req.RouteKey, func(owner pb.ServerAddress) error {
@@ -404,11 +412,16 @@ func (fs *FilerServer) ObjectTransaction(ctx context.Context, req *filer_pb.Obje
 		}
 		current, findErr := fs.filer.FindEntry(ctx, conditionPath)
 		if findErr == nil && current != nil && current.IsDirectory() && req.ConditionAltKey != "" {
-			// A directory is not the object: implicit directories can share a
-			// path with an S3 key, so treat it as an absent slot. Only the
-			// alt-key callers want object-slot semantics; an explicit
-			// condition_key may legitimately name a directory.
-			current, findErr = nil, filer_pb.ErrNotFound
+			// A bare directory is not the object: implicit directories can
+			// share a path with an S3 key, so treat it as an absent slot. A
+			// directory entry holding content or the prefix-object marker is
+			// an object and stays. Only the alt-key callers want object-slot
+			// semantics; an explicit condition_key may legitimately name a
+			// directory.
+			_, isPrefixObject := current.Extended[s3_constants.SeaweedFSPrefixObject]
+			if current.Mime == "" && len(current.GetChunks()) == 0 && len(current.Content) == 0 && !current.IsInRemoteOnly() && !isPrefixObject {
+				current, findErr = nil, filer_pb.ErrNotFound
+			}
 		}
 		// The caller can name a fallback evaluated when the primary is absent —
 		// a suspended-versioning write checks "the null slot if present, else
@@ -416,8 +429,24 @@ func (fs *FilerServer) ObjectTransaction(ctx context.Context, req *filer_pb.Obje
 		// the object's .versions directory, and the latest it resolves to is
 		// read from the pointer maintained by the same lock, so a concurrent
 		// version delete cannot move which entry the condition sees.
-		if findErr == filer_pb.ErrNotFound && req.ConditionAltKey != "" {
-			current, conditionPath, findErr = fs.latestVersionedConditionEntry(ctx, util.FullPath(req.ConditionAltKey))
+		if req.ConditionAltKey != "" {
+			altEntry, altPath, altErr := fs.latestVersionedConditionEntry(ctx, util.FullPath(req.ConditionAltKey))
+			if req.ConditionPreferAlt {
+				// The versioned path resolves "current" through the latest
+				// pointer, so a stale null-version entry or a tombstoned
+				// latest decides correctly. When the alt path cannot resolve
+				// (no .versions at all), the primary entry stands.
+				switch {
+				case altErr == nil:
+					current, conditionPath, findErr = altEntry, altPath, nil
+				case errors.Is(altErr, filer_pb.ErrNotFound):
+				default:
+					record = false
+					return nil, fmt.Errorf("ObjectTransaction condition %s: %w", conditionPath, altErr)
+				}
+			} else if findErr == filer_pb.ErrNotFound {
+				current, conditionPath, findErr = altEntry, altPath, altErr
+			}
 		}
 		if findErr != nil && findErr != filer_pb.ErrNotFound {
 			record = false // a lookup error decides nothing; a retry must re-run, not replay
@@ -435,14 +464,61 @@ func (fs *FilerServer) ObjectTransaction(ctx context.Context, req *filer_pb.Obje
 	}
 
 	for i, m := range req.Mutations {
+		if code, err := fs.checkMutationCondition(ctx, m); err != nil {
+			glog.V(2).InfofCtx(ctx, "ObjectTransaction %s mutation %d condition lookup: %v", lockPath, i, err)
+			resp.Error = fmt.Sprintf("mutation %d: %v", i, err)
+			failed := int32(i)
+			resp.FailedMutation = &failed
+			return resp, nil
+		} else if code != filer_pb.FilerError_OK {
+			glog.V(3).InfofCtx(ctx, "ObjectTransaction %s mutation %d precondition failed", lockPath, i)
+			resp.Error = fmt.Sprintf("mutation %d: precondition failed", i)
+			resp.ErrorCode = code
+			failed := int32(i)
+			resp.FailedMutation = &failed
+			return resp, nil
+		}
 		if err := fs.applyObjectMutation(ctx, m, req.IsFromOtherCluster, req.Signatures); err != nil {
 			glog.V(2).InfofCtx(ctx, "ObjectTransaction %s mutation %d (%v): %v", lockPath, i, m.Type, err)
 			resp.Error = fmt.Sprintf("mutation %d: %v", i, err)
+			resp.ErrorCode = filerErrorCode(err)
+			failed := int32(i)
+			resp.FailedMutation = &failed
 			return resp, nil
 		}
 	}
 
 	return resp, nil
+}
+
+// checkMutationCondition evaluates a mutation's optional precondition under the
+// transaction's lock, against condition_key when set or the mutation's target
+// (the PUT's entry path, else directory/name). Unlike the request-level
+// condition there is no alt-key fallback: a mutation guard names the exact entry
+// it guards.
+func (fs *FilerServer) checkMutationCondition(ctx context.Context, m *filer_pb.ObjectMutation) (filer_pb.FilerError, error) {
+	if !conditionIsSet(m.Condition) {
+		return filer_pb.FilerError_OK, nil
+	}
+	target := util.FullPath(m.ConditionKey)
+	if target == "" {
+		name := m.Name
+		if m.Type == filer_pb.ObjectMutation_PUT && m.Entry != nil {
+			name = m.Entry.Name
+		}
+		target = util.JoinPath(m.Directory, name)
+	}
+	current, err := fs.filer.FindEntry(ctx, target)
+	if err != nil && err != filer_pb.ErrNotFound {
+		return filer_pb.FilerError_OK, fmt.Errorf("condition check %s: %w", target, err)
+	}
+	if err == filer_pb.ErrNotFound {
+		current = nil
+	}
+	if !writeConditionSatisfied(m.Condition, current) {
+		return filer_pb.FilerError_PRECONDITION_FAILED, nil
+	}
+	return filer_pb.FilerError_OK, nil
 }
 
 const (
@@ -521,9 +597,11 @@ func (fs *FilerServer) rememberObjectTxn(requestID string, lockPath util.FullPat
 // latestVersionedConditionEntry resolves the object a conditional write should
 // be checked against inside a .versions directory: the entry the latest-version
 // pointer names, or nothing when the pointer names a delete marker — a
-// tombstone is not a current version. A missing pointer or a pointer to a file
-// that is gone means the metadata cannot answer the question, which reports an
-// error rather than guessing at either branch.
+// tombstone is not a current version. A suspended-versioning write clears the
+// pointer and stamps null-version-is-latest instead, which reports not-found so
+// the regular path's null object decides. Any other missing pointer, or a
+// pointer to a file that is gone, means the metadata cannot answer the
+// question, which reports an error rather than guessing at either branch.
 func (fs *FilerServer) latestVersionedConditionEntry(ctx context.Context, versionsDir util.FullPath) (*filer.Entry, util.FullPath, error) {
 	versionsEntry, err := fs.filer.FindEntry(ctx, versionsDir)
 	if err != nil {
@@ -534,6 +612,9 @@ func (fs *FilerServer) latestVersionedConditionEntry(ctx context.Context, versio
 	}
 	latestName := string(versionsEntry.Extended[s3_constants.ExtLatestVersionFileNameKey])
 	if latestName == "" {
+		if string(versionsEntry.Extended[s3_constants.ExtNullVersionIsLatestKey]) == "true" {
+			return nil, versionsDir, filer_pb.ErrNotFound
+		}
 		return nil, versionsDir, fmt.Errorf("%s has no latest-version pointer", versionsDir)
 	}
 	latestPath := util.NewFullPath(string(versionsDir), latestName)
@@ -545,7 +626,7 @@ func (fs *FilerServer) latestVersionedConditionEntry(ctx context.Context, versio
 		return nil, latestPath, err
 	}
 	if string(entry.Extended[s3_constants.ExtDeleteMarkerKey]) == "true" {
-		return nil, latestPath, filer_pb.ErrNotFound
+		return nil, latestPath, nil
 	}
 	return entry, latestPath, nil
 }
@@ -625,7 +706,7 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 		if m.KeepRemoteObject {
 			ctx = filer.WithKeepRemoteObject(ctx)
 		}
-		err := fs.filer.DeleteEntryMetaAndData(ctx, fullpath, m.IsRecursive, false, m.IsDeleteData, fromOtherCluster, signatures, 0)
+		err := fs.filer.DeleteEntryMetaAndData(ctx, fullpath, m.IsRecursive, false, m.IsDeleteData, fromOtherCluster, signatures, time.Time{})
 		if err != nil && err != filer_pb.ErrNotFound {
 			return err
 		}
@@ -635,7 +716,7 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 			// transaction. Best-effort: a non-empty or already-removed parent is
 			// the expected no-op, and a failed teardown must not fail the
 			// already-applied delete.
-			parentErr := fs.filer.DeleteEntryMetaAndData(ctx, util.FullPath(m.Directory), false, false, false, fromOtherCluster, signatures, 0)
+			parentErr := fs.filer.DeleteEntryMetaAndData(ctx, util.FullPath(m.Directory), false, false, false, fromOtherCluster, signatures, time.Time{})
 			if parentErr != nil && parentErr != filer_pb.ErrNotFound && !errors.Is(parentErr, filer.ErrNonEmptyFolder) {
 				glog.V(1).InfofCtx(ctx, "remove empty parent %s: %v", m.Directory, parentErr)
 			}
@@ -715,6 +796,10 @@ func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.Obj
 	}
 	if err != nil {
 		return err
+	}
+
+	if rc.OnlyIfCurrentName != "" && string(pointer.Extended[rc.NameToKey]) != rc.OnlyIfCurrentName {
+		return nil
 	}
 
 	// Capture the pre-update image so the metadata notification carries a correct
@@ -831,7 +916,7 @@ func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.Obj
 
 func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 
-	glog.V(4).InfofCtx(ctx, "UpdateEntry %v", req)
+	glog.V(4).InfofCtx(ctx, "UpdateEntry %s/%s", req.GetDirectory(), req.GetEntry().GetName())
 	if len(req.Entry.HardLinkId) > 0 {
 		glog.V(4).InfofCtx(ctx, "UpdateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
 	}
@@ -1007,7 +1092,7 @@ func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, exist
 
 func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendToEntryRequest) (*filer_pb.AppendToEntryResponse, error) {
 
-	glog.V(4).InfofCtx(ctx, "AppendToEntry %v", req)
+	glog.V(4).InfofCtx(ctx, "AppendToEntry %s/%s", req.GetDirectory(), req.GetEntryName())
 	fullpath := util.NewFullPath(req.Directory, req.EntryName)
 
 	lockClient := cluster.NewLockClient(fs.grpcDialOption, fs.option.Host)
@@ -1062,23 +1147,84 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 	return &filer_pb.AppendToEntryResponse{}, err
 }
 
+// deleteCutoff merges the conditional-delete guards into one cutoff:
+// if_not_modified_after_ns wins when set, and the whole-second
+// if_not_modified_after maps to the last nanosecond of its second so that
+// entry.Mtime.Unix() > sec keeps its exact meaning as a time comparison,
+// even for dates int64 nanoseconds cannot hold.
+func deleteCutoff(ifNotModifiedAfter, ifNotModifiedAfterNs int64) time.Time {
+	if ifNotModifiedAfterNs > 0 {
+		return time.Unix(0, ifNotModifiedAfterNs)
+	}
+	if ifNotModifiedAfter <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(ifNotModifiedAfter, 999_999_999)
+}
+
 func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntryRequest) (resp *filer_pb.DeleteEntryResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "DeleteEntry %v", req)
+
+	fullpath := util.JoinPath(req.Directory, req.Name)
+
+	// A delete carrying extended-attribute preconditions is a read-then-delete
+	// that the per-path lock below only makes atomic on this filer. Route it
+	// to the entry's ring owner so one filer's lock arbitrates every writer
+	// cluster-wide; is_moved bounds this to one hop.
+	if len(req.ExpectedExtended) > 0 {
+		if !req.IsMoved {
+			var ownerResp *filer_pb.DeleteEntryResponse
+			handled, forwardErr := fs.forwardToWriteOwner(ctx, entryRouteKey(fullpath), func(owner pb.ServerAddress) error {
+				glog.V(2).InfofCtx(ctx, "DeleteEntry %s: forwarding to owner %s", fullpath, owner)
+				req.IsMoved = true
+				return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+					forwarded, e := client.DeleteEntry(ctx, req)
+					if e != nil {
+						return e
+					}
+					ownerResp = forwarded
+					return nil
+				})
+			})
+			if handled {
+				if forwardErr != nil {
+					return &filer_pb.DeleteEntryResponse{}, forwardErr
+				}
+				return ownerResp, nil
+			}
+		} else {
+			if err := fs.checkMovedMarker(ctx, req.IsMoved, fs.writeOwner(entryRouteKey(fullpath))); err != nil {
+				return &filer_pb.DeleteEntryResponse{}, err
+			}
+		}
+	}
 
 	// A delete queues the entry's chunks for deletion, so it must not
 	// interleave with a conditional update's check-then-write on the same
 	// path: the update would pass its precondition and then resurrect fids
 	// that are already on the deletion queue.
-	fullpath := util.JoinPath(req.Directory, req.Name)
 	pathLock := fs.entryLockTable.AcquireLock("DeleteEntry", fullpath, util.ExclusiveLock)
 	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+
+	// Extended-attribute preconditions run here, under the lock the delete
+	// runs under: an attribute write that keeps Mtime can no longer slip
+	// between the check and the delete.
+	if len(req.ExpectedExtended) > 0 {
+		entry, err := fs.filer.FindEntry(ctx, fullpath)
+		if err != nil {
+			return &filer_pb.DeleteEntryResponse{}, status.Errorf(codes.FailedPrecondition, "extended attribute precondition %s: %v", fullpath, err)
+		}
+		if err := validateUpdateEntryPreconditions(entry, req.ExpectedExtended); err != nil {
+			return &filer_pb.DeleteEntryResponse{}, err
+		}
+	}
 
 	if req.KeepRemoteObject {
 		ctx = filer.WithKeepRemoteObject(ctx)
 	}
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
-	err = fs.filer.DeleteEntryMetaAndData(ctx, fullpath, req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, req.IfNotModifiedAfter)
+	err = fs.filer.DeleteEntryMetaAndData(ctx, fullpath, req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, deleteCutoff(req.IfNotModifiedAfter, req.IfNotModifiedAfterNs))
 	resp = &filer_pb.DeleteEntryResponse{}
 	if err != nil && err != filer_pb.ErrNotFound {
 		resp.Error = err.Error()

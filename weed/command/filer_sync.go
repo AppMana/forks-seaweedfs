@@ -683,7 +683,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 		}
 
 		if debug {
-			glog.V(0).Infof("received %v", resp)
+			glog.V(0).Infof("received %s ts_ns=%d", resp.Directory, resp.TsNs)
 		}
 
 		if isMultipartUploadDir(resp.Directory + "/") {
@@ -768,7 +768,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 						oldKey := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
 						if mover, ok := dataSink.(sink.EntryMover); ok {
 							// native atomic move: no re-copy, no descendant gap, no chunk leak.
-							return mover.MoveEntry(oldKey, newKey, message.NewEntry, message.Signatures)
+							return mover.MoveEntry(oldKey, newKey, message.OldEntry, message.NewEntry, message.Signatures)
 						}
 						// no native move: create the new entry first, then delete the
 						// old, so a crash between the two leaves the entry visible.

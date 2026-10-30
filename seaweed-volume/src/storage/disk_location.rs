@@ -10,7 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::MinFreeSpace;
 use crate::storage::erasure_coding::ec_bitrot::remove_bitrot_sidecars;
@@ -40,7 +40,15 @@ pub struct DiskLocation {
     volumes: HashMap<VolumeId, Arc<Volume>>,
     ec_volumes: HashMap<VolumeId, EcVolume>,
     pub is_disk_space_low: Arc<AtomicBool>,
+    /// Go's `DiskLocation.readOnlyMount`: dir or idx_dir is on a read-only
+    /// filesystem. Volumes load read-only and the location offers no free
+    /// slots. Fixed at startup.
+    pub read_only_mount: bool,
     pub available_space: AtomicU64,
+    /// Headroom promised to in-flight copies that statfs cannot see yet.
+    /// Probes keep it out of available_space so they cannot re-spend it; a
+    /// copy that lands ends its charge, one that fails removes only its own.
+    pub reserved_space: AtomicU64,
     // Physical filesystem capacity from the latest check_disk_space probe, reported
     // to the master so balancing can see real disk fullness, not just slot counts.
     pub disk_total_bytes: AtomicU64,
@@ -67,11 +75,19 @@ impl DiskLocation {
             fs::create_dir_all(idx_directory)?;
             idx_directory.to_string()
         };
+        let read_only_mount = is_read_only_mount(directory) || is_read_only_mount(&idx_dir);
+        if read_only_mount {
+            info!(
+                "{} is on a read-only filesystem: its volumes load read-only, no new volumes",
+                directory
+            );
+        }
         let directory_uuid = Self::generate_directory_uuid(directory)?;
 
         Ok(DiskLocation {
             directory: directory.to_string(),
             idx_directory: idx_dir,
+            read_only_mount,
             directory_uuid,
             disk_type,
             tags,
@@ -81,6 +97,7 @@ impl DiskLocation {
             ec_volumes: HashMap::new(),
             is_disk_space_low: Arc::new(AtomicBool::new(false)),
             available_space: AtomicU64::new(0),
+            reserved_space: AtomicU64::new(0),
             disk_total_bytes: AtomicU64::new(0),
             disk_free_bytes: AtomicU64::new(0),
             min_free_space,
@@ -97,8 +114,35 @@ impl DiskLocation {
         }
 
         let dir_uuid = uuid::Uuid::new_v4().to_string();
-        fs::write(path, &dir_uuid)?;
-        Ok(dir_uuid)
+        match fs::write(&path, &dir_uuid) {
+            Ok(()) => Ok(dir_uuid),
+            // The uuid file cannot be written on a read-only mount; derive a
+            // stable one from the directory plus its device and host so
+            // restarts report the same id and independent disks at the same
+            // path differ.
+            Err(_) if is_read_only_mount(directory) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                directory.hash(&mut h);
+                if let Ok(meta) = fs::metadata(directory) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        meta.dev().hash(&mut h);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = meta;
+                    }
+                }
+                if let Ok(host) = std::env::var("HOSTNAME") {
+                    host.hash(&mut h);
+                }
+                let derived = (h.finish() as u128) << 64 | h.finish() as u128;
+                Ok(uuid::Uuid::from_u128(derived).to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // ---- Volume management ----
@@ -715,6 +759,9 @@ impl DiskLocation {
     /// Matches Go's FindFreeLocation formula:
     ///   free = ((MaxVolumeCount - VolumesLen()) * DataShardsCount - EcShardCount()) / DataShardsCount
     pub fn free_volume_count(&self) -> i32 {
+        if self.read_only_mount {
+            return 0;
+        }
         use crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT;
         let max = self.max_volume_count.load(Ordering::Relaxed);
         let free_count = (max as i64 - self.volumes.len() as i64) * DATA_SHARDS_COUNT as i64
@@ -761,15 +808,16 @@ impl DiskLocation {
             return;
         }
         let used = total.saturating_sub(free);
-        let is_low = match &self.min_free_space {
-            MinFreeSpace::Percent(pct) => {
-                let free_pct = (free as f64 / total as f64) * 100.0;
-                free_pct < *pct
-            }
-            MinFreeSpace::Bytes(min_bytes) => free < *min_bytes,
-        };
+        let is_low = self.min_free_space.is_low(free, total);
         self.is_disk_space_low.store(is_low, Ordering::Relaxed);
-        self.available_space.store(free, Ordering::Relaxed);
+        // Go's DiskLocation.AvailableSpace counts only free space above the
+        // -volume.minFreeSpace floor, so space checks stay above it too.
+        self.available_space.store(
+            self.min_free_space
+                .available_space(free, total)
+                .saturating_sub(self.reserved_space.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         self.disk_total_bytes.store(total, Ordering::Relaxed);
         self.disk_free_bytes.store(free, Ordering::Relaxed);
 
@@ -945,6 +993,32 @@ impl DiskLocation {
                 .inc();
         }
         Ok(())
+    }
+
+    /// Swap the mounted shard's descriptor for a fresh open of its on-disk
+    /// file, keeping the registration — and therefore the master's view —
+    /// untouched. Mirrors Go's `DiskLocation.ReopenEcShard`: the rebuild
+    /// recreates a shard file under a handle that still serves the detached
+    /// inode, and reopening repoints reads at the repaired file without an
+    /// unmount/remount heartbeat flip-flop. Readers holding a cloned fd keep
+    /// the old inode until they finish — the same contract eviction relies on.
+    pub fn reopen_ec_shard(&mut self, vid: VolumeId, shard_id: ShardId) -> Result<bool, VolumeError> {
+        let dir = self.directory.clone();
+        let Some(ec_vol) = self.ec_volumes.get_mut(&vid) else {
+            return Ok(false);
+        };
+        let Some(existing) = ec_vol
+            .shards
+            .get_mut(shard_id as usize)
+            .and_then(|s| s.as_mut())
+        else {
+            return Ok(false);
+        };
+        let mut new_shard = EcVolumeShard::new(&dir, &existing.collection, vid, shard_id);
+        new_shard.disk_type = existing.disk_type.clone();
+        new_shard.open().map_err(VolumeError::Io)?;
+        *existing = new_shard;
+        Ok(true)
     }
 
     /// Unmount EC shards for a volume on this location.
@@ -1171,6 +1245,27 @@ impl DiskLocation {
             ec_vol.close();
         }
     }
+}
+
+/// Mirror of Go's `util.IsReadOnlyMount`: access(2) with W_OK answers EROFS
+/// for a filesystem mounted read-only regardless of the permission bits, and
+/// also for root, unlike a permission-bits check.
+#[cfg(unix)]
+pub(crate) fn is_read_only_mount(path: &str) -> bool {
+    use std::ffi::CString;
+    let c_path = match CString::new(path.as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0 {
+        return false;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EROFS)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_read_only_mount(_path: &str) -> bool {
+    false
 }
 
 /// Get total and free disk space for a given path.
@@ -1443,6 +1538,73 @@ mod tests {
         let (total, free) = get_disk_stats(tmp.path().to_str().unwrap());
         assert!(total > 0, "expected total>0, got {total}");
         assert!(free > 0, "expected free>0, got {free}");
+    }
+
+    // Mirrors Go's DiskLocation.AvailableSpace: the cached figure a copy is
+    // checked against counts only free space above the min-free-space floor.
+    #[test]
+    fn test_check_disk_space_counts_only_space_above_floor() {
+        const FLOOR: u64 = 1 << 20;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(FLOOR),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.check_disk_space();
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            loc.disk_free_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(FLOOR)
+        );
+
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(u64::MAX),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.check_disk_space();
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), 0);
+    }
+
+    // Mirrors Go's CheckDiskSpace pending subtraction: an in-flight copy's
+    // charge stays out of the cache across a probe, so another copy cannot
+    // re-spend the headroom the live reading still shows as free.
+    #[test]
+    fn test_check_disk_space_keeps_pending_reservation_out_of_cache() {
+        const FLOOR: u64 = 1 << 20;
+        const RESERVED: u64 = 512 * 1024;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(FLOOR),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.reserved_space.store(RESERVED, Ordering::Relaxed);
+        loc.check_disk_space();
+        let expected = loc
+            .min_free_space
+            .available_space(
+                loc.disk_free_bytes.load(Ordering::Relaxed),
+                loc.disk_total_bytes.load(Ordering::Relaxed),
+            )
+            .saturating_sub(RESERVED);
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), expected);
     }
 
     /// When `-dir.idx` is configured the EC `.vif` may live in the idx
@@ -2222,5 +2384,54 @@ mod tests {
                 p,
             );
         }
+    }
+
+    /// Mirrors Go's TestReopenEcShardReadsReplacedFile: a shard file the
+    /// rebuild replaced under its mount keeps serving the old inode through
+    /// the open descriptor; reopen_ec_shard must repoint the mounted shard at
+    /// the new file without dropping its registration.
+    #[test]
+    fn test_reopen_ec_shard_reads_replaced_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut loc = DiskLocation::new(
+            dir,
+            dir,
+            10,
+            DiskType::HardDrive,
+            MinFreeSpace::Percent(0.0),
+            Vec::new(),
+        )
+        .unwrap();
+
+        std::fs::write(format!("{}/pics_5.ecx", dir), [0u8; 16]).unwrap();
+        let shard_path = format!("{}/pics_5.ec00", dir);
+        std::fs::write(&shard_path, b"old bytes").unwrap();
+        loc.mount_ec_shards(VolumeId(5), "pics", &[0], "").unwrap();
+
+        let read_shard = |loc: &DiskLocation| -> Vec<u8> {
+            let ec_vol = loc.find_ec_volume(VolumeId(5)).expect("ec volume mounted");
+            let shard = ec_vol.shards[0].as_ref().expect("shard 0 mounted");
+            let mut buf = vec![0u8; shard.file_size() as usize];
+            let n = shard.read_at(&mut buf, 0).unwrap();
+            buf.truncate(n);
+            buf
+        };
+        assert_eq!(read_shard(&loc), b"old bytes");
+
+        // The rebuild writes a fresh file and renames it over the original:
+        // the mounted descriptor is now on the detached inode.
+        let rebuilt = format!("{}.rebuilding", shard_path);
+        std::fs::write(&rebuilt, b"new bytes").unwrap();
+        std::fs::rename(&rebuilt, &shard_path).unwrap();
+        assert_eq!(read_shard(&loc), b"old bytes", "mounted shard still reads the replaced inode");
+
+        assert!(loc.reopen_ec_shard(VolumeId(5), 0).unwrap());
+        assert_eq!(read_shard(&loc), b"new bytes", "reopened shard should read the regenerated file");
+
+        assert!(
+            !loc.reopen_ec_shard(VolumeId(5), 7).unwrap(),
+            "a shard that is not mounted should report false"
+        );
     }
 }

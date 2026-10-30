@@ -27,15 +27,15 @@ var (
 )
 
 type WebDavOption struct {
-	filer          *string
-	ipBind         *string
-	filerRootPath  *string
-	port           *int
-	collection     *string
-	replication    *string
-	disk           *string
-	tlsPrivateKey  *string
-	tlsCertificate *string
+	filer                   *string
+	ipBind                  *string
+	filerRootPath           *string
+	port                    *int
+	collection              *string
+	replication             *string
+	disk                    *string
+	tlsPrivateKey           *string
+	tlsCertificate          *string
 	cacheDir                *string
 	cacheSizeMB             *int64
 	wholeCacheSizeMB        *int64
@@ -44,6 +44,7 @@ type WebDavOption struct {
 	sharedReaderCacheBudget *filer.ReaderCacheBudget
 	sharedReaderCache       *filer.ReaderCache
 	maxMB                   *int
+	idleTimeout             *int
 	// shutdownCtx, when non-nil, tells startWebDav to gracefully shut down the
 	// HTTP server once the ctx is cancelled. Used by weed mini; nil for
 	// standalone weed webdav.
@@ -66,6 +67,7 @@ func init() {
 	webDavStandaloneOptions.readerCacheSizeMB = cmdWebDav.Flag.Int64("readerCacheSizeMB", 0, "in-memory reader cache budget in MiB")
 	webDavStandaloneOptions.maxMB = cmdWebDav.Flag.Int("maxMB", 4, "split files larger than the limit")
 	webDavStandaloneOptions.filerRootPath = cmdWebDav.Flag.String("filer.path", "/", "use this remote path from filer server")
+	webDavStandaloneOptions.idleTimeout = cmdWebDav.Flag.Int("idleTimeout", 10, "connection idle seconds")
 }
 
 var cmdWebDav = &Command{
@@ -137,15 +139,15 @@ func (wo *WebDavOption) startWebDav() bool {
 	}
 
 	ws, webdavServer_err := weed_server.NewWebDavServer(&weed_server.WebDavOption{
-		Filer:          filerAddress,
-		FilerRootPath:  *wo.filerRootPath,
-		GrpcDialOption: grpcDialOption,
-		Collection:     *wo.collection,
-		Replication:    *wo.replication,
-		DiskType:       *wo.disk,
-		Uid:            uid,
-		Gid:            gid,
-		Cipher:         cipher,
+		Filer:                   filerAddress,
+		FilerRootPath:           *wo.filerRootPath,
+		GrpcDialOption:          grpcDialOption,
+		Collection:              *wo.collection,
+		Replication:             *wo.replication,
+		DiskType:                *wo.disk,
+		Uid:                     uid,
+		Gid:                     gid,
+		Cipher:                  cipher,
 		CacheDir:                *wo.cacheDir,
 		CacheSizeMB:             *wo.cacheSizeMB,
 		WholeCacheSizeMB:        wholeCacheSizeOrZero(wo.wholeCacheSizeMB),
@@ -161,8 +163,10 @@ func (wo *WebDavOption) startWebDav() bool {
 
 	httpS := &http.Server{Handler: ws.Handler}
 
+	idleTimeout := idleTimeoutSeconds(wo.idleTimeout)
+
 	listenAddress := fmt.Sprintf("%s:%d", *wo.ipBind, *wo.port)
-	webDavListener, err := util.NewListener(listenAddress, time.Duration(10)*time.Second)
+	webDavListener, err := util.NewListener(listenAddress, idleTimeout)
 	if err != nil {
 		glog.Fatalf("WebDav Server listener on %s error: %v", listenAddress, err)
 	}

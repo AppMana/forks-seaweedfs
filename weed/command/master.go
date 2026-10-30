@@ -2,13 +2,16 @@ package command
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
 	"fmt"
+	"io/fs"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +21,7 @@ import (
 	hashicorpRaft "github.com/hashicorp/raft"
 
 	"slices"
+	"sync/atomic"
 
 	"github.com/gorilla/mux"
 	"github.com/seaweedfs/raft/protobuf"
@@ -87,10 +91,16 @@ type MasterOptions struct {
 	// single-master mode, with singleReporterAddr pinning the embedded volume
 	// server as the only admitted reporter: any other volume server is refused,
 	// so the warmup window after a fresh topology id is dead time.
-	// Standalone weed master / weed server can face late-arriving veterans and
-	// must keep the window.
+	// Standalone weed master can face late-arriving veterans and must keep
+	// the window; a single-master weed server releases on its embedded
+	// volume server's clean report through expectedReporterAddr instead.
 	releaseAllocOnFirstReport bool
 	singleReporterAddr        string
+	// expectedReporterAddr names the reporter whose first clean inventory
+	// collapses the post-mint allocation hold to a confirm pulse without
+	// refusing others: a single-master weed server points it at its
+	// embedded volume server.
+	expectedReporterAddr string
 }
 
 func init() {
@@ -194,7 +204,7 @@ func runMaster(cmd *Command, args []string) bool {
 	return true
 }
 
-func startMaster(masterOption MasterOptions, masterWhiteList []string) {
+func startMaster(masterOption MasterOptions, masterWhiteList []string, masterOut ...*atomic.Pointer[weed_server.MasterServer]) {
 
 	backend.LoadConfiguration(util.GetViper())
 
@@ -222,6 +232,12 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 
 	r := mux.NewRouter()
 	ms := weed_server.NewMasterServer(r, masterOption.toMasterOption(masterWhiteList), masterPeers)
+	// Embedded setups (weed server) hand the instance back so sibling
+	// components can read cluster-state signals such as a fresh TopologyId
+	// mint.
+	if len(masterOut) > 0 && masterOut[0] != nil {
+		masterOut[0].Store(ms)
+	}
 	listeningAddress := util.JoinHostPort(*masterOption.ipBind, *masterOption.port)
 	glog.V(0).Infof("Start Seaweed Master %s at %s", version.Version(), listeningAddress)
 	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0, listenOnLocalhost)
@@ -230,7 +246,19 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 
 	// start raftServer
-	metaDir := path.Join(*masterOption.metaFolder, fmt.Sprintf("m%d", *masterOption.port))
+	metaFolder := util.ResolvePath(*masterOption.metaFolder)
+	metaDir := path.Join(metaFolder, fmt.Sprintf("m%d", *masterOption.port))
+	if util.IsReadOnlyMount(metaFolder) {
+		// raft rewrites conf/state even to start. Run it from a private copy and
+		// allocate no volume ids, so nothing is lost when the copy is dropped.
+		roCopy, err := copyDirForReadOnly(metaDir)
+		if err != nil {
+			glog.Fatalf("-mdir %s is read-only and could not be copied: %v", *masterOption.metaFolder, err)
+		}
+		glog.V(0).Infof("-mdir %s is on a read-only filesystem: raft runs from %s, volume growth disabled", *masterOption.metaFolder, roCopy)
+		metaDir = roCopy
+		ms.Topo.SetMetaReadOnly(true)
+	}
 
 	isSingleMaster := isSingleMasterMode(*masterOption.peers)
 
@@ -242,7 +270,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		GrpcDialOption:    security.LoadClientTLS(util.GetViper(), "grpc.master"),
 		Peers:             masterPeers,
 		ServerAddr:        myMasterAddress,
-		DataDir:           util.ResolvePath(metaDir),
+		DataDir:           metaDir,
 		Topo:              ms.Topo,
 		RaftResumeState:   *masterOption.raftResumeState,
 		SingleMaster:      isSingleMaster,
@@ -408,6 +436,78 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 }
 
+// copyDirForReadOnly copies the master's raft directory (a few KB) into a
+// writable directory under os.TempDir keyed by src, and returns its path.
+// A previous copy is reused so a restart keeps the votes and committed
+// entries the frozen -mdir could not record; it is rebuilt only when the
+// on-disk state is newer, i.e. the mount was writable in between. A missing
+// src yields an empty copy.
+func copyDirForReadOnly(src string) (string, error) {
+	// Key by the absolute path: a relative -mdir from different working
+	// directories must not collide on one copy.
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		abs = src
+	}
+	sum := sha1.Sum([]byte(abs))
+	dst := filepath.Join(os.TempDir(), fmt.Sprintf("weed-master-ro-%x", sum[:8]))
+	if fi, err := os.Stat(dst); err == nil && fi.IsDir() &&
+		fi.Mode().Perm() == 0700 && util.DirOwnedBySelf(fi) {
+		if !newestMtime(dst).Before(newestMtime(src)) {
+			return dst, nil
+		}
+		os.RemoveAll(dst)
+	}
+	staging, err := os.MkdirTemp("", "weed-master-ro-")
+	if err != nil {
+		return "", err
+	}
+	err = filepath.WalkDir(src, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if p == src && os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(staging, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0700)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0600)
+	})
+	if err != nil {
+		os.RemoveAll(staging)
+		return "", err
+	}
+	if err = os.Rename(staging, dst); err != nil {
+		return staging, nil
+	}
+	return dst, nil
+}
+
+// newestMtime returns the latest modification time under dir, or the zero
+// time for a missing or empty one.
+func newestMtime(dir string) (latest time.Time) {
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info, statErr := d.Info(); statErr == nil && info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+		return nil
+	})
+	return latest
+}
+
 func isSingleMasterMode(peers string) bool {
 	p := strings.ToLower(strings.TrimSpace(peers))
 	return p == "none"
@@ -508,5 +608,6 @@ func (m *MasterOptions) toMasterOption(whiteList []string) *weed_server.MasterOp
 		SingleMaster:              isSingleMasterMode(*m.peers),
 		ReleaseAllocOnFirstReport: m.releaseAllocOnFirstReport,
 		SingleVolumeReporter:      m.singleReporterAddr,
+		ExpectedReporterAddr:      m.expectedReporterAddr,
 	}
 }

@@ -257,6 +257,23 @@ func TestStoredEntryETag(t *testing.T) {
 	if got := storedEntryETag(md5Only); got != "abcd" {
 		t.Errorf("md5 fallback: got %q", got)
 	}
+	remoteOnly := &filer.Entry{
+		Attr:   filer.Attr{FileSize: 10},
+		Remote: &filer_pb.RemoteEntry{RemoteETag: `"remote-etag"`, RemoteSize: 10},
+	}
+	if got := storedEntryETag(remoteOnly); got != "remote-etag" {
+		t.Errorf("remote etag: got %q", got)
+	}
+	remoteStale := &filer.Entry{
+		Attr:   filer.Attr{FileSize: 10, Md5: []byte{0xab}},
+		Remote: &filer_pb.RemoteEntry{RemoteETag: `"remote-etag"`, RemoteSize: 99},
+	}
+	if got := storedEntryETag(remoteStale); got != "ab" {
+		t.Errorf("stale remote size falls to md5: got %q", got)
+	}
+	if got := storedEntryETag(&filer.Entry{}); got != "" {
+		t.Errorf("empty entry: got %q", got)
+	}
 }
 
 // The CreateEntry handler enforces the precondition atomically: a matching
@@ -380,5 +397,40 @@ func TestUpdateEntryConditionEnforced(t *testing.T) {
 	}
 	if got := store.entries["/test/obj"].Attr.Mtime.Unix(); got != 1700000005 {
 		t.Fatalf("update not applied, mtime %d", got)
+	}
+}
+
+func TestDeleteCutoff(t *testing.T) {
+	base := time.Unix(1700000000, 500_000_000)
+
+	// nanoseconds take precedence when set
+	if got := deleteCutoff(1, base.UnixNano()); !got.Equal(base) {
+		t.Fatalf("ns guard should win, got %v", got)
+	}
+	// no guard stays disabled
+	if got := deleteCutoff(0, 0); !got.IsZero() {
+		t.Fatalf("no guard must stay zero, got %v", got)
+	}
+	// a whole-second guard covers its full second: entry.Mtime.Unix() > sec
+	// is entry.Mtime after the last nanosecond of that second
+	cutoff := deleteCutoff(base.Unix(), 0)
+	if want := time.Unix(0, (base.Unix()+1)*1_000_000_000-1); !cutoff.Equal(want) {
+		t.Fatalf("seconds guard = %v, want %v", cutoff, want)
+	}
+	if base.After(cutoff) {
+		t.Fatal("entry inside the guard second must not be treated as newer")
+	}
+	// a seconds guard beyond the nanosecond range keeps its date: an entry
+	// in the guarded second is deleted and only a newer one is skipped
+	farSec := time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	farCutoff := deleteCutoff(farSec, 0)
+	if want := time.Unix(farSec, 999_999_999); !farCutoff.Equal(want) {
+		t.Fatalf("huge seconds guard = %v, want %v", farCutoff, want)
+	}
+	if time.Unix(farSec, 0).After(farCutoff) {
+		t.Fatal("entry in the guarded far-future second must not be treated as newer")
+	}
+	if !time.Unix(farSec+1, 0).After(farCutoff) {
+		t.Fatal("entry past the guarded far-future second must be treated as newer")
 	}
 }

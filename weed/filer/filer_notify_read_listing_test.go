@@ -108,7 +108,7 @@ func seedFullDayOfLogs(t *testing.T, f *Filer, day string, filerIds ...string) (
 func TestPersistedLogReadsListOnlyFromTheScanStartMinute(t *testing.T) {
 	stub := newStubFilerStore()
 	store := &countingListStore{stubFilerStore: stub, yields: map[string]int{}}
-	f, _ := newTestFilerWithStubStore()
+	f, _ := newTestFilerWithStubStore(t)
 	f.Store = NewFilerStoreWrapper(store)
 
 	day := "2026-10-28"
@@ -191,7 +191,7 @@ func TestPersistedLogReadsListOnlyFromTheScanStartMinute(t *testing.T) {
 func TestPersistedLogReadsPaginateStoreCappedListings(t *testing.T) {
 	stub := newStubFilerStore()
 	store := &cappedListStore{stubFilerStore: stub, max: 1000}
-	f, _ := newTestFilerWithStubStore()
+	f, _ := newTestFilerWithStubStore(t)
 	f.Store = NewFilerStoreWrapper(store)
 
 	day := "2026-10-28"
@@ -239,7 +239,7 @@ func TestPersistedLogReadsPaginateStoreCappedListings(t *testing.T) {
 }
 
 func TestPersistedLogReadsUseUTCRegardlessOfStartPositionTimezone(t *testing.T) {
-	f, _ := newTestFilerWithStubStore()
+	f, _ := newTestFilerWithStubStore(t)
 
 	// Log files on disk are always written under UTC day and hour-minute paths
 	// (see logFlushFunc). Seed a file at 2026-10-28 16:00 UTC.
@@ -308,7 +308,7 @@ func TestPersistedLogReadsUseUTCRegardlessOfStartPositionTimezone(t *testing.T) 
 
 func TestPersistedLogReadsAcrossDayBoundaries(t *testing.T) {
 	t.Run("midnight scan start when previous day has no 23-59 file", func(t *testing.T) {
-		f, _ := newTestFilerWithStubStore()
+		f, _ := newTestFilerWithStubStore(t)
 		ctx := context.Background()
 		for _, dir := range []string{
 			SystemLogDir,
@@ -358,7 +358,7 @@ func TestPersistedLogReadsAcrossDayBoundaries(t *testing.T) {
 	})
 
 	t.Run("filer absent on intermediate day resumes on later day", func(t *testing.T) {
-		f, _ := newTestFilerWithStubStore()
+		f, _ := newTestFilerWithStubStore(t)
 		ctx := context.Background()
 		for _, dir := range []string{
 			SystemLogDir,

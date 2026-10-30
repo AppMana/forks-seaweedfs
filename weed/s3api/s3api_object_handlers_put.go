@@ -249,6 +249,9 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			if !objectLockEnabled {
 				return s3err.ErrNone
 			}
+			// mkdir replaces the entry on the default filer, so the lock check
+			// must read there too — a routed read can miss a marker the owner
+			// has not received yet.
 			existing, existErr := s3a.getEntry(fullDirPath, entryName)
 			if existErr != nil {
 				return s3err.ErrNone
@@ -511,6 +514,21 @@ func (s3a *S3ApiServer) uploadChunkSize() int32 {
 	return sizeMB * 1024 * 1024
 }
 
+// multipartPartContextKey marks a putToFiler request as writing a staged
+// multipart part. Encryption for the upload is decided at
+// CreateMultipartUpload and replayed through request headers, so bucket
+// default encryption must not be re-evaluated for part writes.
+type multipartPartContextKey struct{}
+
+func withMultipartPart(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), multipartPartContextKey{}, true))
+}
+
+func isMultipartPartRequest(r *http.Request) bool {
+	marked, _ := r.Context().Value(multipartPartContextKey{}).(bool)
+	return marked
+}
+
 // putToFiler writes one chunk of object bytes (a full PutObject body, a
 // single MPU part, a copy-part destination). lifecycleTTLSec is non-zero
 // only for top-level PutObject paths where the lifecycle XML's
@@ -590,7 +608,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// Apply bucket default encryption if no explicit encryption was provided
 	// This implements AWS S3 behavior where bucket default encryption automatically applies
-	if !hasExplicitEncryption(customerKey, sseKMSKey, sseS3Key) {
+	if !isMultipartPartRequest(r) && !hasExplicitEncryption(customerKey, sseKMSKey, sseS3Key) {
 		glog.V(4).Infof("putToFiler: no explicit encryption detected, checking for bucket default encryption")
 
 		// Apply bucket default encryption and get the result
@@ -1051,7 +1069,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	}
 
 	// Route the create to the object's owner filer (its per-path lock serializes
-	// it); conditional/object-lock/non-reducible cases fall back to the lock.
+	// it); unparseable or unroutable conditions fall back to the lock.
 	var createCode s3err.ErrorCode
 	routed := false
 	routedAmbiguous := false
@@ -1068,7 +1086,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				lockKey, finalizeMutations = finalize.lockKey, finalize.mutations
 			}
 			routeKey := s3a.objectRouteKey(bucket, object)
-			resp, err := s3a.routedPut(owner, routeKey, lockKey, filePath, entry, cond, "", condAltKey, finalizeMutations)
+			resp, err := s3a.routedPut(owner, routeKey, lockKey, filePath, entry, cond, "", condAltKey, false, nil, "", finalizeMutations)
 			if err == nil && resp.ErrorCode == filer_pb.FilerError_PRECONDITION_FAILED && condAltKey != "" {
 				// A filer that ignores condition_alt_key evaluated the empty
 				// null slot alone; resend the transaction against the entry the
@@ -1081,7 +1099,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 					conditionKey = condAltKey + "/" + resolved.Name
 				}
 				glog.Warningf("putToFiler: routed PUT to %s precondition-failed for %s; resending against %s", owner, filePath, conditionKey)
-				resp, err = s3a.routedPut(owner, routeKey, lockKey, filePath, entry, cond, conditionKey, condAltKey, finalizeMutations)
+				resp, err = s3a.routedPut(owner, routeKey, lockKey, filePath, entry, cond, conditionKey, condAltKey, false, nil, "", finalizeMutations)
 			}
 			switch {
 			case err != nil:

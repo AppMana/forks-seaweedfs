@@ -96,7 +96,10 @@ jobs:
           .\weed.exe version
       - name: Native windows unit tests (winfsp adapter, mount, command)
         working-directory: forks-seaweedfs
-        run: go test -count=1 -tags 5BytesOffset ./weed/mount/ ./weed/command/
+        # weed/mount/winfsp is upstream's adapter. The mount does not run it,
+        # but it builds against the fork's WFS, so its tests keep that WFS
+        # honest for upstream merges.
+        run: go test -count=1 -tags 5BytesOffset ./weed/mount/ ./weed/mount/winfsp/ ./weed/command/
       - name: Upload weed.exe
         uses: actions/upload-artifact@v4
         with:

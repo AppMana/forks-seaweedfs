@@ -142,8 +142,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		fmt.Printf("Please specify the mount directory via \"-dir\"")
 		return false
 	}
-	isDriveMountPoint := len(dir) == 2 && dir[1] == ':'
-	if !isDriveMountPoint {
+	if _, isDriveMountPoint := winFspDriveMountPoint(dir); !isDriveMountPoint {
 		if err := prepareWinFspMountPoint(dir, *option.dirAutoCreate); err != nil {
 			glog.Errorf("prepare mount point: %v", err)
 			return false

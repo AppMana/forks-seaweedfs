@@ -36,7 +36,7 @@ dmesg -C
 echo "KERNEL $(uname -r) fuse_max_request_timeout=$(cat /proc/sys/fs/fuse/max_request_timeout 2>/dev/null || echo unsupported)"
 
 pkill -x weed; sleep 1
-rm -rf /srv/data/*
+rm -rf /srv/data && mkdir -p /srv/data
 $W server -dir=/srv/data -ip=127.0.0.1 -ip.bind=127.0.0.1 -filer -filer.port=8888 \
   -master.port=9333 -volume.port=8080 -volume.max=20 >$LOG/server.log 2>&1 &
 SERVER=$!

@@ -24,8 +24,8 @@ func TestMountPointReparseRoundTrip(t *testing.T) {
 	}
 }
 
-// The buffer WinFsp 2.1 wrote for a mount-manager directory mount in the
-// Windows lab (fsutil reparsepoint query, 2026-10-13).
+// Verify the mount-point reparse buffer layout produced by WinFsp 2.1 for a
+// mount-manager directory mount.
 func TestMountPointReparseTargetParsesWinFspJunction(t *testing.T) {
 	target := `\Device\Volume{7c5aae80-c6e6-11f1-94f7-c7d2afe5d61a}\`
 	buf := mountPointReparseBuffer(target)

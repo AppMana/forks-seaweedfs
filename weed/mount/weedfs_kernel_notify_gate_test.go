@@ -67,10 +67,9 @@ func eventually(t *testing.T, what string, cond func() bool) {
 // Linux holds a directory's lock across a lookup, create, rename or unlink in
 // it until this mount replies, and takes the same lock, uninterruptibly, to
 // expire a name in it. Expiring a name there while that request waits on a
-// stalled filer parks the notifying thread in state D for as long as the
-// filer stalls (the hung-task panics of appmana-008 and appmana-031), and a
-// mount that exits meanwhile cannot release /dev/fuse. The expiry has to wait
-// until the request is answered, and must still happen.
+// stalled filer would park the notifying thread in state D and prevent a mount
+// that exits meanwhile from releasing /dev/fuse. The expiry must wait until the
+// request is answered, and must still happen.
 func TestNameExpiryWaitsForRequestHoldingTheDirectory(t *testing.T) {
 	wfs := newInvalidateTestWFS(t)
 	fake := &fakeFilerServer{lookupStarted: make(chan struct{}), lookupGate: make(chan struct{})}

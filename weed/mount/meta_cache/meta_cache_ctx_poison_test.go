@@ -16,19 +16,13 @@ import (
 
 // The shared directory build behind EnsureVisited is a singleflight call: the
 // first requester for a path owns the build, and every later requester for the
-// same path waits on that same build. If the build runs on the owner's request
-// context, the owner walking away (a FUSE request returning, the kernel
-// interrupting it) kills the build for everybody else.
+// same path waits on that same build. The build must not inherit the first
+// requester's cancellation, or a waiter whose own context is still alive would
+// receive that cancellation when the first requester leaves early.
 //
-// A waiter whose own context is still alive then receives somebody else's
-// cancellation. weed/mount/weedfs_dir_read.go classifies a canceled read as
-// EINTR only when the *local* context is done, so the waiter falls through to
-// fuse.EIO — the kernel hands EIO to readdirent, kubelet's applyFSGroup fails,
-// and the volume never mounts. That is the 2026-10-28 gitea outage.
-//
-// The mock below reproduces it deterministically: the filer stream blocks
-// mid-listing, the owner's context is canceled while the build is in flight,
-// and a second requester joins that same build.
+// The mock below blocks the filer stream mid-listing, cancels the owner's
+// context while the build is in flight, and has a second requester join that
+// same build.
 
 // ctxAwareListStream models a filer listing that fails with the request
 // context's error once that context is canceled, the way a real gRPC stream

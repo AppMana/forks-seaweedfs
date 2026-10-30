@@ -91,17 +91,9 @@ const (
 )
 
 func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerClient, path util.FullPath, maxCacheableEntries int) error {
-	// The shared build must not run on the requester's context. A FUSE request
-	// that returns — or that the kernel interrupts — cancels that context, and
-	// every other requester waiting on the same build would inherit the
-	// cancellation. weed/mount/weedfs_dir_read.go only reports EINTR when the
-	// *local* context is done, so such a waiter falls through to fuse.EIO and
-	// the kernel hands EIO to readdirent: kubelet's applyFSGroup fails and the
-	// volume never mounts.
-	//
-	// Build on a context that keeps the request's values but not its
-	// cancellation. Waiters still abandon on their own context below, so a
-	// canceled request stops waiting immediately.
+	// Run the shared singleflight build on a context that retains request
+	// values without inheriting the first requester's cancellation. Waiters
+	// still select on their own ctx.Done() below.
 	buildCtx := context.WithoutCancel(ctx)
 
 	// Use singleflight to deduplicate concurrent requests for the same path.

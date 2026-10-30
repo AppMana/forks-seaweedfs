@@ -178,3 +178,72 @@ func TestEnsureVisitedSharedBuildSurvivesOwnerRequestCancel(t *testing.T) {
 		t.Fatal("directory /dir should be cached after the shared build completes")
 	}
 }
+
+func TestEnsureVisitedPositionFnSurvivesOwnerRequestCancel(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{
+		"/": true,
+	})
+	defer mc.Shutdown()
+
+	posEntered := make(chan struct{})
+	posRelease := make(chan struct{})
+	mc.positionFn = func(ctx context.Context, dir util.FullPath) ([]*filer_pb.FilerDirectoryPosition, error) {
+		close(posEntered)
+		<-posRelease
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 500, Remembered: true}}, nil
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	close(release)
+	client := &ctxAwareListClient{
+		stream: &ctxAwareListStream{
+			responses: []*filer_pb.ListEntriesResponse{
+				{
+					Entry: &filer_pb.Entry{
+						Name: "base.txt",
+						Attributes: &filer_pb.FuseAttributes{
+							Crtime:   1,
+							Mtime:    1,
+							FileMode: 0100644,
+							FileSize: 3,
+						},
+					},
+					SnapshotTsNs: 100,
+				},
+			},
+			entered: entered,
+			release: release,
+		},
+	}
+	accessor := &buildFilerAccessor{client: client}
+
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	ownerErr := make(chan error, 1)
+	go func() {
+		ownerErr <- EnsureVisited(ownerCtx, mc, accessor, util.FullPath("/dir"), 0)
+	}()
+
+	<-posEntered
+	cancelOwner()
+	if err := <-ownerErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner error = %v, want context.Canceled", err)
+	}
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		waiterErr <- EnsureVisited(context.Background(), mc, accessor, util.FullPath("/dir"), 0)
+	}()
+
+	close(posRelease)
+	if err := <-waiterErr; err != nil {
+		t.Fatalf("waiter error = %v, want nil", err)
+	}
+	if hasBasis, pending := mc.DirectoryPending("/dir", []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 500, Remembered: true}}); !hasBasis || len(pending) != 0 {
+		t.Fatalf("shared build lost its directory basis when owner canceled: hasBasis=%v pending=%v", hasBasis, pending)
+	}
+}
+

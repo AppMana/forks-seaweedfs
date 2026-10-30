@@ -208,6 +208,8 @@ func (wfs *WFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 }
 
 func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out DirEntrySink, isPlusMode bool) fuse.Status {
+	ctx, cancel := filerReplyContext(ctx)
+	defer cancel()
 	listingCtx := filer_pb.WithChunksOmitted(ctx)
 
 	// Get the directory handle and lock it for the duration of this operation.

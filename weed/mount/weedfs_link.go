@@ -235,7 +235,7 @@ func (wfs *WFS) syncHardLinkSiblings(ctx context.Context, inode uint64, authorit
 	// One overall deadline for the sequential sibling lookups: they run
 	// under the caller's exclusive hard-link lock, so a slow filer must not
 	// stall every other link operation on this group.
-	ctx, cancel := context.WithTimeout(ctx, metadataFlushTimeout)
+	waitCtx, cancel := filerReplyContext(ctx)
 	defer cancel()
 	for _, p := range paths {
 		if _, skipped := skip[p]; skipped {
@@ -250,8 +250,22 @@ func (wfs *WFS) syncHardLinkSiblings(ctx context.Context, inode uint64, authorit
 		// claiming this mutation's version for that stale content would
 		// fence the pending event out at the version gate, leaving old
 		// chunks and attributes until a refresh.
-		pbEntry, entryTsNs, _, fetchErr := filer_pb.GetEntry(ctx, wfs, p)
-		if fetchErr == nil {
+		siblingDir, siblingName := p.DirAndName()
+		resp, fetchErr := awaitFilerReply(waitCtx, "sync sibling "+string(p), func() (*filer_pb.LookupDirectoryEntryResponse, error) {
+			var resp *filer_pb.LookupDirectoryEntryResponse
+			err := wfs.withFilerClient(waitCtx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+				var lookupErr error
+				resp, lookupErr = filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
+					Directory: siblingDir,
+					Name:      siblingName,
+				})
+				return lookupErr
+			})
+			return resp, err
+		})
+		if fetchErr == nil && resp != nil {
+			pbEntry := resp.Entry
+			entryTsNs := resp.LogTsNs
 			// A path the filer no longer knows is on its way out — leave the
 			// cache alone. Only touch entries that genuinely share the same
 			// hard-link id: inodeToPath's shared-inode invariant should

@@ -128,23 +128,24 @@ func (fh *FileHandle) refreshEntryForRead(ctx context.Context) bool {
 	}
 	fileFullPath := fh.FullPath()
 	dir, name := fileFullPath.DirAndName()
-	var fetched *filer_pb.Entry
-	var versionTsNs int64
-	var signature int32
-	err := fh.wfs.withFilerClient(ctx, false, fh.wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
-		resp, lookupErr := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
-			Directory: dir,
-			Name:      name,
-		})
-		if lookupErr != nil {
+	waitCtx, cancel := filerReplyContext(ctx)
+	defer cancel()
+	resp, err := awaitFilerReply(waitCtx, "refresh "+string(fileFullPath), func() (*filer_pb.LookupDirectoryEntryResponse, error) {
+		var resp *filer_pb.LookupDirectoryEntryResponse
+		err := fh.wfs.withFilerClient(waitCtx, false, fh.wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+			var lookupErr error
+			resp, lookupErr = filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
+				Directory: dir,
+				Name:      name,
+			})
 			return lookupErr
-		}
-		fetched, versionTsNs, signature = resp.Entry, resp.LogTsNs, resp.GetLogSignature()
-		return nil
+		})
+		return resp, err
 	})
-	if err != nil || fetched == nil || versionTsNs == 0 {
+	if err != nil || resp == nil || resp.Entry == nil || resp.LogTsNs == 0 {
 		return false
 	}
+	fetched, versionTsNs, signature := resp.Entry, resp.LogTsNs, resp.GetLogSignature()
 	// The saved path may name a different file by now — an unlinked handle
 	// keeps answering under the reused name. Only an entry that still carries
 	// the handle's inode is its own content; zero means unverifiable, not

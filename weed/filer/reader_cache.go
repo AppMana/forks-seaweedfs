@@ -2,6 +2,7 @@ package filer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -54,6 +55,7 @@ type SingleChunkCacher struct {
 	isGzipped      bool
 	chunkSize      int
 	shouldCache    bool
+	speculative    bool // prefetch must not displace a stream for its memory reservation
 	wg             sync.WaitGroup
 	cacheStartedCh chan struct{}
 	done           chan struct{} // signals when download is complete
@@ -232,6 +234,7 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 		// cache this chunk if not yet
 		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= root.chunkCache.GetMaxFilePartSizeInCache()
 		cacher := newSingleChunkCacher(root, rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
+		cacher.speculative = true
 		cacher.wg.Add(1) // the fetch, so destroy() waits even before the goroutine runs
 		root.downloaders[chunkView.FileId] = cacher
 		go cacher.startCaching()
@@ -368,6 +371,13 @@ retry:
 func (rc *ReaderCache) readFromCacher(ctx context.Context, stream *chunkStream, cacher *SingleChunkCacher, previous *SingleChunkCacher, buffer []byte, offset int64, chunkSize int) (n int, err error) {
 	rc.unpin(previous)
 	n, err = cacher.readChunkAt(ctx, buffer, offset)
+	if errors.Is(err, errPrefetchBudgetBusy) {
+		// A demand reader may have joined a speculative download before
+		// admission failed. Retry with demand priority instead of exposing
+		// the internal prefetch decision as a client read error.
+		rc.rootOrSelf().remove(cacher)
+		return rc.readChunkAt(ctx, stream, buffer, cacher.chunkFileId, cacher.cipherKey, cacher.isGzipped, offset, chunkSize, cacher.shouldCache)
+	}
 	rc.releaseIfFinished(stream, cacher, offset, n, err, chunkSize)
 	return
 }

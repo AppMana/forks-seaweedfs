@@ -2,12 +2,15 @@ package filer
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 )
+
+var errPrefetchBudgetBusy = errors.New("prefetch skipped: reader cache budget is busy")
 
 const DefaultReaderCacheMemoryLimit = 256 << 20
 const DefaultSessionReaderCacheMemoryLimit = 64 << 20
@@ -133,7 +136,7 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 				pinnedVictim = false
 				break
 			}
-			if victim == nil {
+			if victim == nil && !s.speculative {
 				victim, entry = c, e
 				pinnedVictim = true
 			}
@@ -155,6 +158,10 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 				b.Unlock()
 			}
 			continue
+		}
+		if s.speculative && b.idle.Len() > 0 {
+			b.Unlock()
+			return errPrefetchBudgetBusy
 		}
 		changed := b.changed
 		b.Unlock()

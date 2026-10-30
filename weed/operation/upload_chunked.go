@@ -486,7 +486,7 @@ const cleanupJwtLookupTimeout = 10 * time.Second
 
 // cleanupDeleteTimeout bounds one holder even when an uploader was built with
 // a custom HTTP client that has no response timeout of its own.
-const cleanupDeleteTimeout = 30 * time.Second
+var cleanupDeleteTimeout = 30 * time.Second
 
 // deleteChunkFromHolders best-effort removes a needle from each holder it landed
 // on, using type=replicate so the volume drops only its local copy. A failed

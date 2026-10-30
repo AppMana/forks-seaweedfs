@@ -184,6 +184,8 @@ type Uploader struct {
 	httpClient HTTPClient
 	// deleteAbandonedFileId is replaceable per uploader in tests.
 	deleteAbandonedFileId func(hosts []string, fid string, jwt security.EncodedJwt)
+	// scheduleCleanup runs an abandoned-write cleanup; tests make it synchronous.
+	scheduleCleanup func(abandonedCleanup)
 	// watchedHttpClient serves writes a ProgressWatch guards. It has no
 	// response-header timeout: the watch's response timeout replaces that
 	// absolute bound, and waits only while the peer acknowledges nothing.
@@ -278,9 +280,15 @@ func queueAbandonedCleanup(cleanup abandonedCleanup) {
 }
 
 func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+	stalledServers := uploadOption.StalledServers
+	if stalledServers == nil {
+		stalledServers = NewStalledServers(time.Minute)
+	}
 	doUploadFunc := func() error {
+		fileId = ""
+		uploadResult = nil
 		var a uploadAssignment
-		err = uploadOption.StalledServers.Pick(func(avoid []string) ([]string, error) {
+		err = stalledServers.Pick(func(avoid []string) ([]string, error) {
 			var assignErr error
 			a, assignErr = assignFn(avoid)
 			return a.servers, assignErr
@@ -288,7 +296,6 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 		if err != nil {
 			return err
 		}
-		fileId = a.fileId
 
 		genUrl := uploadOption.GenUploadUrl
 		if genUrl == nil {
@@ -299,7 +306,8 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 			uploadOption.UploadUrl = util_http.AppendQueryParameter(uploadOption.UploadUrl, "fsync", "true")
 		}
 		uploadOption.Jwt = a.auth
-		if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
+		proxied := util_http.IsProxyChunkUrl(uploadOption.UploadUrl)
+		if proxied {
 			// The request addresses the filer, which authorizes it and mints the
 			// volume credential itself. The AssignVolume token is not a filer
 			// credential and gets the caller nowhere here.
@@ -312,33 +320,41 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
 		if err != nil {
-			uploadOption.StalledServers.NoteFailure(a.servers, err)
-			// The holders may have stored the needle before the write failed,
-			// including a holder whose response stalled after its commit. The
-			// retry writes under a new file id, so nothing will name this one.
-			holders := a.holders
-			if len(holders) == 0 {
-				holders = a.servers
+			if !proxied {
+				stalledServers.NoteFailure(a.servers, err)
+				// The holders may have stored the needle before the write failed,
+				// including a holder whose response stalled after its commit. The
+				// retry writes under a new file id, so nothing will name this one.
+				holders := a.holders
+				if len(holders) == 0 {
+					holders = a.servers
+				}
+				if len(holders) == 0 && a.host != "" {
+					holders = []string{a.host}
+				}
+				if len(holders) > 0 {
+					cleanup := abandonedCleanup{
+						holders: append([]string(nil), holders...),
+						fid:     a.fileId,
+						jwt:     a.auth,
+						delete:  uploader.deleteAbandonedFileId,
+					}
+					if cleanup.delete == nil {
+						cleanup.delete = DeleteChunkFromHolders
+					}
+					// A stalled holder answers the delete no sooner than the write,
+					// so the retry does not wait for it.
+					schedule := uploader.scheduleCleanup
+					if schedule == nil {
+						schedule = queueAbandonedCleanup
+					}
+					schedule(cleanup)
+				}
 			}
-			if len(holders) == 0 {
-				holders = []string{a.host}
-			}
-			cleanup := abandonedCleanup{
-				holders: append([]string(nil), holders...),
-				fid:     a.fileId,
-				jwt:     a.auth,
-				delete:  uploader.deleteAbandonedFileId,
-			}
-			if cleanup.delete == nil {
-				cleanup.delete = DeleteChunkFromHolders
-			}
-			if uploadOption.StalledServers != nil {
-				queueAbandonedCleanup(cleanup)
-			} else {
-				cleanup.delete(cleanup.holders, cleanup.fid, cleanup.jwt)
-			}
+			return err
 		}
-		return err
+		fileId = a.fileId
+		return nil
 	}
 
 	if uploadOption.RetryForever {

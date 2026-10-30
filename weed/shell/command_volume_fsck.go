@@ -408,11 +408,16 @@ func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[
 			applyPurgingEffective = false
 		}
 		// volume file ids subtract filer file ids
-		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(checks.modifyFromAtNs), uint64(checks.cutoffFromAtNs), checks.maxOrphanPercent); err != nil {
-			return fmt.Errorf("findExtraChunksInVolumeServers: %w", err)
-		}
+		extraErr := c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(checks.modifyFromAtNs), uint64(checks.cutoffFromAtNs), checks.maxOrphanPercent)
 		if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 {
-			return fmt.Errorf("incomplete fsck: %d entries have unresolved chunk manifests; no purge was authorized", unresolved)
+			unresolvedErr := fmt.Errorf("incomplete fsck: %d entries have unresolved chunk manifests; no purge was authorized", unresolved)
+			if extraErr != nil {
+				return fmt.Errorf("%w; findExtraChunksInVolumeServers: %w", unresolvedErr, extraErr)
+			}
+			return unresolvedErr
+		}
+		if extraErr != nil {
+			return fmt.Errorf("findExtraChunksInVolumeServers: %w", extraErr)
 		}
 	}
 
@@ -640,7 +645,7 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 			inUseCount, orphanFileIds, orphanDataSize, checkErr := c.oneVolumeFileIdsSubtractFilerFileIds(dataNodeId, volumeId, &vinfo, modifyFrom, cutoffFrom)
 			if checkErr != nil {
 				fmt.Fprintf(c.writer, "volume %d on %s: not purging the volume: %v\n", volumeId, vinfo.server, checkErr)
-				incompleteVolumes[volumeId] = fmt.Errorf("volume %d on %s: %v", volumeId, vinfo.server, checkErr)
+				incompleteVolumes[volumeId] = errors.Join(incompleteVolumes[volumeId], fmt.Errorf("volume %d on %s: %v", volumeId, vinfo.server, checkErr))
 				continue
 			}
 			if _, found := volumeIdOrphanFileIds[volumeId]; !found {
@@ -683,6 +688,7 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 	// volume — that helper already fans out to all replica locations via
 	// MasterClient.GetLocations, so iterating per replica here (as the old
 	// code did) would issue N*N delete RPCs for N replicas.
+	var purgeErr error
 	if applyPurging {
 		var skippedVolumeIds []uint32
 		for volumeId, orphanReplicaFileIds := range volumeIdOrphanFileIds {
@@ -710,7 +716,7 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 		if len(skippedVolumeIds) > 0 {
 			sort.Slice(skippedVolumeIds, func(i, j int) bool { return skippedVolumeIds[i] < skippedVolumeIds[j] })
 			fmt.Fprintf(c.writer, "skipped purge on %d volume(s): %v\n", len(skippedVolumeIds), skippedVolumeIds)
-			return fmt.Errorf("incomplete purge on volumes %v", skippedVolumeIds)
+			purgeErr = fmt.Errorf("incomplete purge on volumes %v", skippedVolumeIds)
 		}
 	}
 
@@ -722,6 +728,7 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 		fmt.Fprintf(c.writer, "no orphan data\n")
 	}
 
+	var scanErr error
 	if len(incompleteVolumes) > 0 {
 		volumeIds := make([]uint32, 0, len(incompleteVolumes))
 		for volumeId := range incompleteVolumes {
@@ -733,10 +740,15 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 			errs = append(errs, incompleteVolumes[volumeId])
 		}
 		fmt.Fprintf(c.writer, "incomplete scan on %d volume(s), not purged: %v\n", len(volumeIds), volumeIds)
-		return fmt.Errorf("incomplete scan on volumes %v: %w", volumeIds, errors.Join(errs...))
+		scanErr = fmt.Errorf("incomplete scan on volumes %v: %w", volumeIds, errors.Join(errs...))
 	}
-
-	return nil
+	if purgeErr != nil && scanErr != nil {
+		return fmt.Errorf("%w; %w", purgeErr, scanErr)
+	}
+	if purgeErr != nil {
+		return purgeErr
+	}
+	return scanErr
 }
 
 // purgeOneVolume picks the orphan fids to delete for a single volume and

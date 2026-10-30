@@ -110,6 +110,13 @@ Rules for tests:
   branch) that touch server inputs. It publishes
   `ghcr.io/appmana/seaweedfs:sha-<commit>_large_disk`. When a new line becomes
   the default branch, move this branch filter with it.
+- `appmana-promote-server-image.yml`: dispatch with a `release`
+  (`<upstream major.minor>-appmana.<n>`, e.g. `4.51-appmana.1`) and a
+  default-branch `commit`. It adds the release tag to that commit's
+  `sha-<commit>_large_disk` images (manifest list, `-linux-amd64`,
+  `-linux-arm64`) without rebuilding, tags the commit in git, and never moves
+  an existing tag. Deployments follow release tags through an image policy, so
+  promote only a build that passed the reliability gates.
 
 Mount images are built in
 [forks-seaweedfs-csi-driver](https://github.com/AppMana/forks-seaweedfs-csi-driver)

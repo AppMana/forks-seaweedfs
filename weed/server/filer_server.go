@@ -325,19 +325,26 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec)
 
-	if option.CacheSizeMBForRead > 0 {
-		maxEntries := max(option.CacheSizeMBForRead/4, int64(64))
+	if option.CacheSizeMBForRead > 0 || (option.CacheDirForRead != "" && option.WholeCacheSizeMBForRead > 0) {
+		scopeCacheMB := option.CacheSizeMBForRead
+		if scopeCacheMB <= 0 {
+			scopeCacheMB = max(option.WholeCacheSizeMBForRead/4, int64(64))
+			if scopeCacheMB > option.WholeCacheSizeMBForRead {
+				scopeCacheMB = option.WholeCacheSizeMBForRead
+			}
+		}
+		maxEntries := max(scopeCacheMB/4, int64(64))
 		if option.CacheDirForRead != "" {
 			wholeCacheMB := option.WholeCacheSizeMBForRead
 			if wholeCacheMB <= 0 {
-				wholeCacheMB = max(option.CacheSizeMBForRead*4, int64(16384))
-				if option.CacheSizeMBForRead < 64 {
-					wholeCacheMB = option.CacheSizeMBForRead * 2
+				wholeCacheMB = max(scopeCacheMB*4, int64(16384))
+				if scopeCacheMB < 64 {
+					wholeCacheMB = scopeCacheMB * 2
 				}
 			}
 			sharedChunksDir := filepath.Join(option.CacheDirForRead, "chunks")
-			fs.chunkCache = chunk_cache.NewSharedTieredChunkCache(maxEntries, sharedChunksDir, "filer", option.CacheSizeMBForRead, wholeCacheMB, 1024*1024)
-			glog.V(0).Infof("filer nearside chunk cache enabled: shared disk (%s, scope=%dMB, whole=%dMB) + in-memory (%d chunks)", sharedChunksDir, option.CacheSizeMBForRead, wholeCacheMB, maxEntries)
+			fs.chunkCache = chunk_cache.NewSharedTieredChunkCache(maxEntries, sharedChunksDir, "filer", scopeCacheMB, wholeCacheMB, 1024*1024)
+			glog.V(0).Infof("filer nearside chunk cache enabled: shared disk (%s, scope=%dMB, whole=%dMB) + in-memory (%d chunks)", sharedChunksDir, scopeCacheMB, wholeCacheMB, maxEntries)
 		} else {
 			fs.chunkCache = chunk_cache.NewChunkCacheInMemory(maxEntries)
 			glog.V(0).Infof("filer nearside chunk cache enabled: in-memory (%d chunks)", maxEntries)

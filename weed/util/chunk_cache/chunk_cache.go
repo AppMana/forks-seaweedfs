@@ -65,6 +65,9 @@ func NewTieredChunkCache(maxEntries int64, dir string, diskSizeInUnit int64, uni
 // (FUSE mounts, S3, Filer HTTP, WebDAV) on the same host with both per-scope and whole-cache
 // disk limits.
 func NewSharedTieredChunkCache(maxEntries int64, sharedDir string, scopeID string, scopeSizeInUnit int64, wholeSizeInUnit int64, unitSize int64) *TieredChunkCache {
+	if scopeSizeInUnit <= 0 && wholeSizeInUnit > 0 {
+		scopeSizeInUnit = wholeSizeInUnit
+	}
 	if wholeSizeInUnit < scopeSizeInUnit {
 		wholeSizeInUnit = scopeSizeInUnit
 	}
@@ -100,7 +103,7 @@ func (c *TieredChunkCache) IsInCache(fileId string, lockNeeded bool) (answer boo
 		return false
 	}
 
-	if lockNeeded {
+	if lockNeeded && c.sharedDisk == nil {
 		c.RLock()
 		defer c.RUnlock()
 	}
@@ -149,8 +152,10 @@ func (c *TieredChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64
 		return 0, nil
 	}
 
-	c.RLock()
-	defer c.RUnlock()
+	if c.sharedDisk == nil {
+		c.RLock()
+		defer c.RUnlock()
+	}
 
 	if offset > ^uint64(0)-uint64(len(data)) {
 		return 0, ErrorOutOfBounds
@@ -202,6 +207,23 @@ func (c *TieredChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64
 
 func (c *TieredChunkCache) SetChunk(fileId string, data []byte) {
 	if c == nil {
+		return
+	}
+	if c.sharedDisk != nil {
+		glog.V(4).Infof("SetChunk %s size %d\n", fileId, len(data))
+		if fid, err := needle.ParseFileIdFromString(fileId); err == nil && c.sharedDisk.hasScopeEntry(fid) {
+			if c.memCache.cache.Get(fileId) != nil || len(data) > int(c.onDiskCacheSizeLimit0) {
+				glog.V(4).Infof("fileId %s is already in cache", fileId)
+				return
+			}
+		}
+		c.doSetChunk(fileId, data)
+		c.RLock()
+		onCache := c.onCacheChunk
+		c.RUnlock()
+		if onCache != nil {
+			onCache(fileId)
+		}
 		return
 	}
 	c.Lock()

@@ -2279,6 +2279,36 @@ func (s3a *S3ApiServer) fetchChunkData(ctx context.Context, fileId string, ciphe
 	return s3a.readChunkRange(ctx, fileId, offset, size, isFullChunk)
 }
 
+type replicaLoadReadCloser struct {
+	io.ReadCloser
+	done    func(bytes int, err error)
+	bytes   int
+	readErr error
+	closed  bool
+}
+
+func (r *replicaLoadReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytes += n
+	if err != nil && err != io.EOF {
+		r.readErr = err
+	}
+	return n, err
+}
+
+func (r *replicaLoadReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	if !r.closed {
+		r.closed = true
+		doneErr := r.readErr
+		if doneErr == nil {
+			doneErr = err
+		}
+		r.done(r.bytes, doneErr)
+	}
+	return err
+}
+
 func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offset int64, size int64, isFullChunk bool) (io.ReadCloser, error) {
 	// Lookup the volume server URLs for this chunk
 	lookupFileIdFn := s3a.createLookupFileIdFunction()
@@ -2287,46 +2317,61 @@ func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offse
 		return nil, fmt.Errorf("failed to lookup chunk %s: %w", fileId, err)
 	}
 
-	// Use the first URL (already contains complete URL with fileId). The lookup returns http:// URLs; when
-	// [https.client] is configured the volume servers only speak TLS, so take the global client's scheme.
-	chunkUrl, err := util_http.NormalizeUrl(urlStrings[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to normalize chunk URL %s: %w", fileId, err)
-	}
-
 	// Generate JWT for volume server authentication (uses config loaded once at startup)
 	jwt := filer.JwtForVolumeServer(fileId)
 
-	// Create request with Range header for the chunk view
-	req, err := http.NewRequestWithContext(ctx, "GET", chunkUrl, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	var lastErr error
+	for _, lookedUpUrl := range util_http.ReachableFirst(urlStrings) {
+		// The lookup returns http:// URLs; when [https.client] is configured the
+		// volume servers only speak TLS, so take the global client's scheme.
+		chunkUrl, normErr := util_http.NormalizeUrl(lookedUpUrl)
+		if normErr != nil {
+			lastErr = fmt.Errorf("failed to normalize chunk URL %s: %w", fileId, normErr)
+			continue
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, "GET", chunkUrl, nil)
+		if reqErr != nil {
+			lastErr = fmt.Errorf("failed to create request: %w", reqErr)
+			continue
+		}
+
+		if !isFullChunk {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
+		}
+		if jwt != "" {
+			req.Header.Set("Authorization", security.BearerPrefix+jwt)
+		}
+
+		done := util_http.BeginReplicaRead(ctx, chunkUrl)
+		// The global HTTP client carries the [https.client] TLS configuration
+		// that HTTPS volume servers require.
+		resp, doErr := util_http.GetGlobalHttpClient().Do(req)
+		if doErr != nil {
+			done(0, doErr)
+			if ctx.Err() == nil {
+				util_http.RecordUnreachable(chunkUrl)
+			}
+			lastErr = fmt.Errorf("failed to fetch chunk: %w", doErr)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			statusErr := util_http.StatusError(chunkUrl, resp)
+			resp.Body.Close()
+			done(0, statusErr)
+			util_http.RecordReachable(chunkUrl)
+			lastErr = statusErr
+			continue
+		}
+
+		util_http.RecordReachable(chunkUrl)
+		return &replicaLoadReadCloser{
+			ReadCloser: resp.Body,
+			done:       done,
+		}, nil
 	}
 
-	// Set Range header to fetch only the needed portion of the chunk
-	if !isFullChunk {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
-	}
-
-	// Set JWT for authentication
-	if jwt != "" {
-		req.Header.Set("Authorization", security.BearerPrefix+jwt)
-	}
-
-	// Use the global HTTP client: it carries the [https.client] TLS configuration (CA and client
-	// certificate) that HTTPS volume servers require; a bare http.Client cannot reach them.
-	resp, err := util_http.GetGlobalHttpClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch chunk: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		err = util_http.StatusError(chunkUrl, resp)
-		resp.Body.Close()
-		return nil, err
-	}
-
-	return resp.Body, nil
+	return nil, lastErr
 }
 
 // getEncryptedStreamFromVolumes gets a raw encrypted data stream from volume

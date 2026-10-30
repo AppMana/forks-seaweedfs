@@ -2,6 +2,7 @@ package filer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,7 @@ type SingleChunkCacher struct {
 	consumed         int32
 	pins             int32 // streams currently positioned inside this chunk
 	left             int32 // set once the last pinning stream moved on
+	readOnce         int32 // set once a foreground read attaches to this chunk
 	sync.Mutex
 	parent         *ReaderCache
 	scope          *ReaderCache
@@ -52,6 +54,7 @@ type SingleChunkCacher struct {
 	err            error
 	cipherKey      []byte
 	isGzipped      bool
+	isPrefetch     bool // prefetch must not displace a stream for its memory reservation
 	chunkSize      int
 	shouldCache    bool
 	wg             sync.WaitGroup
@@ -147,41 +150,43 @@ func (rc *ReaderCache) scopeDownloaderCountLocked() int {
 	return count
 }
 
-func (rc *ReaderCache) pinnedBytesLocked() int64 {
-	root := rc.rootOrSelf()
-	var pinned int64
-	for _, d := range root.downloaders {
-		if (rc == root || d.scope == rc) && atomic.LoadInt32(&d.pins) > 0 {
-			pinned += int64(mem.AllocationSize(d.chunkSize))
-		}
-	}
-	return pinned
-}
-
 func (rc *ReaderCache) pickOldestVictimLocked(onlyScope *ReaderCache) string {
 	root := rc.rootOrSelf()
-	oldestFid, oldestTime := "", time.Now().UnixNano()
+	oldestReadFid, oldestReadTime := "", time.Now().UnixNano()
+	newestPrefetchFid, newestPrefetchTime := "", int64(0)
 	pinnedFid, pinnedTime := "", int64(0)
+	inFlight := 0
 	for fid, downloader := range root.downloaders {
 		if onlyScope != nil && downloader.scope != onlyScope {
 			continue
 		}
 		completedTime := atomic.LoadInt64(&downloader.completedTimeNew)
 		if completedTime <= 0 {
+			inFlight++
 			continue
 		}
 		if atomic.LoadInt32(&downloader.pins) == 0 {
-			if completedTime < oldestTime {
-				oldestFid, oldestTime = fid, completedTime
+			if !downloader.isUnreadPrefetch() {
+				if completedTime < oldestReadTime {
+					oldestReadFid, oldestReadTime = fid, completedTime
+				}
+			} else if newestPrefetchFid == "" || completedTime > newestPrefetchTime {
+				newestPrefetchFid, newestPrefetchTime = fid, completedTime
 			}
 		} else if pinnedFid == "" || completedTime < pinnedTime {
 			pinnedFid, pinnedTime = fid, completedTime
 		}
 	}
-	if oldestFid == "" {
-		oldestFid = pinnedFid
+	if oldestReadFid != "" {
+		return oldestReadFid
 	}
-	return oldestFid
+	if newestPrefetchFid != "" {
+		return newestPrefetchFid
+	}
+	if inFlight == 0 {
+		return pinnedFid
+	}
+	return ""
 }
 
 // MaybeCache prefetches up to 'count' chunks ahead in parallel.
@@ -210,19 +215,30 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 		return
 	}
 
-	// The window is the next count chunks, whether or not a download for them
-	// is already running: counting only newly started downloads would push the
-	// window count chunks further on every call.
 	budgetLimit := rc.budget.effectiveLimit()
-	windowBytes := rc.pinnedBytesLocked()
-	for x, i := chunkViews, 0; x != nil && i < count; x, i = x.Next, i+1 {
-		chunkView := x.Value
-		allocSize := int64(mem.AllocationSize(int(chunkView.ChunkSize)))
-		if budgetLimit > 0 && windowBytes > 0 && windowBytes+allocSize > budgetLimit {
-			return
+	var pinnedBytes int64
+	if budgetLimit > 0 {
+		for _, d := range root.downloaders {
+			if (rc == root || d.scope == rc) && (atomic.LoadInt32(&d.pins) > 0 || atomic.LoadInt32(&d.readers) > 0) {
+				pinnedBytes += int64(mem.AllocationSize(d.chunkSize))
+			}
 		}
-		if _, found := root.downloaders[chunkView.FileId]; found {
-			windowBytes += allocSize
+	}
+
+	// The window is the next count chunks, whether already downloading,
+	// cached or started here. Skipping present chunks without counting them
+	// let every read on a slow link start count more, until the prefetch
+	// filled the request's slots and evicted the chunk being read.
+	window := 0
+	var windowBytes int64
+	for x := chunkViews; x != nil && window < count; x = x.Next {
+		chunkView := x.Value
+		window++
+		chunkAlloc := int64(mem.AllocationSize(int(chunkView.ChunkSize)))
+		if existing, found := root.downloaders[chunkView.FileId]; found {
+			if atomic.LoadInt32(&existing.pins) == 0 || (rc != root && existing.scope != rc) {
+				windowBytes += chunkAlloc
+			}
 			continue
 		}
 		if root.chunkCache.IsInCache(chunkView.FileId, true) {
@@ -242,16 +258,23 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 			// it cannot fit the budget at all
 			continue
 		}
+		if budgetLimit > 0 && pinnedBytes+windowBytes+chunkAlloc > budgetLimit {
+			// Do not launch prefetches beyond the active budget capacity;
+			// otherwise the furthest prefetch evicts the next chunk before the
+			// stream reaches it.
+			return
+		}
 
 		// glog.V(4).Infof("prefetch %s offset %d", chunkView.FileId, chunkView.ViewOffset)
 		// cache this chunk if not yet
-		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= root.chunkCache.GetMaxFilePartSizeInCache()
+		shouldCache := chunkView.ChunkSize <= root.chunkCache.GetMaxFilePartSizeInCache()
 		cacher := newSingleChunkCacher(root, rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
+		cacher.isPrefetch = true
 		cacher.wg.Add(1) // the fetch, so destroy() waits even before the goroutine runs
 		root.downloaders[chunkView.FileId] = cacher
+		windowBytes += chunkAlloc
 		go cacher.startCaching()
 		started = append(started, cacher)
-		windowBytes += allocSize
 	}
 
 	return
@@ -300,6 +323,7 @@ retry:
 		// start wg.Wait() on a zero counter while this read is about to register.
 		cacher.wg.Add(1)
 		atomic.AddInt32(&cacher.readers, 1)
+		atomic.StoreInt32(&cacher.readOnce, 1)
 		previous := stream.pin(cacher)
 		root.RUnlock()
 		n, err := rc.readFromCacher(ctx, stream, cacher, previous, buffer, offset, chunkSize)
@@ -332,6 +356,7 @@ retry:
 		}
 		cacher.wg.Add(1)
 		atomic.AddInt32(&cacher.readers, 1)
+		atomic.StoreInt32(&cacher.readOnce, 1)
 		previous := stream.pin(cacher)
 		root.Unlock()
 		n, err := rc.readFromCacher(ctx, stream, cacher, previous, buffer, offset, chunkSize)
@@ -366,14 +391,16 @@ retry:
 	// glog.V(4).Infof("cache1 %s", fileId)
 
 	cacher := newSingleChunkCacher(root, rc, fileId, cipherKey, isGzipped, chunkSize, shouldCache)
+	atomic.StoreInt32(&cacher.readOnce, 1)
 	cacher.wg.Add(2) // the fetch plus this read, so destroy() waits even before the goroutine runs
 	atomic.AddInt32(&cacher.readers, 1)
 	root.downloaders[fileId] = cacher
 	previous := stream.pin(cacher)
 	root.Unlock()
+	rc.unpin(previous)
 	go cacher.startCaching()
 	<-cacher.cacheStartedCh
-	n, err := rc.readFromCacher(ctx, stream, cacher, previous, buffer, offset, chunkSize)
+	n, err := rc.readFromCacher(ctx, stream, cacher, nil, buffer, offset, chunkSize)
 	return n, err
 }
 
@@ -384,6 +411,13 @@ retry:
 func (rc *ReaderCache) readFromCacher(ctx context.Context, stream *chunkStream, cacher *SingleChunkCacher, previous *SingleChunkCacher, buffer []byte, offset int64, chunkSize int) (n int, err error) {
 	rc.unpin(previous)
 	n, err = cacher.readChunkAt(ctx, buffer, offset)
+	if errors.Is(err, errPrefetchBudgetBusy) {
+		// A demand reader may have joined a speculative download before
+		// admission failed. Retry with demand priority instead of exposing
+		// the internal prefetch decision as a client read error.
+		rc.rootOrSelf().remove(cacher)
+		return rc.readChunkAt(ctx, stream, buffer, cacher.chunkFileId, cacher.cipherKey, cacher.isGzipped, offset, chunkSize, cacher.shouldCache)
+	}
 	rc.releaseIfFinished(stream, cacher, offset, n, err, chunkSize)
 	return
 }
@@ -403,6 +437,16 @@ func (stream *chunkStream) pin(cacher *SingleChunkCacher) (previous *SingleChunk
 	previous = stream.cacher
 	stream.cacher = cacher
 	return previous
+}
+
+// isPinnedTo reports whether the stream is currently positioned in fileId.
+func (stream *chunkStream) isPinnedTo(fileId string) bool {
+	if stream == nil {
+		return false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return stream.cacher != nil && stream.cacher.chunkFileId == fileId
 }
 
 // detach unpins the stream from its chunk and returns that chunk for the
@@ -445,6 +489,7 @@ func (rc *ReaderCache) unpin(downloader *SingleChunkCacher) {
 	}
 	if atomic.AddInt32(&downloader.pins, -1) == 0 {
 		atomic.StoreInt32(&downloader.left, 1)
+		downloader.budget.notifyChanged()
 	}
 	rc.removeConsumed(downloader)
 }
@@ -480,7 +525,8 @@ func (rc *ReaderCache) removeUnpinned(downloader *SingleChunkCacher) (removed bo
 	root := rc.rootOrSelf()
 	root.Lock()
 	removed = root.downloaders[downloader.chunkFileId] == downloader &&
-		atomic.LoadInt32(&downloader.pins) == 0
+		atomic.LoadInt32(&downloader.pins) == 0 &&
+		atomic.LoadInt32(&downloader.readers) == 0
 	if removed {
 		delete(root.downloaders, downloader.chunkFileId)
 	}
@@ -506,6 +552,13 @@ func (s *SingleChunkCacher) shouldKeepUntilEvicted() bool {
 		return true
 	}
 	return s.parent != nil && s.parent.keepUntilEvicted
+}
+
+func (s *SingleChunkCacher) isUnreadPrefetch() bool {
+	return s.isPrefetch &&
+		atomic.LoadInt32(&s.readOnce) == 0 &&
+		atomic.LoadInt32(&s.left) == 0 &&
+		atomic.LoadInt32(&s.consumed) == 0
 }
 
 // removeConsumed drops a cacher once its buffer was fully read, or the
@@ -639,12 +692,14 @@ func newSingleChunkCacher(parent *ReaderCache, scope *ReaderCache, fileId string
 // downloaders map, so a removal can never observe the fetch as absent.
 func (s *SingleChunkCacher) startCaching() {
 	defer func() {
+		hasErr := s.hasCompletedError()
+		if !hasErr {
+			s.budget.complete(s)
+		}
 		close(s.done)
 		s.wg.Done()
-		if s.hasCompletedError() {
+		if hasErr {
 			s.parent.remove(s)
-		} else {
-			s.budget.complete(s)
 		}
 	}()
 
@@ -677,7 +732,6 @@ func (s *SingleChunkCacher) startCaching() {
 
 	// Now acquire lock to update state
 	s.Lock()
-	atomic.StoreInt64(&s.completedTimeNew, time.Now().UnixNano())
 	if fetchErr != nil {
 		s.err = fetchErr
 	} else {
@@ -686,6 +740,7 @@ func (s *SingleChunkCacher) startCaching() {
 			s.parent.chunkCache.SetChunk(s.chunkFileId, s.data)
 		}
 	}
+	atomic.StoreInt64(&s.completedTimeNew, time.Now().UnixNano())
 	s.Unlock()
 }
 

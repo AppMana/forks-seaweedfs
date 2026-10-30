@@ -355,25 +355,32 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	var chunkCache chunk_cache.ChunkCache
 	if option.SharedChunkCache != nil {
 		chunkCache = option.SharedChunkCache
-	} else if option.CacheSizeMB > 0 {
+	} else if option.CacheSizeMB > 0 || (option.CacheDir != "" && option.WholeCacheSizeMB > 0) {
+		scopeCacheMB := option.CacheSizeMB
+		if scopeCacheMB <= 0 {
+			scopeCacheMB = max(option.WholeCacheSizeMB/4, int64(64))
+			if scopeCacheMB > option.WholeCacheSizeMB {
+				scopeCacheMB = option.WholeCacheSizeMB
+			}
+		}
 		// ccache sizes entries by count; convert the configured byte budget
 		// via the assumed chunk size. Clamp to a floor so tiny caches still
 		// function.
-		maxEntries := option.CacheSizeMB / s3ChunkCacheChunkSizeMB
+		maxEntries := scopeCacheMB / s3ChunkCacheChunkSizeMB
 		if maxEntries < 8 {
 			maxEntries = 8
 		}
 		if option.CacheDir != "" {
 			wholeCacheMB := option.WholeCacheSizeMB
 			if wholeCacheMB <= 0 {
-				wholeCacheMB = max(option.CacheSizeMB*4, 16384)
-				if option.CacheSizeMB < 64 {
-					wholeCacheMB = option.CacheSizeMB * 2
+				wholeCacheMB = max(scopeCacheMB*4, 16384)
+				if scopeCacheMB < 64 {
+					wholeCacheMB = scopeCacheMB * 2
 				}
 			}
 			sharedChunksDir := filepath.Join(option.CacheDir, "chunks")
-			chunkCache = chunk_cache.NewSharedTieredChunkCache(maxEntries, sharedChunksDir, "s3", option.CacheSizeMB, wholeCacheMB, 1024*1024)
-			glog.V(0).Infof("s3 nearside chunk cache enabled: shared disk (%s, scope=%dMB, whole=%dMB) + in-memory (%d chunks)", sharedChunksDir, option.CacheSizeMB, wholeCacheMB, maxEntries)
+			chunkCache = chunk_cache.NewSharedTieredChunkCache(maxEntries, sharedChunksDir, "s3", scopeCacheMB, wholeCacheMB, 1024*1024)
+			glog.V(0).Infof("s3 nearside chunk cache enabled: shared disk (%s, scope=%dMB, whole=%dMB) + in-memory (%d chunks)", sharedChunksDir, scopeCacheMB, wholeCacheMB, maxEntries)
 		} else {
 			chunkCache = chunk_cache.NewChunkCacheInMemory(maxEntries)
 			glog.V(0).Infof("s3 chunk cache enabled: in-memory, ~%dMB (%d chunks of ~%dMB)", maxEntries*s3ChunkCacheChunkSizeMB, maxEntries, s3ChunkCacheChunkSizeMB)

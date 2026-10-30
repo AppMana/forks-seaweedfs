@@ -84,6 +84,9 @@ type commandVolumeFsck struct {
 	walkFiler               func(path string, genFn func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) error, saveFn func(outputChan chan interface{}) error) error
 	purgedDirsLock          sync.Mutex
 	purgedDirs              map[util.FullPath]struct{}
+	// compaction revision of each copied index, by dataNodeId and volume
+	indexRevisionsLock sync.Mutex
+	indexRevisions     map[string]map[uint32]uint32
 }
 
 func (c *commandVolumeFsck) Name() string {
@@ -175,6 +178,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	// suppress -reallyDeleteFromVolume in this session.
 	c.unresolvedManifestEntries.Store(0)
 	c.purgedDirs = make(map[util.FullPath]struct{})
+	c.indexRevisions = nil
 
 	if err = commandEnv.confirmIsLocked(args); err != nil {
 		return
@@ -766,7 +770,16 @@ func (c *commandVolumeFsck) collectOneVolumeFileIds(dataNodeId string, volumeId 
 	if *c.verbose {
 		fmt.Fprintf(c.writer, "collecting volume %d file ids from %s ...\n", volumeId, vinfo.server)
 	}
+	if vinfo.isEcVolume {
+		return c.copyVolumeIndex(dataNodeId, volumeId, vinfo, math.MaxUint32)
+	}
+	return c.copyVolumeIndexAtRevision(dataNodeId, volumeId, vinfo)
+}
 
+// copyVolumeIndex copies the volume's index into the temp folder; unless
+// compactionRevision is math.MaxUint32, the volume server refuses the copy
+// once the volume has been compacted past it.
+func (c *commandVolumeFsck) copyVolumeIndex(dataNodeId string, volumeId uint32, vinfo VInfo, compactionRevision uint32) error {
 	return operation.WithVolumeServerClient(false, vinfo.server, c.env.option.GrpcDialOption,
 		func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 			ext := ".idx"
@@ -777,7 +790,7 @@ func (c *commandVolumeFsck) collectOneVolumeFileIds(dataNodeId string, volumeId 
 			copyFileClient, err := volumeServerClient.CopyFile(context.Background(), &volume_server_pb.CopyFileRequest{
 				VolumeId:                 volumeId,
 				Ext:                      ext,
-				CompactionRevision:       math.MaxUint32,
+				CompactionRevision:       compactionRevision,
 				StopOffset:               math.MaxInt64,
 				Collection:               vinfo.collection,
 				IsEcVolume:               vinfo.isEcVolume,
@@ -1095,6 +1108,39 @@ func (c *commandVolumeFsck) canPurgeDirectory(dir util.FullPath) bool {
 }
 
 func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId string, volumeId uint32, vinfo *VInfo, modifyFrom, cutoffFrom uint64) (inUseCount uint64, orphanFileIds []string, orphanDataSize uint64, err error) {
+	var staleNeedleCount uint64
+	for recopies := 0; ; recopies++ {
+		inUseCount, orphanFileIds, orphanDataSize, staleNeedleCount, err = c.subtractFilerFileIdsFromIndex(dataNodeId, volumeId, vinfo, modifyFrom, cutoffFrom)
+		if err != nil || staleNeedleCount == 0 || recopies == fsckIndexRecopyAttempts {
+			break
+		}
+		// A vacuum since the copy moves needles off their copied offsets;
+		// only then is a fresh index a reason to read them again.
+		if recopyErr := c.recopyCompactedIndex(dataNodeId, volumeId, *vinfo); recopyErr != nil {
+			fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\tnot copying the index again: %v\n", dataNodeId, volumeId, recopyErr)
+			break
+		}
+	}
+	if err != nil {
+		return
+	}
+
+	if orphanCount := uint64(len(orphanFileIds)); orphanCount > 0 {
+		pct := float64(orphanCount*100) / (float64(orphanCount + inUseCount))
+		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\tentries:%d\torphan:%d\t%.2f%%\t%dB\n",
+			dataNodeId, volumeId, orphanCount+inUseCount, orphanCount, pct, orphanDataSize)
+	}
+	if staleNeedleCount > 0 {
+		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\t%d needle(s) have unknown metadata; scan incomplete, refusing purge; investigate and rerun\n",
+			dataNodeId, volumeId, staleNeedleCount)
+		return inUseCount, nil, 0, fmt.Errorf("incomplete fsck for volume %d: %d needle metadata reads failed", volumeId, staleNeedleCount)
+	}
+	return
+}
+
+// subtractFilerFileIdsFromIndex lists the needles of the copied index that
+// no filer reference keeps, counting those whose metadata could not be read.
+func (c *commandVolumeFsck) subtractFilerFileIdsFromIndex(dataNodeId string, volumeId uint32, vinfo *VInfo, modifyFrom, cutoffFrom uint64) (inUseCount uint64, orphanFileIds []string, orphanDataSize uint64, staleNeedleCount uint64, err error) {
 
 	volumeFileIdDb := needle_map.NewMemDb()
 	defer volumeFileIdDb.Close()
@@ -1130,7 +1176,6 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		return
 	}
 
-	var orphanFileCount, staleNeedleCount uint64
 	if err = volumeFileIdDb.AscendingVisit(func(n needle_map.NeedleValue) error {
 		if n.Size.IsDeleted() {
 			return nil
@@ -1148,7 +1193,6 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 			}
 			if (modifyFrom == 0 || modifyFrom <= appendAtNs) && (cutoffFrom == 0 || appendAtNs <= cutoffFrom) {
 				orphanFileIds = append(orphanFileIds, n.Key.FileId(volumeId))
-				orphanFileCount++
 				orphanDataSize += uint64(n.Size)
 			}
 			return nil
@@ -1159,7 +1203,6 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 				}
 			}
 			orphanFileIds = append(orphanFileIds, n.Key.FileId(volumeId))
-			orphanFileCount++
 			orphanDataSize += uint64(n.Size)
 		}
 		return nil
@@ -1167,20 +1210,7 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		err = fmt.Errorf("failed to AscendingVisit %+v", err)
 		return
 	}
-
-	if orphanFileCount > 0 {
-		pct := float64(orphanFileCount*100) / (float64(orphanFileCount + inUseCount))
-		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\tentries:%d\torphan:%d\t%.2f%%\t%dB\n",
-			dataNodeId, volumeId, orphanFileCount+inUseCount, orphanFileCount, pct, orphanDataSize)
-	}
-	if staleNeedleCount > 0 {
-		fmt.Fprintf(c.writer, "dataNode:%s\tvolume:%d\t%d needle(s) have unknown metadata; scan incomplete, refusing purge; investigate and rerun\n",
-			dataNodeId, volumeId, staleNeedleCount)
-		return inUseCount, nil, 0, fmt.Errorf("incomplete fsck for volume %d: %d needle metadata reads failed", volumeId, staleNeedleCount)
-	}
-
 	return
-
 }
 
 // needleAppendAtNs reads one needle's append time from its volume server at

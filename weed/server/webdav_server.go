@@ -215,12 +215,19 @@ func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
 	var chunkCache chunk_cache.ChunkCache
 	if option.SharedChunkCache != nil {
 		chunkCache = option.SharedChunkCache
-	} else if option.CacheSizeMB > 0 {
+	} else if option.CacheSizeMB > 0 || (option.CacheDir != "" && option.WholeCacheSizeMB > 0) {
+		scopeCacheMB := option.CacheSizeMB
+		if scopeCacheMB <= 0 {
+			scopeCacheMB = max(option.WholeCacheSizeMB/4, int64(64))
+			if scopeCacheMB > option.WholeCacheSizeMB {
+				scopeCacheMB = option.WholeCacheSizeMB
+			}
+		}
 		wholeCacheMB := option.WholeCacheSizeMB
 		if wholeCacheMB <= 0 {
-			wholeCacheMB = max(option.CacheSizeMB*4, 16384)
-			if option.CacheSizeMB < 64 {
-				wholeCacheMB = option.CacheSizeMB * 2
+			wholeCacheMB = max(scopeCacheMB*4, 16384)
+			if scopeCacheMB < 64 {
+				wholeCacheMB = scopeCacheMB * 2
 			}
 		}
 		sharedChunksDir := filepath.Join(option.CacheDir, "chunks")
@@ -228,7 +235,7 @@ func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
 			cacheUniqueId := util.Md5String([]byte("webdav" + string(option.Filer) + version.Version()))[0:8]
 			sharedChunksDir = path.Join(os.TempDir(), cacheUniqueId, "chunks")
 		}
-		chunkCache = chunk_cache.NewSharedTieredChunkCache(256, sharedChunksDir, "webdav", option.CacheSizeMB, wholeCacheMB, 1024*1024)
+		chunkCache = chunk_cache.NewSharedTieredChunkCache(256, sharedChunksDir, "webdav", scopeCacheMB, wholeCacheMB, 1024*1024)
 	} else {
 		chunkCache = (*chunk_cache.TieredChunkCache)(nil)
 	}

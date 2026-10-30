@@ -147,6 +147,17 @@ func (rc *ReaderCache) scopeDownloaderCountLocked() int {
 	return count
 }
 
+func (rc *ReaderCache) pinnedBytesLocked() int64 {
+	root := rc.rootOrSelf()
+	var pinned int64
+	for _, d := range root.downloaders {
+		if (rc == root || d.scope == rc) && atomic.LoadInt32(&d.pins) > 0 {
+			pinned += int64(mem.AllocationSize(d.chunkSize))
+		}
+	}
+	return pinned
+}
+
 func (rc *ReaderCache) pickOldestVictimLocked(onlyScope *ReaderCache) string {
 	root := rc.rootOrSelf()
 	oldestFid, oldestTime := "", time.Now().UnixNano()
@@ -202,9 +213,16 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 	// The window is the next count chunks, whether or not a download for them
 	// is already running: counting only newly started downloads would push the
 	// window count chunks further on every call.
+	budgetLimit := rc.budget.effectiveLimit()
+	windowBytes := rc.pinnedBytesLocked()
 	for x, i := chunkViews, 0; x != nil && i < count; x, i = x.Next, i+1 {
 		chunkView := x.Value
+		allocSize := int64(mem.AllocationSize(int(chunkView.ChunkSize)))
+		if budgetLimit > 0 && windowBytes > 0 && windowBytes+allocSize > budgetLimit {
+			return
+		}
 		if _, found := root.downloaders[chunkView.FileId]; found {
+			windowBytes += allocSize
 			continue
 		}
 		if root.chunkCache.IsInCache(chunkView.FileId, true) {
@@ -233,6 +251,7 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 		root.downloaders[chunkView.FileId] = cacher
 		go cacher.startCaching()
 		started = append(started, cacher)
+		windowBytes += allocSize
 	}
 
 	return

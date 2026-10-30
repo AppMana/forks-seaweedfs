@@ -97,6 +97,9 @@ func (section *FileChunkSection) setupForRead(ctx context.Context, group *ChunkG
 
 	if section.reader == nil {
 		section.reader = NewChunkReaderAtFromClientWithMode(ctx, group.readerCache, section.chunkViews, sectionStop, group.GetPrefetchCount(), group.readerCacheMode)
+		if group.readerPattern != nil {
+			section.reader.readerPattern = group.readerPattern
+		}
 	}
 
 	section.isPrepared = true

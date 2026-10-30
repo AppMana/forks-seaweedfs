@@ -19,6 +19,7 @@ type ChunkGroup struct {
 	readerCache       *ReaderCache
 	concurrentReaders int
 	readerCacheMode   ReaderCacheMode
+	readerPattern     *ReaderPattern
 	// cacheInvalidator lets manifest resolution drop stale volume locations, as ReaderCache does for chunk reads
 	cacheInvalidator CacheInvalidator
 	// manifestCache caches resolved chunk manifest bytes across repeated opens
@@ -85,6 +86,7 @@ func NewChunkGroupWithReaderCache(lookupFn wdclient.LookupFileIdFunctionType, pa
 		readerCache:       rc,
 		concurrentReaders: concurrentReaders,
 		readerCacheMode:   readerCacheMode,
+		readerPattern:     NewReaderPatternWithMode(readerCacheMode),
 		cacheInvalidator:  cacheInvalidator,
 		manifestCache:     manifestCache,
 	}

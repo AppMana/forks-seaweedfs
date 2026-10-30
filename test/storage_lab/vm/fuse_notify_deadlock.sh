@@ -44,7 +44,7 @@ start_mount() { # name -> pid
   name=$1
   rm -rf /var/cache/notify-$name
   $W mount -filer=127.0.0.1:8888 -dir=/mnt/$name -filer.path=/ -cacheDir=/var/cache/notify-$name \
-    -dirAutoCreate >>$LOG/mount-$name.log 2>&1 &
+    -dirAutoCreate >>$LOG/mount-$name-$MODE.log 2>&1 &
   pid=$!
   for _ in $(seq 60); do
     mountpoint -q /mnt/$name && break

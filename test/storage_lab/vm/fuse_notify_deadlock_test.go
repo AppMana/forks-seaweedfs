@@ -128,7 +128,7 @@ func TestFuseReverseInvalidationLab(t *testing.T) {
 		if err != nil || r.GetExitCode() != 0 {
 			diagnosticCtx, stop := context.WithTimeout(context.Background(), time.Minute)
 			defer stop()
-			d, derr := node.ExecWithTimeout(diagnosticCtx, 50*time.Second, "sh", "-c", "cat /var/log/notify-lab/progress.txt; ps -eo pid,stat,wchan:32,args | grep -E 'weed|mv' ; for p in $(pgrep -x weed); do for s in /proc/$p/task/*/stack; do grep -q fuse_ $s && { echo \"== $s\"; cat $s; }; done; done; dmesg | tail -n 80; tail -n 100 /var/log/notify-lab/*.log")
+			d, derr := node.ExecWithTimeout(diagnosticCtx, 50*time.Second, "sh", "-c", "cat /var/log/notify-lab/progress.txt; ps -eo pid,stat,wchan:32,args | grep -E 'weed|mv' ; for p in $(pgrep -x weed); do for s in /proc/$p/task/*/stack; do grep -q fuse_ $s && { echo \"== $s\"; cat $s; }; done; done; dmesg | tail -n 80; tail -n 100 /var/log/notify-lab/*.log; for f in /var/log/notify-lab/mount-b-*.log /var/log/notify-lab/server.log; do echo \"==> head $f\"; head -n 300 $f; done")
 			_ = os.WriteFile(filepath.Join(results, "guest-"+mode+"-diagnostics.log"), []byte(fmt.Sprintf("error=%v\n%s\n%s", derr, d.GetStdout(), d.GetStderr())), 0600)
 		}
 		if err != nil {

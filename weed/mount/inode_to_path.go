@@ -201,9 +201,14 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	}
 	i.path2inode[path] = inode
 
-	if _, found := i.inode2path[inode]; found {
+	if entry, entryFound := i.inode2path[inode]; entryFound {
+		if !found {
+			// Another name of a hard-linked inode. Record it with the inode, or
+			// the last Forget leaves this name mapped to an inode that is gone.
+			entry.addPath(path)
+		}
 		if isLookup {
-			i.inode2path[inode].nlookup++
+			entry.nlookup++
 		}
 	} else {
 		nlookup := uint64(0)

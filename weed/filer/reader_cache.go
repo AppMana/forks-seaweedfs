@@ -266,7 +266,7 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 
 		// glog.V(4).Infof("prefetch %s offset %d", chunkView.FileId, chunkView.ViewOffset)
 		// cache this chunk if not yet
-		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= root.chunkCache.GetMaxFilePartSizeInCache()
+		shouldCache := chunkView.ChunkSize <= root.chunkCache.GetMaxFilePartSizeInCache()
 		cacher := newSingleChunkCacher(root, rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
 		cacher.isPrefetch = true
 		cacher.wg.Add(1) // the fetch, so destroy() waits even before the goroutine runs

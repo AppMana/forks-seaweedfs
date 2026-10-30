@@ -14,7 +14,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const mtimeTouchInterval = 30 * time.Second
@@ -107,6 +106,14 @@ func (l *SharedDiskCacheLayer) hasChunk(fid *needle.FileId) bool {
 	return volId == fid.VolumeId && cookie == fid.Cookie
 }
 
+func (l *SharedDiskCacheLayer) hasScopeEntry(fid *needle.FileId) bool {
+	relPath := l.chunkRelPath(fid)
+	l.mu.Lock()
+	_, inScope := l.scopeEntries[relPath]
+	l.mu.Unlock()
+	return inScope && l.hasChunk(fid)
+}
+
 func (l *SharedDiskCacheLayer) readChunkAt(buffer []byte, fid *needle.FileId, offset uint64) (n int, err error) {
 	relPath := l.chunkRelPath(fid)
 	fullPath := filepath.Join(l.dir, relPath)
@@ -149,9 +156,6 @@ func (l *SharedDiskCacheLayer) readChunkAt(buffer []byte, fid *needle.FileId, of
 	n, err = f.ReadAt(buffer[:wanted], readOffset)
 	if err != nil && n == wanted {
 		err = nil
-	}
-	if n > 0 && int64(n) >= minFadviseSize {
-		_ = util.DropOSPageCache(int(f.Fd()), readOffset, int64(n))
 	}
 
 	now := time.Now()

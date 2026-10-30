@@ -130,7 +130,7 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 		var entry *list.Element
 		for e := b.idle.Front(); e != nil; e = e.Next() {
 			c := e.Value.(*SingleChunkCacher)
-			if atomic.LoadInt32(&c.pins) == 0 && !c.isUnreadPrefetch() {
+			if atomic.LoadInt32(&c.pins) == 0 && atomic.LoadInt32(&c.readers) == 0 && !c.isUnreadPrefetch() {
 				victim, entry = c, e
 				break
 			}
@@ -140,14 +140,14 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 			var sameScopeEntry *list.Element
 			for e := b.idle.Back(); e != nil; e = e.Prev() {
 				c := e.Value.(*SingleChunkCacher)
-				if atomic.LoadInt32(&c.pins) != 0 {
+				if atomic.LoadInt32(&c.pins) != 0 || atomic.LoadInt32(&c.readers) != 0 {
 					continue
 				}
 				if s == nil || c.scope != s.scope {
 					victim, entry = c, e
 					break
 				}
-				if !s.isPrefetch && sameScopeEntry == nil {
+				if sameScopeEntry == nil {
 					sameScopeVictim, sameScopeEntry = c, e
 				}
 			}

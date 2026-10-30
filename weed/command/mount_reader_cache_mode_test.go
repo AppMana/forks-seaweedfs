@@ -7,12 +7,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 )
 
-// parseReaderCacheMode backs the fork-added -readerCacheMode weed mount flag.
-// Its contract is to fail closed: anything that is not one of the three known
-// modes must produce an error rather than silently degrading to "auto". A
-// mount that quietly reverts to inferred classification after a StorageClass
-// typo is the exact failure this flag exists to prevent, so the fails-closed
-// behavior is load-bearing and not merely defensive.
+// parseReaderCacheMode backs the -readerCacheMode weed mount flag and fails
+// closed on unknown modes rather than silently defaulting to "auto".
 func TestParseReaderCacheModeAcceptsKnownModes(t *testing.T) {
 	for _, tc := range []struct {
 		value string

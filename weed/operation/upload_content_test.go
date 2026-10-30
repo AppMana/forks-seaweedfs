@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"io"
 	"net"
 	"net/http"
@@ -944,5 +945,58 @@ func TestCipherUploadKeepsPlaintextETag(t *testing.T) {
 	}
 	if !bytes.Equal(decrypted, payload) {
 		t.Fatalf("decrypted %d bytes, want %d", len(decrypted), len(payload))
+	}
+}
+
+// A write that fails after the primary stored it (a replica forward failed)
+// leaves the needle on every holder that accepted it. The retry writes under
+// a new file id, so nothing will ever name the old one: it must be deleted
+// from each holder, or it lives on as an orphan that replica checks report
+// as divergence.
+func TestUploadWithRetryDataDeletesAbandonedFileId(t *testing.T) {
+	replicaErr := `{"error":"failed to write to replicas for volume 1: [volume-c:8080]: stalled"}`
+	httpClient := &scriptedHTTPClient{
+		responses: map[string][]scriptedHTTPResponse{
+			"http://volume-a/1,first": {
+				{status: http.StatusInternalServerError, body: replicaErr},
+				{status: http.StatusInternalServerError, body: replicaErr},
+				{status: http.StatusInternalServerError, body: replicaErr},
+			},
+			"http://volume-b/2,second": {
+				{status: http.StatusCreated, body: `{"name":"test.bin","size":3}`},
+			},
+		},
+	}
+	uploader := newUploader(httpClient)
+
+	type deletion struct {
+		hosts []string
+		fid   string
+		jwt   string
+	}
+	var deletions []deletion
+	previous := deleteAbandonedFileId
+	deleteAbandonedFileId = func(hosts []string, fid string, jwt security.EncodedJwt) {
+		deletions = append(deletions, deletion{hosts, fid, string(jwt)})
+	}
+	t.Cleanup(func() { deleteAbandonedFileId = previous })
+
+	assignCalls := 0
+	fileID, _, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
+		assignCalls++
+		if assignCalls == 1 {
+			return uploadAssignment{fileId: "1,first", host: "volume-a", auth: "jwt-1", servers: []string{"volume-a:8080", "volume-c:8080"}}, nil
+		}
+		return uploadAssignment{fileId: "2,second", host: "volume-b", auth: "jwt-2", servers: []string{"volume-b:8080", "volume-d:8080"}}, nil
+	}, &UploadOption{Filename: "test.bin"}, []byte("abc"))
+	if err != nil || fileID != "2,second" {
+		t.Fatalf("upload = %q, %v; want the reassigned file id", fileID, err)
+	}
+	if len(deletions) != 1 {
+		t.Fatalf("deletions %+v, want exactly the abandoned file id", deletions)
+	}
+	d := deletions[0]
+	if d.fid != "1,first" || d.jwt != "jwt-1" || strings.Join(d.hosts, ",") != "volume-a:8080,volume-c:8080" {
+		t.Fatalf("deleted %+v, want 1,first from both holders with its own token", d)
 	}
 }

@@ -232,6 +232,10 @@ func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
 // uploadAssignment is where one upload attempt writes: the file id, the host
 // the request goes to, and every server holding a copy of the volume (the
 // primary first), which a replicated write passes through synchronously.
+// deleteAbandonedFileId removes a file id that a failed write may have left
+// on its holders; tests replace it.
+var deleteAbandonedFileId = DeleteChunkFromHolders
+
 type uploadAssignment struct {
 	fileId  string
 	host    string
@@ -276,6 +280,27 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
 		if err != nil {
 			uploadOption.StalledServers.NoteFailure(a.servers, err)
+			// The holders may have stored the needle before the write failed,
+			// and the retry writes under a new file id, so nothing will name
+			// this one. A delete to a server that just stalled would stall
+			// too; its copy is left for fsck.
+			holders := a.servers
+			if len(holders) == 0 {
+				holders = []string{a.host}
+			}
+			var reachable []string
+			for _, holder := range holders {
+				if _, stalled := uploadOption.StalledServers.FirstStalled([]string{holder}); !stalled {
+					reachable = append(reachable, holder)
+				}
+			}
+			if len(reachable) > 0 {
+				if uploadOption.StalledServers != nil {
+					go deleteAbandonedFileId(reachable, a.fileId, a.auth)
+				} else {
+					deleteAbandonedFileId(reachable, a.fileId, a.auth)
+				}
+			}
 		}
 		return err
 	}

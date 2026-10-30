@@ -71,6 +71,7 @@ type healthyVolumeServer struct {
 	*httptest.Server
 	mu       sync.Mutex
 	paths    []string
+	deletes  []string
 	failWith map[string]string
 }
 
@@ -80,6 +81,12 @@ func startHealthyVolumeServer(t *testing.T, failWith map[string]string) *healthy
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		s.mu.Lock()
+		if r.Method == http.MethodDelete {
+			s.deletes = append(s.deletes, r.URL.Path)
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		s.paths = append(s.paths, r.URL.Path)
 		body, fail := s.failWith[r.URL.Path]
 		s.mu.Unlock()
@@ -101,6 +108,22 @@ func (s *healthyVolumeServer) uploads() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.paths...)
+}
+
+// waitForDelete reports whether path is deleted within timeout; the delete
+// of an abandoned file id runs in the background.
+func (s *healthyVolumeServer) waitForDelete(path string, timeout time.Duration) bool {
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		s.mu.Lock()
+		for _, deleted := range s.deletes {
+			if deleted == path {
+				s.mu.Unlock()
+				return true
+			}
+		}
+		s.mu.Unlock()
+	}
+	return false
 }
 
 // scriptedAssignFilerClient hands out the given assignments in order, then
@@ -212,6 +235,10 @@ func TestUploadWithRetryAvoidsTheReplicaAPrimaryNames(t *testing.T) {
 	}
 	if got := primary.uploads(); len(got) != 2 || got[0] != "/1,01" || got[1] != "/3,03" {
 		t.Fatalf("primary uploads = %v, want [/1,01 /3,03]", got)
+	}
+	// The primary stored 1,01 before its replica stalled; nothing names it.
+	if !primary.waitForDelete("/1,01", 5*time.Second) {
+		t.Fatal("the abandoned file id 1,01 was not deleted from the primary")
 	}
 }
 

@@ -625,6 +625,9 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 	// read-only state across replicas: if one replica was RO and another RW,
 	// the deferred cleanup would mark the originally-RW replica RO too.
 	readOnlyServerReplicas := make(map[uint32][]pb.ServerAddress)
+	// A volume whose scan is incomplete on any replica has no trustworthy
+	// orphan set, so it is never purged; every other volume still is.
+	incompleteVolumes := make(map[uint32]error)
 	// Phase 1: collect orphan fids from every replica of every volume.
 	// The purge step runs in Phase 2, AFTER every replica has contributed.
 	// Running purge inside this loop (as the original code did) meant the
@@ -636,7 +639,9 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 		for volumeId, vinfo := range volumeIdToVInfo {
 			inUseCount, orphanFileIds, orphanDataSize, checkErr := c.oneVolumeFileIdsSubtractFilerFileIds(dataNodeId, volumeId, &vinfo, modifyFrom, cutoffFrom)
 			if checkErr != nil {
-				return fmt.Errorf("failed to collect file ids from volume %d on %s: %v", volumeId, vinfo.server, checkErr)
+				fmt.Fprintf(c.writer, "volume %d on %s: not purging the volume: %v\n", volumeId, vinfo.server, checkErr)
+				incompleteVolumes[volumeId] = fmt.Errorf("volume %d on %s: %v", volumeId, vinfo.server, checkErr)
+				continue
 			}
 			if _, found := volumeIdOrphanFileIds[volumeId]; !found {
 				volumeIdOrphanFileIds[volumeId] = make(map[string]int)
@@ -684,6 +689,9 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 			if len(orphanReplicaFileIds) == 0 {
 				continue
 			}
+			if _, incomplete := incompleteVolumes[volumeId]; incomplete {
+				continue
+			}
 			if isEcVolumeReplicas[volumeId] {
 				fmt.Fprintf(c.writer, "skip purging for Erasure Coded volume %d.\n", volumeId)
 				continue
@@ -712,6 +720,20 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 
 	if totalOrphanChunkCount == 0 {
 		fmt.Fprintf(c.writer, "no orphan data\n")
+	}
+
+	if len(incompleteVolumes) > 0 {
+		volumeIds := make([]uint32, 0, len(incompleteVolumes))
+		for volumeId := range incompleteVolumes {
+			volumeIds = append(volumeIds, volumeId)
+		}
+		sort.Slice(volumeIds, func(i, j int) bool { return volumeIds[i] < volumeIds[j] })
+		errs := make([]error, 0, len(volumeIds))
+		for _, volumeId := range volumeIds {
+			errs = append(errs, incompleteVolumes[volumeId])
+		}
+		fmt.Fprintf(c.writer, "incomplete scan on %d volume(s), not purged: %v\n", len(volumeIds), volumeIds)
+		return fmt.Errorf("incomplete scan on volumes %v: %w", volumeIds, errors.Join(errs...))
 	}
 
 	return nil

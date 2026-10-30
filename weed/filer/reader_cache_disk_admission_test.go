@@ -11,14 +11,15 @@ import (
 )
 
 // Exercise the production disk quotas without allocating their capacity.
-// The admission limit is a file-prefix cutoff, not the whole-cache capacity.
-func TestReviewProductionDiskCacheAdmission(t *testing.T) {
+// Admission compares the chunk's size with the cutoff, not its file offset:
+// chunks past the first 512 MiB of a large file are cached too.
+func TestDiskCacheAdmitsChunksAtAnyFileOffset(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		offset int64
 		want   int32
 	}{
-		{"within495MiB", 490 << 20, 1}, {"past512MiB", 513 << 20, 2},
+		{"within495MiB", 490 << 20, 1}, {"past512MiB", 513 << 20, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cache := chunk_cache.NewSharedTieredChunkCache(8, t.TempDir(), "s3", 2048, 51200, 1<<20)

@@ -124,21 +124,51 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 			b.Unlock()
 			return nil
 		}
-		// Prefer evicting an idle chunk no stream is positioned in; fall back
-		// to the oldest pinned one so abandoned pins cannot block the budget.
+		// Prefer evicting an unpinned chunk that has already been read (FIFO from
+		// Front). If only unread prefetches are available, evict the newest
+		// (furthest-ahead) unread prefetch from Back, and never let a background
+		// prefetch evict an unread prefetch of the same request scope. A pinned
+		// chunk is taken only by a demand read and only when no download is in
+		// flight to free space: then nothing else will, and streams that each
+		// hold a pin would wait on one another forever.
 		var victim *SingleChunkCacher
 		var entry *list.Element
 		pinnedVictim := false
 		for e := b.idle.Front(); e != nil; e = e.Next() {
 			c := e.Value.(*SingleChunkCacher)
-			if atomic.LoadInt32(&c.pins) == 0 {
+			if atomic.LoadInt32(&c.pins) == 0 && atomic.LoadInt32(&c.readers) == 0 && !c.isUnreadPrefetch() {
 				victim, entry = c, e
-				pinnedVictim = false
 				break
 			}
-			if victim == nil && !s.speculative {
-				victim, entry = c, e
-				pinnedVictim = true
+		}
+		if entry == nil {
+			var sameScopeVictim *SingleChunkCacher
+			var sameScopeEntry *list.Element
+			for e := b.idle.Back(); e != nil; e = e.Prev() {
+				c := e.Value.(*SingleChunkCacher)
+				if atomic.LoadInt32(&c.pins) != 0 || atomic.LoadInt32(&c.readers) != 0 {
+					continue
+				}
+				if s == nil || c.scope != s.scope {
+					victim, entry = c, e
+					break
+				}
+				if sameScopeEntry == nil {
+					sameScopeVictim, sameScopeEntry = c, e
+				}
+			}
+			if entry == nil && sameScopeEntry != nil {
+				victim, entry = sameScopeVictim, sameScopeEntry
+			}
+		}
+		if entry == nil && (s == nil || !s.isPrefetch) && len(b.reservations) == b.idle.Len() {
+			for e := b.idle.Front(); e != nil; e = e.Next() {
+				c := e.Value.(*SingleChunkCacher)
+				if atomic.LoadInt32(&c.readers) == 0 {
+					victim, entry = c, e
+					pinnedVictim = true
+					break
+				}
 			}
 		}
 		if entry != nil {
@@ -149,8 +179,8 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 				victim.parent.remove(victim)
 			} else if !victim.parent.removeUnpinned(victim) {
 				// The victim was pinned between selection and removal: keep it
-				// evictable so a pin abandoned in that gap cannot wedge the
-				// budget, then retry the selection.
+				// in the idle list so it becomes evictable again once unpinned,
+				// then retry the selection.
 				b.Lock()
 				if _, ok := b.reservations[victim]; ok && b.idleEntries[victim] == nil {
 					b.idleEntries[victim] = b.idle.PushBack(victim)
@@ -159,7 +189,7 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 			}
 			continue
 		}
-		if s.speculative && b.idle.Len() > 0 {
+		if s != nil && s.isPrefetch && b.idle.Len() > 0 {
 			b.Unlock()
 			return errPrefetchBudgetBusy
 		}
@@ -223,5 +253,18 @@ func (b *ReaderCacheBudget) release(s *SingleChunkCacher) {
 	b.releaseSelf(s)
 	if b.parent != nil {
 		b.parent.release(s)
+	}
+}
+
+func (b *ReaderCacheBudget) notifyChanged() {
+	if b == nil {
+		return
+	}
+	b.Lock()
+	close(b.changed)
+	b.changed = make(chan struct{})
+	b.Unlock()
+	if b.parent != nil {
+		b.parent.notifyChanged()
 	}
 }

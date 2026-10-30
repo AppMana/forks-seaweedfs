@@ -18,7 +18,7 @@ type WinFspHost struct {
 }
 
 // NewWinFspHost wraps wfs in the cgofuse adapter.
-func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions bool) *WinFspHost {
+func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions, readOnly bool) *WinFspHost {
 	// WinFsp checks the caller's Windows token against the mode-derived
 	// security descriptor before dispatching Open/Create. Rechecking with
 	// the adapter's synthetic Unix identity would reject authorized backup/
@@ -30,6 +30,7 @@ func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions bool) *WinFspHost {
 	}
 	adapter := newWinfspFS(wfs, caseSensitive)
 	adapter.basicPermissions = basicPermissions
+	adapter.readOnly = readOnly
 	host := cgofuse.NewFileSystemHost(adapter)
 	// WinFsp-only optimization: Readdir fills full stats, so the FSD can
 	// answer directory queries without per-entry Getattr round trips.

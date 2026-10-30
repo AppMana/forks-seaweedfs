@@ -28,6 +28,7 @@ type winfspFS struct {
 	caseSensitive    bool
 	identityError    error
 	basicPermissions bool
+	readOnly         bool
 }
 
 func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {

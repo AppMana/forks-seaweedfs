@@ -138,6 +138,14 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 				pinnedVictim = true
 			}
 		}
+		if pinnedVictim {
+			for c := range b.reservations {
+				if b.idleEntries[c] == nil && atomic.LoadInt32(&c.pins) == 0 {
+					victim, entry = nil, nil
+					break
+				}
+			}
+		}
 		if entry != nil {
 			b.idle.Remove(entry)
 			delete(b.idleEntries, victim)

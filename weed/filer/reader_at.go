@@ -311,10 +311,24 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		}
 		g.SetLimit(concurrency)
 
-		for _, task := range tasks {
+		var lastStream chunkStream
+		for i, task := range tasks {
+			taskIdx := i
+			task := task
 			g.Go(func() error {
+				var taskStream *chunkStream
+				releaseFirst := false
+				if taskIdx == 0 && len(tasks) > 1 {
+					taskStream = &c.stream
+					releaseFirst = true
+				} else if taskIdx == len(tasks)-1 {
+					taskStream = &lastStream
+				}
 				// Read directly into the correct position in the output buffer
-				copied, readErr := c.readChunkSliceAtForParallel(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, task.chunkOffset)
+				copied, readErr := c.readChunkSliceAtForParallel(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, task.chunkOffset, taskStream)
+				if releaseFirst {
+					c.readerCache.releaseStream(&c.stream)
+				}
 				task.bytesRead = copied
 				task.modifiedTsNs = task.chunk.ModifiedTsNs
 				return readErr
@@ -324,6 +338,16 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		// Wait for all chunk reads to complete
 		if waitErr := g.Wait(); waitErr != nil {
 			err = waitErr
+		}
+		c.readerCache.releaseStream(&c.stream)
+		if cacher := lastStream.detach(nil); cacher != nil {
+			if err == nil {
+				c.readerCache.unpin(c.stream.pin(cacher))
+				c.lastChunkMu.Lock()
+				c.lastChunkFid = tasks[len(tasks)-1].chunk.FileId
+				c.lastChunkMu.Unlock()
+			}
+			c.readerCache.unpin(cacher)
 		}
 
 		// Aggregate results (order is preserved since we read directly into buffer positions)
@@ -446,8 +470,11 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 
 // readChunkSliceAtForParallel is a simplified version for parallel chunk fetching
 // It doesn't update lastChunkFid or trigger prefetch (handled by the caller)
-func (c *ChunkReadAt) readChunkSliceAtForParallel(ctx context.Context, buffer []byte, chunkView *ChunkView, offset uint64) (n int, err error) {
+func (c *ChunkReadAt) readChunkSliceAtForParallel(ctx context.Context, buffer []byte, chunkView *ChunkView, offset uint64, stream *chunkStream) (n int, err error) {
 	if (chunkView.CanRangeFetch() || !c.readerCache.budget.canFit(int(chunkView.ChunkSize))) && !chunkView.IsFullChunk() {
+		if stream != nil {
+			c.readerCache.releaseStream(stream)
+		}
 		n, err = c.readerCache.chunkCache.ReadChunkAt(buffer, chunkView.FileId, offset)
 		if n > 0 {
 			return n, err
@@ -455,7 +482,7 @@ func (c *ChunkReadAt) readChunkSliceAtForParallel(ctx context.Context, buffer []
 		return c.readerCache.fetchChunkRange(ctx, buffer, chunkView, int64(offset))
 	}
 	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
-	return c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
+	return c.readerCache.readChunkAt(ctx, stream, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 }
 
 func zero(buffer []byte, start, length int64) int {

@@ -499,3 +499,51 @@ func TestCopyChunksForRangeMissingChunkETag(t *testing.T) {
 		t.Errorf("part Md5 = %x, want %x (hashed copied range)", partMd5, wantMd5)
 	}
 }
+
+// A key that also has child keys under it is stored with IsDirectory=true and
+// SeaweedFSPrefixObject="true". CopyObjectPartHandler must unwrap that prefix
+// object just like CopyObjectHandler instead of classifying it as ErrNoSuchKey.
+func TestCopyObjectPartHandlerPrefixObjectSource(t *testing.T) {
+	volume := startFakeVolumeServer(t)
+	filerImpl := &ambiguousPutFiler{volume: volume, apply: true, entries: map[string]*filer_pb.Entry{}}
+	s3a := newPutTestServer(t, startFakeFiler(t, filerImpl))
+	s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+	util_http.InitGlobalHttpClient()
+
+	content := []byte("prefix-object-body")
+	uploadID := s3a.generateUploadID("dst")
+	filerImpl.entries["/buckets/b"] = &filer_pb.Entry{Name: "b", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}}
+	filerImpl.entries["/buckets/b/src"] = &filer_pb.Entry{
+		Name:        "src",
+		IsDirectory: true,
+		Attributes:  &filer_pb.FuseAttributes{FileSize: uint64(len(content))},
+		Content:     content,
+		Extended: map[string][]byte{
+			s3_constants.SeaweedFSPrefixObject: []byte("true"),
+		},
+	}
+	filerImpl.entries["/buckets/b/src/child"] = &filer_pb.Entry{
+		Name:       "child",
+		Attributes: &filer_pb.FuseAttributes{FileSize: 5},
+		Content:    []byte("child"),
+	}
+	filerImpl.entries["/buckets/b/.uploads/"+uploadID] = &filer_pb.Entry{
+		Name:        uploadID,
+		IsDirectory: true,
+		Extended:    map[string][]byte{s3_constants.ExtMultipartObjectKey: []byte("dst")},
+	}
+
+	r := httptest.NewRequest(http.MethodPut, "/b/dst?partNumber=1&uploadId="+uploadID, nil)
+	r = mux.SetURLVars(r, map[string]string{"bucket": "b", "object": "dst"})
+	r.Header.Set("X-Amz-Copy-Source", "/b/src")
+	w := httptest.NewRecorder()
+	s3a.CopyObjectPartHandler(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("CopyObjectPartHandler on prefix-object source = %d %s, want 200", w.Code, w.Body.String())
+	}
+	wantMd5 := fmt.Sprintf("%x", md5.Sum(content))
+	if !strings.Contains(w.Body.String(), wantMd5) {
+		t.Errorf("response %q does not contain copied part ETag %q", w.Body.String(), wantMd5)
+	}
+}
+

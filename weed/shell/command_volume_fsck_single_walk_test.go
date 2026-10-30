@@ -42,7 +42,6 @@ func singleWalkFsck(t *testing.T, refs []fakeFilerRef, out *bytes.Buffer) (c *co
 		verifyNeedle:             &verify,
 		findMissingChunksInFiler: &findMissing,
 		collection:               &collection,
-		scopedFilerPath:          "/",
 		walkFiler: func(path string, genFn func(context.Context, *filer_pb.FullEntry, chan interface{}) error, saveFn func(chan interface{}) error) error {
 			*walks++
 			ch := make(chan interface{}, len(refs))

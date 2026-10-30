@@ -371,6 +371,8 @@ message ObjectMutation {
     bool touch_mtime = 12;                 // PATCH_EXTENDED: set the entry's Mtime to now (e.g. a metadata-replace copy)
     bool remove_empty_parent = 13;         // DELETE: also remove the parent directory when the delete leaves it empty (best-effort)
     bool keep_remote_object = 14;          // DELETE: leave the object on the mounted remote storage
+    WriteCondition condition = 15;         // optional precondition checked under the transaction lock just before this mutation applies
+    string condition_key = 16;             // entry the condition evaluates against; empty = the mutation's target
 }
 
 // Recompute re-derives a pointer entry (directory/name on the mutation) from the
@@ -391,6 +393,7 @@ message Recompute {
     string demote_key = 7;                 // if set, stamp demote_value on the prior name_to_key target when it changes
     bytes demote_value = 8;                // value for demote_key
     string exclude_name = 9;               // if set, skip this child when scanning (e.g. a version about to be deleted)
+    string only_if_current_name = 10;      // if set, apply only while the pointer's name_to_key value still equals this
 }
 
 // ObjectTransactionRequest applies an ordered list of mutations atomically with
@@ -415,6 +418,7 @@ message ObjectTransactionRequest {
 message ObjectTransactionResponse {
     string error = 1;
     FilerError error_code = 2;
+    optional int32 failed_mutation = 3;  // index of the mutation that failed (its condition or its apply); unset when the request-level condition failed
 }
 
 // PosixLockRange is one advisory byte-range lock. Owner identity is (sid, owner):
@@ -536,8 +540,14 @@ message DeleteEntryRequest {
     bool ignore_recursive_error = 6;
     bool is_from_other_cluster = 7;
     repeated int32 signatures = 8;
-    int64 if_not_modified_after = 9;
+    int64 if_not_modified_after = 9;    // unix time in seconds
     bool keep_remote_object = 10;
+    int64 if_not_modified_after_ns = 11; // unix time in nanoseconds; overrides if_not_modified_after when set
+    // Optional precondition evaluated against the entry atomically with the
+    // delete, under the filer's per-path lock. The request is routed to the
+    // entry's owner filer for the check to be authoritative.
+    map<string, bytes> expected_extended = 12;
+    bool is_moved = 13;             // set on a forwarded request so the owner applies it locally
 }
 
 message DeleteEntryResponse {
@@ -735,6 +745,7 @@ message SubscribeMetadataResponse {
     repeated SubscribeMetadataResponse events = 4; // batch of additional events (backlog catch-up)
     repeated LogFileChunkRef log_file_refs = 5;    // log file chunk refs for client direct-read
     int64 flushed_ts_ns = 6; // local log-buffer flush watermark: everything at or below it is on disk
+    int64 mutation_ts_ns = 7; // metadata mutation commit stamp; ts_ns carries the delivery stream position instead
 }
 message ListMetadataSubscribersRequest {
     repeated string client_types = 1; // optional filter by client type, e.g. "mount"; empty = all
@@ -859,6 +870,7 @@ message CacheRemoteObjectToLocalClusterRequest {
     string name = 2;
     int32 chunk_concurrency = 3; // parallel chunk downloads per file, 0 = default (8)
     int32 download_concurrency = 4; // multipart download concurrency per chunk (if supported by remote storage), 0 = default (5 for S3)
+    int64 max_size = 5; // reject remote objects larger than this before downloading, 0 = no limit
 }
 message CacheRemoteObjectToLocalClusterResponse {
     Entry entry = 1;
@@ -910,6 +922,7 @@ message Lock {
     int64 generation = 5;
     bool is_backup = 6;
     int64 seq = 7;
+    string prev_renew_token = 8;
 }
 message TransferLocksRequest {
     repeated Lock locks = 1;
@@ -924,6 +937,7 @@ message ReplicateLockRequest {
     int64 generation = 5;
     bool is_unlock = 6;
     int64 seq = 7;
+    string prev_renew_token = 8;
 }
 message ReplicateLockResponse {
 }

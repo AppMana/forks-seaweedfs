@@ -55,6 +55,11 @@ func renameLoggedEvents(t *testing.T, server *FilerServer) []*filer_pb.Subscribe
 		if err := proto.Unmarshal(entry.Data, event); err != nil {
 			t.Fatal(err)
 		}
+		// As a subscriber receives it: under its stream position. The
+		// mutation stamp stays in the payload's MutationTsNs, which a rename
+		// reply does not carry.
+		event.TsNs = entry.TsNs
+		event.MutationTsNs = 0
 		events = append(events, event)
 		data = data[4+n:]
 	}

@@ -16,7 +16,7 @@ import (
 func TestKernelAttributeNotificationPreservesDirtyWrites(t *testing.T) {
 	wfs := newInvalidateTestWFS(t)
 	inode := wfs.inodeToPath.Lookup(util.FullPath("/dir/file"), time.Now().Unix(), false, false, 0, false)
-	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "file", Attributes: &filer_pb.FuseAttributes{FileSize: 100}}, 0, 0)
+	fh, _, _, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "file", Attributes: &filer_pb.FuseAttributes{FileSize: 100}}, 0, 0)
 	want := []byte("local-dirty")
 	if err := fh.dirtyPages.AddPage(100, want, false, 2000); err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestForeignSameMtimeContentChangeInvalidatesKernelData(t *testing.T) {
 func TestEntryListenerSeesRefreshedOpenHandle(t *testing.T) {
 	wfs := newInvalidateTestWFS(t)
 	inode := wfs.inodeToPath.Lookup(util.FullPath("/dir/file"), time.Now().Unix(), false, false, 0, false)
-	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "file", Attributes: &filer_pb.FuseAttributes{}}, 0, 0)
+	fh, _, _, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "file", Attributes: &filer_pb.FuseAttributes{}}, 0, 0)
 	called := false
 	wfs.SetEntryChangeListener(func(meta_cache.EntryInvalidation) {
 		called = true

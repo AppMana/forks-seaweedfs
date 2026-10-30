@@ -31,7 +31,7 @@ func TestWriteAfterFutureChunkSurvivesCompaction(t *testing.T) {
 	wfs := newInvalidateTestWFS(t)
 	inode := wfs.inodeToPath.Lookup(util.FullPath("/file"), time.Now().Unix(), false, false, 0, false)
 	old := &filer_pb.FileChunk{FileId: "1,0100000001", Size: 4, ModifiedTsNs: time.Now().Add(time.Hour).UnixNano()}
-	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "file", Attributes: &filer_pb.FuseAttributes{FileSize: 4}, Chunks: []*filer_pb.FileChunk{old}}, 0, 0)
+	fh, _, _, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "file", Attributes: &filer_pb.FuseAttributes{FileSize: 4}, Chunks: []*filer_pb.FileChunk{old}}, 0, 0)
 	r := &timestampRecordingPages{DirtyPages: fh.dirtyPages.randomWriter}
 	fh.dirtyPages.randomWriter = r
 	t.Cleanup(fh.dirtyPages.Destroy)

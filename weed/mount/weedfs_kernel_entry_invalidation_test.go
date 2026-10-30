@@ -83,7 +83,7 @@ func TestCrossDirectoryRenameNotifiesAfterOpenHandleMoves(t *testing.T) {
 	sourceParent := wfs.inodeToPath.Lookup("/source", now, true, false, 0, true)
 	destParent := wfs.inodeToPath.Lookup("/dest", now, true, false, 0, true)
 	inode := wfs.inodeToPath.Lookup("/source/old", now, false, false, 0, true)
-	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "old", Content: []byte("intact"), Attributes: &filer_pb.FuseAttributes{FileSize: 6}}, 0, 0)
+	fh, _, _, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{Name: "old", Content: []byte("intact"), Attributes: &filer_pb.FuseAttributes{FileSize: 6}}, 0, 0)
 	t.Cleanup(fh.dirtyPages.Destroy)
 	notifier := &recordingInodeNotifier{}
 	wfs.fuseServer = notifier

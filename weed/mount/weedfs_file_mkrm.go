@@ -56,20 +56,20 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return fuse.Status(syscall.EEXIST)
 		}
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
-		fileHandle, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
+		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
 			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
-				wfs.ReleaseHandle(fileHandle.fh)
+				wfs.ReleaseHandle(openFh)
 				return code
 			}
 			newEntry = fileHandle.GetEntry().GetEntry()
 		}
 
 		wfs.outputPbEntry(&out.EntryOut, inode, newEntry)
-		out.Fh = uint64(fileHandle.fh)
+		out.Fh = uint64(openFh)
 		out.OpenFlags = 0
 		return fuse.OK
 	}
@@ -105,19 +105,19 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return fuse.EIO
 		}
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
-		fileHandle, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
+		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
 			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
-				wfs.ReleaseHandle(fileHandle.fh)
+				wfs.ReleaseHandle(openFh)
 				return code
 			}
 			newEntry = fileHandle.GetEntry().GetEntry()
 		}
 		wfs.outputPbEntry(&out.EntryOut, inode, newEntry)
-		out.Fh = uint64(fileHandle.fh)
+		out.Fh = uint64(openFh)
 		out.OpenFlags = 0
 		return fuse.OK
 	} else if code != fuse.OK {
@@ -134,7 +134,20 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	// For deferred creates, bypass AcquireHandle (which calls maybeReadEntry
 	// and would fail since the entry is not yet on the filer or in the meta cache).
 	// We already have the entry from createRegularFile, so create the handle directly.
-	fileHandle, existed := wfs.fhMap.AcquireFileHandle(wfs, inode, newEntry, 0, 0)
+	var fileHandle *FileHandle
+	var openFh FileHandleId
+	var existed, draining bool
+	for {
+		fileHandle, openFh, existed, draining = wfs.fhMap.AcquireFileHandle(wfs, inode, newEntry, 0, 0)
+		if !draining {
+			break
+		}
+		// A prior incarnation's deferred flush is still draining on this
+		// inode; wait for it to release the handle before attaching ours.
+		if !wfs.waitForPendingAsyncFlush(ctx, inode) {
+			return fuse.EINTR
+		}
+	}
 	if existed {
 		// A create is authoritative for the entry it just made, so it takes
 		// effect even on a handle that outlived a previous incarnation.
@@ -157,7 +170,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		}
 	}
 
-	out.Fh = uint64(fileHandle.fh)
+	out.Fh = uint64(openFh)
 	out.OpenFlags = 0
 
 	return fuse.OK
@@ -344,7 +357,7 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		now := time.Now()
 		decremented.Attributes.Ctime = now.Unix()
 		decremented.Attributes.CtimeNs = int32(now.Nanosecond())
-		wfs.syncHardLinkSiblings(sharedInode, decremented, entryFullPath)
+		wfs.syncHardLinkSiblings(ctx, sharedInode, decremented, event.GetTsNs(), entryFullPath)
 	}
 
 	return fuse.OK
@@ -447,7 +460,7 @@ func (wfs *WFS) createRegularFile(ctx context.Context, dirFullPath util.FullPath
 		SkipCheckParentDirectory: true,
 	}
 
-	glog.V(1).Infof("createFile: %v", request)
+	glog.V(1).Infof("createFile: %s", entryFullPath)
 	resp, err := wfs.streamCreateEntry(context.Background(), request)
 	if err != nil {
 		glog.V(0).Infof("createFile %s: %v", entryFullPath, err)

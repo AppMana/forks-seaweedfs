@@ -309,25 +309,29 @@ func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFrom
 			Signatures:         signatures,
 		},
 		// In flight until appended to the local log buffer (see metaLogInflight).
-		TsNs: tsNs,
+		TsNs:         tsNs,
+		MutationTsNs: tsNs,
 	}
 }
 
 func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetadataResponse) {
 	data, err := proto.Marshal(event)
 	if err != nil {
-		glog.Errorf("failed to marshal filer_pb.SubscribeMetadataResponse %+v: %v", event, err)
+		glog.Errorf("failed to marshal filer_pb.SubscribeMetadataResponse %s -> %s ts_ns=%d: %v", filer_pb.MetadataEventSourceFullPath(event), filer_pb.MetadataEventTargetFullPath(event), event.TsNs, err)
 		return
 	}
 
-	positionNs, err := f.LocalMetaLogBuffer.AddDataToBufferAt([]byte(event.Directory), data, event.TsNs)
+	tsNs, err := f.LocalMetaLogBuffer.AddDataToBufferAndGetTs([]byte(event.Directory), data, event.TsNs)
 	if err != nil {
 		glog.Errorf("failed to add data to log buffer for %s: %v", event.Directory, err)
 		return
 	}
+	// The in-memory copy now carries the position the stream assigns it, the
+	// same value subscribers will see delivered.
+	event.TsNs = tsNs
 	// Still before the mutation's caller is answered, and at the position a
 	// reader of this log meets the event.
-	f.dirWriters.note(positionNs, slices.Clone(event.EventNotification.GetSignatures()), ChangedDirectories(event)...)
+	f.dirWriters.note(tsNs, slices.Clone(event.EventNotification.GetSignatures()), ChangedDirectories(event)...)
 
 }
 

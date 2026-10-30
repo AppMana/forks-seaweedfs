@@ -1,10 +1,13 @@
 package command
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -419,6 +422,7 @@ type stubFilerClient struct {
 	filer_pb.SeaweedFilerClient
 	entry     *filer_pb.Entry
 	entries   map[string]*filer_pb.Entry
+	locations *filer_pb.Locations
 	err       error
 	updateErr error
 	lookups   int
@@ -435,6 +439,14 @@ func (c *stubFilerClient) LookupDirectoryEntry(_ context.Context, req *filer_pb.
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: c.entries[req.Directory+"/"+req.Name]}, nil
 	}
 	return &filer_pb.LookupDirectoryEntryResponse{Entry: c.entry}, nil
+}
+
+func (c *stubFilerClient) LookupVolume(_ context.Context, req *filer_pb.LookupVolumeRequest, _ ...grpc.CallOption) (*filer_pb.LookupVolumeResponse, error) {
+	locationsMap := make(map[string]*filer_pb.Locations, len(req.VolumeIds))
+	for _, vid := range req.VolumeIds {
+		locationsMap[vid] = c.locations
+	}
+	return &filer_pb.LookupVolumeResponse{LocationsMap: locationsMap}, nil
 }
 
 func (c *stubFilerClient) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest, _ ...grpc.CallOption) (*filer_pb.UpdateEntryResponse, error) {
@@ -517,6 +529,10 @@ func chunk(fileId, etag string) *filer_pb.FileChunk {
 	return &filer_pb.FileChunk{FileId: fileId, Size: 1024, ETag: etag}
 }
 
+func chunkAt(fileId, etag string, offset int64) *filer_pb.FileChunk {
+	return &filer_pb.FileChunk{FileId: fileId, Offset: offset, Size: 1024, ETag: etag}
+}
+
 func entryWith(name string, remote *filer_pb.RemoteEntry, chunks ...*filer_pb.FileChunk) *filer_pb.Entry {
 	return &filer_pb.Entry{Name: name, Attributes: &filer_pb.FuseAttributes{Mtime: 1786096669}, RemoteEntry: remote, Chunks: chunks}
 }
@@ -532,6 +548,11 @@ func entryWith(name string, remote *filer_pb.RemoteEntry, chunks ...*filer_pb.Fi
 // by chunk identity, the way the filer itself decides which chunks an update
 // leaves for deletion. Content fingerprints would miss a delete-and-recreate
 // of identical bytes and fail the event forever on its dead chunks.
+//
+// Chunks the filer has added since count too. The event was then a snapshot
+// of a write in progress: a mount flushes metadata while chunk uploads are
+// still running, so the snapshot can have holes, and the stream reader stops
+// at the first one on every retry.
 func TestIsSuperseded(t *testing.T) {
 	const dir = "/buckets/ingest"
 	event := entryWith("tmpjt9req69__Alan_Doe_Resume-1.pdf", nil, chunk("3,01", "e1"), chunk("3,02", "e2"))
@@ -549,7 +570,7 @@ func TestIsSuperseded(t *testing.T) {
 		{name: "truncated since", filer: &stubFilerClient{entry: entryWith(event.Name, nil, chunk("3,01", "e1"))}, want: true},
 		{name: "still as described", filer: &stubFilerClient{entry: entryWith(event.Name, nil, chunk("3,01", "e1"), chunk("3,02", "e2"))}, want: false},
 		{name: "still as described, since replicated", filer: &stubFilerClient{entry: entryWith(event.Name, stamped, chunk("3,01", "e1"), chunk("3,02", "e2"))}, want: false},
-		{name: "appended since, chunks still live", filer: &stubFilerClient{entry: entryWith(event.Name, nil, chunk("3,01", "e1"), chunk("3,02", "e2"), chunk("3,03", "e3"))}, want: false},
+		{name: "appended since", filer: &stubFilerClient{entry: entryWith(event.Name, nil, chunk("3,01", "e1"), chunk("3,02", "e2"), chunk("3,03", "e3"))}, want: true},
 		{name: "filer lookup failed", filer: &stubFilerClient{err: errors.New("rpc error: code = Unavailable")}, want: false},
 	}
 	for _, tt := range tests {
@@ -580,6 +601,17 @@ func TestIsSuperseded(t *testing.T) {
 		}
 	})
 
+	t.Run("mid-write snapshot with a hole, filled in since", func(t *testing.T) {
+		snapshot := entryWith("IMG_6526.mov", nil, chunkAt("222,01", "e1", 0), chunkAt("220,03", "e3", 2048))
+		filled := entryWith("IMG_6526.mov", nil, chunkAt("222,01", "e1", 0), chunkAt("216,02", "e2", 1024), chunkAt("220,03", "e3", 2048))
+		if !isSuperseded(&stubFilerClient{entry: filled}, dir, snapshot) {
+			t.Error("isSuperseded = false, want true: the filer holds the finished write, the snapshot can never be read past its hole")
+		}
+		if isSuperseded(&stubFilerClient{entry: filled}, dir, filled) {
+			t.Error("isSuperseded = true, want false for the event that describes the finished write")
+		}
+	})
+
 	t.Run("inline content rewritten since", func(t *testing.T) {
 		event := &filer_pb.Entry{Name: "note.txt", Content: []byte("v1")}
 		if !isSuperseded(&stubFilerClient{entry: &filer_pb.Entry{Name: "note.txt", Content: []byte("v2")}}, dir, event) {
@@ -601,6 +633,121 @@ type failingRemote struct {
 func (r *failingRemote) WriteFile(*remote_pb.RemoteStorageLocation, *filer_pb.Entry, io.Reader) (*filer_pb.RemoteEntry, error) {
 	r.writes++
 	return nil, r.err
+}
+
+// captureRemote records the bytes the upload body produced.
+type captureRemote struct {
+	remote_storage.RemoteStorageClient
+	body []byte
+}
+
+func (r *captureRemote) WriteFile(_ *remote_pb.RemoteStorageLocation, _ *filer_pb.Entry, reader io.Reader) (*filer_pb.RemoteEntry, error) {
+	var err error
+	r.body, err = io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return &filer_pb.RemoteEntry{}, nil
+}
+
+// servingFilerClient answers lookups with entry and volume lookups with a
+// test HTTP server that serves the named chunk contents as raw bodies, the
+// same way a volume server answers a full-chunk read.
+func servingFilerClient(entry *filer_pb.Entry, chunks map[string][]byte) (*stubFilerClient, func()) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if data, ok := chunks[strings.TrimPrefix(r.URL.Path, "/")]; ok {
+			_, _ = w.Write(data)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	client := &stubFilerClient{
+		entry:     entry,
+		locations: &filer_pb.Locations{Locations: []*filer_pb.Location{{Url: strings.TrimPrefix(srv.URL, "http://")}}},
+	}
+	return client, srv.Close
+}
+
+// TestRetriedWriteFileZeroFillsHoles checks that an upload streams the
+// entry's declared size even where no chunk covers a range: a sparse file and
+// a mid-write snapshot read as zeros there, so the remote object holds the
+// same bytes a read of the entry returns, instead of stopping short or
+// skipping the entry's only sync event.
+func TestRetriedWriteFileZeroFillsHoles(t *testing.T) {
+	const dir = "/buckets/ingest"
+	head := bytes.Repeat([]byte{1}, 100)
+	tail := bytes.Repeat([]byte{3}, 100)
+
+	chunked := func(name string) *filer_pb.Entry {
+		entry := entryWith(name, nil,
+			&filer_pb.FileChunk{FileId: "2,01", ETag: "e1", Offset: 0, Size: 100},
+			&filer_pb.FileChunk{FileId: "2,03", ETag: "e3", Offset: 200, Size: 100})
+		entry.Attributes.FileSize = 300
+		return entry
+	}
+	want := append(append(append([]byte{}, head...), make([]byte, 100)...), tail...)
+
+	t.Run("gap between chunks", func(t *testing.T) {
+		entry := chunked("sparse.dat")
+		filerClient, done := servingFilerClient(entry, map[string][]byte{"2,01": head, "2,03": tail})
+		defer done()
+		remote := &captureRemote{}
+		if _, err := retriedWriteFile(remote, filerClient, dir, entry, &remote_pb.RemoteStorageLocation{Name: "b2", Bucket: "tier", Path: "/" + entry.Name}); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !bytes.Equal(remote.body, want) {
+			t.Errorf("body is %d bytes, want 300: data, a zero-filled hole, data", len(remote.body))
+		}
+	})
+
+	t.Run("gap inside a manifest chunk", func(t *testing.T) {
+		manifest, err := proto.Marshal(&filer_pb.FileChunkManifest{Chunks: []*filer_pb.FileChunk{
+			{FileId: "2,01", ETag: "e1", Offset: 0, Size: 100},
+			{FileId: "2,03", ETag: "e3", Offset: 200, Size: 100},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := entryWith("sparse.dat", nil,
+			&filer_pb.FileChunk{FileId: "3,0a", IsChunkManifest: true, Offset: 0, Size: 300})
+		entry.Attributes.FileSize = 300
+		filerClient, done := servingFilerClient(entry, map[string][]byte{"3,0a": manifest, "2,01": head, "2,03": tail})
+		defer done()
+		remote := &captureRemote{}
+		if _, err := retriedWriteFile(remote, filerClient, dir, entry, &remote_pb.RemoteStorageLocation{Name: "b2", Bucket: "tier", Path: "/" + entry.Name}); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !bytes.Equal(remote.body, want) {
+			t.Errorf("body is %d bytes, want 300: data, a zero-filled hole, data", len(remote.body))
+		}
+	})
+
+	t.Run("holed entry with no declared size", func(t *testing.T) {
+		entry := entryWith("sparse.dat", nil,
+			&filer_pb.FileChunk{FileId: "2,01", ETag: "e1", Offset: 0, Size: 100},
+			&filer_pb.FileChunk{FileId: "2,03", ETag: "e3", Offset: 200, Size: 100})
+		filerClient, done := servingFilerClient(entry, map[string][]byte{"2,01": head, "2,03": tail})
+		defer done()
+		remote := &captureRemote{}
+		if _, err := retriedWriteFile(remote, filerClient, dir, entry, &remote_pb.RemoteStorageLocation{Name: "b2", Bucket: "tier", Path: "/" + entry.Name}); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !bytes.Equal(remote.body, want) {
+			t.Errorf("body is %d bytes, want 300: the effective size covers the chunk extent", len(remote.body))
+		}
+	})
+
+	t.Run("chunkless entry uploads zeros to its declared size", func(t *testing.T) {
+		entry := entryWith("truncated.dat", nil)
+		entry.Attributes.FileSize = 100
+		remote := &captureRemote{}
+		if _, err := retriedWriteFile(remote, &stubFilerClient{entry: entry}, dir, entry, &remote_pb.RemoteStorageLocation{Name: "b2", Bucket: "tier", Path: "/" + entry.Name}); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !bytes.Equal(remote.body, make([]byte, 100)) {
+			t.Errorf("body is %d bytes, want 100 zeros", len(remote.body))
+		}
+	})
 }
 
 // TestRetriedWriteFileStopsWhenSuperseded checks that a failed upload asks the
@@ -649,6 +796,39 @@ func TestRetriedWriteFileStopsWhenSuperseded(t *testing.T) {
 		}
 		if filerClient.lookups != 2 {
 			t.Errorf("looked up the filer %d times, want one before the attempt and one after it failed", filerClient.lookups)
+		}
+	})
+
+	t.Run("mid-write snapshot filled in during the attempt, one write", func(t *testing.T) {
+		snapshot := entryWith("IMG_6526.mov", nil, chunkAt("222,01", "e1", 0), chunkAt("220,03", "e3", 2048))
+		filled := entryWith("IMG_6526.mov", nil, chunkAt("222,01", "e1", 0), chunkAt("216,02", "e2", 1024), chunkAt("220,03", "e3", 2048))
+		// What the S3 SDK reports when the stream reader stops at the hole.
+		shortBody := errors.New("RequestError: send request failed\ncaused by: Put \"https://s3.example.com/tier/IMG_6526.mov?partNumber=12\": net/http: HTTP/1.x transport connection broken: http: ContentLength=8388608 with Body length 4194304")
+		remote := &failingRemote{err: shortBody}
+		filerClient := &supersedingFilerClient{live: snapshot, then: filled}
+		_, err := retriedWriteFile(remote, filerClient, dir, snapshot, dest)
+		if !errors.Is(err, errSuperseded) {
+			t.Errorf("err = %v, want errSuperseded", err)
+		}
+		if remote.writes != 1 {
+			t.Errorf("wrote %d times, want 1: the snapshot reads short on every retry", remote.writes)
+		}
+	})
+
+	t.Run("mid-write snapshot still held uploads its hole as zeros", func(t *testing.T) {
+		head := bytes.Repeat([]byte{1}, 1024)
+		tail := bytes.Repeat([]byte{3}, 1024)
+		snapshot := entryWith("IMG_6526.mov", nil, chunkAt("222,01", "e1", 0), chunkAt("220,03", "e3", 2048))
+		snapshot.Attributes.FileSize = 3072
+		filerClient, done := servingFilerClient(snapshot, map[string][]byte{"222,01": head, "220,03": tail})
+		defer done()
+		remote := &captureRemote{}
+		if _, err := retriedWriteFile(remote, filerClient, dir, snapshot, dest); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		want := append(append(append([]byte{}, head...), make([]byte, 1024)...), tail...)
+		if !bytes.Equal(remote.body, want) {
+			t.Errorf("body is %d bytes, want head chunk, a zero-filled hole, then the tail chunk", len(remote.body))
 		}
 	})
 
@@ -993,6 +1173,7 @@ func TestIsFailedPrecondition(t *testing.T) {
 type supersedingFilerClient struct {
 	filer_pb.SeaweedFilerClient
 	live    *filer_pb.Entry
+	then    *filer_pb.Entry // returned after the first lookup; nil means deleted
 	lookups int
 }
 
@@ -1000,6 +1181,9 @@ func (c *supersedingFilerClient) LookupDirectoryEntry(context.Context, *filer_pb
 	c.lookups++
 	if c.lookups == 1 {
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: c.live}, nil
+	}
+	if c.then != nil {
+		return &filer_pb.LookupDirectoryEntryResponse{Entry: c.then}, nil
 	}
 	return nil, filer_pb.ErrNotFound
 }

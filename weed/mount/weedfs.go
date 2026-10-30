@@ -183,6 +183,7 @@ type WFS struct {
 	posixSid              uint64             // this mount's session id, for routed-lock owner identity
 	posixHint             *posixLockHint     // local fcntl-lock hint for routed mode
 	posixOwn              *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
+	fhLocks               fhLockOwners       // non-flock lock owners per open fh, drained at release
 	peerRegistrar         *PeerRegistrar
 	peerDirectory         *PeerDirectory
 	peerGrpcServer        *PeerGrpcServer
@@ -784,7 +785,7 @@ const expiredDirRebuildCooldown = 30 * time.Second
 // It also returns the log position the entry reflects: the entry's stored
 // version, the lookup response's, or zero if unknown.
 func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer.Entry, entryVersion, fuse.Status) {
-	dir, _ := fullpath.DirAndName()
+	dir, name := fullpath.DirAndName()
 	dirPath := util.FullPath(dir)
 	// The kernel holds the parent's lock until this lookup is answered: one
 	// deadline covers the rebuild and the filer lookup below. An interrupt of
@@ -795,8 +796,10 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 
 	// The kernel can serve a directory listing from its page cache past
 	// cacheMetaTtlSec, so ReadDir never runs and EnsureVisited is not called.
-	// Rebuild the expired directory once here so the cache hit below serves
-	// metadata lookups instead of issuing one LookupEntry RPC per entry.
+	// Invalidation, idle eviction, and a kernel Forget also drop a cached
+	// listing without scheduling a rebuild. Rebuild here — once — so the
+	// cache hit below serves metadata lookups instead of issuing one
+	// LookupEntry RPC per entry.
 	if !wfs.metaCache.IsDirectoryCached(dirPath) && wfs.inodeToPath.ShouldRebuildExpiredDir(dirPath, expiredDirRebuildCooldown) {
 		// The rebuild lists the parent from the filer; let any pending async
 		// flush of the target entry land first so the rebuilt cache does not
@@ -823,48 +826,78 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 		}
 	}
 
-	if wfs.metaCache.IsDirectoryCached(dirPath) && wfs.metaCache.IsNameFresh(fullpath) {
-		cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(ctx, fullpath)
-		if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
-			glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
-			return nil, entryVersion{}, fuse.EIO
-		}
-		if cachedEntry != nil {
-			glog.V(4).Infof("lookupEntry cache hit %s", fullpath)
-			// Store versions come from applied events, not an RPC fence.
-			return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
-		}
-		// Re-check: the directory may have been evicted from cache between
-		// our IsDirectoryCached check and FindEntry.
-		// If it's no longer cached, fall through to the filer lookup below.
-		if wfs.metaCache.IsDirectoryCached(dirPath) && wfs.metaCache.IsNameFresh(fullpath) {
-			if handleEntry := wfs.lookupDirtyHandleEntry(fullpath); handleEntry != nil {
-				glog.V(4).Infof("lookupEntry found deferred entry in open handle %s", fullpath)
-				return handleEntry, entryVersion{}, fuse.OK
-			}
-			// Authoritative ENOENT only if inodeToPath also has no record.
-			// If the kernel still tracks this inode, the three layers
-			// disagree; trust the filer over the local cache (the
-			// filer-ErrNotFound branch below logs the confirmed drift).
-			if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); !inodeFound {
-				// The name may be a file another mount has just closed whose
-				// change is still on its way here. Once the listing is current
-				// its answer stands, as it does unverified while the filer
-				// cannot be asked; otherwise ask the filer below.
-				if currency := wfs.awaitDirectoryCurrent(ctx, dirPath); currency.cached && wfs.metaCache.IsNameFresh(fullpath) {
-					cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(context.Background(), fullpath)
-					if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
-						glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
-						return nil, entryVersion{}, fuse.EIO
+	if wfs.metaCache.IsDirectoryCached(dirPath) {
+		if !wfs.metaCache.IsNameFresh(fullpath) {
+			// A burst of remote changes invalidated this name's section, and a
+			// workload that never reads the directory would read through per
+			// entry until one did. Re-validate just that section here so the
+			// lookups after this one are served from the cache again. As with
+			// the rebuild above, let a pending flush land first so the section
+			// refresh cannot capture pre-flush metadata. A failing refresh
+			// backs off under the same cooldown the rebuild gate uses rather
+			// than re-listing the range on every lookup.
+			if sectionLo, stale := meta_cache.StaleRangeOf(wfs.metaCache, dirPath, name); stale && wfs.inodeToPath.ShouldRefreshStaleSection(dirPath, sectionLo, expiredDirRebuildCooldown) {
+				if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+					if !wfs.waitForPendingAsyncFlush(ctx, inode) {
+						return nil, entryVersion{}, fuse.EINTR
 					}
-					if cachedEntry != nil {
-						return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
-					}
-					glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
-					return nil, entryVersion{}, fuse.ENOENT
 				}
-			} else {
-				glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
+				if err := meta_cache.EnsureNameFresh(ctx, wfs.metaCache, wfs, dirPath, name); err != nil {
+					if errors.Is(err, meta_cache.ErrRefreshRangeTooLarge) {
+						// The section outgrew one refresh: drop the cached
+						// listing so a later lookup rebuilds it re-tiled, the
+						// same way ReadDir falls back to read-through.
+						wfs.purgeDirectoryCache(dirPath)
+					} else {
+						wfs.inodeToPath.MarkSectionRefreshAttempt(dirPath, sectionLo, time.Now())
+						glog.V(2).Infof("lookupEntry: refresh stale section of %s: %v", dirPath, err)
+					}
+				}
+			}
+		}
+		if wfs.metaCache.IsNameFresh(fullpath) {
+			cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(ctx, fullpath)
+			if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
+				glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
+				return nil, entryVersion{}, fuse.EIO
+			}
+			if cachedEntry != nil {
+				glog.V(4).Infof("lookupEntry cache hit %s", fullpath)
+				// Store versions come from applied events, not an RPC fence.
+				return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
+			}
+			// Re-check: the directory may have been evicted from cache between
+			// our IsDirectoryCached check and FindEntry.
+			// If it's no longer cached, fall through to the filer lookup below.
+			if wfs.metaCache.IsDirectoryCached(dirPath) && wfs.metaCache.IsNameFresh(fullpath) {
+				if handleEntry := wfs.lookupDirtyHandleEntry(fullpath); handleEntry != nil {
+					glog.V(4).Infof("lookupEntry found deferred entry in open handle %s", fullpath)
+					return handleEntry, entryVersion{}, fuse.OK
+				}
+				// Authoritative ENOENT only if inodeToPath also has no record.
+				// If the kernel still tracks this inode, the three layers
+				// disagree; trust the filer over the local cache (the
+				// filer-ErrNotFound branch below logs the confirmed drift).
+				if _, inodeFound := wfs.inodeToPath.GetInode(fullpath); !inodeFound {
+					// The name may be a file another mount has just closed whose
+					// change is still on its way here. Once the listing is current
+					// its answer stands, as it does unverified while the filer
+					// cannot be asked; otherwise ask the filer below.
+					if currency := wfs.awaitDirectoryCurrent(ctx, dirPath); currency.cached && wfs.metaCache.IsNameFresh(fullpath) {
+						cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(context.Background(), fullpath)
+						if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
+							glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
+							return nil, entryVersion{}, fuse.EIO
+						}
+						if cachedEntry != nil {
+							return cachedEntry, entryVersion{tsNs: cachedVersionTsNs}, fuse.OK
+						}
+						glog.V(4).Infof("lookupEntry cache miss (dir cached) %s", fullpath)
+						return nil, entryVersion{}, fuse.ENOENT
+					}
+				} else {
+					glog.V(2).Infof("lookupEntry: %s missing from cache while parent %s is cached; inode tracked, consulting filer", fullpath, dirPath)
+				}
 			}
 		}
 	}

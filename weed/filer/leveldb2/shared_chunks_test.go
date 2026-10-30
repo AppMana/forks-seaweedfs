@@ -195,7 +195,7 @@ func lockPath(p string) func() {
 
 func deleteObjectErr(f *filer.Filer, path string) error {
 	defer lockPath(path)()
-	return f.DeleteEntryMetaAndData(testCtx(), util.FullPath(path), false, false, true, false, nil, 0)
+	return f.DeleteEntryMetaAndData(testCtx(), util.FullPath(path), false, false, true, false, nil, time.Time{})
 }
 
 func createObject(f *filer.Filer, path string, chunks []*filer_pb.FileChunk, ext map[string][]byte) error {
@@ -610,7 +610,7 @@ func TestSharedChunksRecursiveDeleteOfAFolderHoldingOneLink(t *testing.T) {
 	putObject(t, f, "/buckets/bkt/uploads/u1/startedat", plain, nil)
 	mustLink(t, f, "/buckets/bkt/uploads/u1/data", "/buckets/bkt/blobs/x")
 
-	if err := f.DeleteEntryMetaAndData(testCtx(), "/buckets/bkt/uploads", true, false, true, false, nil, 0); err != nil {
+	if err := f.DeleteEntryMetaAndData(testCtx(), "/buckets/bkt/uploads", true, false, true, false, nil, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	deleted := drainDeleted(f)
@@ -618,7 +618,7 @@ func TestSharedChunksRecursiveDeleteOfAFolderHoldingOneLink(t *testing.T) {
 	assertDeletedOnce(t, deleted, fids(plain), "recursive delete of an unshared file")
 	mustFind(t, f, "/buckets/bkt/blobs/x")
 
-	if err := f.DeleteEntryMetaAndData(testCtx(), "/buckets/bkt/blobs", true, false, true, false, nil, 0); err != nil {
+	if err := f.DeleteEntryMetaAndData(testCtx(), "/buckets/bkt/blobs", true, false, true, false, nil, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	assertDeletedOnce(t, drainDeleted(f), fids(chunks), "recursive delete of the last link")
@@ -754,7 +754,7 @@ func TestSharedChunksDeleteWithEveryStoreWriteFailing(t *testing.T) {
 			mustLink(t, f, "/buckets/bkt/src", "/buckets/bkt/dst")
 
 			fs.arm(n)
-			_ = f.DeleteEntryMetaAndData(testCtx(), "/buckets/bkt/src", false, false, true, false, nil, 0)
+			_ = f.DeleteEntryMetaAndData(testCtx(), "/buckets/bkt/src", false, false, true, false, nil, time.Time{})
 			fs.disarm()
 			live := liveObjects(t, f, []string{"/buckets/bkt/src", "/buckets/bkt/dst"})
 			deleted := drainDeleted(f)

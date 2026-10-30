@@ -2,16 +2,32 @@ package weed_server
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"io"
+	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	s3remote "github.com/seaweedfs/seaweedfs/weed/remote_storage/s3"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 // stubLookup returns a resolver func that maps the supplied hostnames to
@@ -477,34 +493,6 @@ func TestGuardedRemoteClientAzureBuildsGuardedClient(t *testing.T) {
 	}
 }
 
-// TestGcsCredentialsArePath confirms a caller-supplied gcs credentials value is
-// only accepted as inline JSON. A filesystem path would otherwise be read from
-// disk by the SDK when handling the request.
-func TestGcsCredentialsArePath(t *testing.T) {
-	paths := []string{
-		"/etc/hostname",
-		"/etc/shadow",
-		"/nope/nothere",
-		"~/creds.json",
-		"relative/creds.json",
-	}
-	for _, p := range paths {
-		if !gcsCredentialsArePath(p) {
-			t.Errorf("expected %q to be treated as a path", p)
-		}
-	}
-	inlineOrEmpty := []string{
-		"",
-		`{"type":"service_account"}`,
-		`{}`,
-	}
-	for _, c := range inlineOrEmpty {
-		if gcsCredentialsArePath(c) {
-			t.Errorf("expected %q to be accepted (inline or empty)", c)
-		}
-	}
-}
-
 // TestGuardedRemoteClientGuardsGcsTokenURL confirms the token endpoint named by
 // inline gcs credentials is the endpoint the guard validates, so a loopback
 // token_uri is refused while the Google default passes.
@@ -785,5 +773,358 @@ func TestValidateRemoteConfForLoad(t *testing.T) {
 	}
 	if _, err := BuildGuardedRemoteStorageClient(context.Background(), aliyunNoEndpoint, false); err == nil {
 		t.Error("aliyun with empty endpoint should be rejected by the guard")
+	}
+}
+
+// TestGuardedPeerHTTPClientCarriesClusterTLS confirms the replica-upload
+// client borrows the shared global client's TLS configuration — an https
+// volume server expects the https.client cert and CA — while the remote
+// storage client stays on a plain transport.
+func TestGuardedPeerHTTPClientCarriesClusterTLS(t *testing.T) {
+	globalTransport := util_http.GetGlobalHttpClient().GetClientTransport()
+	original := globalTransport.TLSClientConfig
+	globalTransport.TLSClientConfig = &tls.Config{ServerName: "volume-peer.test"}
+	t.Cleanup(func() { globalTransport.TLSClientConfig = original })
+
+	peer := newGuardedPeerHTTPClient("10.0.0.1:8080")
+	if peer.Transport.(*http.Transport).TLSClientConfig != globalTransport.TLSClientConfig {
+		t.Error("peer upload client should share the global TLS config")
+	}
+	if peer.CheckRedirect == nil {
+		t.Error("peer upload client should share the global redirect policy")
+	}
+	if remote := newGuardedHTTPClient("10.0.0.1:8080").Transport.(*http.Transport); remote.TLSClientConfig != nil {
+		t.Error("remote storage client should not carry cluster TLS config")
+	}
+}
+
+// peerIPv4 returns a non-loopback IPv4 of this host — the only kind of
+// address the peer dialer connects to — or skips the test when none exists.
+func peerIPv4(t *testing.T) net.IP {
+	t.Helper()
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("list interface addresses: %v", err)
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip := ipnet.IP.To4(); ip != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
+			return ip
+		}
+	}
+	t.Skip("no non-loopback IPv4 for the peer dialer to reach")
+	return nil
+}
+
+// peerTLSServer runs handler over TLS on a non-loopback IPv4 under a
+// self-signed cert carrying that IP, and returns its host:port plus a pool
+// trusting the cert.
+func peerTLSServer(t *testing.T, handler http.Handler) (string, *x509.CertPool) {
+	t.Helper()
+
+	peerIP := peerIPv4(t)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "volume-peer"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{peerIP},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+
+	listener, err := net.Listen("tcp", net.JoinHostPort(peerIP.String(), "0"))
+	if err != nil {
+		t.Skipf("bind non-loopback %s: %v", peerIP, err)
+	}
+	server := &httptest.Server{
+		Listener: listener,
+		Config:   &http.Server{Handler: handler},
+		TLS:      &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}},
+	}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return listener.Addr().String(), pool
+}
+
+// usePeerCA points the shared global client's transport at pool for the test.
+func usePeerCA(t *testing.T, pool *x509.CertPool) {
+	t.Helper()
+	transport := util_http.GetGlobalHttpClient().GetClientTransport()
+	original := transport.TLSClientConfig
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+	t.Cleanup(func() { transport.TLSClientConfig = original })
+}
+
+// TestGuardedPeerHTTPClientUploadsOverTLS sends a real replicate upload
+// through the guarded peer client to a TLS server — the global client's CA
+// config and the https scheme must carry it, so a hardcoded http:// URL
+// could never reach the handler.
+func TestGuardedPeerHTTPClientUploadsOverTLS(t *testing.T) {
+	var sawReplicate atomic.Bool
+	addr, pool := peerTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			t.Error("peer upload arrived over plaintext")
+		}
+		sawReplicate.Store(r.URL.Query().Get("type") == "replicate")
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	usePeerCA(t, pool)
+
+	uploader := operation.NewUploaderWithHttpClient(newGuardedPeerHTTPClient(addr))
+	data := []byte("needle-data")
+	result, err := uploader.UploadData(t.Context(), data, &operation.UploadOption{
+		UploadUrl:     "https://" + addr + "/1,01637037d6?type=replicate",
+		IsReplication: true,
+	})
+	if err != nil {
+		t.Fatalf("upload to TLS peer: %v", err)
+	}
+	if !sawReplicate.Load() {
+		t.Error("peer never saw a ?type=replicate upload")
+	}
+	if result == nil || result.Size != uint32(len(data)) {
+		t.Errorf("unexpected upload result %+v", result)
+	}
+}
+
+// TestGuardedPeerHTTPClientRejectsHTTPSDowngrade pins the downgrade guard the
+// global client carries: an HTTPS peer answering with a redirect to a
+// reachable http server must fail the upload rather than resend the body and
+// auth header in plaintext. The plaintext target sits on an address the peer
+// dialer accepts, so only the redirect policy can stop the resend.
+func TestGuardedPeerHTTPClientRejectsHTTPSDowngrade(t *testing.T) {
+	var sawPlaintext atomic.Bool
+	plaintext := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPlaintext.Store(true)
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	listener, err := net.Listen("tcp", net.JoinHostPort(peerIPv4(t).String(), "0"))
+	if err != nil {
+		t.Skipf("bind non-loopback plaintext target: %v", err)
+	}
+	plaintext.Listener = listener
+	plaintext.Start()
+	defer plaintext.Close()
+
+	var sawUpload atomic.Bool
+	addr, pool := peerTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawUpload.Store(true)
+		io.Copy(io.Discard, r.Body)
+		http.Redirect(w, r, "http://"+listener.Addr().String()+"/latest/meta-data", http.StatusTemporaryRedirect)
+	}))
+	usePeerCA(t, pool)
+
+	uploader := operation.NewUploaderWithHttpClient(newGuardedPeerHTTPClient(addr))
+	if _, err := uploader.UploadData(t.Context(), []byte("needle-data"), &operation.UploadOption{
+		UploadUrl:     "https://" + addr + "/1,01637037d6?type=replicate",
+		IsReplication: true,
+		MaxAttempts:   1,
+	}); err == nil {
+		t.Error("HTTPS→HTTP redirect must fail the upload, not resend the body in plaintext")
+	}
+	if sawPlaintext.Load() {
+		t.Error("redirect resend reached the plaintext server")
+	}
+	if !sawUpload.Load() {
+		t.Error("HTTPS peer never saw the original upload")
+	}
+}
+
+// guardedCacheTest empties the process-wide remote client cache before and
+// after a test and stubs DNS with a lookup counter.
+func guardedCacheTest(t *testing.T, ips map[string][]net.IP) *atomic.Int64 {
+	t.Helper()
+	remote_storage.ResetRemoteStorageClients()
+	t.Cleanup(remote_storage.ResetRemoteStorageClients)
+	original := lookupIPAddrFunc
+	t.Cleanup(func() { lookupIPAddrFunc = original })
+	var lookups atomic.Int64
+	stub := stubLookup(t, ips)
+	lookupIPAddrFunc = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		lookups.Add(1)
+		return stub(ctx, host)
+	}
+	return &lookups
+}
+
+// The same configuration gets the same client; a rotated key a new one; a loopback endpoint under a cached name is
+// still refused (it is another configuration: a miss, checked when it is built).
+func TestBuildGuardedRemoteStorageClientReusesOneClientPerConf(t *testing.T) {
+	guardedCacheTest(t, nil)
+	conf := &remote_pb.RemoteConf{
+		Name:        "reuse",
+		Type:        "s3",
+		S3Endpoint:  "https://93.184.216.34", // a public address literal: validated without DNS
+		S3AccessKey: "k",
+		S3SecretKey: "s",
+		S3Region:    "us-east-1",
+	}
+	first, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		again, err := BuildGuardedRemoteStorageClient(context.Background(), proto.Clone(conf).(*remote_pb.RemoteConf), false)
+		if err != nil {
+			t.Fatalf("build again: %v", err)
+		}
+		if again != first {
+			t.Fatalf("call %d built a new client for the same configuration", i)
+		}
+	}
+	rotated := proto.Clone(conf).(*remote_pb.RemoteConf)
+	rotated.S3SecretKey = "s2"
+	if next, err := BuildGuardedRemoteStorageClient(context.Background(), rotated, false); err != nil || next == first {
+		t.Errorf("a changed configuration (a rotated key) must get a new client (err %v)", err)
+	}
+	loop := proto.Clone(conf).(*remote_pb.RemoteConf)
+	loop.S3Endpoint = "http://127.0.0.1:8000"
+	if _, err := BuildGuardedRemoteStorageClient(context.Background(), loop, false); err == nil ||
+		!strings.Contains(err.Error(), "reject remote endpoint") {
+		t.Errorf("a loopback endpoint under a cached name must still be rejected, got %v", err)
+	}
+}
+
+// The endpoint's DNS is checked when a client is built (a cache miss), not on every call; the guarded dialer still
+// checks every new connection.
+func TestBuildGuardedRemoteStorageClientResolvesOnlyOnAMiss(t *testing.T) {
+	lookups := guardedCacheTest(t, map[string][]net.IP{"s3.example.test": {net.ParseIP("52.216.10.10")}})
+	conf := &remote_pb.RemoteConf{Name: "dns", Type: "s3", S3Endpoint: "https://s3.example.test",
+		S3AccessKey: "k", S3SecretKey: "s", S3Region: "us-east-1"}
+	for i := 0; i < 10; i++ {
+		if _, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false); err != nil {
+			t.Fatalf("build: %v", err)
+		}
+	}
+	if n := lookups.Load(); n != 1 {
+		t.Fatalf("%d DNS lookups for 10 calls with one configuration, want 1", n)
+	}
+}
+
+// The shared transport keeps a burst's connections for reuse and caps them per host (WEED_REMOTE_MAX_CONNS_PER_HOST).
+func TestGuardedHTTPClientBoundsConnectionsPerHost(t *testing.T) {
+	tr := newGuardedHTTPClient("https://93.184.216.34").Transport.(*http.Transport)
+	if tr.MaxIdleConnsPerHost < 32 || tr.MaxConnsPerHost != 64 {
+		t.Fatalf("MaxIdleConnsPerHost %d (want >= 32), MaxConnsPerHost %d (want 64)", tr.MaxIdleConnsPerHost, tr.MaxConnsPerHost)
+	}
+	t.Setenv("WEED_REMOTE_MAX_CONNS_PER_HOST", "8")
+	if got := newGuardedHTTPClient("https://93.184.216.34").Transport.(*http.Transport).MaxConnsPerHost; got != 8 {
+		t.Fatalf("MaxConnsPerHost %d with WEED_REMOTE_MAX_CONNS_PER_HOST=8", got)
+	}
+}
+
+// A gcs credentials file is part of the key by its content: the same file shares one client, a changed file builds anew.
+func TestBuildGuardedRemoteStorageClientGcsFileCredentialsByContent(t *testing.T) {
+	guardedCacheTest(t, map[string][]net.IP{"oauth2.googleapis.com": {net.ParseIP("142.250.0.95")}})
+	credsFile := filepath.Join(t.TempDir(), "service-account.json")
+	write := func(email string) {
+		creds := `{"type":"service_account","token_uri":"https://oauth2.googleapis.com/token","client_email":"` + email + `","private_key":"-----BEGIN PRIVATE KEY-----\nMIIBVwIBADANBgkqhkiG9w0BAQEFAASCAUEwggE9AgEAAkEAxY\n-----END PRIVATE KEY-----\n","private_key_id":"key1"}`
+		if err := os.WriteFile(credsFile, []byte(creds), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("sa@example.iam.gserviceaccount.com")
+	conf := &remote_pb.RemoteConf{Name: "gcsfile", Type: "gcs", GcsGoogleApplicationCredentials: credsFile}
+	first, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	again, _ := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	if again != first {
+		t.Fatal("the same credentials file must share one client")
+	}
+	write("other@example.iam.gserviceaccount.com")
+	if next, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false); err != nil || next == first {
+		t.Fatalf("a changed credentials file must build a new client (err %v)", err)
+	}
+}
+
+// An s3-compatible remote without keys (the SDK's default chain) is keyed by the shared credentials file and the AWS_*
+// variables: unchanged, one client; changed, a new one.
+func TestBuildGuardedRemoteStorageClientS3DefaultChainByCredentials(t *testing.T) {
+	guardedCacheTest(t, nil)
+	shared := filepath.Join(t.TempDir(), "credentials")
+	if err := os.WriteFile(shared, []byte("[default]\naws_access_key_id = a\naws_secret_access_key = b\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", shared)
+	conf := &remote_pb.RemoteConf{Name: "chain", Type: "s3", S3Endpoint: "https://93.184.216.34", S3Region: "us-east-1"}
+	first, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if again, _ := BuildGuardedRemoteStorageClient(context.Background(), conf, false); again != first {
+		t.Fatal("unchanged credentials must share one client")
+	}
+	if err := os.WriteFile(shared, []byte("[default]\naws_access_key_id = c\naws_secret_access_key = d\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false); err != nil || next == first {
+		t.Fatalf("a changed shared credentials file must build a new client (err %v)", err)
+	}
+	awsConfig := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(awsConfig, []byte("[default]\nregion = us-east-1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", awsConfig)
+	withConfig, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := os.WriteFile(awsConfig, []byte("[default]\nregion = us-west-2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if next, _ := BuildGuardedRemoteStorageClient(context.Background(), conf, false); next == withConfig {
+		t.Fatal("a changed shared config file must build a new client")
+	}
+	t.Setenv("AWS_PROFILE", "other")
+	prev, _ := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	t.Setenv("AWS_PROFILE", "third")
+	if next, _ := BuildGuardedRemoteStorageClient(context.Background(), conf, false); next == prev {
+		t.Fatal("a changed AWS_PROFILE must build a new client")
+	}
+}
+
+// An s3-compatible remote whose keys come from its type's environment fallback is keyed by them too: a changed variable
+// builds a new client even though nothing in the configuration changed.
+func TestBuildGuardedRemoteStorageClientS3EnvironmentCredentials(t *testing.T) {
+	guardedCacheTest(t, nil)
+	t.Setenv("ALICLOUD_ACCESS_KEY_ID", "a")
+	t.Setenv("ALICLOUD_ACCESS_KEY_SECRET", "b")
+	conf := &remote_pb.RemoteConf{Name: "env", Type: "aliyun", AliyunEndpoint: "https://93.184.216.34"}
+	first, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if again, _ := BuildGuardedRemoteStorageClient(context.Background(), conf, false); again != first {
+		t.Fatal("unchanged environment credentials must share one client")
+	}
+	t.Setenv("ALICLOUD_ACCESS_KEY_SECRET", "c")
+	if next, err := BuildGuardedRemoteStorageClient(context.Background(), conf, false); err != nil || next == first {
+		t.Fatalf("a changed environment credential must build a new client (err %v)", err)
 	}
 }

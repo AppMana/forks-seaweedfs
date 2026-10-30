@@ -135,6 +135,10 @@ func (h *Handler) scanTablesForMaintenance(
 					}
 					continue
 				}
+				if err := state.loadMetadata(ctx, filerClient, bucketName); err != nil {
+					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: cannot load iceberg metadata: %v", bucketName, nsName, tblName, err)
+					continue
+				}
 				if !isIcebergTableEntry(tableEntry.Extended, state.Metadata) {
 					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: not an iceberg table", bucketName, nsName, tblName)
 					continue
@@ -152,7 +156,11 @@ func (h *Handler) scanTablesForMaintenance(
 				}
 				effective := resolveTableConfig(config, state.Metadata.Properties(), maintenance)
 
-				needsWork, err := h.tableNeedsMaintenance(ctx, filerClient, bucketName, tablePath, state, effective, tableOps)
+				// A table whose files cannot be read is skipped for this pass;
+				// the other tables are still evaluated.
+				needsWork, err := guardRead(path.Join(bucketName, tablePath), func() (bool, error) {
+					return h.tableNeedsMaintenance(ctx, filerClient, bucketName, tablePath, state, effective, tableOps)
+				})
 				if err != nil {
 					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: cannot evaluate maintenance need: %v", bucketName, nsName, tblName, err)
 					continue

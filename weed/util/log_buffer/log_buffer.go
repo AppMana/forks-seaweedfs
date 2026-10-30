@@ -558,14 +558,14 @@ func (logBuffer *LogBuffer) AddLogEntryToBuffer(logEntry *filer_pb.LogEntry) err
 }
 
 func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processingTsNs int64) error {
-	_, err := logBuffer.AddDataToBufferAt(partitionKey, data, processingTsNs)
+	_, err := logBuffer.AddDataToBufferAndGetTs(partitionKey, data, processingTsNs)
 	return err
 }
 
-// AddDataToBufferAt is AddDataToBuffer that also returns the entry's position
-// in the buffer: its TsNs after collision handling, strictly rising in append
-// order.
-func (logBuffer *LogBuffer) AddDataToBufferAt(partitionKey, data []byte, processingTsNs int64) (positionNs int64, err error) {
+// AddDataToBufferAndGetTs appends like AddDataToBuffer and returns the
+// position the entry was assigned, bumped past processingTsNs when the
+// buffer must stay monotone.
+func (logBuffer *LogBuffer) AddDataToBufferAndGetTs(partitionKey, data []byte, processingTsNs int64) (int64, error) {
 
 	// An entry this large gets a window to itself, so it will seal and copy one;
 	// wait for the queue to have room before joining the queue for the lock.
@@ -692,7 +692,7 @@ func (logBuffer *LogBuffer) AddDataToBufferAt(partitionKey, data []byte, process
 	}
 
 	logBuffer.offset++
-	return processingTsNs, nil
+	return logEntry.TsNs, nil
 }
 
 func (logBuffer *LogBuffer) IsStopping() bool {

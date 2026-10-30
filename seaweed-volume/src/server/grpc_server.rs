@@ -16,11 +16,14 @@ use crate::pb::filer_pb;
 use crate::pb::master_pb;
 use crate::pb::volume_server_pb;
 use crate::pb::volume_server_pb::volume_server_server::VolumeServer;
+use crate::storage::erasure_coding::ec_bitrot;
 use crate::storage::erasure_coding::ec_shard::{ShardId, shard_id_try_from};
 use crate::storage::erasure_coding::ecj_merge::EcjIdDecoder;
 use crate::storage::needle::needle::{self, Needle};
 use crate::storage::types::*;
-use crate::storage::volume::VolumeSpec;
+use crate::storage::volume::{
+    PREALLOCATE_SUPPORTED, VolumeSpec, allocated_file_size, preallocate_file,
+};
 
 use super::grpc_client::{
     GrpcDialOptions, VolumeServerGrpcClient, connect_channel, connect_channel_guarded,
@@ -57,6 +60,42 @@ fn needle_not_found(needle_id: NeedleId) -> Status {
 /// which arrives as an Unknown-status message.
 fn is_not_leader_status(e: &Status) -> bool {
     e.message().contains("Not current leader")
+}
+
+/// A gRPC error that still carries the ids of shards the rebuild wrote before
+/// failing. The Go shell pulls VolumeEcShardsRebuildResponse out of the status
+/// details so its deferred cleanup keeps the copies the rebuild regenerated
+/// in place instead of deleting them as orphans — a plain error drops the
+/// response holding them. `details` is the serialized google.rpc.Status that
+/// the grpc-status-details-bin trailer carries.
+fn status_internal_with_rebuild_ids(message: String, rebuilt_shard_ids: &[u32]) -> Status {
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct RpcStatus {
+        #[prost(int32, tag = "1")]
+        code: i32,
+        #[prost(string, tag = "2")]
+        message: String,
+        #[prost(message, repeated, tag = "3")]
+        details: Vec<prost_types::Any>,
+    }
+    use prost::Message;
+    let resp = volume_server_pb::VolumeEcShardsRebuildResponse {
+        rebuilt_shard_ids: rebuilt_shard_ids.to_vec(),
+    };
+    let status = RpcStatus {
+        code: tonic::Code::Internal as i32,
+        message: message.clone(),
+        details: vec![prost_types::Any {
+            type_url: "type.googleapis.com/volume_server_pb.VolumeEcShardsRebuildResponse"
+                .to_string(),
+            value: resp.encode_to_vec(),
+        }],
+    };
+    Status::with_details(
+        tonic::Code::Internal,
+        message,
+        status.encode_to_vec().into(),
+    )
 }
 
 /// Deadline from the caller's `grpc-timeout` header (TimeoutValue +
@@ -2067,8 +2106,13 @@ impl VolumeServer for VolumeGrpcService {
         let source_status_before =
             fetch_source_status_before(&mut client, req.volume_id, vid).await;
         let source = SourceVolumeStatus::fetch(&mut client, req.volume_id).await?;
-        let dest = self.plan_copy_destination(&req, vid, &source, had_existing_volume)?;
-        dest.write_note(vid, &req.source_data_node)?;
+        let preallocate_size = self.copy_preallocate_size(&source).await;
+        let dest =
+            self.plan_copy_destination(&req, vid, &source, had_existing_volume, preallocate_size)?;
+        if let Err(e) = dest.write_note(vid, &req.source_data_node) {
+            dest.release_reservation(&self.state.store.read().unwrap());
+            return Err(e);
+        }
 
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<volume_server_pb::VolumeCopyResponse, Status>>(16);
@@ -2079,6 +2123,7 @@ impl VolumeServer for VolumeGrpcService {
             source,
             source_status_before,
             dest,
+            preallocate_size,
             tx,
         };
 
@@ -2088,8 +2133,11 @@ impl VolumeServer for VolumeGrpcService {
             // races a departing caller is the one case where the existing
             // file-only cleanup leaves the volume loaded in memory.
             let mut mounted = false;
-            if let Err(e) = job.run(&mut client, &mut mounted).await {
-                job.cleanup_failed_copy(e, mounted).await;
+            match job.run(&mut client, &mut mounted).await {
+                Ok(()) => job
+                    .dest
+                    .commit_reservation(&job.state.store.read().unwrap()),
+                Err(e) => job.cleanup_failed_copy(e, mounted).await,
             }
         });
 
@@ -3196,63 +3244,215 @@ impl VolumeServer for VolumeGrpcService {
             })?;
         let total_shards = data_shards + parity_shards;
 
-        // Check which shards are missing (check rebuild dir and all other dirs)
-        let mut missing: Vec<u32> = Vec::new();
-        for shard_id in 0..total_shards as u8 {
-            let shard = crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
-                &rebuild_dir,
-                collection,
-                vid,
-                shard_id,
-            );
-            let mut found = std::path::Path::new(&shard.file_name()).exists();
-            if !found {
-                for other_dir in &other_dirs {
-                    let other_shard = crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
-                        other_dir, collection, vid, shard_id,
-                    );
-                    if std::path::Path::new(&other_shard.file_name()).exists() {
-                        found = true;
-                        break;
+        // Discover shard files like Go's findShardFile: the rebuild's own data
+        // and index directories first, then every sibling directory. Track
+        // each present shard's path — a shard the sidecar reclassifies as
+        // corrupt is replaced at ITS discovered path, not at the rebuild dir.
+        let shard_file_path = |dir: &str, shard_id: ShardId| -> String {
+            crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
+                dir, collection, vid, shard_id,
+            )
+            .file_name()
+        };
+        let mut shard_dirs: Vec<String> = vec![rebuild_dir.clone()];
+        if !rebuild_idx_dir.is_empty() && rebuild_idx_dir != rebuild_dir {
+            shard_dirs.push(rebuild_idx_dir.clone());
+        }
+        shard_dirs.extend(other_dirs.iter().cloned());
+
+        let mut found: Vec<Option<String>> = vec![None; total_shards as usize];
+        for shard_id in 0..total_shards as ShardId {
+            found[shard_id as usize] = shard_dirs
+                .iter()
+                .map(|d| shard_file_path(d, shard_id))
+                .find(|p| std::path::Path::new(p).exists());
+        }
+
+        // Load the generation-0 checksum sidecar the way Go's
+        // loadRebuildSidecar does: absent, wrong-generation, or recording no
+        // geometry => Off; a self-integrity, geometry, or manifest failure =>
+        // Invalid; otherwise On.
+        let data_base = crate::storage::volume::volume_file_name(&rebuild_dir, collection, vid);
+        let idx_base = crate::storage::volume::volume_file_name(&rebuild_idx_dir, collection, vid);
+        let sidecar_dir_refs: Vec<&str> = other_dirs.iter().map(|s| s.as_str()).collect();
+        let sidecar_path =
+            ec_bitrot::find_bitrot_sidecar(0, &data_base, &idx_base, &sidecar_dir_refs);
+        let (prot, bitrot_status) = if sidecar_path.is_empty() {
+            (None, ec_bitrot::BitrotStatus::Off)
+        } else {
+            match ec_bitrot::load_bitrot_sidecar(&sidecar_path) {
+                Err(e) => {
+                    tracing::warn!(path = %sidecar_path, error = %e, "bitrot: sidecar self-integrity failed");
+                    (None, ec_bitrot::BitrotStatus::Invalid)
+                }
+                Ok(prot) => {
+                    if prot.generation != 0 || prot.ec_shard_config.is_none() {
+                        (None, ec_bitrot::BitrotStatus::Off)
+                    } else if !ec_bitrot::geometry_matches(
+                        &prot,
+                        data_shards as usize,
+                        parity_shards as usize,
+                        block_size,
+                    ) {
+                        tracing::warn!(path = %sidecar_path, "bitrot: sidecar records a different layout than the rebuild uses");
+                        (None, ec_bitrot::BitrotStatus::Invalid)
+                    } else if let Err(e) = ec_bitrot::validate_manifest(
+                        &prot,
+                        data_shards as usize,
+                        parity_shards as usize,
+                    ) {
+                        tracing::warn!(path = %sidecar_path, error = %e, "bitrot: sidecar manifest invalid");
+                        (None, ec_bitrot::BitrotStatus::Invalid)
+                    } else {
+                        (Some(prot), ec_bitrot::BitrotStatus::On)
                     }
                 }
             }
-            if !found {
-                missing.push(shard_id as u32);
+        };
+        let unsafe_ignore_sidecar = req.unsafe_ignore_sidecar;
+
+        // Present/missing/corrupt classification — mirrors pass 1 of Go's
+        // generateMissingEcFiles plus its bitrot verify-and-exclude.
+        let mut missing: Vec<u32> = Vec::new();
+        let mut corrupt_owned: Vec<(u32, String)> = Vec::new();
+        let mut present = vec![false; total_shards as usize];
+        let mut present_count = 0usize;
+        for shard_id in 0..total_shards as usize {
+            match &found[shard_id] {
+                None => missing.push(shard_id as u32),
+                Some(p) => {
+                    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                    if size == 0 {
+                        // Zero-sized residue is a failed operation's leftover,
+                        // not a shard: exclude it from inputs and regenerate
+                        // over it in place, like a reclassified-corrupt shard.
+                        tracing::warn!(shard = shard_id, path = %p, "zero-sized shard; excluding from rebuild inputs and regenerating");
+                        corrupt_owned.push((shard_id as u32, p.clone()));
+                    } else {
+                        present[shard_id] = true;
+                        present_count += 1;
+                    }
+                }
             }
         }
 
-        if missing.is_empty() {
-            return Ok(Response::new(
-                volume_server_pb::VolumeEcShardsRebuildResponse {
-                    rebuilt_shard_ids: vec![],
-                },
-            ));
+        match bitrot_status {
+            ec_bitrot::BitrotStatus::Invalid => {
+                if !unsafe_ignore_sidecar {
+                    return Err(Status::internal(format!(
+                        "bitrot sidecar for {} is malformed/unverifiable; refusing to rebuild (pass unsafe_ignore_sidecar to override)",
+                        base_name
+                    )));
+                }
+                tracing::warn!(base = %base_name, "bitrot sidecar is malformed/unverifiable; proceeding because unsafe_ignore_sidecar is set");
+            }
+            ec_bitrot::BitrotStatus::On if !unsafe_ignore_sidecar => {
+                let prot = prot.as_ref().unwrap();
+                let mut corrupt: Vec<u32> = Vec::new();
+                for shard_id in 0..total_shards as usize {
+                    if !present[shard_id] {
+                        continue;
+                    }
+                    let Some(entry) = ec_bitrot::shard_checksums(prot, shard_id as u32) else {
+                        continue;
+                    };
+                    let p = found[shard_id].as_ref().unwrap();
+                    match ec_bitrot::verify_shard_file_blocks(p, entry, prot.block_size as i64) {
+                        Err(e) => {
+                            // A read error means we cannot trust this shard as
+                            // a Reed-Solomon input: exclude it rather than
+                            // silently feeding possibly-corrupt bytes into
+                            // reconstruction.
+                            tracing::warn!(shard = shard_id, error = %e, "bitrot: failed to verify present shard; excluding it");
+                            corrupt.push(shard_id as u32);
+                        }
+                        Ok(mismatched) if !mismatched.is_empty() => {
+                            corrupt.push(shard_id as u32);
+                        }
+                        _ => {}
+                    }
+                }
+                if !corrupt.is_empty() {
+                    // Wholesale-mismatch guard (RS-arbiter conservative form):
+                    // localized bitrot touches a few shards; a stale/wrong
+                    // sidecar mismatches more than parity_shards.
+                    if corrupt.len() > parity_shards as usize {
+                        return Err(Status::internal(format!(
+                            "bitrot sidecar suspect for {}: {}/{} present shards mismatch (> parity {}); refusing to rebuild (pass unsafe_ignore_sidecar to override)",
+                            base_name,
+                            corrupt.len(),
+                            present_count,
+                            parity_shards
+                        )));
+                    }
+                    if present_count - corrupt.len() < data_shards as usize {
+                        return Err(Status::internal(format!(
+                            "bitrot: only {} verified-good shards for {}, need {} data shards; sidecar may be stale (pass unsafe_ignore_sidecar to override)",
+                            present_count - corrupt.len(),
+                            base_name,
+                            data_shards
+                        )));
+                    }
+                    for shard_id in corrupt {
+                        tracing::warn!(
+                            shard = shard_id,
+                            "bitrot: present shard fails checksum; excluding from rebuild inputs and regenerating"
+                        );
+                        let p = found[shard_id as usize].take().unwrap();
+                        present[shard_id as usize] = false;
+                        present_count -= 1;
+                        corrupt_owned.push((shard_id, p));
+                    }
+                }
+            }
+            _ => {}
         }
 
-        // Rebuild missing shards, searching all locations for input shards.
-        // Pass other_dirs so shards on sibling disks are found even when the
-        // primary rebuild dir doesn't hold them. This one takes a single flat
-        // list — the shape Go's RebuildEcFiles uses — so unlike the resolvers
-        // above it cannot be handed the rebuild's own index directory
-        // separately, and a split -dir/-dir.idx location keeps its .ecx and
-        // .vif there. Go's additionalDirs carries that directory for the same
-        // reason.
+        // Everything the rebuild (re)writes: genuinely missing plus
+        // reclassified-corrupt. The response — and any failure after this
+        // point — must report the whole set, since the caller keeps copies
+        // the rebuild regenerated in place.
+        let mut rebuilt: Vec<u32> = missing.clone();
+        rebuilt.extend(corrupt_owned.iter().map(|(id, _)| *id));
+        rebuilt.sort_unstable();
+
+        if !rebuilt.is_empty() && present_count < data_shards as usize {
+            return Err(Status::internal(format!(
+                "not enough shards to rebuild {}: found {} shards, need at least {} (data shards), missing shards: {:?}",
+                base_name, present_count, data_shards, rebuilt
+            )));
+        }
+
+        // Rebuild missing and corrupt shards, searching all locations for
+        // input shards. This takes a single flat list — the shape Go's
+        // RebuildEcFiles uses — so unlike the resolvers above it cannot be
+        // handed the rebuild's own index directory separately, and a split
+        // -dir/-dir.idx location keeps its .ecx and .vif there. Go's
+        // additionalDirs carries that directory for the same reason. Nothing
+        // missing skips only the regeneration: a retry after a failed earlier
+        // attempt still owes the .ecx rebuild and the mounted-handle repoint
+        // below.
         let mut rebuild_search_dirs: Vec<String> = other_dirs.clone();
         if !rebuild_idx_dir.is_empty() && rebuild_idx_dir != rebuild_dir {
             rebuild_search_dirs.push(rebuild_idx_dir.clone());
         }
         let other_dir_refs: Vec<&str> = rebuild_search_dirs.iter().map(|s| s.as_str()).collect();
-        crate::storage::erasure_coding::ec_encoder::rebuild_ec_files(
-            &rebuild_dir,
-            collection,
-            vid,
-            &missing,
-            data_shards as usize,
-            parity_shards as usize,
-            &other_dir_refs,
-        )
-        .map_err(|e| Status::internal(format!("RebuildEcFiles: {}", e)))?;
+        if !rebuilt.is_empty() {
+            crate::storage::erasure_coding::ec_encoder::rebuild_ec_files(
+                &rebuild_dir,
+                collection,
+                vid,
+                &missing,
+                &corrupt_owned,
+                data_shards as usize,
+                parity_shards as usize,
+                &other_dir_refs,
+                prot.as_ref().filter(|_| {
+                    bitrot_status == ec_bitrot::BitrotStatus::On && !unsafe_ignore_sidecar
+                }),
+            )
+            .map_err(|e| Status::internal(format!("RebuildEcFiles: {}", e)))?;
+        }
 
         // Rebuild .ecx; use idx_directory with fallback to data directory
         let ecx_base = format!("{}/{}", rebuild_idx_dir, base_name);
@@ -3275,20 +3475,113 @@ impl VolumeServer for VolumeGrpcService {
         }
         ecx_dir_refs.extend(other_dir_refs.iter().copied());
 
-        crate::storage::erasure_coding::ec_encoder::rebuild_ecx_file(
-            &ecx_rebuild_dir,
-            collection,
-            vid,
-            data_shards as usize,
-            block_size,
-            dat_file_size,
-            &ecx_dir_refs,
-        )
-        .map_err(|e| Status::internal(format!("RebuildEcxFile: {}", e)))?;
+        // A mounted volume folds its .ecj into the live .ecx in place —
+        // the same path Go takes under LockDeletionJournal — so readers
+        // searching the open index never watch it get truncated. Only an
+        // unmounted index takes the full regen; nothing holds it open to
+        // interrupt. Either failure still owes the caller the regenerated
+        // ids — the shards are already written and its deferred cleanup
+        // would delete the copies as strays without them.
+        let mut folded = false;
+        {
+            let mut store = self.state.store.write().unwrap_or_else(|e| e.into_inner());
+            let loc_idx = store
+                .locations
+                .iter()
+                .position(|loc| loc.directory == rebuild_dir);
+            if let Some(loc_idx) = loc_idx {
+                if let Some(ev) = store.locations[loc_idx].find_ec_volume_mut(vid) {
+                    let journal_path = ev.ecj_file_name();
+                    ev.rebuild_ecx_from_journal().map_err(|e| {
+                        status_internal_with_rebuild_ids(
+                            format!("RebuildEcxFile: {}", e),
+                            &rebuilt,
+                        )
+                    })?;
+                    folded = true;
+                    // The fold replaced a journal other disks may share:
+                    // repoint their handles before dropping the store lock,
+                    // or their next delete lands on the detached inode.
+                    for (i, loc) in store.locations.iter_mut().enumerate() {
+                        if i == loc_idx {
+                            continue;
+                        }
+                        if let Some(other) = loc.find_ec_volume_mut(vid) {
+                            if std::path::Path::new(&other.ecj_file_name())
+                                == std::path::Path::new(&journal_path)
+                            {
+                                other.adopt_folded_journal().map_err(|e| {
+                                    status_internal_with_rebuild_ids(
+                                        format!("RebuildEcxFile: {}", e),
+                                        &rebuilt,
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !folded {
+            crate::storage::erasure_coding::ec_encoder::rebuild_ecx_file(
+                &ecx_rebuild_dir,
+                collection,
+                vid,
+                data_shards as usize,
+                block_size,
+                dat_file_size,
+                &ecx_dir_refs,
+            )
+            .map_err(|e| {
+                status_internal_with_rebuild_ids(format!("RebuildEcxFile: {}", e), &rebuilt)
+            })?;
+        }
+
+        // Repoint every mounted handle of this volume at the file now on
+        // disk, not just this run's outputs — mirrors Go's repoint loop in
+        // VolumeEcShardsRebuild: a shard an earlier rebuild wrote on another
+        // disk is "present" this run and never re-enters `missing`, yet its
+        // mounted handle still serves the detached inode.
+        {
+            let mut store = self.state.store.write().unwrap_or_else(|e| e.into_inner());
+            for loc_idx in 0..store.locations.len() {
+                let mounted: Vec<ShardId> = match store.locations[loc_idx].find_ec_volume(vid) {
+                    Some(ev) => ev
+                        .shards
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| s.as_ref().map(|_| i as ShardId))
+                        .collect(),
+                    None => continue,
+                };
+                for shard_id in mounted {
+                    if store.locations[loc_idx]
+                        .reopen_ec_shard(vid, shard_id)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    // The mounted disk lost the file and the rebuild wrote it
+                    // elsewhere — or it is unreadable in place. Drop the stale
+                    // handle and remount from whichever local disk holds the
+                    // rebuilt file; a shard that cannot be remounted stays
+                    // unmounted rather than serving replaced bytes.
+                    store.locations[loc_idx].unmount_ec_shards(vid, &[shard_id]);
+                    if let Err(e) = store.mount_ec_shard(vid, collection, shard_id, "") {
+                        tracing::warn!(
+                            "rebuilt ec shard {}.{} left unmounted: {}",
+                            vid.0,
+                            shard_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(Response::new(
             volume_server_pb::VolumeEcShardsRebuildResponse {
-                rebuilt_shard_ids: missing,
+                rebuilt_shard_ids: rebuilt,
             },
         ))
     }
@@ -4987,9 +5280,11 @@ impl VolumeServer for VolumeGrpcService {
                 .map_err(|e| Status::invalid_argument(format!("reject remote endpoint: {}", e)))?;
         }
 
-        // Create remote storage client
+        // One client per configuration: a client built per request kept its
+        // connector's idle connections and never reused them. Mirrors the Go
+        // volume server.
         let client =
-            crate::remote_storage::make_remote_storage_client(remote_conf).map_err(|e| {
+            crate::remote_storage::get_remote_storage_client(remote_conf).map_err(|e| {
                 Status::internal(format!(
                     "get remote client: make remote storage client {}: {}",
                     remote_conf.name, e,
@@ -5075,15 +5370,25 @@ impl VolumeServer for VolumeGrpcService {
                 handles.push(tokio::spawn(async move {
                     let form = reqwest::multipart::Form::new()
                         .part("file", reqwest::multipart::Part::bytes(data_clone));
-                    client_clone
+                    let resp = client_clone
                         .post(&url)
                         .multipart(form)
                         .send()
                         .await
-                        .map(|_| ())
                         .map_err(|e| {
                             format!("remote write needle {} size {}: {}", needle_id, size, e)
-                        })
+                        })?;
+                    if resp.status().is_success() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "remote write needle {} size {}: {} returned status {}",
+                            needle_id,
+                            size,
+                            url,
+                            resp.status()
+                        ))
+                    }
                 }));
             }
         }
@@ -5635,6 +5940,11 @@ struct CopyDestination {
     disk_type: DiskType,
     /// A remote-backed volume only lands its .idx/.vif locally; the .dat stays in the tier.
     has_remote_dat: bool,
+    /// The disk and headroom charge held by reserve_free_location; the copy
+    /// settles it as its bytes land on disk, and a failed copy releases only
+    /// what is still promised.
+    loc_idx: usize,
+    reserved_space: std::sync::atomic::AtomicU64,
 }
 
 impl CopyDestination {
@@ -5649,6 +5959,27 @@ impl CopyDestination {
         std::fs::write(&note_path, format!("copying from {}", source))
             .map_err(|e| Status::internal(format!("write .note for volume {}: {}", vid, e)))?;
         Ok(())
+    }
+
+    /// Bytes the copy put on disk stop needing the headroom charge, so a
+    /// slow copy does not count its own .dat against the free space a
+    /// second reservation needs.
+    fn settle_reservation(&self, store: &crate::storage::store::Store, n: u64) {
+        let n = n.min(self.reserved_space.load(Ordering::Relaxed));
+        if n > 0 {
+            store.commit_free_location(self.loc_idx, n);
+            self.reserved_space.fetch_sub(n, Ordering::Relaxed);
+        }
+    }
+
+    fn release_reservation(&self, store: &crate::storage::store::Store) {
+        store.release_free_location(self.loc_idx, self.reserved_space.swap(0, Ordering::Relaxed));
+    }
+
+    /// The copied bytes are on disk now, so the pending charge ends without
+    /// refunding the cache — the charge and the landed usage cancel out.
+    fn commit_reservation(&self, store: &crate::storage::store::Store) {
+        store.commit_free_location(self.loc_idx, self.reserved_space.swap(0, Ordering::Relaxed));
     }
 }
 
@@ -5684,6 +6015,36 @@ impl VolumeGrpcService {
         Ok(volume_server_client(channel))
     }
 
+    /// Query master for the .dat reservation a copy will make, as Go's
+    /// VolumeCopy does before picking a destination. A remote-backed volume
+    /// lands no .dat, so only a local copy needs the reservation.
+    async fn copy_preallocate_size(&self, source: &SourceVolumeStatus) -> i64 {
+        let has_remote_dat = source
+            .volume_info
+            .as_ref()
+            .map(|vi| !vi.files.is_empty())
+            .unwrap_or(false);
+        if !has_remote_dat {
+            let master = self.state.current_master().await;
+            let grpc_addr = super::heartbeat::to_grpc_address(&master);
+            match super::heartbeat::try_get_master_configuration(
+                &grpc_addr,
+                self.state.outgoing_grpc_tls.as_ref(),
+            )
+            .await
+            {
+                Ok(resp) if resp.volume_preallocate => {
+                    return resp.volume_size_limit_m_b as i64 * 1024 * 1024;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("get master {} configuration: {}", master, e);
+                }
+            }
+        }
+        0
+    }
+
     /// Picks the destination disk and, under the same write lock, drops a
     /// pre-existing local replica so its slot counts as free for the pick.
     fn plan_copy_destination(
@@ -5692,6 +6053,7 @@ impl VolumeGrpcService {
         vid: VolumeId,
         vol_info: &SourceVolumeStatus,
         had_existing_volume: bool,
+        preallocate_size: i64,
     ) -> Result<CopyDestination, Status> {
         let requested_disk_type = if !req.disk_type.is_empty() {
             DiskType::from_string(&req.disk_type)
@@ -5704,17 +6066,24 @@ impl VolumeGrpcService {
             .as_ref()
             .map(|vi| !vi.files.is_empty())
             .unwrap_or(false);
-        let needed_space = if has_remote_dat {
+        let mut needed_space = if has_remote_dat {
             vol_info.idx_file_size
         } else {
             vol_info.dat_file_size
         };
+        if !has_remote_dat && PREALLOCATE_SUPPORTED && preallocate_size as u64 > needed_space {
+            // the .dat reserves the master's volume size limit up front, so
+            // the location must fit the reservation, not just the copied
+            // bytes (Go's neededSpace)
+            needed_space = preallocate_size as u64;
+        }
 
-        // Find a free disk location using Go's Store.FindFreeLocation
+        // Find a free disk location using Go's Store.ReserveFreeLocation
         // semantics; the slot of the replica being replaced counts as free.
-        let (data_base, idx_base, selected_disk_type) = {
+        let ((data_base, idx_base, selected_disk_type), loc_idx) = {
             let mut store = self.state.store.write().unwrap();
-            let Some(loc_idx) = store.find_free_location_predicate(
+            let Some(loc_idx) = store.reserve_free_location(
+                needed_space,
                 |loc| {
                     loc.disk_type == requested_disk_type
                         && loc.available_space.load(Ordering::Relaxed) > needed_space
@@ -5733,9 +6102,12 @@ impl VolumeGrpcService {
                 loc.disk_type.clone(),
             );
             if had_existing_volume {
-                delete_existing_replica(&mut store, vid, vol_info)?;
+                if let Err(e) = delete_existing_replica(&mut store, vid, vol_info) {
+                    store.release_free_location(loc_idx, needed_space);
+                    return Err(e);
+                }
             }
-            selected
+            (selected, loc_idx)
         };
         if had_existing_volume {
             self.state.volume_state_notify.notify_one();
@@ -5751,6 +6123,8 @@ impl VolumeGrpcService {
             idx_base_name,
             disk_type: selected_disk_type,
             has_remote_dat,
+            loc_idx,
+            reserved_space: std::sync::atomic::AtomicU64::new(needed_space),
         })
     }
 }
@@ -5763,6 +6137,7 @@ struct VolumeCopyJob {
     source: SourceVolumeStatus,
     source_status_before: Option<volume_server_pb::VolumeStatusResponse>,
     dest: CopyDestination,
+    preallocate_size: i64,
     tx: tokio::sync::mpsc::Sender<Result<volume_server_pb::VolumeCopyResponse, Status>>,
 }
 
@@ -5792,15 +6167,24 @@ impl VolumeCopyJob {
         };
         let mut throttler = WriteThrottler::new(io_byte_per_second);
 
-        self.preallocate_dat().await?;
+        let dat_on_disk = self.preallocate_dat().await?;
 
+        let dest = &self.dest;
+        let store = &self.state.store;
+        let mut settle = |landed: i64| {
+            if landed > 0 {
+                dest.settle_reservation(&store.read().unwrap(), landed as u64);
+            }
+        };
         let mut progress = CopyProgress {
             tx,
             next_report_target: &mut next_report_target,
             report_interval,
             throttler: &mut throttler,
+            settle: &mut settle,
         };
-        self.transfer_files(client, &mut progress).await?;
+        self.transfer_files(client, &mut progress, dat_on_disk)
+            .await?;
 
         let source_status_after =
             fetch_source_status_after(client, self.req.volume_id, vid, tx).await?;
@@ -5809,64 +6193,39 @@ impl VolumeCopyJob {
             .await
     }
 
-    /// Query master for preallocation settings (matching Go VolumeCopy behavior).
-    async fn preallocate_dat(&self) -> Result<(), Status> {
-        let (state, vid, tx) = (&self.state, self.vid, &self.tx);
+    /// Reserve the .dat's full size up front, matching Go's VolumeCopy
+    /// CreateVolumeFile. Returns the bytes the filesystem actually holds —
+    /// settled at once, since statfs already counts them — which a failed
+    /// fallocate reports as 0 so the write progress settles them instead.
+    async fn preallocate_dat(&self) -> Result<u64, Status> {
         let (data_base_name, has_remote_dat) =
             (&self.dest.data_base_name, self.dest.has_remote_dat);
-        let mut preallocate_size: i64 = 0;
-        if !has_remote_dat {
-            let master = state.current_master().await;
-            let grpc_addr = super::heartbeat::to_grpc_address(&master);
-            // Race the master-configuration RPC against the caller's
-            // response channel: a stalled master (or a slow leader
-            // election) would otherwise hold the task and its .note
-            // past a departing caller, since the per-chunk checks in
-            // copy_file_from_source are never reached.
-            let config = tokio::select! {
-                res = super::heartbeat::try_get_master_configuration(
-                    &grpc_addr,
-                    state.outgoing_grpc_tls.as_ref(),
-                ) => res,
-                _ = tx.closed() => {
-                    return Err(Status::cancelled(format!(
-                        "volume {} copy cancelled by caller",
-                        vid
-                    )));
-                }
-            };
-            match config {
-                Ok(resp) => {
-                    if resp.volume_preallocate {
-                        preallocate_size = resp.volume_size_limit_m_b as i64 * 1024 * 1024;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("get master {} configuration: {}", master, e);
-                }
-            }
-
-            if preallocate_size > 0 {
-                let dat_path = format!("{}.dat", data_base_name);
-                let file = std::fs::File::create(&dat_path).map_err(|e| {
-                    Status::internal(format!(
-                        "create preallocated volume file {}: {}",
-                        dat_path, e
-                    ))
-                })?;
-                file.set_len(preallocate_size as u64).map_err(|e| {
-                    Status::internal(format!("preallocate volume file {}: {}", dat_path, e))
-                })?;
-            }
+        let preallocate_size = self.preallocate_size;
+        if preallocate_size <= 0 || has_remote_dat {
+            return Ok(0);
         }
-        Ok(())
+        let dat_path = format!("{}.dat", data_base_name);
+        let file = std::fs::File::create(&dat_path).map_err(|e| {
+            Status::internal(format!(
+                "create preallocated volume file {}: {}",
+                dat_path, e
+            ))
+        })?;
+        preallocate_file(&file, preallocate_size as u64);
+        let allocated = allocated_file_size(&file);
+        self.dest
+            .settle_reservation(&self.state.store.read().unwrap(), allocated);
+        Ok(allocated)
     }
 
     /// Pull the .dat (unless it stays in the remote tier), .idx and .vif.
+    /// dat_on_disk is how much of the .dat statfs already counts, so only
+    /// writes past it settle the charge.
     async fn transfer_files(
         &self,
         client: &mut VolumeServerGrpcClient,
         progress: &mut CopyProgress<'_>,
+        dat_on_disk: u64,
     ) -> Result<(), Status> {
         let (req, vol_info) = (&self.req, &self.source);
         let (data_base_name, idx_base_name, has_remote_dat) = (
@@ -5874,7 +6233,9 @@ impl VolumeCopyJob {
             &self.dest.idx_base_name,
             self.dest.has_remote_dat,
         );
-        // Copy .dat file
+        // Copy .dat file. Writing in place into the just-preallocated file
+        // keeps its fallocated blocks — truncating would free them at open
+        // and re-spend the headroom as the bytes stream back in.
         if !has_remote_dat {
             let dat_path = format!("{}.dat", data_base_name);
             let dat_modified_ts_ns = copy_file_from_source(
@@ -5887,9 +6248,10 @@ impl VolumeCopyJob {
                     stop_offset: vol_info.dat_file_size,
                     dest_path: &dat_path,
                     ext: ".dat",
-                    is_append: false,
+                    is_append: self.preallocate_size > 0,
                     ignore_source_not_found: true,
                     report_progress: true,
+                    settle_skip: dat_on_disk as i64,
                 },
                 progress,
             )
@@ -5914,6 +6276,7 @@ impl VolumeCopyJob {
                 is_append: false,
                 ignore_source_not_found: false,
                 report_progress: false,
+                settle_skip: 0,
             },
             progress,
         )
@@ -5937,6 +6300,7 @@ impl VolumeCopyJob {
                 is_append: false,
                 ignore_source_not_found: true,
                 report_progress: false,
+                settle_skip: 0,
             },
             progress,
         )
@@ -6106,6 +6470,8 @@ impl VolumeCopyJob {
         let _ = std::fs::remove_file(format!("{}.idx", idx_base_name));
         let _ = std::fs::remove_file(format!("{}.vif", data_base_name));
         let _ = std::fs::remove_file(&note_path);
+        self.dest
+            .release_reservation(&state.store.read().unwrap());
         let _ = tx.send(Err(e)).await;
     }
 }
@@ -6304,6 +6670,9 @@ struct CopyFileSpec<'a> {
     ignore_source_not_found: bool,
     /// Whether this file's bytes are reported back to the caller as progress.
     report_progress: bool,
+    /// Bytes of this file statfs already counts (a fallocated .dat); only
+    /// writes past it settle the copy's headroom charge.
+    settle_skip: i64,
 }
 
 /// Progress reporting and throttling shared by every file of one volume copy.
@@ -6312,6 +6681,8 @@ struct CopyProgress<'a> {
     next_report_target: &'a mut i64,
     report_interval: i64,
     throttler: &'a mut WriteThrottler,
+    /// Settles the headroom charge for bytes newly visible to statfs.
+    settle: &'a mut (dyn FnMut(i64) + Send),
 }
 
 /// Mirrors Go's checkVolumeFileExtension: the client-supplied Ext that
@@ -6363,6 +6734,7 @@ where
         is_append,
         ignore_source_not_found,
         report_progress,
+        settle_skip,
     } = *spec;
     let progress_tx = progress.tx;
     let copy_req = volume_server_pb::CopyFileRequest {
@@ -6421,6 +6793,7 @@ where
 
     let mut progressed_bytes: i64 = 0;
     let mut modified_ts_ns: i64 = 0;
+    let mut settled_bytes: i64 = 0;
 
     // The source stream's message() future is the one await in this loop that
     // can hang indefinitely: a stalled source (slow disk, network partition,
@@ -6455,6 +6828,11 @@ where
             file.write_all(&resp.file_content)
                 .map_err(|e| Status::internal(format!("write file {}: {}", dest_path, e)))?;
             progressed_bytes += resp.file_content.len() as i64;
+            // Writes past settle_skip are new usage statfs can see; the
+            // copy's headroom charge settles as they land.
+            let landed = (progressed_bytes - settle_skip).max(0);
+            (progress.settle)(landed - settled_bytes);
+            settled_bytes = landed;
             // A throttled copy sleeps seconds at a time; wake for a departing
             // caller instead of finishing the nap first.
             tokio::select! {
@@ -8941,12 +9319,14 @@ mod tests {
                 is_append: false,
                 ignore_source_not_found: true,
                 report_progress: true,
+                settle_skip: 0,
             },
             &mut CopyProgress {
                 tx: &tx,
                 next_report_target: &mut next_report_target,
                 report_interval: 128 * 1024 * 1024,
                 throttler: &mut throttler,
+                settle: &mut |_| {},
             },
         )
         .await

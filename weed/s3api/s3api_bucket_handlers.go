@@ -79,19 +79,22 @@ func (s3a *S3ApiServer) ListBucketsHandler(w http.ResponseWriter, r *http.Reques
 
 	var buckets []ListAllMyBucketsEntry
 	var nextToken string
-	// Unauthenticated users should not see any buckets
+	var err error
+	// Unauthenticated users should not see any buckets, unless auth is off:
+	// then every request may use every bucket, so all of them are listed.
 	if identity != nil {
-		var err error
 		if fromIndex, granted := s3a.iam.canListBucketsFromOwnerIndex(r, identity); fromIndex && s3a.bucketOwnerIndexReady() {
 			buckets, nextToken, err = s3a.listBucketsFromOwnerIndex(r, identity, granted, prefix, startAfter, maxBuckets)
 		} else {
 			buckets, nextToken, err = s3a.scanVisibleBuckets(r, identity, prefix, startAfter, maxBuckets)
 		}
-		if err != nil {
-			glog.Errorf("ListBucketsHandler: %v", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return
-		}
+	} else if !s3a.iam.isEnabled() {
+		buckets, nextToken, err = s3a.scanVisibleBuckets(r, nil, prefix, startAfter, maxBuckets)
+	}
+	if err != nil {
+		glog.Errorf("ListBucketsHandler: %v", err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
 	}
 
 	response := ListAllMyBucketsResult{
@@ -152,6 +155,9 @@ func decodeContinuationToken(token string) (string, error) {
 // bucketVisibleToIdentity reports whether ListBuckets should include the bucket:
 // the identity owns it or has explicit permission to list it.
 func (s3a *S3ApiServer) bucketVisibleToIdentity(r *http.Request, bucket, owner string, identity *Identity) bool {
+	if !s3a.iam.isEnabled() {
+		return true
+	}
 	if isBucketOwnedByIdentity(owner, identity) {
 		return true
 	}
@@ -252,7 +258,7 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 	requestHasACL := hasExplicitBucketACL(r)
 	var aclGrantsBytes []byte
 	if requestHasACL {
-		accountId := getAccountId(r)
+		accountId := s3a.ownerAccountId(r)
 		_, grants, errCode := ParseAndValidateAclHeaders(r, s3a.iam, "", accountId, accountId, false)
 		if errCode != s3err.ErrNone {
 			s3err.WriteErrorResponse(w, r, errCode)
@@ -335,7 +341,7 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 		bucketCrtime = entry.Attributes.Crtime
 
 		// Set bucket owner
-		setBucketOwner(r)(entry)
+		s3a.setBucketOwner(r)(entry)
 
 		// S3 folders are implicit: opt the bucket in to empty-folder cleanup.
 		empty_folder_cleanup.SetBucketAllowEmptyFolders(entry, false)
@@ -718,11 +724,22 @@ func hasExplicitBucketACL(r *http.Request) bool {
 }
 
 // setBucketOwner creates a function that sets the bucket owner from the request context
-func setBucketOwner(r *http.Request) func(entry *filer_pb.Entry) {
+func (s3a *S3ApiServer) setBucketOwner(r *http.Request) func(entry *filer_pb.Entry) {
 	currentIdentityId := s3_constants.GetIdentityNameFromContext(r)
+	if identityObj := s3_constants.GetIdentityFromContext(r); identityObj != nil {
+		if identity, ok := identityObj.(*Identity); ok && s3a.iam != nil &&
+			s3a.iam.identityAnonymous != nil && identity.Name == s3a.iam.identityAnonymous.Name {
+			currentIdentityId = ""
+		}
+	}
 	// Record the canonical account id too so GetBucketAcl can report the bucket
 	// owner instead of whoever is reading (e.g. an admin or another account).
+	// Nothing is recorded when auth is off (client-supplied header, untrusted)
+	// or for the anonymous account: those buckets report the admin fallback.
 	accountId := r.Header.Get(s3_constants.AmzAccountId)
+	if accountId == AccountAnonymous.Id || (s3a.iam != nil && !s3a.iam.isEnabled()) {
+		accountId = ""
+	}
 	return func(entry *filer_pb.Entry) {
 		if currentIdentityId == "" && accountId == "" {
 			return
@@ -760,7 +777,7 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 	var bucketCrtime int64
 	if err := s3a.mkdirExclusive(s3a.option.BucketsPath, bucket, func(entry *filer_pb.Entry) {
 		bucketCrtime = entry.Attributes.Crtime
-		setBucketOwner(r)(entry)
+		s3a.setBucketOwner(r)(entry)
 		empty_folder_cleanup.SetBucketAllowEmptyFolders(entry, false)
 	}); err != nil {
 		// In case of a race condition where another request created the bucket
@@ -787,7 +804,7 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 			// we'll set it here to ensure consistency.
 			if entry.Extended == nil || len(entry.Extended[s3_constants.AmzIdentityId]) == 0 {
 				// No owner set, assign current admin as owner
-				setBucketOwner(r)(entry)
+				s3a.setBucketOwner(r)(entry)
 				if updateErr := s3a.updateEntry(s3a.option.BucketsPath, entry); updateErr != nil {
 					glog.Warningf("autoCreateBucket: failed to set owner for existing bucket %s: %v", bucket, updateErr)
 				} else {
@@ -1016,9 +1033,10 @@ func (s3a *S3ApiServer) GetBucketAclHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Report the bucket's owner (recorded at creation or by PutBucketAcl), not the
-	// caller; fall back to the caller only when no owner was persisted. Likewise
-	// return any stored ACL, defaulting to the owner's full-control grant.
-	ownerId := r.Header.Get(s3_constants.AmzAccountId)
+	// caller; an ownerless bucket reports the registry's default owner, the admin
+	// account, rather than the anonymous caller. Likewise return any stored ACL,
+	// defaulting to the owner's full-control grant.
+	ownerId := s3a.ownerAccountId(r)
 	var storedGrants []*s3.Grant
 	if bucketConfig, errCode := s3a.getBucketConfig(bucket); errCode == s3err.ErrNone {
 		storedGrants = parseAclGrants(bucketConfig.ACL)
@@ -1026,6 +1044,8 @@ func (s3a *S3ApiServer) GetBucketAclHandler(w http.ResponseWriter, r *http.Reque
 			ownerId = bucketConfig.Owner
 		}
 	}
+	// Stored grants are reported verbatim: an explicitly saved anonymous
+	// full-control grant must survive a GET-to-PUT round trip unchanged.
 	ownerDisplayName := s3a.iam.GetAccountNameById(ownerId)
 	response := AccessControlPolicy{
 		Owner: CanonicalUser{
@@ -1049,15 +1069,23 @@ func (s3a *S3ApiServer) PutBucketAclHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Get account information for ACL processing
-	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
+	// Without auth the request carries no account; resolve it as PutBucketHandler does.
+	aclAccountId := s3a.ownerAccountId(r)
+
+	// XML ACLs must name the owner GetBucketAcl reports: the stored owner when
+	// the bucket has one, else the request's account — an anonymous request
+	// resolves to the admin account, the registry's default bucket owner.
+	ownerId := aclAccountId
+	if config, errCode := s3a.getBucketConfig(bucket); errCode == s3err.ErrNone && config.Owner != "" {
+		ownerId = config.Owner
+	}
 
 	// Get bucket ownership settings (these would be used for ownership validation in a full implementation)
-	bucketOwnership := ""         // Default/simplified for now - in a full implementation this would be retrieved from bucket config
-	bucketOwnerId := amzAccountId // Simplified - bucket owner is current account
+	bucketOwnership := ""    // Default/simplified for now - in a full implementation this would be retrieved from bucket config
+	bucketOwnerId := ownerId // Simplified - bucket owner is current account
 
 	// Use the existing ACL parsing logic to handle both canned ACLs and XML body
-	grants, errCode := ExtractAcl(r, s3a.iam, bucketOwnership, bucketOwnerId, amzAccountId, amzAccountId)
+	grants, errCode := ExtractAcl(r, s3a.iam, bucketOwnership, bucketOwnerId, ownerId, aclAccountId)
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
@@ -1083,7 +1111,11 @@ func (s3a *S3ApiServer) PutBucketAclHandler(w http.ResponseWriter, r *http.Reque
 			config.ACL = nil
 			config.IsPublicRead = false
 		}
-		config.Owner = amzAccountId
+		// An ACL update never takes over ownership: an ownerless bucket adopts
+		// the ACL's owner so the stored owner and full-control grantee agree.
+		if config.Owner == "" {
+			config.Owner = ownerId
+		}
 		return nil
 	})
 

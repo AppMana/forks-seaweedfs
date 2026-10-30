@@ -128,9 +128,9 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 		// Front). If only unread prefetches are available, evict the newest
 		// (furthest-ahead) unread prefetch from Back, and never let a background
 		// prefetch evict an unread prefetch of the same request scope. A pinned
-		// chunk is taken only by a demand read and only when no download is in
-		// flight to free space: then nothing else will, and streams that each
-		// hold a pin would wait on one another forever.
+		// chunk is taken only by a demand read and only when no download or
+		// read is in flight to free space: then nothing else will, and streams
+		// that each hold a pin would wait on one another forever.
 		var victim *SingleChunkCacher
 		var entry *list.Element
 		pinnedVictim := false
@@ -162,13 +162,24 @@ func (b *ReaderCacheBudget) reserveSelf(s *SingleChunkCacher, size int64) error 
 			}
 		}
 		if entry == nil && (s == nil || !s.isPrefetch) && len(b.reservations) == b.idle.Len() {
+			// A chunk being read frees itself when its read ends, which wakes
+			// this loop; only when none is can nothing but a pinned chunk free.
+			var pinned *SingleChunkCacher
+			var pinnedEntry *list.Element
+			beingRead := false
 			for e := b.idle.Front(); e != nil; e = e.Next() {
 				c := e.Value.(*SingleChunkCacher)
-				if atomic.LoadInt32(&c.readers) == 0 {
-					victim, entry = c, e
-					pinnedVictim = true
+				if atomic.LoadInt32(&c.readers) != 0 {
+					beingRead = true
 					break
 				}
+				if pinned == nil {
+					pinned, pinnedEntry = c, e
+				}
+			}
+			if !beingRead && pinned != nil {
+				victim, entry = pinned, pinnedEntry
+				pinnedVictim = true
 			}
 		}
 		if entry != nil {

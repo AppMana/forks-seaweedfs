@@ -809,7 +809,11 @@ func (s *SingleChunkCacher) destroy() {
 func (s *SingleChunkCacher) readChunkAt(ctx context.Context, buf []byte, offset int64) (n int, err error) {
 	defer func() {
 		s.wg.Done()
-		atomic.AddInt32(&s.readers, -1)
+		if atomic.AddInt32(&s.readers, -1) == 0 {
+			// A budget waiter may have passed over this chunk while it was
+			// being read; it is evictable now.
+			s.budget.notifyChanged()
+		}
 		s.parent.removeConsumed(s)
 	}()
 

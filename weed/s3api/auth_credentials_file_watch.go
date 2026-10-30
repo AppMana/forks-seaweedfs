@@ -35,12 +35,9 @@ func (iam *IdentityAccessManagement) startStaticConfigWatcher(fileName string, i
 		return
 	}
 
-	lastHash, err := hashFileContent(fileName)
-	if err != nil {
-		// Not fatal: the initial load already succeeded or the process would
-		// not be here. A nil hash simply means the first tick reloads once.
-		glog.Warningf("fail to hash config file %s: %v", fileName, err)
-	}
+	// The file can change between the initial load and watcher startup.
+	// Reload on the first tick rather than assuming this content is active.
+	var lastHash []byte
 
 	go func() {
 		ticker := time.NewTicker(interval)

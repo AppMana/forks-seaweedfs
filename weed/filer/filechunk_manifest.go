@@ -435,6 +435,7 @@ func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrin
 			retriedCnt++
 			var localProcessed int
 			var writeErr error
+			done := util_http.BeginReplicaRead(ctx, urlString)
 			shouldRetry, err = util_http.ReadUrlAsStream(ctx, util_http.AppendQueryParameter(urlString, "readDeleted", "true"), jwt, cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
 				// Check for context cancellation during data processing
 				select {
@@ -458,6 +459,11 @@ func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrin
 				localProcessed += writtenCount
 				totalWritten += writtenCount
 			})
+			readErr := err
+			if readErr == nil && writeErr != nil {
+				readErr = writeErr
+			}
+			done(localProcessed, readErr)
 			if writeErr != nil {
 				err = writeErr
 				break

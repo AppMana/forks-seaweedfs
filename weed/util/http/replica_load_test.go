@@ -2,6 +2,8 @@ package http
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -126,3 +128,66 @@ func TestFailedReplicaReadDoesNotLowerLoadScore(t *testing.T) {
 	assertOrder(t, ReachableFirst(urls), urls[1], urls[0])
 }
 
+// A fast error is not evidence of a fast data replica. Otherwise repeated
+// HTTP errors drive the failing host toward the floor and put it first.
+func TestReplicaFailureDoesNotLookFasterThanSuccess(t *testing.T) {
+	forgetUnreachable(t)
+	forgetReplicaLoad(t)
+	recordReadCost("healthy:8080", 50*time.Millisecond, 1<<20)
+	done := beginReplicaRead(context.Background(), "broken:8080")
+	done(0, io.ErrUnexpectedEOF)
+	urls := []string{"http://broken:8080/1,a", "http://healthy:8080/1,a"}
+	assertOrder(t, ReachableFirst(urls), urls[1], urls[0])
+}
+
+func TestReplicaCanceledReadDoesNotRecordCost(t *testing.T) {
+	forgetReplicaLoad(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := beginReplicaRead(ctx, "canceled:8080")
+	cancel()
+	done(1024, ctx.Err())
+	l := loadOf("canceled:8080")
+	if !l.at.IsZero() || l.inflight.Load() != 0 {
+		t.Fatal("cancellation recorded cost or leaked inflight")
+	}
+}
+
+// A failed or zero-byte read (e.g. HTTP 404/500 or early EOF) returns in sub-ms
+// with 0 bytes and must not record a near-zero per-MiB cost that makes the
+// broken replica look faster than healthy peers.
+func TestFailedReplicaReadDoesNotRecordFastCost(t *testing.T) {
+	forgetUnreachable(t)
+	forgetReplicaLoad(t)
+	urls := []string{"http://failing:8080/3,x", "http://good:8080/3,x"}
+	recordReadCost("failing:8080", 100*time.Millisecond, 1<<20)
+	recordReadCost("good:8080", 50*time.Millisecond, 1<<20)
+
+	for i := 0; i < 3; i++ {
+		done := beginReplicaRead(context.Background(), "failing:8080")
+		done(0, errors.New("500 internal server error"))
+	}
+
+	assertOrder(t, ReachableFirst(urls), urls[1], urls[0])
+}
+
+// An unmeasured replica should receive one initial probe (when inflight == 0),
+// but while that first probe is still in flight (costNs == 0 && inflight > 0),
+// concurrent reads must not herd onto the unmeasured replica ahead of a healthy
+// measured peer.
+func TestUnmeasuredReplicaWithProbeInFlightDoesNotHerd(t *testing.T) {
+	forgetUnreachable(t)
+	forgetReplicaLoad(t)
+	urls := []string{"http://measured:8080/3,x", "http://unmeasured:8080/3,x"}
+	recordReadCost("measured:8080", 40*time.Millisecond, 1<<20)
+
+	// With 0 reads in flight, the unmeasured host is probed first.
+	assertOrder(t, ReachableFirst(urls), urls[1], urls[0])
+
+	// While that first probe is in flight on unmeasured:8080, concurrent reads
+	// must prefer the known-healthy measured replica instead of piling 39 reads
+	// onto the unmeasured replica before its first measurement completes.
+	probeDone := beginReplicaRead(context.Background(), "unmeasured:8080")
+	defer probeDone(1<<20, nil)
+
+	assertOrder(t, ReachableFirst(urls), urls[0], urls[1])
+}

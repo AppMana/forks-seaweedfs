@@ -106,6 +106,7 @@ type FilerOptions struct {
 	wholeCacheSizeMB              *int64
 	readerCacheSizeMB             *int64
 	sessionReaderCacheSizeMB      *int64
+	readyCh                       chan struct{}
 	// shutdownCtx, when non-nil, tells startFiler to gracefully shut down its
 	// HTTP/gRPC servers once the ctx is cancelled. Used by integration tests
 	// and by weed mini; nil for standalone weed filer.
@@ -316,6 +317,7 @@ func runFiler(cmd *Command, args []string) bool {
 	// captured before startFiler fills *f.bindIp in place.
 	filerBindIpUnset := *f.bindIp == ""
 	filerAddress := pb.NewServerAddress(*f.ip, *f.port, *f.portGrpc).String()
+	f.readyCh = make(chan struct{})
 	startDelay := time.Duration(2)
 	if *filerStartS3 {
 		filerS3Options.filer = &filerAddress
@@ -329,10 +331,11 @@ func runFiler(cmd *Command, args []string) bool {
 		if *filerS3Options.metricsHttpIp == "" {
 			*filerS3Options.metricsHttpIp = *filerS3Options.bindIp
 		}
-		go func(delay time.Duration) {
+		go func(delay time.Duration, ready <-chan struct{}) {
+			<-ready
 			time.Sleep(delay * time.Second)
 			filerS3Options.startS3Server()
-		}(startDelay)
+		}(startDelay, f.readyCh)
 		startDelay++
 	}
 
@@ -344,10 +347,11 @@ func runFiler(cmd *Command, args []string) bool {
 			filerWebDavOptions.disk = f.diskType
 		}
 
-		go func(delay time.Duration) {
+		go func(delay time.Duration, ready <-chan struct{}) {
+			<-ready
 			time.Sleep(delay * time.Second)
 			filerWebDavOptions.startWebDav()
-		}(startDelay)
+		}(startDelay, f.readyCh)
 		startDelay++
 	}
 
@@ -490,8 +494,11 @@ func (fo *FilerOptions) startFiler() {
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)
 	}
-	if cacheSizeMBForRead > 0 || readerCacheSizeMB > 0 {
+	if cacheSizeMBForRead > 0 || wholeCacheSizeMB > 0 || readerCacheSizeMB > 0 {
 		filerS3Options.sharedReaderCacheBudget = fs.ReaderCacheBudget()
+		if filerS3Options.sessionReaderCacheSizeMB != nil && *filerS3Options.sessionReaderCacheSizeMB <= 0 && fo.sessionReaderCacheSizeMB != nil && *fo.sessionReaderCacheSizeMB > 0 {
+			*filerS3Options.sessionReaderCacheSizeMB = *fo.sessionReaderCacheSizeMB
+		}
 		if !configureEmbeddedS3Scope(&filerS3Options, cacheDirForRead, wholeCacheSizeMB) {
 			filerS3Options.sharedChunkCache = fs.ChunkCache()
 			filerS3Options.sharedReaderCache = fs.ReaderCache()
@@ -499,6 +506,9 @@ func (fo *FilerOptions) startFiler() {
 		filerWebDavOptions.sharedChunkCache = fs.ChunkCache()
 		filerWebDavOptions.sharedReaderCacheBudget = fs.ReaderCacheBudget()
 		filerWebDavOptions.sharedReaderCache = fs.ReaderCache()
+	}
+	if fo.readyCh != nil {
+		close(fo.readyCh)
 	}
 
 	// Serve "//" and ".." paths at their cleaned form instead of letting the mux

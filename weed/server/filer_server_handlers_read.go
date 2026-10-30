@@ -341,7 +341,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		// Matches S3 API behavior. Request context (ctx) is used for metadata operations above.
 		streamCtx, streamCancel := context.WithCancel(context.WithoutCancel(ctx))
 
-		if fs.readerCache != nil && fs.option.DownloadMaxBytesPs == 0 && (fs.option.CacheSizeMBForRead > 0 || fs.option.ReaderCacheSizeMB > 0) {
+		if fs.readerCache != nil && fs.option.DownloadMaxBytesPs == 0 && (fs.option.CacheSizeMBForRead > 0 || fs.option.WholeCacheSizeMBForRead > 0 || fs.option.ReaderCacheSizeMB > 0) {
 			visibleIntervals, err := filer.NonOverlappingVisibleIntervals(streamCtx, fs.filer.MasterClient.GetLookupFileIdFunction(), chunks, offset, offset+size)
 			if err != nil {
 				streamCancel()

@@ -260,4 +260,3 @@ func TestNotifyUpdateEventRecordsBumpedLogPositionInDirectoryChanges(t *testing.
 		t.Fatalf("DirectoryChangePosition(/d) = (%d, %v), want (%d, true)", pos, remembered, event.TsNs)
 	}
 }
-

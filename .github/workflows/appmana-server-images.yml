@@ -2,7 +2,7 @@ name: AppMana large-disk server images
 
 on:
   push:
-    branches: ['merge/upstream-4.48']
+    branches: ['merge/upstream-4.51']
     paths:
       - 'weed/**'
       - 'go.mod'

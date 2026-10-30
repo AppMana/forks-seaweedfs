@@ -2229,12 +2229,8 @@ func (s3a *S3ApiServer) downloadChunkData(ctx context.Context, srcUrl, fileId st
 		return nil, fmt.Errorf("chunk size %d exceeds maximum int32 size", size)
 	}
 	sizeInt := int(size)
-	// Pre-size the receive buffer to the known chunk size so the streaming
-	// callback below does not trigger geometric `append`-grow on a nil slice.
-	// Receiving a 64 MiB chunk through 256 KiB callback ticks would otherwise
-	// allocate ~2x the chunk size, and with concurrent UploadPartCopy requests
-	// (Harbor-style assemble loops) this caused the runaway-RSS pattern in
-	// https://github.com/seaweedfs/seaweedfs/issues/6541.
+	// Preallocate the known chunk size to avoid geometric buffer growth
+	// across streaming callbacks.
 	chunkData := make([]byte, 0, sizeInt)
 	shouldRetry, err := util_http.ReadUrlAsStream(ctx, srcUrl, jwt, nil, false, false, offset, sizeInt, func(data []byte) {
 		chunkData = append(chunkData, data...)

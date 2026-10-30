@@ -168,7 +168,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	if *repairFromReplicas && *c.findMissingChunksInFiler && (*applyPurging || *purgeAbsent) {
 		return fmt.Errorf("-findMissingChunksInFiler -repairMissingFromReplicas cannot be combined with -reallyDeleteFromVolume or -reallyDeleteFilerEntries, which would delete filer entries")
 	}
-	if *maxOrphanPercent < 0 || *maxOrphanPercent > 100 {
+	if math.IsNaN(*maxOrphanPercent) || *maxOrphanPercent < 0 || *maxOrphanPercent > 100 {
 		return fmt.Errorf("-maxOrphanPercent %v is not between 0 and 100", *maxOrphanPercent)
 	}
 
@@ -481,14 +481,8 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 				if errors.Is(resolveErr, context.Canceled) || errors.Is(resolveErr, context.DeadlineExceeded) {
 					return resolveErr
 				}
-				// A single broken manifest used to abort the whole traversal,
-				// leaving the operator with no way to identify orphans without
-				// first fixing the broken file. Instead, record only the
-				// top-level chunk fids (data chunks plus the manifest needles
-				// themselves — sub-chunks behind the unreadable manifest are
-				// unknown), warn, and keep going. The unresolved counter blocks
-				// any purge step downstream so we never delete a sub-chunk we
-				// couldn't account for.
+				// An unreadable manifest hides sub-chunk references. Keep its top-level
+				// fids for reporting and block purging with the unresolved counter.
 				fmt.Fprintf(c.writer, "WARNING: ResolveChunkManifest failed for %s: %v — recording top-level chunk fids only; purging will be disabled\n",
 					util.NewFullPath(entry.Dir, entry.Entry.Name), resolveErr)
 				c.unresolvedManifestEntries.Add(1)

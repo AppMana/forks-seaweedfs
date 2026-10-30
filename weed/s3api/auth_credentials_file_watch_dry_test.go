@@ -7,15 +7,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 )
 
-// The whole point of routing SIGHUP and the file watcher through one function
-// is that they cannot diverge. These tests pin the properties that would
-// silently break if someone re-introduced a second reload path.
-
-// Identity removal is the fork's addition -- upstream's merge is purely
-// additive. Because removal lives inside the shared reload path rather than
-// inside the watcher, an operator sending SIGHUP gets it too. If removal were
-// implemented in the watcher goroutine instead, this test would fail while the
-// watcher tests still passed.
+// SIGHUP and polling must apply the same identity-removal semantics.
 func TestSighupReloadPathAlsoRemovesIdentities(t *testing.T) {
 	configFile := filepath.Join(t.TempDir(), "seaweedfs_s3_config")
 	writeConfigFile(t, configFile, identityConfigJson(

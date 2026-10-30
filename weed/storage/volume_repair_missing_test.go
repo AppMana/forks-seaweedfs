@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"github.com/stretchr/testify/require"
 	"os"
 	"path/filepath"
 	"sync"
@@ -283,3 +285,40 @@ func TestWriteNeedleBlobIfAbsentWaitsForInFlightSyncWrite(t *testing.T) {
 	}
 }
 
+func TestMissingNeedleRepairRejectsLevelDBTombstone(t *testing.T) {
+	for _, reopen := range []bool{false, true} {
+		t.Run(fmt.Sprint("reopen=", reopen), func(t *testing.T) {
+			dir := t.TempDir()
+			open := func() *Volume {
+				v, err := NewVolume(dir, dir, "", 7, NeedleMapLevelDb, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+				require.NoError(t, err)
+				return v
+			}
+			v := open()
+			n := newRandomNeedle(17)
+			offset, _, _, err := v.writeNeedle2(n, true, true, false)
+			require.NoError(t, err)
+			blob, err := v.ReadNeedleBlob(int64(offset), n.Size)
+			require.NoError(t, err)
+			size := n.Size
+			_, err = v.deleteNeedle2(n)
+			require.NoError(t, err)
+			if reopen {
+				v.Close()
+				v = open()
+			}
+			defer v.Close()
+			before, err := os.ReadFile(v.DataFileName() + ".dat")
+			require.NoError(t, err)
+			indexBefore, err := os.ReadFile(v.IndexFileName() + ".idx")
+			require.NoError(t, err)
+			require.ErrorIs(t, v.WriteNeedleBlobIfAbsent(n.Id, blob, size), ErrNeedleAlreadyExists)
+			after, err := os.ReadFile(v.DataFileName() + ".dat")
+			require.NoError(t, err)
+			indexAfter, err := os.ReadFile(v.IndexFileName() + ".idx")
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.Equal(t, indexBefore, indexAfter)
+		})
+	}
+}

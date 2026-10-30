@@ -68,15 +68,8 @@ func (s3a *S3ApiServer) readLocation(locations []*filer_pb.Location) *filer_pb.L
 	return locations[0]
 }
 
-// copyChunkToNewVolume copies one chunk: it assigns a destination volume,
-// avoiding servers that recently stalled, finds a source location the same
-// way, and runs write against them; write abandons an attempt that stops
-// making progress (operation.ProgressWatch). An attempt that fails on a server, the source or the destination, records the
-// server and retries with a new assignment, up to copyChunkAttempts times.
-// Before this a single stalled destination failed the whole copy: Harbor's
-// UploadPartCopy of a large layer returned 500 InternalError when one chunk
-// POST to a stalled volume server timed out awaiting response headers.
-// It returns the assignment the chunk landed on.
+// copyChunkToNewVolume retries failed copies with a new assignment,
+// avoiding recently stalled source and destination servers.
 func (s3a *S3ApiServer) copyChunkToNewVolume(ctx context.Context, sourceFileId, dstPath string, size uint64, write func(ctx context.Context, srcUrl string, assignResult *filer_pb.AssignVolumeResponse) error) (*filer_pb.AssignVolumeResponse, error) {
 	var lastErr error
 	for attempt := 1; attempt <= copyChunkAttempts; attempt++ {

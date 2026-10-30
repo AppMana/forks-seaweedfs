@@ -53,3 +53,30 @@ func TestReplaceVolumeRestoresOldReplicaWhenMountFails(t *testing.T) {
 	require.Equal(t, "old replica", string(n.Data))
 	require.NoDirExists(t, filepath.Dir(replacedVolumeFileName(VolumeFileName(dir, "", int(vid)))))
 }
+
+func TestReplaceVolumePreservesRecoveryBackup(t *testing.T) {
+	dir := t.TempDir()
+	const vid = needle.VolumeId(21)
+	writeReplaceTestVolume(t, dir, vid, "active replica")
+	store := NewStore(nil, "localhost", 8080, 18080, "http://localhost:8080", "store-id",
+		[]string{dir}, []int32{100}, []util.MinFreeSpace{{}}, "",
+		NeedleMapInMemory, []types.DiskType{types.HardDriveType}, nil, 3,
+		stats.DefaultDiskIOProbeConfig())
+	defer store.Close()
+	backup := replacedVolumeFileName(VolumeFileName(dir, "", int(vid)))
+	require.NoError(t, os.MkdirAll(filepath.Dir(backup), 0755))
+	writeReplaceTestVolume(t, filepath.Dir(backup), vid, "recovery replica")
+	before, err := os.ReadFile(backup + ".dat")
+	require.NoError(t, err)
+	staged := StagedVolumeFileName(dir, "", int(vid))
+	require.NoError(t, os.MkdirAll(filepath.Dir(staged), 0755))
+	writeReplaceTestVolume(t, filepath.Dir(staged), vid, "new copy")
+	require.Error(t, store.ReplaceVolume(vid, "", store.Locations[0]))
+	after, err := os.ReadFile(backup + ".dat")
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	n := &needle.Needle{Id: 1, Cookie: 7}
+	_, err = store.ReadVolumeNeedle(vid, n, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "active replica", string(n.Data))
+}

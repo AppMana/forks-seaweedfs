@@ -272,13 +272,8 @@ func sortedNeedleIds(keys []uint64) string {
 	return fmt.Sprint(sorted)
 }
 
-// The master's periodic vacuum can compact volumes during a long filer walk.
-// Every needle after the first garbage moves, the orphan candidates' copied
-// offsets no longer hold them, and the run used to fail with "incomplete fsck
-// for volume N: M needle metadata reads failed".
-// A compaction is not lost metadata: the replica's index is copied again
-// and the candidates are read at their new offsets. A needle deleted and
-// vacuumed away meanwhile is no longer an orphan and is not purged.
+// Compaction during the filer walk requires a fresh index copy.
+// Needles deleted and vacuumed in the meantime must not be purged.
 func TestFsckRereadsNeedleMetadataAfterVolumeCompaction(t *testing.T) {
 	var out bytes.Buffer
 	var a, b *fakeCompactingVolumeServer

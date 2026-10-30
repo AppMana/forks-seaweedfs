@@ -205,13 +205,8 @@ func totalAlloc() int64 {
 	return int64(m.TotalAlloc)
 }
 
-// TestStalledUploadsHoldOnlyTheirAdmittedBytes reproduces the 2026-10-12
-// OOM of seaweedfs-volume-zxa2a5f0: 534 POSTs of 4 MiB chunks in flight
-// (filer writes and ?type=replicate forwards that later failed with
-// "unexpected EOF"), a heap of 5.2 GB while upload admission had reserved
-// about half of that. Upload admission reserved each request's
-// Content-Length; the heap the server holds for them must not exceed that
-// reservation plus a fixed per-request overhead.
+// Stalled uploads must stay within their admission reservation plus
+// a fixed per-request overhead.
 func TestStalledUploadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 	const clients = 24
 	s := newTransferTestServer(t, 0, 1<<30, 0)
@@ -238,11 +233,8 @@ func TestStalledUploadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 	}
 }
 
-// TestStalledRangeReadsHoldOnlyTheirAdmittedBytes covers the read side of the
-// same incident: Harbor's S3 gateways issued Range GETs for 2 MiB halves of
-// 4 MiB needles, then gave up ("broken pipe"). Readers that stop reading must
-// hold no more than their download reservation, and every reservation, and
-// the exported in-flight gauge, must return to zero once the clients are gone.
+// Stalled range reads must stay within their download reservation.
+// Reservations and gauges must return to zero after clients disconnect.
 func TestStalledRangeReadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 	const (
 		clients = 64
@@ -277,11 +269,8 @@ func TestStalledRangeReadsHoldOnlyTheirAdmittedBytes(t *testing.T) {
 	})
 }
 
-// TestTransfersStayWithinAdmissionBudgets is the memlimit plan's invariant:
-// with the upload and download budgets full and more clients queued behind
-// them, all of them stalled, the heap above the idle base stays within the
-// two budgets plus a fixed per-connection overhead. The incident mix: slow
-// 4 MiB chunk uploads and slow 2 MiB range reads at the same time.
+// Concurrent stalled uploads and reads must stay within their combined
+// admission budgets plus a fixed per-connection overhead.
 func TestTransfersStayWithinAdmissionBudgets(t *testing.T) {
 	const (
 		needles       = 8
@@ -320,10 +309,7 @@ func TestTransfersStayWithinAdmissionBudgets(t *testing.T) {
 	}
 }
 
-// TestCompletedTransfersClearInFlightGauges: the in-flight size gauges must
-// report what is reserved now, not the value seen when the last request was
-// admitted. Production showed in_flight_download_size at 24.5 MB with no GET
-// in flight.
+// Completed transfers must release reservations and clear the gauges.
 func TestCompletedTransfersClearInFlightGauges(t *testing.T) {
 	s := newTransferTestServer(t, 1, 1<<30, 1<<30)
 

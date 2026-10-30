@@ -97,11 +97,8 @@ func singleWalkVolumes() map[string]map[uint32]VInfo {
 	}
 }
 
-// Restoring missed writes, reporting orphans and purging them each need the
-// filer's references, and each used to be its own volume.fsck run, so a
-// weekly repair walked a 4M-entry namespace three times. One run must walk it
-// once and do all three. A reference newer than the cutoff still protects
-// its needle from the purge but proves no missed write, so it is not copied.
+// Repair, reporting and purging share one filer walk. New references
+// protect their needles from deletion but do not authorize repair.
 func TestFsckRepairsReportsAndPurgesInOneFilerWalk(t *testing.T) {
 	cutoff := time.Now().Add(-5 * time.Hour).UnixNano()
 	var out bytes.Buffer

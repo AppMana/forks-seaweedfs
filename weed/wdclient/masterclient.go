@@ -188,15 +188,8 @@ type MasterClient struct {
 	// before it is ready to be routed to.
 	announceCh chan struct{}
 
-	// peerUpdates hands ClusterNodeUpdate off to a single worker goroutine so a
-	// slow or stuck callback can never stall the receive loop. OnPeerUpdate is
-	// caller-supplied and does real work: the master's implementation takes
-	// Topo.RaftServerAccessLock and, on the removal path, makes a blocking Ping
-	// to the peer being removed. Calling it inline from the loop that owns
-	// stream.Recv() means one blocked callback freezes every later
-	// VolumeLocation update forever, and the vidMap silently stops tracking new
-	// volumes while raft keeps working. gRPC keepalive cannot detect that: the
-	// goroutine is blocked in application code, not in the transport.
+	// Run callbacks separately so a blocked callback cannot stop volume
+	// location updates on the receive loop.
 	peerUpdates     chan peerUpdate
 	peerUpdatesOnce sync.Once
 }
@@ -211,7 +204,7 @@ type peerUpdate struct {
 // peerUpdateQueueSize bounds the handoff queue. A healthy callback drains this
 // far faster than the master produces cluster node updates; a wedged one fills
 // it, and updates are then dropped with a warning rather than applying
-// backpressure to the receive loop, which is the failure being fixed.
+// backpressure to the receive loop.
 const peerUpdateQueueSize = 128
 
 // startPeerUpdateWorker lazily starts the single worker that invokes
@@ -233,8 +226,7 @@ func (mc *MasterClient) startPeerUpdateWorker() {
 }
 
 // queuePeerUpdate enqueues an update for the worker. It never blocks: if the
-// queue is full the update is dropped, because stalling here would reintroduce
-// the very wedge this indirection exists to prevent.
+// queue is full the update is dropped to keep volume locations current.
 func (mc *MasterClient) queuePeerUpdate(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
 	mc.startPeerUpdateWorker()
 	select {

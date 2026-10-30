@@ -84,20 +84,9 @@ type S3ApiServerOption struct {
 	SharedChunkCache          chunk_cache.ChunkCache
 	SharedReaderCacheBudget   *filer.ReaderCacheBudget
 	SharedReaderCache         *filer.ReaderCache
-	// SurfaceEmptyDirectories makes a listing whose prefix ends in "/" report a
-	// real but empty directory as a zero-byte directory marker, so clients that
-	// probe "<dir>/" to test existence (hadoop-aws getFileStatus, Spark) can see
-	// directories created out of band via mount, mkdir or the filer API.
-	//
-	// Off by default because real S3 cannot produce such a key: it has no
-	// directories, so a prefix whose objects were all deleted simply returns
-	// KeyCount 0. Clients that walk a tree with trailing-slash prefixes assume
-	// every returned key has a non-empty basename, and a synthesised "<dir>/"
-	// key breaks them. docker/distribution's upload purger does
-	// `_, file := path.Split(key); if file[0] == '_'` and panics outright with
-	// "index out of range [0] with length 0", which took Harbor's registry down
-	// on 2026-08-24. Enable only when no S3 client of this gateway walks
-	// prefixes that way.
+	// SurfaceEmptyDirectories exposes empty filer directories as zero-byte
+	// markers for clients such as hadoop-aws. Disabled by default because
+	// implicit directories are not S3 objects.
 	SurfaceEmptyDirectories bool
 	// ShareCopyChunks lets a whole-object CopyObject within an unversioned
 	// bucket give the destination the source's chunks instead of copying the
@@ -165,8 +154,7 @@ type S3ApiServer struct {
 	// Shared ReaderCache used by the S3 GET streaming path. It lives for the
 	// lifetime of the server so that concurrent and repeat reads share a
 	// single in-flight download per chunk, and so that no per-request
-	// teardown waits on context.Background() fetches. The chunkCache field
-	// is nil in this commit; a follow-up wires in an in-memory chunk cache.
+	// teardown waits on context.Background() fetches.
 	readerCache *filer.ReaderCache
 	// stalledServers records the volume servers chunk writes recently stalled
 	// on, so object writes and copies are assigned around them.

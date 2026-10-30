@@ -266,3 +266,78 @@ func TestPrefetchWindowFitsBudgetAndDoesNotEvictNextChunk(t *testing.T) {
 		t.Errorf("total fetches = %d for %d chunks (%.2fx amplification), want %d", total, chunkCount, float64(total)/float64(chunkCount), chunkCount)
 	}
 }
+
+func TestUnalignedRangeStreamDoesNotDropStreamPinOrEvictNextChunk(t *testing.T) {
+	const chunkSize = 64 << 10
+	const sliceSize = 16 << 10
+	const chunkCount = 10
+	const budgetChunks = 4
+
+	var mu sync.Mutex
+	fetches := map[string]int{}
+	rangeFetches := map[string]int{}
+	root := NewReaderCache(64, (*chunk_cache.TieredChunkCache)(nil), func(context.Context, string) ([]string, error) {
+		return []string{"unused"}, nil
+	}, nil, NewReaderCacheBudget(512<<20))
+	defer root.destroy()
+
+	root.fetchChunkDataFn = func(_ context.Context, buffer []byte, _ []string, _ []byte, _ bool, isFullChunk bool, _ int64, fileId string, _ util_http.RefreshUrlsFunc) (int, error) {
+		mu.Lock()
+		if isFullChunk {
+			fetches[fileId]++
+		} else {
+			rangeFetches[fileId]++
+		}
+		mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+		for i := range buffer {
+			buffer[i] = fileId[len(fileId)-1]
+		}
+		return len(buffer), nil
+	}
+
+	scope := root.NewRequestScope(32, int64(budgetChunks*chunkSize))
+	defer scope.ReleaseScope()
+
+	// Simulate an unaligned open-ended Range GET starting at chunkSize/8 (8 KiB into chunk00)
+	startOff := int64(chunkSize / 8)
+	totalSize := int64(chunkSize * chunkCount)
+	rangeSize := totalSize - startOff
+
+	vis := NewIntervalList[*VisibleInterval]()
+	for i := 0; i < chunkCount; i++ {
+		vis.AppendInterval(&Interval[*VisibleInterval]{
+			StartOffset: int64(i * chunkSize),
+			StopOffset:  int64((i + 1) * chunkSize),
+			Value: &VisibleInterval{
+				start:     int64(i * chunkSize),
+				stop:      int64((i + 1) * chunkSize),
+				fileId:    fmt.Sprintf("chunk%02d", i),
+				chunkSize: chunkSize,
+			},
+		})
+	}
+	views := ViewFromVisibleIntervals(vis, startOff, rangeSize)
+	reader := NewChunkReaderAtFromClient(context.Background(), scope, views, totalSize, DefaultPrefetchCount)
+	defer reader.ReleaseStream()
+
+	buf := make([]byte, sliceSize)
+	for off := startOff; off < totalSize; off += int64(len(buf)) {
+		if off+int64(len(buf)) > totalSize {
+			buf = buf[:totalSize-off]
+		}
+		n, err := reader.ReadAt(buf, off)
+		if (err != nil && err != io.EOF) || n != len(buf) {
+			t.Fatalf("read at %d: n=%d want=%d err=%v", off, n, len(buf), err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i < chunkCount; i++ {
+		fid := fmt.Sprintf("chunk%02d", i)
+		if fetches[fid] != 1 {
+			t.Errorf("%s whole fetches = %d, want 1", fid, fetches[fid])
+		}
+	}
+}

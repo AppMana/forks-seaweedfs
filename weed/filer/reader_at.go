@@ -282,6 +282,22 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		n += zero(p, gap.start, gap.length)
 	}
 
+	// If the stream is currently positioned in the first task's chunk (e.g. an
+	// unaligned sequential read straddling a chunk boundary), finish reading
+	// that chunk first so its stream pin and budget slot are released before
+	// advancing to the next chunk(s).
+	if len(tasks) > 1 && !c.readerPattern.IsRandomMode() && c.stream.isPinnedTo(tasks[0].chunk.FileId) {
+		first := tasks[0]
+		copied, readErr := c.readChunkSliceAt(ctx, p[first.bufferStart:first.bufferEnd], first.chunk, nil, first.chunkOffset)
+		ts = max(ts, first.chunk.ModifiedTsNs)
+		if readErr != nil {
+			glog.Errorf("fetching chunk %+v: %v\n", first.chunk, readErr)
+			return n + copied, ts, readErr
+		}
+		n += copied
+		tasks = tasks[1:]
+	}
+
 	// If only one chunk or random access mode, use sequential reading
 	if len(tasks) <= 1 || c.readerPattern.IsRandomMode() {
 		for _, task := range tasks {
@@ -294,6 +310,12 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 			n += copied
 		}
 	} else {
+		// Release any stale pin before starting parallel chunk reads; the final
+		// task in the slice will pin the chunk the stream ends in.
+		if !c.stream.isPinnedTo(tasks[len(tasks)-1].chunk.FileId) {
+			c.readerCache.releaseStream(&c.stream)
+		}
+
 		// Parallel chunk fetching for multiple chunks
 		// This significantly improves throughput when chunks are on different volume servers
 		g, gCtx := errgroup.WithContext(ctx)
@@ -308,10 +330,17 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		}
 		g.SetLimit(concurrency)
 
-		for _, task := range tasks {
+		for i, task := range tasks {
+			isLastTask := i == len(tasks)-1
 			g.Go(func() error {
 				// Read directly into the correct position in the output buffer
-				copied, readErr := c.readChunkSliceAtForParallel(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, task.chunkOffset)
+				var copied int
+				var readErr error
+				if isLastTask {
+					copied, readErr = c.readChunkSliceAt(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, nil, task.chunkOffset)
+				} else {
+					copied, readErr = c.readChunkSliceAtForParallel(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, task.chunkOffset)
+				}
 				task.bytesRead = copied
 				task.modifiedTsNs = task.chunk.ModifiedTsNs
 				return readErr

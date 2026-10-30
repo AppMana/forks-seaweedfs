@@ -218,7 +218,7 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 	var pinnedBytes int64
 	if budgetLimit > 0 {
 		for _, d := range root.downloaders {
-			if (rc == root || d.scope == rc) && atomic.LoadInt32(&d.pins) > 0 {
+			if (rc == root || d.scope == rc) && (atomic.LoadInt32(&d.pins) > 0 || atomic.LoadInt32(&d.readers) > 0) {
 				pinnedBytes += int64(mem.AllocationSize(d.chunkSize))
 			}
 		}
@@ -431,6 +431,16 @@ func (stream *chunkStream) pin(cacher *SingleChunkCacher) (previous *SingleChunk
 	return previous
 }
 
+// isPinnedTo reports whether the stream is currently positioned in fileId.
+func (stream *chunkStream) isPinnedTo(fileId string) bool {
+	if stream == nil {
+		return false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return stream.cacher != nil && stream.cacher.chunkFileId == fileId
+}
+
 // detach unpins the stream from its chunk and returns that chunk for the
 // caller to unpin. A non-nil expected cacher makes the detach conditional on
 // the stream still being positioned in it.
@@ -507,7 +517,8 @@ func (rc *ReaderCache) removeUnpinned(downloader *SingleChunkCacher) (removed bo
 	root := rc.rootOrSelf()
 	root.Lock()
 	removed = root.downloaders[downloader.chunkFileId] == downloader &&
-		atomic.LoadInt32(&downloader.pins) == 0
+		atomic.LoadInt32(&downloader.pins) == 0 &&
+		atomic.LoadInt32(&downloader.readers) == 0
 	if removed {
 		delete(root.downloaders, downloader.chunkFileId)
 	}

@@ -19,6 +19,14 @@ on:
         description: 'Run same-path graceful and process-crash mount cleanup in both registration modes'
         type: boolean
         default: false
+      windows_mount_options:
+        description: 'Extra weed mount flags for the Windows mount lab, e.g. -writebackCache'
+        type: string
+        required: false
+      windows_access_baseline:
+        description: 'Full commit SHA to compare Windows access latency against (hack/appmana/windows-access-regression.sh)'
+        type: string
+        required: false
   push:
     branches: [master, main, 'merge/**']
     paths: ['weed/**', 'docker/Dockerfile.local', 'docker/entrypoint.sh', 'docker/filer.toml', 'test/volume_server/**', 'test/storage_lab/**', 'test/s3/copying/**', 'test/winfsp/**', 'test/winfsp-conformance/**', 'hack/appmana/**', 'go.mod', 'go.sum', '.github/workflows/appmana-storage-reliability.yml']
@@ -448,6 +456,8 @@ jobs:
           SEAWEEDFS_WINDOWS_MOUNT_TRACE: ${{ inputs.windows_trace && '1' || '0' }}
           WINDOWS_MOUNT_MANAGER_PROBE: ${{ inputs.windows_mount_manager_probe && '1' || '0' }}
           WINDOWS_MOUNT_CLEANUP: ${{ inputs.windows_mount_cleanup && '1' || '0' }}
+          SEAWEEDFS_WINDOWS_MOUNT_OPTIONS: ${{ inputs.windows_mount_options }}
+          WINDOWS_ACCESS_BASELINE: ${{ inputs.windows_access_baseline }}
           SEAWEEDFS_WINDOWS_WINFSP_TEST: ${{ runner.temp }}/windows-winfsp.test.exe
           SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
           SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH || env.PINNED_WINFSP_MSI }}
@@ -477,11 +487,20 @@ jobs:
           candidate_sha=$(git rev-parse HEAD)
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o "$SEAWEEDFS_WINDOWS_WINFSP_TEST" ./test/winfsp
+          if [[ -n "$WINDOWS_ACCESS_BASELINE" ]]; then
+            [[ "$WINDOWS_ACCESS_BASELINE" =~ ^[0-9a-f]{40}$ ]]
+            access_baseline="$GITHUB_WORKSPACE/seaweed-access-baseline"
+            git worktree add --detach "$access_baseline" "$WINDOWS_ACCESS_BASELINE"
+            (cd "$access_baseline" && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$WINDOWS_ACCESS_BASELINE" -o "$RUNNER_TEMP/windows-weed-access-baseline.exe" ./weed)
+          fi
           windows_work=$(mktemp -d "$RUNNER_TEMP/windows-mount-work.XXXXXXXX")
           (cd "$windows_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
           export GOWORK="$windows_work/go.work"
           go test ./test/storage_lab/vm -list '^TestWindowsMountLab$' | grep -Fx TestWindowsMountLab
           go test ./test/storage_lab/vm -run '^TestWindowsArtifact' -count=1
+          if [[ -n "$WINDOWS_ACCESS_BASELINE" ]]; then
+            bash hack/appmana/windows-access-regression.sh "$RUNNER_TEMP/windows-weed-access-baseline.exe" "$SEAWEEDFS_WINDOWS_WEED" 2>&1 | tee "$RUNNER_TEMP/windows-access-regression.log"
+          fi
           if [[ "$WINDOWS_MOUNT_MANAGER_PROBE" == '1' ]]; then
             SEAWEEDFS_WINDOWS_MOUNT_SCENARIO=MountManagerDirectoryLifecycle go test ./test/storage_lab/vm -run '^TestWindowsMountLab$' -count=1 -v -timeout=45m 2>&1 | tee "$RUNNER_TEMP/windows-mount-manager-test.log"
           fi
@@ -513,5 +532,7 @@ jobs:
             ${{ runner.temp }}/windows-mount-manager-test.log
             ${{ runner.temp }}/windows-mount-cleanup-*.log
             ${{ runner.temp }}/windows-mount-crash-*.log
+            ${{ runner.temp }}/windows-access-regression.log
+            ${{ runner.temp }}/windows-access-regression.*/
           if-no-files-found: error
           retention-days: 14

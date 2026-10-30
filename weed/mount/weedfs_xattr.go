@@ -1,4 +1,4 @@
-//go:build !freebsd && !windows
+//go:build !freebsd
 
 package mount
 

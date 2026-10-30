@@ -5,8 +5,14 @@ package command
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"net"
 	"testing"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"google.golang.org/grpc"
@@ -213,3 +219,117 @@ func Test_ensureBucketAllowEmptyFolders(t *testing.T) {
 		})
 	}
 }
+
+type oneShotConfigFilerServer struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	calls int
+}
+
+func (s *oneShotConfigFilerServer) GetFilerConfiguration(_ context.Context, _ *filer_pb.GetFilerConfigurationRequest) (*filer_pb.GetFilerConfigurationResponse, error) {
+	s.calls++
+	if s.calls > 1 {
+		return nil, status.Error(codes.Unavailable, "unexpected repeated GetFilerConfiguration call after success")
+	}
+	return &filer_pb.GetFilerConfigurationResponse{Cipher: true, DirBuckets: "/custom-buckets"}, nil
+}
+
+func TestConnectToFilerStopsAfterFirstSuccess(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	srv := &oneShotConfigFilerServer{}
+	grpcServer := pb.NewGrpcServer()
+	filer_pb.RegisterSeaweedFilerServer(grpcServer, srv)
+	go func() { _ = grpcServer.Serve(ln) }()
+	t.Cleanup(grpcServer.Stop)
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	filerAddr := fmt.Sprintf("127.0.0.1:%d.%d", port, port)
+	opt := &MountOptions{filer: &filerAddr}
+
+	addrs, _, cipher, bucketRoot, ok := connectToFiler(opt)
+	if !ok {
+		t.Fatal("connectToFiler failed")
+	}
+	if srv.calls != 1 {
+		t.Fatalf("GetFilerConfiguration calls = %d, want 1", srv.calls)
+	}
+	if len(addrs) != 1 || !cipher || bucketRoot != "/custom-buckets" {
+		t.Fatalf("unexpected connectToFiler result: addrs=%v cipher=%v bucketRoot=%q", addrs, cipher, bucketRoot)
+	}
+}
+
+func TestMountWindowsUsesSharedFilerConnectAndFlags(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "mount_windows.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse mount_windows.go: %v", err)
+	}
+	calls := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			calls[fn.Name] = true
+		case *ast.SelectorExpr:
+			calls[fn.Sel.Name] = true
+		}
+		return true
+	})
+	if calls["GetFilerConfiguration"] {
+		t.Fatal("mount_windows.go still inlines GetFilerConfiguration loop instead of calling connectToFiler")
+	}
+	for _, want := range []string{"connectToFiler", "windowsMountIdentity", "windowsVolumeLabel"} {
+		if !calls[want] {
+			t.Fatalf("mount_windows.go does not call %s", want)
+		}
+	}
+
+	uidVal, gidVal := 544, 18
+	uid, gid := windowsMountIdentity(&MountOptions{windowsUid: &uidVal, windowsGid: &gidVal})
+	if uid != 544 || gid != 18 {
+		t.Fatalf("windowsMountIdentity = (%d, %d), want (544, 18)", uid, gid)
+	}
+	if uid0, gid0 := windowsMountIdentity(&MountOptions{}); uid0 != 0 || gid0 != 0 {
+		t.Fatalf("windowsMountIdentity default = (%d, %d), want (0, 0)", uid0, gid0)
+	}
+
+	filer := "127.0.0.1:8888"
+	root := "/buckets/assets"
+	defaultLabel := "SeaweedFS"
+	empty := ""
+	if got := windowsVolumeLabel(&MountOptions{
+		filer:              &filer,
+		filerMountRootPath: &root,
+		volumeName:         &empty,
+		volumeLabel:        &defaultLabel,
+	}, "S:"); got != "assets" {
+		t.Fatalf("windowsVolumeLabel derived from filer.path = %q, want %q", got, "assets")
+	}
+	explicitName := "Build,Cache"
+	if got := windowsVolumeLabel(&MountOptions{
+		filer:              &filer,
+		filerMountRootPath: &root,
+		volumeName:         &explicitName,
+		volumeLabel:        &defaultLabel,
+	}, "S:"); got != "Build+Cache" {
+		t.Fatalf("windowsVolumeLabel explicit -volumeName = %q, want %q", got, "Build+Cache")
+	}
+	explicitLabel := "LegacyLabel"
+	if got := windowsVolumeLabel(&MountOptions{
+		filer:              &filer,
+		filerMountRootPath: &root,
+		volumeName:         &empty,
+		volumeLabel:        &explicitLabel,
+	}, "S:"); got != "LegacyLabel" {
+		t.Fatalf("windowsVolumeLabel explicit -volumeLabel = %q, want %q", got, "LegacyLabel")
+	}
+}
+
+

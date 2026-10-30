@@ -610,3 +610,51 @@ func newEmptyNeedle(id uint64) *needle.Needle {
 	n.Id = types.Uint64ToNeedleId(id)
 	return n
 }
+
+// checkCompactSource must serialize with in-flight syncWrite/processBatchRun via
+// dataFileSyncLock so it does not observe .dat extended before .idx during the
+// unlocked DataBackend.Sync() window and falsely refuse vacuum.
+func TestCheckCompactSourceWaitsForInFlightSyncWrite(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	t.Cleanup(v.Close)
+
+	if _, _, _, err := v.writeNeedle2(newRandomNeedle(1), true, true, true); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	enteredSync := make(chan struct{})
+	releaseSync := make(chan struct{})
+	v.DataBackend = &blockingSyncBackend{
+		BackendStorageFile: v.DataBackend,
+		enteredSync:        enteredSync,
+		releaseSync:        releaseSync,
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, _, _, writeErr := v.writeNeedle2(newRandomNeedle(2), true, true, true)
+		writeDone <- writeErr
+	}()
+
+	<-enteredSync
+
+	compactDone := make(chan error, 1)
+	go func() {
+		compactDone <- v.CompactByIndex(nil)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	close(releaseSync)
+
+	if writeErr := <-writeDone; writeErr != nil {
+		t.Fatalf("concurrent writeNeedle2 failed: %v", writeErr)
+	}
+	if compactErr := <-compactDone; compactErr != nil {
+		t.Fatalf("CompactByIndex falsely failed during in-flight syncWrite: %v", compactErr)
+	}
+}
+

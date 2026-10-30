@@ -15,6 +15,8 @@ var ErrNeedleAlreadyExists = errors.New("needle already has an index entry")
 // referenced: an absent index alone cannot distinguish loss from vacuumed
 // deletion. Existing live entries AND tombstones are never overwritten.
 func (v *Volume) WriteNeedleBlobIfAbsent(id types.NeedleId, blob []byte, size types.Size) error {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 	if v.nm == nil || v.DataBackend == nil {

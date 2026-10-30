@@ -557,6 +557,11 @@ func TestUploadStallTimeoutScalesWithMeasuredRate(t *testing.T) {
 	if d := uploadStallTimeout(64<<20, 8<<20); d != 64*time.Second {
 		t.Fatalf("stall budget = %v, want 64s", d)
 	}
+	// Non-integer size/bps ratio must not truncate before scaling by uploadStallSlowFactor:
+	// 28MiB at 16MiB/s needs 1.75s, so 8x is 14s (> 10s min wait), not (28/16)*8s = 8s -> 10s.
+	if d := uploadStallTimeout(28<<20, 16<<20); d != 14*time.Second {
+		t.Fatalf("stall budget for 28MiB at 16MiB/s = %v, want 14s", d)
+	}
 	// The same body on a 64MiB/s host gets 8s — under the floor, so clamped.
 	if d := uploadStallTimeout(64<<20, 64<<20); d != uploadStallMinWait {
 		t.Fatalf("stall budget = %v, want the min wait %v", d, uploadStallMinWait)

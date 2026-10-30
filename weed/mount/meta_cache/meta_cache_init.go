@@ -195,7 +195,7 @@ func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 		// up to the positions named.
 		var basis []*filer_pb.FilerDirectoryPosition
 		if mc.positionFn != nil {
-			positions, positionErr := mc.positionFn(ctx, path)
+			positions, positionErr := mc.positionFn(buildCtx, path)
 			if positionErr != nil {
 				glog.V(1).Infof("directory positions %s: %v", path, positionErr)
 			} else {

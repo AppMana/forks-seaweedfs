@@ -8,7 +8,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -180,3 +182,104 @@ func TestMissingNeedleRepairPreservesExistingRecords(t *testing.T) {
 		})
 	}
 }
+
+type blockingSyncBackend struct {
+	backend.BackendStorageFile
+	enteredSync chan struct{}
+	releaseSync chan struct{}
+	syncErr     error
+	hookOnce    sync.Once
+}
+
+func (b *blockingSyncBackend) Sync() error {
+	var err error
+	hooked := false
+	b.hookOnce.Do(func() {
+		hooked = true
+		close(b.enteredSync)
+		<-b.releaseSync
+		err = b.syncErr
+	})
+	if hooked {
+		if err != nil {
+			return err
+		}
+		return b.BackendStorageFile.Sync()
+	}
+	return b.BackendStorageFile.Sync()
+}
+
+// WriteNeedleBlobIfAbsent must acquire dataFileSyncLock so it cannot append a
+// repaired needle to .dat while an in-flight syncWrite/processBatchRun has
+// dropped dataFileAccessLock during DataBackend.Sync() and then have its .dat
+// bytes truncated away if that sync fails and rolls back to the pre-sync offset.
+func TestWriteNeedleBlobIfAbsentWaitsForInFlightSyncWrite(t *testing.T) {
+	dir := t.TempDir()
+	source, err := NewVolume(dir, dir, "", 8, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(source.Close)
+	repairedNeedle := newRandomNeedle(42)
+	repOff, _, _, err := source.writeNeedle2(repairedNeedle, true, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := source.ReadNeedleBlob(int64(repOff), repairedNeedle.Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	v, err := NewVolume(targetDir, targetDir, "", 9, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(v.Close)
+
+	enteredSync := make(chan struct{})
+	releaseSync := make(chan struct{})
+	v.DataBackend = &blockingSyncBackend{
+		BackendStorageFile: v.DataBackend,
+		enteredSync:        enteredSync,
+		releaseSync:        releaseSync,
+		syncErr:            errors.New("simulated fsync failure"),
+	}
+
+	syncWriteDone := make(chan error, 1)
+	go func() {
+		_, _, _, writeErr := v.writeNeedle2(newRandomNeedle(10), true, true, true)
+		syncWriteDone <- writeErr
+	}()
+
+	<-enteredSync
+
+	repairDone := make(chan error, 1)
+	go func() {
+		repairDone <- v.WriteNeedleBlobIfAbsent(repairedNeedle.Id, bytes.Clone(blob), repairedNeedle.Size)
+	}()
+
+	// Give WriteNeedleBlobIfAbsent a chance to enter if it fails to wait on dataFileSyncLock.
+	time.Sleep(30 * time.Millisecond)
+	close(releaseSync)
+
+	if writeErr := <-syncWriteDone; writeErr == nil {
+		t.Fatal("expected syncWrite to fail with injected fsync error")
+	}
+	if repairErr := <-repairDone; repairErr != nil {
+		t.Fatalf("WriteNeedleBlobIfAbsent failed: %v", repairErr)
+	}
+
+	nv, ok := v.nm.Get(repairedNeedle.Id)
+	if !ok {
+		t.Fatal("repaired needle missing from index")
+	}
+	var got needle.Needle
+	if err := got.ReadData(v.DataBackend, nv.Offset.ToActualOffset(), nv.Size, v.Version()); err != nil {
+		t.Fatalf("reading repaired needle failed (truncated by syncWrite rollback?): %v", err)
+	}
+	if !bytes.Equal(got.Data, repairedNeedle.Data) {
+		t.Fatal("repaired needle payload mismatch")
+	}
+}
+

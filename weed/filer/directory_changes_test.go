@@ -215,3 +215,49 @@ func TestLogMetaEventRecordsLogPosition(t *testing.T) {
 		t.Fatalf("leaving out writer 7: %d, want writer 8's position 2000", p8)
 	}
 }
+
+// When notifyUpdateEvent appends an event whose pre-assigned timestamp is behind
+// the log buffer's high-water mark, AddDataToBufferAndGetTs bumps event.TsNs to
+// the monotonic log position. DirectoryChangePosition must record that post-bump
+// log position so LastDirectoryChangeTsNs never lags behind event.TsNs.
+func TestNotifyUpdateEventRecordsBumpedLogPositionInDirectoryChanges(t *testing.T) {
+	f := &Filer{
+		Signature: 42,
+		LocalMetaLogBuffer: log_buffer.NewLogBuffer(
+			"test",
+			time.Hour,
+			func(*log_buffer.LogBuffer, time.Time, time.Time, []byte, int64, int64) {},
+			nil,
+			nil,
+		),
+	}
+	f.dirChanges.reset(1)
+
+	olderTs := f.ReserveEventTsNs()
+	newerTs := f.ReserveEventTsNs()
+
+	ctx, sink := WithMetadataEventSink(context.Background())
+	f.NotifyUpdateEventAt(ctx, nil, &Entry{
+		FullPath: util.FullPath("/d/b"),
+	}, false, false, []int32{8}, newerTs)
+	firstEvent := sink.Last()
+	if firstEvent == nil {
+		t.Fatal("expected first metadata event")
+	}
+
+	f.NotifyUpdateEventAt(ctx, nil, &Entry{
+		FullPath: util.FullPath("/d/a"),
+	}, false, false, []int32{7}, olderTs)
+
+	event := sink.Last()
+	if event == nil {
+		t.Fatal("expected recorded metadata event")
+	}
+	if event.TsNs <= firstEvent.TsNs {
+		t.Fatalf("event.TsNs = %d, want bumped position > %d", event.TsNs, firstEvent.TsNs)
+	}
+	if pos, remembered := f.DirectoryChangePosition("/d"); !remembered || pos != event.TsNs {
+		t.Fatalf("DirectoryChangePosition(/d) = (%d, %v), want (%d, true)", pos, remembered, event.TsNs)
+	}
+}
+

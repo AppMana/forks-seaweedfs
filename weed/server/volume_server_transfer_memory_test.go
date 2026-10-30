@@ -309,10 +309,7 @@ func TestTransfersStayWithinAdmissionBudgets(t *testing.T) {
 	}
 }
 
-// TestCompletedTransfersClearInFlightGauges: the in-flight size gauges must
-// report what is reserved now, not the value seen when the last request was
-// admitted. Production showed in_flight_download_size at 24.5 MB with no GET
-// in flight.
+// Completed transfers must release reservations and clear the gauges.
 func TestCompletedTransfersClearInFlightGauges(t *testing.T) {
 	s := newTransferTestServer(t, 1, 1<<30, 1<<30)
 

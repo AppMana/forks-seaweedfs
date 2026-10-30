@@ -13,14 +13,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
-// Write timeouts, all progress-based (see ProgressWatch): an attempt is
-// abandoned only when its body moves no byte for the stall timeout, or no
-// response arrives within the response timeout after the body was sent. A
-// FUSE close() must be answered within the 60 s request deadline, with room
-// for a second attempt elsewhere, so the mount waits less for a response than
-// the S3 gateway, whose clients wait minutes. A healthy 2 MiB chunk upload
-// measured 0.06 to 0.24 s under load; a server that accepts no byte for 10 s
-// has stopped.
+// The mount's stall and response timeouts leave room to retry within its
+// request deadline. The S3 gateway permits a longer response wait.
 const (
 	UploadStallTimeout           = 10 * time.Second
 	MountUploadResponseTimeout   = 20 * time.Second

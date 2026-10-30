@@ -637,6 +637,7 @@ func (i *InodeToPath) RemovePathForInode(path util.FullPath, inode uint64) {
 	delete(i.path2inode, path)
 	i.dropDirPath(inode)
 	i.removePathFromInode2Path(inode, path)
+	delete(i.wasCachedDirs, path)
 }
 
 func (i *InodeToPath) removePathFromInode2Path(inode uint64, path util.FullPath) {

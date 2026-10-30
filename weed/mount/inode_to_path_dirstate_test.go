@@ -90,3 +90,18 @@ func TestForgetDoesNotDropAReusedDirPath(t *testing.T) {
 	}
 	checkDirIndexes(t, itp)
 }
+
+func TestRemovePathForInodeClearsWasCachedDirs(t *testing.T) {
+	itp := NewInodeToPath(util.FullPath("/"), 0)
+	now := time.Now().Unix()
+
+	inode := itp.Lookup("/cached-dir", now, true, false, 0, true)
+	itp.MarkChildrenCached("/cached-dir")
+
+	itp.RemovePathForInode("/cached-dir", inode)
+	_ = itp.Lookup("/cached-dir", now+1, true, false, 0, true)
+	if itp.ShouldRebuildExpiredDir("/cached-dir", 30*time.Second) {
+		t.Fatal("RemovePathForInode left deleted directory in wasCachedDirs")
+	}
+}
+

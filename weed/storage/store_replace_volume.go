@@ -106,9 +106,9 @@ func (s *Store) ReplaceVolume(vid needle.VolumeId, collection string, location *
 	}
 	for _, base := range bases {
 		backupDir := filepath.Dir(replacedVolumeFileName(base))
-		if err = os.RemoveAll(backupDir); err == nil {
-			err = os.MkdirAll(backupDir, 0755)
-		}
+		// A leftover backup may be the only complete copy after an interrupted
+		// replacement. Preserve it for recovery instead of replacing it.
+		err = os.Mkdir(backupDir, 0755)
 		if err != nil {
 			restore()
 			return fmt.Errorf("volume %d: prepare %s: %w", vid, backupDir, err)

@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
@@ -73,4 +74,19 @@ func (wfs *WFS) listDirectoryForAdapter(ctx context.Context, dir util.FullPath, 
 		}
 		return err
 	})
+}
+
+// findCaseFoldedChild returns the child of dir whose name equals requested
+// under simple case folding, the first in listing order when several do, or
+// "" when none does.
+func (wfs *WFS) findCaseFoldedChild(ctx context.Context, dir util.FullPath, requested string) (string, error) {
+	var actual string
+	err := wfs.listDirectoryForAdapter(ctx, dir, func(entry *filer.Entry) (bool, error) {
+		if strings.EqualFold(requested, entry.Name()) {
+			actual = entry.Name()
+			return false, nil
+		}
+		return true, nil
+	})
+	return actual, err
 }

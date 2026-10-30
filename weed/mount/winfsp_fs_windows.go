@@ -113,14 +113,8 @@ func (a *winfspFS) lookupChild(parent uint64, requested string) (uint64, string,
 	if status != fuse.OK {
 		return 0, "", status
 	}
-	var actual string
-	if err := a.wfs.listDirectoryForAdapter(context.Background(), parentPath, func(entry *filer.Entry) (bool, error) {
-		if winFspNameEqual(requested, entry.Name(), false) {
-			actual = entry.Name()
-			return false, nil
-		}
-		return true, nil
-	}); err != nil {
+	actual, err := a.wfs.findCaseFoldedChild(context.Background(), parentPath, requested)
+	if err != nil {
 		glog.Errorf("winfsp case-fold listing %s: %v", parentPath, err)
 		return 0, "", fuse.EIO
 	}

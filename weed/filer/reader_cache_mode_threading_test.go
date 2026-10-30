@@ -8,25 +8,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
-// The -readerCacheMode override is only useful if it survives the whole
-// journey from the mount option down to the ReaderPattern that actually
-// decides whether a chunk gets cached whole:
-//
-//	weed mount -readerCacheMode
-//	  -> Option.ReaderCacheMode           (weed/mount/weedfs.go)
-//	  -> filer.NewChunkGroupWithMode      (filechunk_group.go)
-//	  -> ChunkGroup.readerCacheMode
-//	  -> section.setupForRead             (filechunk_section.go)
-//	  -> NewChunkReaderAtFromClientWithMode (reader_at.go)
-//	  -> NewReaderPatternWithMode         (reader_pattern.go)
-//	  -> ChunkReadAt.readerPattern.IsRandomMode()
-//
-// Every existing test covers one link in isolation, so an upstream merge that
-// reverted filechunk_section.go's call site back to the mode-less
-// NewChunkReaderAtFromClient would leave the flag parsing green, the
-// ReaderPattern unit tests green, and the feature silently dead: the mount
-// would accept -readerCacheMode=sequential and go on inferring. These tests
-// assert the composition end to end.
+// Verify that ReaderCacheMode is threaded from NewChunkGroupWithMode through
+// section.setupForRead and NewChunkReaderAtFromClientWithMode into
+// ChunkReadAt.readerPattern.
 
 func noopLookupFn() wdclient.LookupFileIdFunctionType {
 	return func(ctx context.Context, fileId string) (targetUrls []string, err error) {

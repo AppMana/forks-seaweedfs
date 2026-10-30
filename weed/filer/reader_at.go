@@ -445,11 +445,7 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 	}
 
 	// Sequential reads and random chunks promoted after reuse go through the
-	// shared, single-flight-coalesced whole-chunk cache. The old random path
-	// bypassed it on every request, so repeated or concurrent reads landing
-	// in the same chunk each paid a separate network round-trip. Promotion
-	// preserves that fix without forcing a whole-chunk transfer for a chunk
-	// that was touched only once.
+	// shared, single-flight-coalesced whole-chunk cache.
 	shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	// The previous chunk is released through the stream pin rather than
 	// UnCache: the buffer is shared, and other streams may still be reading it.

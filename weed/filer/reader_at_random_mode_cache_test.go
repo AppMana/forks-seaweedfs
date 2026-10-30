@@ -12,16 +12,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
-// alwaysMissChunkCache is a chunk_cache.ChunkCache that never has anything
-// cached -- unlike the trivial mockChunkCache in reader_at_test.go, which
-// always "hits" with synthetic fileId-derived bytes (fine for the exact-byte
-// correctness tests it's used in, but it makes the *old*, buggy
-// random-mode code path in readChunkSliceAt short-circuit through it and
-// never reach the backend at all, masking the actual bug this test targets:
-// how many real network fetches a read pattern causes). This lets the old
-// code's fallback to fetchChunkRange, and the new code's real
-// ReaderCache/SingleChunkCacher single-flight path, both actually exercise
-// the counting mock server below.
+// alwaysMissChunkCache is a chunk_cache.ChunkCache that always misses so
+// reads reach the counting mock server via ReaderCache.
 type alwaysMissChunkCache struct{}
 
 func (alwaysMissChunkCache) GetChunk(fileId string, minSize uint64) (data []byte) { return nil }
@@ -32,11 +24,7 @@ func (alwaysMissChunkCache) SetChunk(fileId string, data []byte)                
 func (alwaysMissChunkCache) GetMaxFilePartSizeInCache() uint64                      { return 0 }
 func (alwaysMissChunkCache) IsInCache(fileId string, lockNeeded bool) (answer bool) { return false }
 
-// createCountingMockVolumeServer is like createMockVolumeServer (see
-// stream_benchmark_test.go, same package) but counts requests reaching the
-// backend, so a test can assert on how many separate network fetches a read
-// pattern actually causes -- the thing the random-mode cache bypass bug
-// (see reader_at.go's readChunkSliceAt) multiplied unnecessarily.
+// createCountingMockVolumeServer serves chunkData and counts backend requests.
 func createCountingMockVolumeServer(t *testing.T, chunkData map[string][]byte) (server *httptest.Server, requestCount *int64) {
 	t.Helper()
 	var count int64
@@ -51,13 +39,7 @@ func createCountingMockVolumeServer(t *testing.T, chunkData map[string][]byte) (
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		// Honor Range requests, matching createMockVolumeServer in
-		// stream_benchmark_test.go -- the whole-chunk fetch path and the
-		// per-request fetchChunkRange path both issue ranged GETs, and
-		// without this the response body wouldn't correspond to the bytes
-		// actually requested, producing an unrelated data-correctness
-		// failure that would mask (or falsely appear to demonstrate) the
-		// request-count bug this test targets.
+		// Honor Range requests for both whole-chunk and ranged GETs.
 		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 			var start, end int64
 			fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)

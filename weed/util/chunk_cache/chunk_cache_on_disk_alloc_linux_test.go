@@ -8,11 +8,8 @@ import (
 	"testing"
 )
 
-// A mount's read cache reserved its whole size limit on disk when it was
-// created (fallocate of each cache volume), before caching a byte: on
-// appmana-031 (2026-10-08) every SeaweedFS mount took ~51 GiB of the root
-// disk at mount time, 206 GiB in all while a dataset job filled the rest.
-// The limit bounds what the cache may hold; disk is used as data is cached.
+// A read-cache volume's size limit bounds what the cache may hold; disk blocks
+// are allocated only as chunks are written.
 func TestChunkCacheVolumeDoesNotReserveItsLimitUpFront(t *testing.T) {
 	const limit = 64 << 20
 	name := filepath.Join(t.TempDir(), "c0_1")

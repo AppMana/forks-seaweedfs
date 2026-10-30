@@ -251,7 +251,6 @@ func sharedRef(entry *filer.Entry) (group, nonce string, ok bool) {
 
 var nonceSeq atomic.Int64
 
-func newGroup() string { return fmt.Sprintf("%032x", time.Now().UnixNano()+nonceSeq.Add(1)) }
 func newNonce() string { return fmt.Sprintf("%016x", nonceSeq.Add(1)) }
 
 func refPath(group, nonce string) util.FullPath {

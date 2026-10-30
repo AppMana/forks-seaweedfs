@@ -531,6 +531,7 @@ func StatusError(fileUrl string, r *http.Response) error {
 	var reader io.Reader = r.Body
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		if gz, err := gzip.NewReader(r.Body); err == nil {
+			defer gz.Close()
 			reader = gz
 		}
 	}
@@ -800,13 +801,6 @@ func retriedFetchChunkDataDirect(ctx context.Context, buffer []byte, urlStrings 
 	}
 
 	return n, err
-}
-
-// contentRangeStart returns the first byte position of a "bytes start-end/size"
-// Content-Range header.
-func contentRangeStart(contentRange string) (int, bool) {
-	start, _, _, ok := parseContentRange(contentRange)
-	return start, ok
 }
 
 func parseContentRange(header string) (start, end, total int, ok bool) {

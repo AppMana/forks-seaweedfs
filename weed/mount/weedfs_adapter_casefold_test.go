@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -129,5 +130,78 @@ func TestCaseFoldedLookupMatchesEqualFold(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCaseFoldPrefixes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want []string
+	}{
+		{"", []string{""}},
+		{"1_", []string{"1_"}},
+		{"ab", []string{"ab", "aB", "Ab", "AB"}},
+		{"k", []string{"k", "K", "K"}},
+		{"IMG_0001.JPG", nil},
+		{"\xffabc", []string{""}},
+		{"a�b", []string{"a", "A"}},
+	} {
+		got := caseFoldPrefixes(tc.name, caseFoldPrefixMaxVariants)
+		if len(got) > caseFoldPrefixMaxVariants {
+			t.Fatalf("%q: %d prefixes, over the bound", tc.name, len(got))
+		}
+		if tc.want != nil {
+			sort.Strings(got)
+			want := append([]string(nil), tc.want...)
+			sort.Strings(want)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("caseFoldPrefixes(%q) = %q, want %q", tc.name, got, want)
+			}
+		}
+	}
+	// Free runes extend the prefix: four cased letters, the digits and the
+	// underscore, then the dot, before the next letter would pass 16.
+	got := caseFoldPrefixes("IMG_0001.JPG", caseFoldPrefixMaxVariants)
+	for _, prefix := range got {
+		if len(prefix) != len("IMG_0001.J") {
+			t.Fatalf("prefix %q, want each to run through %q", prefix, "IMG_0001.J")
+		}
+		if !strings.EqualFold(prefix, "IMG_0001.J") {
+			t.Fatalf("prefix %q does not fold to the name", prefix)
+		}
+	}
+	if len(got) != 16 {
+		t.Fatalf("%d prefixes for IMG_0001.JPG, want 16", len(got))
+	}
+}
+
+func TestAdapterPrefixListingPagesThroughCachedDirectory(t *testing.T) {
+	var names []string
+	for i := 0; i < 300; i++ {
+		names = append(names, fmt.Sprintf("x-%04d", i), fmt.Sprintf("y-%04d", i))
+	}
+	names = append(names, "x", "x-", "w-0000")
+	wfs, _ := newCaseFoldWFS(t, names, 0)
+	for _, prefix := range []string{"x-", "x", ""} {
+		var got []string
+		if err := wfs.listDirectoryPrefixForAdapter(context.Background(), "/", prefix, func(entry *filer.Entry) (bool, error) {
+			got = append(got, entry.Name())
+			return true, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var want []string
+		for _, name := range names {
+			if strings.HasPrefix(name, prefix) {
+				want = append(want, name)
+			}
+		}
+		sort.Strings(want)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("prefix %q listed %d names, want %d", prefix, len(got), len(want))
+		}
+	}
+	if !wfs.metaCache.IsDirectoryCached("/") {
+		t.Fatal("the directory was not cached; this test needs the local listing")
 	}
 }

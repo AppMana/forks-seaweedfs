@@ -130,11 +130,7 @@ func chunkDestination(t *testing.T) (*httptest.Server, func() []string) {
 	}
 }
 
-// An UploadPartCopy chunk assigned to a destination volume server that stalls
-// must be copied to another volume instead of failing the copy. On 2026-10-11
-// Harbor's push of an 11.6 GB layer failed with 500 InternalError because a
-// chunk POST to one stalled volume server timed out awaiting response headers
-// and the copy had no second destination.
+// A stalled destination must trigger reassignment of the copied chunk.
 func TestCopyChunkRangeMovesOffAStalledDestination(t *testing.T) {
 	util_http.InitGlobalHttpClient()
 	payload := []byte(strings.Repeat("checkpoint", 100<<10))

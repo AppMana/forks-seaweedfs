@@ -8,13 +8,12 @@ contract failures before changing mount implementation code.
 
 `mount-smoke.ps1` supports four focused cases:
 
-- `NamespaceCoherence` reproduces the traced WinFsp failure: a file remains
+- `NamespaceCoherence` checks namespace coherence: a file remains
   directly readable while its parent enumeration omits it and rename returns
   `NAME NOT FOUND`.
 - `GitAtomicRename` runs `git init` on a fresh mount.
 - `GitAtomicRenamePrimed` first runs the metadata and rename-over-existing
-  sequence from the full smoke test, then runs `git init`. This is the exact
-  reduced workload for the observed stale `config.lock` failure.
+  sequence from the full smoke test, then runs `git init`. This checks `config.lock` handling after metadata changes.
 - `GitLfsTempMetadata` repeatedly runs `git status` over modified LFS assets.
   Its seed `git add` exercises Git LFS's temp-file sequence. Status can use
   cached metadata, so successful status iterations alone do not prove repeated
@@ -52,22 +51,6 @@ include expected absent-file probes, reparses, and fast-I/O fallback: they are
 not automatically bugs. Compare the recorded `GIT FAILURE UTC` timestamp and
 full WinFsp request/reply log before drawing conclusions. Add `--all` to include
 successful completions. Preserve ETL for deeper analysis in WPA.
-
-### Recorded failure signature
-
-The authoritative RED capture used Procmon's native PML recording without
-WinFsp debug logging. Windows successfully created, wrote, closed, reopened,
-and read `hello.txt`; after `subdir/nested.txt` was created, root
-`QueryDirectory` returned only `subdir`, and `SetRenameInformationFile` for
-`hello.txt` returned `NAME NOT FOUND`.
-
-Correlated SeaweedFS logs showed the parent `ListEntries` snapshot beginning
-before the deferred `CreateEntry /hello.txt`. Overlapping WinFsp close/flush
-callbacks all shared one FUSE handle and entered `doFlush`; the old transaction
-boundary allowed every callback to observe dirty metadata before the first
-commit cleared it. `TestConcurrentFlushCommitsDeferredCreateOnce` holds the
-first filer commit open and asserts that concurrent flush callbacks emit one
-authoritative create.
 
 ## Schedule fuzzing and replay
 

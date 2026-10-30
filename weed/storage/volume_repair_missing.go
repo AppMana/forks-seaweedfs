@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
@@ -27,6 +28,24 @@ func (v *Volume) WriteNeedleBlobIfAbsent(id types.NeedleId, blob []byte, size ty
 	}
 	if _, exists := v.nm.Get(id); exists {
 		return fmt.Errorf("%w: volume %d needle %d", ErrNeedleAlreadyExists, v.Id, id)
+	}
+	// LevelDB replay omits tombstones. Absence from the live map does not
+	// prove absence from the authoritative index, even after a restart.
+	index, _, err := v.openIndex()
+	if err != nil {
+		return err
+	}
+	defer index.Close()
+	if _, err := verifyIndexFileIntegrity(index); err != nil {
+		return err
+	}
+	if err := idx.WalkIndexFile(index, 0, func(key types.NeedleId, _ types.Offset, _ types.Size) error {
+		if key == id {
+			return fmt.Errorf("%w: volume %d needle %d", ErrNeedleAlreadyExists, v.Id, id)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if size < 0 || int64(len(blob)) != needle.GetActualSize(size, v.Version()) || len(blob) < types.NeedleHeaderSize {
 		return fmt.Errorf("invalid repair blob length %d for needle %d size %d", len(blob), id, size)

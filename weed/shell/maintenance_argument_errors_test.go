@@ -32,3 +32,14 @@ func TestMaintenanceCommandsRejectMalformedArguments(t *testing.T) {
 		})
 	}
 }
+
+func TestFsckRejectsNaNOrphanLimit(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("invalid orphan limit reached the command environment: %v", r)
+		}
+	}()
+	if err := (&commandVolumeFsck{}).Do([]string{"-maxOrphanPercent=NaN", "-reallyDeleteFromVolume"}, nil, io.Discard); err == nil {
+		t.Fatal("NaN orphan limit accepted")
+	}
+}

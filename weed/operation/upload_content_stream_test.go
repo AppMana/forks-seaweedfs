@@ -185,10 +185,7 @@ func TestReplicationUploadSendsExactLegacyBody(t *testing.T) {
 	}
 }
 
-// TestReplicationUploadDoesNotCopyPayload is the 2026-09-29 OOM: the primary
-// built a full multipart copy of every needle for each replica, while
-// admission charged the needle once. Store replication hands each replica
-// goroutine its own buffer, so measure with a fresh buffer per upload.
+// Replication must not allocate another payload-sized buffer per replica.
 func TestReplicationUploadDoesNotCopyPayload(t *testing.T) {
 	const size = 8 << 20
 	const uploads = 6

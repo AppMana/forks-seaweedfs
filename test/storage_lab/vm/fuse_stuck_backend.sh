@@ -4,13 +4,13 @@
 # guest's hung-task timeout. The guest has 512 MiB, so the mount's read buffer
 # budget and Go memory limit are lowered to fit beside the server.
 #
-# The guest panics on a hung task, as the cluster's nodes do. A FUSE request
+# The guest panics on a hung task, to fail the test. A FUSE request
 # the mount never answers leaves the caller in uninterruptible sleep; a
 # SIGKILLed writer's final FLUSH waits that way by design. If any such wait
 # outlasts 10 s, the VM panics and the harness loses it.
 #
 # Phase "stuck": the server is frozen with SIGSTOP and the mount's cache
-# directory is deleted, as on appmana-031. Every operation must return within
+# directory is deleted. Every operation must return within
 # 2 x request timeout + 1 s.
 # Phase "close": loopback is throttled and a large file is written
 # sequentially through a mount with a write buffer cap. close() must return
@@ -45,7 +45,7 @@ for _ in $(seq 120); do
   sleep 1
 done
 
-# A weed without request deadlines (the pre-fix baseline) runs the same
+# A weed without request deadlines (a negative control) runs the same
 # scenario with none, which is what the gate must catch.
 DEADLINES=
 if $W mount -h 2>&1 | grep -q fuse.requestTimeout; then

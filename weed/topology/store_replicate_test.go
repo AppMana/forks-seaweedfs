@@ -446,11 +446,8 @@ func TestReplicatedWriteRejectsWriteWithNoTarget(t *testing.T) {
 	}
 }
 
-// A replica that accepts the forward and never answers must fail the
-// replicated write once the forward stops making progress, with an error that names the
-// replica, instead of holding the client's request until the client gives up.
-// The client can then avoid that server; on 2026-10-11 it could only blame
-// the primary.
+// A stalled forward must fail with an error naming the replica so the
+// client can avoid that server on retry.
 func TestReplicatedWriteFailsFastNamingAStalledReplica(t *testing.T) {
 	release := make(chan struct{})
 	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -75,7 +75,9 @@ func TestMaintenanceCLIBalancePreservesLiveData(t *testing.T) {
 	}
 	shell := func(apply bool) {
 		t.Helper()
-		command := "lock; volume.balance -collection=balance-qualification -volumesPerExec=1"
+		// The private test directories share the host filesystem. Its usage
+		// must not suppress the move whose data preservation is under test.
+		command := "lock; volume.balance -collection=balance-qualification -volumesPerExec=1 -maxDiskUsagePercent=100"
 		if apply {
 			command += " -apply"
 		}

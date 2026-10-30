@@ -301,3 +301,14 @@ func TestStaticConfigReloadKeepsDynamicIdentities(t *testing.T) {
 func sleepWatchTick() {
 	time.Sleep(testWatchInterval)
 }
+
+func TestStaticConfigWatcherAppliesChangeBeforeWatcherStarts(t *testing.T) {
+	configFile := filepath.Join(t.TempDir(), "s3.json")
+	writeConfigFile(t, configFile, identityConfigJson(identityEntry("alice", "AKALICE", "SKOLD")))
+	iam := newStaticFileIam(t, configFile)
+	writeConfigFile(t, configFile, identityConfigJson(identityEntry("alice", "AKALICE", "SKNEW")))
+	iam.startStaticConfigWatcher(configFile, testWatchInterval)
+	waitForCondition(t, "rotation between initial load and watcher startup", func() bool {
+		return hasAccessKey(iam, "AKALICE", "SKNEW")
+	})
+}

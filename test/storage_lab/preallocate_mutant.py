@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build overlay restoring Linux's historical ignored fallocate error."""
+"""Build overlay ignoring Linux fallocate errors."""
 import json
 from pathlib import Path
 import tempfile
@@ -14,7 +14,7 @@ FIXED = '''\t\tif err := unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE
 \t\t\t)
 \t\t}
 '''
-BROKEN = '''\t\t// MUTANT: reproduce the historical ignored reservation failure.
+BROKEN = '''\t\t// MUTANT: inject ignored reservation failure.
 \t\t_ = errors.Join
 \t\t_ = fmt.Sprintf
 \t\tunix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, preallocate)

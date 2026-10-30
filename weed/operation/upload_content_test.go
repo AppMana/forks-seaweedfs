@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/security"
 	"io"
 	"net"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
@@ -33,6 +33,13 @@ type scriptedHTTPClient struct {
 	mu        sync.Mutex
 	responses map[string][]scriptedHTTPResponse
 	calls     []string
+}
+
+type contextWaitingHTTPClient struct{}
+
+func (contextWaitingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	<-req.Context().Done()
+	return nil, req.Context().Err()
 }
 
 func (c *scriptedHTTPClient) Do(req *http.Request) (*http.Response, error) {
@@ -93,6 +100,9 @@ func TestUploadWithRetryDataReassignsOnVolumeSizeExceeded(t *testing.T) {
 			"http://volume-b/2,second": {
 				{status: http.StatusCreated, body: `{"name":"test.bin","size":3}`},
 			},
+			"http://volume-a/1,first?type=replicate": {
+				{status: http.StatusAccepted},
+			},
 		},
 	}
 	uploader := newUploader(httpClient)
@@ -118,10 +128,12 @@ func TestUploadWithRetryDataReassignsOnVolumeSizeExceeded(t *testing.T) {
 	if uploadResult == nil || uploadResult.Name != "test.bin" {
 		t.Fatalf("expected successful upload result, got %#v", uploadResult)
 	}
-	if len(httpClient.calls) != 4 {
-		t.Fatalf("expected 4 upload attempts (3 same-url retries + 1 reassigned upload), got %d", len(httpClient.calls))
+	if len(httpClient.calls) != 5 {
+		t.Fatalf("expected 4 uploads and 1 abandoned-id cleanup, got %d calls", len(httpClient.calls))
 	}
-	if httpClient.calls[0] != "http://volume-a/1,first" || httpClient.calls[3] != "http://volume-b/2,second" {
+	if httpClient.calls[0] != "http://volume-a/1,first" ||
+		httpClient.calls[3] != "http://volume-a/1,first?type=replicate" ||
+		httpClient.calls[4] != "http://volume-b/2,second" {
 		t.Fatalf("unexpected upload call sequence: %#v", httpClient.calls)
 	}
 }
@@ -140,6 +152,9 @@ func TestUploadWithRetryDataReassignsOnReplicaWriteFailure(t *testing.T) {
 			},
 			"http://volume-b/2,second": {
 				{status: http.StatusCreated, body: `{"name":"test.bin","size":3}`},
+			},
+			"http://volume-a/1,first?type=replicate": {
+				{status: http.StatusAccepted},
 			},
 		},
 	}
@@ -575,10 +590,14 @@ func TestUploadStallTimeoutScalesWithMeasuredRate(t *testing.T) {
 
 type fsyncAssignClient struct {
 	filer_pb.SeaweedFilerClient
-	response *filer_pb.AssignVolumeResponse
+	response   *filer_pb.AssignVolumeResponse
+	responseFn func() *filer_pb.AssignVolumeResponse
 }
 
 func (c *fsyncAssignClient) AssignVolume(context.Context, *filer_pb.AssignVolumeRequest, ...grpc.CallOption) (*filer_pb.AssignVolumeResponse, error) {
+	if c.responseFn != nil {
+		return c.responseFn(), nil
+	}
 	return c.response, nil
 }
 
@@ -975,11 +994,9 @@ func TestUploadWithRetryDataDeletesAbandonedFileId(t *testing.T) {
 		jwt   string
 	}
 	var deletions []deletion
-	previous := deleteAbandonedFileId
-	deleteAbandonedFileId = func(hosts []string, fid string, jwt security.EncodedJwt) {
+	uploader.deleteAbandonedFileId = func(hosts []string, fid string, jwt security.EncodedJwt) {
 		deletions = append(deletions, deletion{hosts, fid, string(jwt)})
 	}
-	t.Cleanup(func() { deleteAbandonedFileId = previous })
 
 	assignCalls := 0
 	fileID, _, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
@@ -998,5 +1015,84 @@ func TestUploadWithRetryDataDeletesAbandonedFileId(t *testing.T) {
 	d := deletions[0]
 	if d.fid != "1,first" || d.jwt != "jwt-1" || strings.Join(d.hosts, ",") != "volume-a:8080,volume-c:8080" {
 		t.Fatalf("deleted %+v, want 1,first from both holders with its own token", d)
+	}
+}
+
+func TestUploadWithRetryCleanupUsesUploadHTTPClient(t *testing.T) {
+	replicaErr := `{"error":"failed to write to replicas"}`
+	httpClient := &scriptedHTTPClient{responses: map[string][]scriptedHTTPResponse{
+		"http://volume-a/1,first": {
+			{status: http.StatusBadRequest, body: replicaErr},
+		},
+		"http://cleanup-a/1,first?type=replicate": {
+			{status: http.StatusAccepted},
+		},
+	}}
+	uploader := NewUploaderWithHttpClient(httpClient)
+	_, _, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
+		return uploadAssignment{fileId: "1,first", host: "volume-a", holders: []string{"cleanup-a"}}, nil
+	}, &UploadOption{MaxAttempts: 1}, []byte("abc"))
+	if err == nil {
+		t.Fatal("upload unexpectedly succeeded")
+	}
+	if got := strings.Join(httpClient.calls, ","); got != "http://volume-a/1,first,http://cleanup-a/1,first?type=replicate" {
+		t.Fatalf("custom client calls = %q, want upload and cleanup", got)
+	}
+}
+
+func TestAbandonedCleanupHonorsRequestContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, err := deleteWithClient(ctx, contextWaitingHTTPClient{}, "http://volume-a/1,first?type=replicate", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cleanup error = %v, want context deadline", err)
+	}
+	if took := time.Since(started); took > time.Second {
+		t.Fatalf("cleanup ignored request context for %v", took)
+	}
+}
+
+type publicUrlAssignClient struct {
+	*fsyncAssignClient
+}
+
+func (c *publicUrlAssignClient) AdjustedUrl(loc *filer_pb.Location) string {
+	return loc.GetPublicUrl()
+}
+
+func TestUploadWithRetryDeletesAbandonedFileIdThroughReachableUrls(t *testing.T) {
+	httpClient := &scriptedHTTPClient{responses: map[string][]scriptedHTTPResponse{
+		"http://public-a/1,first":  {{status: http.StatusInternalServerError, body: `{"error":"replica failed"}`}},
+		"http://public-b/2,second": {{status: http.StatusCreated, body: `{"size":3}`}},
+	}}
+	uploader := newUploader(httpClient)
+	var deleted []string
+	uploader.deleteAbandonedFileId = func(hosts []string, _ string, _ security.EncodedJwt) {
+		deleted = append(deleted, hosts...)
+	}
+	client := &publicUrlAssignClient{fsyncAssignClient: &fsyncAssignClient{}}
+	responses := []*filer_pb.AssignVolumeResponse{
+		{
+			FileId:   "1,first",
+			Location: &filer_pb.Location{Url: "private-a:8080", PublicUrl: "public-a"},
+			Replicas: []*filer_pb.Location{{Url: "private-c:8080", PublicUrl: "public-c"}},
+		},
+		{FileId: "2,second", Location: &filer_pb.Location{Url: "private-b:8080", PublicUrl: "public-b"}},
+	}
+	call := 0
+	client.response = responses[0]
+	client.responseFn = func() *filer_pb.AssignVolumeResponse {
+		resp := responses[call]
+		call++
+		return resp
+	}
+
+	fileID, _, err, _ := uploader.UploadWithRetry(client, &filer_pb.AssignVolumeRequest{Count: 1}, &UploadOption{MaxAttempts: 1}, strings.NewReader("abc"))
+	if err != nil || fileID != "2,second" {
+		t.Fatalf("upload = %q, %v; want reassigned file id", fileID, err)
+	}
+	if got := strings.Join(deleted, ","); got != "public-a,public-c" {
+		t.Fatalf("cleanup holders = %q, want client-reachable public URLs", got)
 	}
 }

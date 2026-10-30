@@ -182,6 +182,8 @@ type HTTPClient interface {
 // Uploader
 type Uploader struct {
 	httpClient HTTPClient
+	// deleteAbandonedFileId is replaceable per uploader in tests.
+	deleteAbandonedFileId func(hosts []string, fid string, jwt security.EncodedJwt)
 	// watchedHttpClient serves writes a ProgressWatch guards. It has no
 	// response-header timeout: the watch's response timeout replaces that
 	// absolute bound, and waits only while the peer acknowledges nothing.
@@ -215,33 +217,64 @@ func NewUploader() (*Uploader, error) {
 }
 
 func newUploader(httpClient HTTPClient) *Uploader {
-	return &Uploader{
-		httpClient: httpClient,
+	uploader := &Uploader{httpClient: httpClient}
+	uploader.deleteAbandonedFileId = func(hosts []string, fid string, jwt security.EncodedJwt) {
+		deleteChunkFromHoldersWithClient(hosts, fid, jwt, nil, uploader.httpClient)
 	}
+	return uploader
 }
 
 // NewUploaderWithHttpClient creates an Uploader that uses the provided HTTP
 // client instead of the global one. This is used by filer.sync to upload to
 // remote clusters that use different TLS certificates.
 func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
-	return &Uploader{
-		httpClient: httpClient,
-	}
+	return newUploader(httpClient)
 }
 
 // uploadAssignment is where one upload attempt writes: the file id, the host
 // the request goes to, and every server holding a copy of the volume (the
 // primary first), which a replicated write passes through synchronously.
-// deleteAbandonedFileId removes a file id that a failed write may have left
-// on its holders; tests replace it.
-var deleteAbandonedFileId = DeleteChunkFromHolders
-
 type uploadAssignment struct {
 	fileId  string
 	host    string
 	auth    security.EncodedJwt
 	fsync   bool
-	servers []string
+	servers []string // topology identities used by stall avoidance
+	holders []string // client-reachable addresses used by cleanup
+}
+
+const (
+	abandonedCleanupWorkers = 4
+	abandonedCleanupBacklog = 64
+)
+
+type abandonedCleanup struct {
+	holders []string
+	fid     string
+	jwt     security.EncodedJwt
+	delete  func([]string, string, security.EncodedJwt)
+}
+
+var (
+	abandonedCleanupOnce  sync.Once
+	abandonedCleanupQueue chan abandonedCleanup
+)
+
+// queueAbandonedCleanup bounds both the workers and queued cleanups. When a
+// widespread outage fills the queue, failed writers apply backpressure rather
+// than creating an unlimited number of goroutines.
+func queueAbandonedCleanup(cleanup abandonedCleanup) {
+	abandonedCleanupOnce.Do(func() {
+		abandonedCleanupQueue = make(chan abandonedCleanup, abandonedCleanupBacklog)
+		for range abandonedCleanupWorkers {
+			go func() {
+				for task := range abandonedCleanupQueue {
+					task.delete(task.holders, task.fid, task.jwt)
+				}
+			}()
+		}
+	})
+	abandonedCleanupQueue <- cleanup
 }
 
 func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
@@ -281,25 +314,28 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 		if err != nil {
 			uploadOption.StalledServers.NoteFailure(a.servers, err)
 			// The holders may have stored the needle before the write failed,
-			// and the retry writes under a new file id, so nothing will name
-			// this one. A delete to a server that just stalled would stall
-			// too; its copy is left for fsck.
-			holders := a.servers
+			// including a holder whose response stalled after its commit. The
+			// retry writes under a new file id, so nothing will name this one.
+			holders := a.holders
+			if len(holders) == 0 {
+				holders = a.servers
+			}
 			if len(holders) == 0 {
 				holders = []string{a.host}
 			}
-			var reachable []string
-			for _, holder := range holders {
-				if _, stalled := uploadOption.StalledServers.FirstStalled([]string{holder}); !stalled {
-					reachable = append(reachable, holder)
-				}
+			cleanup := abandonedCleanup{
+				holders: append([]string(nil), holders...),
+				fid:     a.fileId,
+				jwt:     a.auth,
+				delete:  uploader.deleteAbandonedFileId,
 			}
-			if len(reachable) > 0 {
-				if uploadOption.StalledServers != nil {
-					go deleteAbandonedFileId(reachable, a.fileId, a.auth)
-				} else {
-					deleteAbandonedFileId(reachable, a.fileId, a.auth)
-				}
+			if cleanup.delete == nil {
+				cleanup.delete = DeleteChunkFromHolders
+			}
+			if uploadOption.StalledServers != nil {
+				queueAbandonedCleanup(cleanup)
+			} else {
+				cleanup.delete(cleanup.holders, cleanup.fid, cleanup.jwt)
 			}
 		}
 		return err
@@ -368,8 +404,10 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 			loc := resp.Location
 			a.host = filerClient.AdjustedUrl(loc)
 			a.servers = append(a.servers, loc.GetUrl())
+			a.holders = append(a.holders, filerClient.AdjustedUrl(loc))
 			for _, replica := range resp.Replicas {
 				a.servers = append(a.servers, replica.GetUrl())
+				a.holders = append(a.holders, filerClient.AdjustedUrl(replica))
 			}
 
 			return nil

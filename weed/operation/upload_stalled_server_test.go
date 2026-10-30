@@ -1,6 +1,7 @@
 package operation
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -25,6 +26,7 @@ type stalledVolumeServer struct {
 	mu       sync.Mutex
 	conns    []net.Conn
 	posts    int
+	deletes  []string
 }
 
 func startStalledVolumeServer(t *testing.T) *stalledVolumeServer {
@@ -36,25 +38,50 @@ func startStalledVolumeServer(t *testing.T) *stalledVolumeServer {
 	s := &stalledVolumeServer{listener: listener}
 	go func() {
 		for {
-			c, err := listener.Accept()
+			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
 			s.mu.Lock()
-			s.conns = append(s.conns, c)
-			s.posts++
+			s.conns = append(s.conns, conn)
 			s.mu.Unlock()
+			go s.handle(conn)
 		}
 	}()
 	t.Cleanup(func() {
 		listener.Close()
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		for _, c := range s.conns {
-			c.Close()
+		for _, conn := range s.conns {
+			conn.Close()
 		}
 	})
 	return s
+}
+
+func (s *stalledVolumeServer) handle(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+	requestLine, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	fields := strings.Fields(requestLine)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil || line == "\r\n" {
+			break
+		}
+	}
+	s.mu.Lock()
+	if len(fields) >= 2 && fields[0] == http.MethodDelete {
+		s.deletes = append(s.deletes, strings.SplitN(fields[1], "?", 2)[0])
+		s.mu.Unlock()
+		_, _ = io.WriteString(conn, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		_ = conn.Close()
+		return
+	}
+	s.posts++
+	s.mu.Unlock()
 }
 
 func (s *stalledVolumeServer) addr() string { return s.listener.Addr().String() }
@@ -213,7 +240,8 @@ func TestUploadWithRetryMovesOffAStalledVolumeServer(t *testing.T) {
 // A primary whose replica stalls answers 500 naming the replica. The retry
 // must avoid every volume that replica holds, not only the primary.
 func TestUploadWithRetryAvoidsTheReplicaAPrimaryNames(t *testing.T) {
-	stalledReplica := "replica-stalled:8080"
+	replica := startHealthyVolumeServer(t, nil)
+	stalledReplica := replica.addr()
 	primary := startHealthyVolumeServer(t, map[string]string{
 		"/1,01": fmt.Sprintf(`{"error":"failed to write to replicas for volume 1: [%s]: Post \"http://%s/1,01?type=replicate\": context deadline exceeded"}`, stalledReplica, stalledReplica),
 	})
@@ -239,6 +267,11 @@ func TestUploadWithRetryAvoidsTheReplicaAPrimaryNames(t *testing.T) {
 	// The primary stored 1,01 before its replica stalled; nothing names it.
 	if !primary.waitForDelete("/1,01", 5*time.Second) {
 		t.Fatal("the abandoned file id 1,01 was not deleted from the primary")
+	}
+	// A timeout can happen after the replica committed but before its response
+	// arrived, so being marked stalled must not exempt it from cleanup.
+	if !replica.waitForDelete("/1,01", 5*time.Second) {
+		t.Fatal("the abandoned file id 1,01 was not deleted from the stalled replica")
 	}
 }
 

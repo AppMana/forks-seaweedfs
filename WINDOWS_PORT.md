@@ -34,7 +34,6 @@ other platforms.
 | `go.mod` | `replace` for forks-go-fuse; add `github.com/winfsp/cgofuse` |
 | `weed/mount/weedfs.go` | removed vestigial `fs.Inode` embed + `go-fuse/v2/fs` import |
 | `weed/mount/weedfs_rename.go` | `fs.RENAME_EXCHANGE` constant inlined (0x2), `fs` import dropped |
-| `weed/mount/weedfs_xattr.go` | build tag `!freebsd` → `!freebsd && !windows` |
 | `weed/mount/posix_file_lock.go` | `syscall.F_{RD,WR,UN}LCK` → platform consts `fRdlck/fWrlck/fUnlck` |
 | `weed/mount/weedfs_file_lock.go` | same lock-constant swap |
 | `weed/mount/weedfs_access.go` | `syscall.O_ACCMODE` → platform const `oAccmode` |
@@ -45,7 +44,7 @@ other platforms.
 New files:
 
 - `weed/mount/syscall_constants_{unix,windows}.go`
-- `weed/mount/weedfs_attr_windows.go`, `weed/mount/weedfs_xattr_windows.go`
+- `weed/mount/weedfs_attr_windows.go`
 - `weed/mount/winfsp_fs_windows.go` — cgofuse adapter over the WFS raw handlers
 - `weed/mount/winfsp_errno_windows.go` — go-fuse Status → cgofuse errno map
 - `weed/mount/winfsp_flags_windows.go` — cgofuse O_* → Go os.O_* translation
@@ -57,7 +56,9 @@ New files:
 
 - The volume is declared case-sensitive (`SetCapCaseInsensitive(false)`);
   apps that rely on case-folding will see ENOENT for wrong-case names.
-- xattrs return ENOTSUP / ENOSYS (freebsd precedent).
+- Extended attributes are the mount's xattrs: NT EAs set with
+  `NtSetEaFile` are stored on the filer entry as `xattr-<NAME>`, where Linux
+  mounts read them. Windows upper-cases EA names.
 - POSIX byte-range locks are serviced locally by the WinFsp FSD;
   `-distributedLock` has no effect on windows.
 - Files are presented as owned by the mounting user (`uid=-1,gid=-1`).

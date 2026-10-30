@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -106,5 +107,29 @@ func TestRetriedFetchChunkDataAvoidsTheSlowReplica(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&slowHits); got > 3 {
 		t.Fatalf("slow replica served %d of 40 reads, want at most 3", got)
+	}
+}
+
+// A fast error is not evidence of a fast data replica. Otherwise repeated
+// HTTP errors drive the failing host toward the floor and put it first.
+func TestReplicaFailureDoesNotLookFasterThanSuccess(t *testing.T) {
+	forgetUnreachable(t)
+	forgetReplicaLoad(t)
+	recordReadCost("healthy:8080", 50*time.Millisecond, 1<<20)
+	done := beginReplicaRead(context.Background(), "broken:8080")
+	done(0, io.ErrUnexpectedEOF)
+	urls := []string{"http://broken:8080/1,a", "http://healthy:8080/1,a"}
+	assertOrder(t, ReachableFirst(urls), urls[1], urls[0])
+}
+
+func TestReplicaCanceledReadDoesNotRecordCost(t *testing.T) {
+	forgetReplicaLoad(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := beginReplicaRead(ctx, "canceled:8080")
+	cancel()
+	done(1024, ctx.Err())
+	l := loadOf("canceled:8080")
+	if !l.at.IsZero() || l.inflight.Load() != 0 {
+		t.Fatal("cancellation recorded cost or leaked inflight")
 	}
 }

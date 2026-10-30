@@ -79,7 +79,14 @@ func beginReplicaRead(ctx context.Context, host string) func(bytes int, err erro
 		if ctx.Err() != nil {
 			return
 		}
-		recordReadCost(host, time.Since(start), bytes)
+		elapsed := time.Since(start)
+		if err != nil {
+			// Fast HTTP errors and short bodies are failed service, not cheap
+			// successful reads. Penalize them even when no bytes arrived.
+			elapsed = max(elapsed, time.Second)
+			bytes = 0
+		}
+		recordReadCost(host, elapsed, bytes)
 	}
 }
 

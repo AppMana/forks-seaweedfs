@@ -985,7 +985,7 @@ func TestUploadWithRetryDataDeletesAbandonedFileId(t *testing.T) {
 	fileID, _, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
 		assignCalls++
 		if assignCalls == 1 {
-			return uploadAssignment{fileId: "1,first", host: "volume-a", auth: "jwt-1", servers: []string{"volume-a:8080", "volume-c:8080"}}, nil
+			return uploadAssignment{fileId: "1,first", host: "volume-a", auth: "jwt-1", servers: []string{"volume-a:8080", "volume-b:8080", "volume-c:8080"}}, nil
 		}
 		return uploadAssignment{fileId: "2,second", host: "volume-b", auth: "jwt-2", servers: []string{"volume-b:8080", "volume-d:8080"}}, nil
 	}, &UploadOption{Filename: "test.bin"}, []byte("abc"))
@@ -996,7 +996,64 @@ func TestUploadWithRetryDataDeletesAbandonedFileId(t *testing.T) {
 		t.Fatalf("deletions %+v, want exactly the abandoned file id", deletions)
 	}
 	d := deletions[0]
-	if d.fid != "1,first" || d.jwt != "jwt-1" || strings.Join(d.hosts, ",") != "volume-a:8080,volume-c:8080" {
-		t.Fatalf("deleted %+v, want 1,first from both holders with its own token", d)
+	if d.fid != "1,first" || d.jwt != "jwt-1" || strings.Join(d.hosts, ",") != "volume-a:8080,volume-b:8080" {
+		t.Fatalf("deleted %+v, want 1,first from responsive holders only with its own token", d)
+	}
+}
+
+// A failed upload that deletes its abandoned file id must not still return
+// that deleted file id to the caller, and a filer-proxy upload must not send
+// direct volume-server deletes.
+func TestUploadWithRetryDataClearsFailedFileIdAndSkipsProxyDeletes(t *testing.T) {
+	httpClient := &scriptedHTTPClient{
+		responses: map[string][]scriptedHTTPResponse{
+			"http://volume-a/1,first": {
+				{status: http.StatusBadRequest, body: `{"error":"invalid request"}`},
+			},
+			"http://filer:8888/?proxyChunkId=1,proxied": {
+				{status: http.StatusInternalServerError, body: `{"error":"proxy failed"}`},
+				{status: http.StatusInternalServerError, body: `{"error":"proxy failed"}`},
+				{status: http.StatusInternalServerError, body: `{"error":"proxy failed"}`},
+			},
+		},
+	}
+	uploader := newUploader(httpClient)
+
+	var deleted []string
+	previous := deleteAbandonedFileId
+	deleteAbandonedFileId = func(hosts []string, fid string, _ security.EncodedJwt) {
+		deleted = append(deleted, fid+"@"+strings.Join(hosts, ","))
+	}
+	t.Cleanup(func() { deleteAbandonedFileId = previous })
+
+	fileID, _, err := uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
+		return uploadAssignment{fileId: "1,first", host: "volume-a", auth: "jwt-1", servers: []string{"volume-a:8080"}}, nil
+	}, &UploadOption{Filename: "test.bin", MaxAttempts: 1}, []byte("abc"))
+	if err == nil {
+		t.Fatal("expected upload error")
+	}
+	if fileID != "" {
+		t.Fatalf("failed upload returned deleted fileID %q, want empty", fileID)
+	}
+	if len(deleted) != 1 || deleted[0] != "1,first@volume-a:8080" {
+		t.Fatalf("deleted = %v, want [1,first@volume-a:8080]", deleted)
+	}
+
+	deleted = nil
+	calls := 0
+	_, _, _ = uploader.uploadWithRetryData(func([]string) (uploadAssignment, error) {
+		calls++
+		if calls > 1 {
+			return uploadAssignment{}, errors.New("no more assignments")
+		}
+		return uploadAssignment{fileId: "1,proxied", host: "volume-a:8080", auth: "jwt-1", servers: []string{"volume-a:8080"}}, nil
+	}, &UploadOption{
+		Filename:     "test.bin",
+		MaxAttempts:  1,
+		GenUploadUrl: GenUploadUrlProxy("filer:8888"),
+		FilerJwt:     func(bool) security.EncodedJwt { return "filer-jwt" },
+	}, []byte("abc"))
+	if len(deleted) != 0 {
+		t.Fatalf("filer-proxy upload sent direct holder deletes: %v", deleted)
 	}
 }

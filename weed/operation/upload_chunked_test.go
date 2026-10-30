@@ -764,3 +764,48 @@ func TestDeleteChunkFromHoldersRenewsPerHolder(t *testing.T) {
 		t.Fatalf("expected the second holder's retried delete to land, got %d", acceptedDeletes)
 	}
 }
+
+// A holder that stalls after accepting the DELETE connection must time out
+// instead of wedging the cleanup and preventing remaining holders from being
+// cleaned up.
+func TestDeleteChunkFromHoldersBoundsStalledHolder(t *testing.T) {
+	unblock := make(chan struct{})
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+	}))
+	defer func() {
+		close(unblock)
+		stalled.Close()
+	}()
+
+	var deleted int32
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			atomic.AddInt32(&deleted, 1)
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer healthy.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		DeleteChunkFromHolders(
+			[]string{
+				strings.TrimPrefix(stalled.URL, "http://"),
+				strings.TrimPrefix(healthy.URL, "http://"),
+			},
+			"1,0a0b0c0d",
+			"jwt-1",
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(7 * time.Second):
+		t.Fatal("DeleteChunkFromHolders hung on a stalled holder")
+	}
+	if atomic.LoadInt32(&deleted) != 1 {
+		t.Fatalf("healthy holder deletes = %d, want 1", deleted)
+	}
+}

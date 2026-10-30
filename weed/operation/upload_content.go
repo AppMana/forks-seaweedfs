@@ -245,9 +245,15 @@ type uploadAssignment struct {
 }
 
 func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+	stalledServers := uploadOption.StalledServers
+	if stalledServers == nil {
+		stalledServers = NewStalledServers(time.Minute)
+	}
 	doUploadFunc := func() error {
+		fileId = ""
+		uploadResult = nil
 		var a uploadAssignment
-		err = uploadOption.StalledServers.Pick(func(avoid []string) ([]string, error) {
+		err = stalledServers.Pick(func(avoid []string) ([]string, error) {
 			var assignErr error
 			a, assignErr = assignFn(avoid)
 			return a.servers, assignErr
@@ -255,7 +261,6 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 		if err != nil {
 			return err
 		}
-		fileId = a.fileId
 
 		genUrl := uploadOption.GenUploadUrl
 		if genUrl == nil {
@@ -266,7 +271,8 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 			uploadOption.UploadUrl = util_http.AppendQueryParameter(uploadOption.UploadUrl, "fsync", "true")
 		}
 		uploadOption.Jwt = a.auth
-		if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
+		proxied := util_http.IsProxyChunkUrl(uploadOption.UploadUrl)
+		if proxied {
 			// The request addresses the filer, which authorizes it and mints the
 			// volume credential itself. The AssignVolume token is not a filer
 			// credential and gets the caller nowhere here.
@@ -279,30 +285,34 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
 		if err != nil {
-			uploadOption.StalledServers.NoteFailure(a.servers, err)
-			// The holders may have stored the needle before the write failed,
-			// and the retry writes under a new file id, so nothing will name
-			// this one. A delete to a server that just stalled would stall
-			// too; its copy is left for fsck.
-			holders := a.servers
-			if len(holders) == 0 {
-				holders = []string{a.host}
-			}
-			var reachable []string
-			for _, holder := range holders {
-				if _, stalled := uploadOption.StalledServers.FirstStalled([]string{holder}); !stalled {
-					reachable = append(reachable, holder)
+			if !proxied {
+				holders := a.servers
+				if len(holders) == 0 && a.host != "" {
+					holders = []string{a.host}
+				}
+				stalledServers.NoteFailure(holders, err)
+				// The holders may have stored the needle before the write failed,
+				// and the retry writes under a new file id, so nothing will name
+				// this one. A delete to a server that just stalled would stall
+				// too; its copy is left for fsck.
+				var reachable []string
+				for _, holder := range holders {
+					if _, stalled := stalledServers.FirstStalled([]string{holder}); !stalled {
+						reachable = append(reachable, holder)
+					}
+				}
+				if len(reachable) > 0 {
+					if uploadOption.StalledServers != nil {
+						go deleteAbandonedFileId(reachable, a.fileId, a.auth)
+					} else {
+						deleteAbandonedFileId(reachable, a.fileId, a.auth)
+					}
 				}
 			}
-			if len(reachable) > 0 {
-				if uploadOption.StalledServers != nil {
-					go deleteAbandonedFileId(reachable, a.fileId, a.auth)
-				} else {
-					deleteAbandonedFileId(reachable, a.fileId, a.auth)
-				}
-			}
+			return err
 		}
-		return err
+		fileId = a.fileId
+		return nil
 	}
 
 	if uploadOption.RetryForever {

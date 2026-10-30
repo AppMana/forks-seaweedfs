@@ -484,6 +484,33 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 // rollback of a failed fan-out.
 const cleanupJwtLookupTimeout = 10 * time.Second
 
+// cleanupDeleteTimeout bounds one holder's rollback DELETE so a holder that
+// stalls after accepting the connection cannot block the caller or leak a
+// cleanup goroutine.
+const cleanupDeleteTimeout = 5 * time.Second
+
+func deleteHolderChunk(deleteUrl, jwt string) (body []byte, status int, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupDeleteTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteUrl, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if jwt != "" {
+		req.Header.Set("Authorization", "Bearer "+jwt)
+	}
+	resp, err := util_http.GetGlobalHttpClient().Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, resp.StatusCode, nil
+}
+
 // deleteChunkFromHolders best-effort removes a needle from each holder it landed
 // on, using type=replicate so the volume drops only its local copy. A failed
 // delete falls back to vacuum reclaiming the orphan.
@@ -495,14 +522,14 @@ func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt,
 	deleteJwt := jwt
 	for _, host := range hosts {
 		deleteUrl := fmt.Sprintf("http://%s/%s?type=replicate", host, fid)
-		body, status, err := util_http.DeleteProxied(deleteUrl, string(deleteJwt))
+		body, status, err := deleteHolderChunk(deleteUrl, string(deleteJwt))
 		if status == http.StatusUnauthorized && opt != nil && opt.LookupJwtFunc != nil {
 			lookupCtx, cancel := context.WithTimeout(context.Background(), cleanupJwtLookupTimeout)
 			token := opt.LookupJwtFunc(lookupCtx, fid)
 			cancel()
 			if token != "" {
 				deleteJwt = token
-				body, status, err = util_http.DeleteProxied(deleteUrl, string(deleteJwt))
+				body, status, err = deleteHolderChunk(deleteUrl, string(deleteJwt))
 			}
 		}
 		if err != nil {

@@ -2,6 +2,7 @@ package mount
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -67,7 +68,7 @@ func logWinfspStatsLoop() {
 			if dc == 0 {
 				continue
 			}
-			line += " " + winfspOpNames[op] + "=" + itoa(dc) + "/" + itoa(dus/dc) + "us"
+			line += " " + winfspOpNames[op] + "=" + strconv.FormatInt(dc, 10) + "/" + strconv.FormatInt(dus/dc, 10) + "us"
 		}
 		if line != "" {
 			glog.V(1).Infof("winfsp ops (1m):%s", line)
@@ -92,36 +93,14 @@ func writeWinfspStatsTrace() {
 		totalUs := winfspStats[op].totalUs.Load()
 		b.WriteString(winfspOpNames[op])
 		b.WriteByte(' ')
-		b.WriteString(itoa(count))
+		b.WriteString(strconv.FormatInt(count, 10))
 		b.WriteByte(' ')
-		b.WriteString(itoa(totalUs))
+		b.WriteString(strconv.FormatInt(totalUs, 10))
 		b.WriteByte(' ')
-		b.WriteString(itoa(totalUs / count))
+		b.WriteString(strconv.FormatInt(totalUs/count, 10))
 		b.WriteByte('\n')
 	}
 	if err := os.WriteFile(path, []byte(b.String()), 0600); err != nil {
 		glog.Errorf("write WinFsp operation summary %s: %v", path, err)
 	}
-}
-
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }

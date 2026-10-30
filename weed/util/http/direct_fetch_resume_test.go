@@ -106,7 +106,7 @@ func TestRetriedFetchChunkDataResumeFallsBackToWholeObject(t *testing.T) {
 	}
 }
 
-func TestContentRangeStart(t *testing.T) {
+func TestParseContentRange(t *testing.T) {
 	for _, c := range []struct {
 		in   string
 		want int
@@ -117,9 +117,9 @@ func TestContentRangeStart(t *testing.T) {
 		{"", 0, false},
 		{"bytes */10", 0, false},
 	} {
-		got, ok := contentRangeStart(c.in)
+		got, _, _, ok := parseContentRange(c.in)
 		if got != c.want || ok != c.ok {
-			t.Errorf("contentRangeStart(%q) = %d, %v; want %d, %v", c.in, got, ok, c.want, c.ok)
+			t.Errorf("parseContentRange(%q) = %d, %v; want %d, %v", c.in, got, ok, c.want, c.ok)
 		}
 	}
 }

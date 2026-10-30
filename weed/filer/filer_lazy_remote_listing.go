@@ -136,11 +136,11 @@ func (f *Filer) maybeLazyListFromRemote(ctx context.Context, p util.FullPath) {
 					existingEntry.Attr.FileSize = uint64(remoteEntry.RemoteSize)
 					existingEntry.Extended = MergeRemoteContentEncoding(remoteEntry, existingEntry.Extended)
 				}
-				f.stampEntryCommitTsNs(existingEntry)
+				f.StampEntryCommitTsNs(existingEntry)
 				if saveErr := f.Store.UpdateEntry(persistCtx, existingEntry); saveErr != nil {
 					glog.Warningf("maybeLazyListFromRemote: update %s: %v", childPath, saveErr)
 				}
-				f.releaseEntryCommitTsNs(existingEntry.CommitTsNs)
+				f.ReleaseEntryCommitTsNs(existingEntry.CommitTsNs)
 			} else {
 				// New entry not yet in local store
 				var entry *Entry
@@ -230,9 +230,9 @@ func (f *Filer) updateDirectoryListingSyncedAt(ctx context.Context, p util.FullP
 		dirEntry.Extended = make(map[string][]byte)
 	}
 	dirEntry.Extended[xattrRemoteListingSyncedAt] = []byte(fmt.Sprintf("%d", syncTime.Unix()))
-	f.stampEntryCommitTsNs(dirEntry)
+	f.StampEntryCommitTsNs(dirEntry)
 	if saveErr := f.Store.UpdateEntry(ctx, dirEntry); saveErr != nil {
 		glog.Warningf("maybeLazyListFromRemote: update synced_at for %s: %v", p, saveErr)
 	}
-	f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
+	f.ReleaseEntryCommitTsNs(dirEntry.CommitTsNs)
 }

@@ -248,27 +248,17 @@ func (f *Filer) DoneMetaLogInflightForTest(tsNs int64) {
 	f.metaLogInflight.done(tsNs)
 }
 
-// stampEntryCommitTsNs assigns the mutation's event timestamp to the entry
+// StampEntryCommitTsNs assigns the mutation's event timestamp to the entry
 // pre-write so the emitted event and stored version carry the same commit
 // time. The stamp stays in flight until the event appends; a write no event
-// covers must release it via releaseEntryCommitTsNs.
-func (f *Filer) stampEntryCommitTsNs(entry *Entry) int64 {
+// covers must release it via ReleaseEntryCommitTsNs.
+func (f *Filer) StampEntryCommitTsNs(entry *Entry) int64 {
 	tsNs := f.metaLogInflight.stamp()
 	entry.CommitTsNs = tsNs
 	return tsNs
 }
 
-// releaseEntryCommitTsNs drops a stamp no event will adopt.
-func (f *Filer) releaseEntryCommitTsNs(tsNs int64) {
-	f.metaLogInflight.release(tsNs)
-}
-
-// StampEntryCommitTsNs/ReleaseEntryCommitTsNs expose the lifecycle to the
-// filer server's mutation paths.
-func (f *Filer) StampEntryCommitTsNs(entry *Entry) int64 {
-	return f.stampEntryCommitTsNs(entry)
-}
-
+// ReleaseEntryCommitTsNs drops a stamp no event will adopt.
 func (f *Filer) ReleaseEntryCommitTsNs(tsNs int64) {
 	f.metaLogInflight.release(tsNs)
 }

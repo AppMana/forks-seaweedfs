@@ -1,0 +1,76 @@
+name: AppMana promote server image
+
+# A release is a built server image's exact bytes under a version tag;
+# nothing is built here. Deployments follow the version tags through an
+# image policy, so promoting is what releases a build.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Version tag, <upstream major.minor>-appmana.<n>
+        required: true
+      commit:
+        description: Default-branch commit whose sha-<commit>_large_disk image to promote
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: promote-server-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/appmana/seaweedfs
+
+jobs:
+  promote:
+    if: github.repository == 'AppMana/forks-seaweedfs'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Check the release and the commit
+        env:
+          RELEASE: ${{ inputs.release }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE" =~ ^[0-9]+\.[0-9]+-appmana\.[0-9]+$ ]] || { echo "release $RELEASE is not <major.minor>-appmana.<n>" >&2; exit 1; }
+          sha="$(git rev-parse --verify "$COMMIT^{commit}")"
+          git merge-base --is-ancestor "$sha" "origin/${{ github.event.repository.default_branch }}"
+          echo "SOURCE_SHA=$sha" >> "$GITHUB_ENV"
+      - name: Tag the images
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          crane auth login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          # Resolve every source and check every existing target before the
+          # first tag is written; a release tag never moves.
+          for suffix in "" -linux-amd64 -linux-arm64; do
+            src="$IMAGE:sha-${SOURCE_SHA}_large_disk$suffix"
+            digest="$(crane digest "$src")"
+            if existing="$(crane digest "$IMAGE:$RELEASE$suffix" 2>/dev/null)"; then
+              test "$existing" = "$digest" || { echo "$IMAGE:$RELEASE$suffix names $existing, not $digest" >&2; exit 1; }
+            fi
+          done
+          for suffix in "" -linux-amd64 -linux-arm64; do
+            crane tag "$IMAGE:sha-${SOURCE_SHA}_large_disk$suffix" "$RELEASE$suffix"
+            echo "$IMAGE:$RELEASE$suffix@$(crane digest "$IMAGE:$RELEASE$suffix")" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Tag the source commit
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          if existing="$(git rev-parse -q --verify "refs/tags/$RELEASE^{commit}")"; then
+            test "$existing" = "$SOURCE_SHA" || { echo "git tag $RELEASE names $existing" >&2; exit 1; }
+            exit 0
+          fi
+          git tag "$RELEASE" "$SOURCE_SHA"
+          git push origin "refs/tags/$RELEASE"

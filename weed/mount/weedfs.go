@@ -602,22 +602,32 @@ func (wfs *WFS) Init(server *fuse.Server) {
 	wfs.fuseServer = server
 }
 
+type fuseCancelContext struct {
+	cancel <-chan struct{}
+}
+
+func (fuseCancelContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c fuseCancelContext) Done() <-chan struct{}     { return c.cancel }
+func (c fuseCancelContext) Err() error {
+	select {
+	case <-c.cancel:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+func (fuseCancelContext) Value(any) any { return nil }
+
+func noopCancel() {}
+
 // ctxFromCancel bridges a FUSE request's interrupt channel into a context so
 // metadata lookups can abandon a stalled filer call when the kernel has given
 // up on the operation.
 func ctxFromCancel(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
-	ctx, cancelFunc := context.WithCancel(context.Background())
 	if cancel == nil {
-		return ctx, cancelFunc
+		return context.Background(), noopCancel
 	}
-	go func() {
-		select {
-		case <-cancel:
-			cancelFunc()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancelFunc
+	return fuseCancelContext{cancel: cancel}, noopCancel
 }
 
 // maybeReadEntry resolves an inode to the entry metadata operations act on. An
@@ -809,8 +819,18 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 	// deadline covers the rebuild and the filer lookup below. An interrupt of
 	// the request (reqCtx) ends it early and answers EINTR.
 	reqCtx := ctx
-	ctx, cancel := filerReplyContext(reqCtx)
-	defer cancel()
+	var cancel context.CancelFunc
+	replyCtx := func() context.Context {
+		if cancel == nil {
+			ctx, cancel = filerReplyContext(reqCtx)
+		}
+		return ctx
+	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 
 	// The kernel can serve a directory listing from its page cache past
 	// cacheMetaTtlSec, so ReadDir never runs and EnsureVisited is not called.
@@ -819,6 +839,7 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 	// cache hit below serves metadata lookups instead of issuing one
 	// LookupEntry RPC per entry.
 	if !wfs.metaCache.IsDirectoryCached(dirPath) && wfs.inodeToPath.ShouldRebuildExpiredDir(dirPath, expiredDirRebuildCooldown) {
+		ctx := replyCtx()
 		// The rebuild lists the parent from the filer; let any pending async
 		// flush of the target entry land first so the rebuilt cache does not
 		// capture pre-flush metadata and bypass the wait below.
@@ -845,7 +866,8 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 	}
 
 	if wfs.metaCache.IsDirectoryCached(dirPath) {
-		if !wfs.metaCache.IsNameFresh(fullpath) {
+		fresh := wfs.metaCache.IsNameFresh(fullpath)
+		if !fresh {
 			// A burst of remote changes invalidated this name's section, and a
 			// workload that never reads the directory would read through per
 			// entry until one did. Re-validate just that section here so the
@@ -855,6 +877,7 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 			// backs off under the same cooldown the rebuild gate uses rather
 			// than re-listing the range on every lookup.
 			if sectionLo, stale := meta_cache.StaleRangeOf(wfs.metaCache, dirPath, name); stale && wfs.inodeToPath.ShouldRefreshStaleSection(dirPath, sectionLo, expiredDirRebuildCooldown) {
+				ctx := replyCtx()
 				if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
 					if !wfs.waitForPendingAsyncFlush(ctx, inode) {
 						return nil, entryVersion{}, fuse.EINTR
@@ -871,10 +894,11 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 						glog.V(2).Infof("lookupEntry: refresh stale section of %s: %v", dirPath, err)
 					}
 				}
+				fresh = wfs.metaCache.IsNameFresh(fullpath)
 			}
 		}
-		if wfs.metaCache.IsNameFresh(fullpath) {
-			cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(ctx, fullpath)
+		if fresh {
+			cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(reqCtx, fullpath)
 			if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
 				glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
 				return nil, entryVersion{}, fuse.EIO
@@ -901,7 +925,7 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 					// change is still on its way here. Once the listing is current
 					// its answer stands, as it does unverified while the filer
 					// cannot be asked; otherwise ask the filer below.
-					if currency := wfs.awaitDirectoryCurrent(ctx, dirPath); currency.cached && wfs.metaCache.IsNameFresh(fullpath) {
+					if currency := wfs.awaitDirectoryCurrent(replyCtx(), dirPath); currency.cached && wfs.metaCache.IsNameFresh(fullpath) {
 						cachedEntry, cachedVersionTsNs, cacheErr := wfs.metaCache.FindEntry(context.Background(), fullpath)
 						if cacheErr != nil && cacheErr != filer_pb.ErrNotFound {
 							glog.Errorf("lookupEntry: cache lookup for %s failed: %v", fullpath, cacheErr)
@@ -919,6 +943,8 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 			}
 		}
 	}
+
+	ctx = replyCtx()
 
 	// About to trust the filer, so first let any async flush of a just-closed
 	// handle land: it would otherwise answer with pre-close metadata, a

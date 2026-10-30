@@ -93,8 +93,24 @@ func TestLocalReplyDoesNotMovePositions(t *testing.T) {
 	if _, pending := mc.DirectoryPending("/dir", []*filer_pb.FilerDirectoryPosition{at(filerA, 1, true)}); len(pending) != 1 {
 		t.Fatal("the mount's own change moved filer A's position")
 	}
-	if mc.DirectoryGeneration("/dir") == generation {
-		t.Fatal("the mount's own change left the listing's generation")
+	if mc.DirectoryGeneration("/dir") != generation+1 {
+		t.Fatalf("the mount's own create advanced generation from %d to %d, want %d", generation, mc.DirectoryGeneration("/dir"), generation+1)
+	}
+
+	update := &filer_pb.SubscribeMetadataResponse{
+		Directory: "/dir",
+		TsNs:      600,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry:      &filer_pb.Entry{Name: "own", Attributes: &filer_pb.FuseAttributes{FileMode: 0100644}},
+			NewEntry:      &filer_pb.Entry{Name: "own", Attributes: &filer_pb.FuseAttributes{FileMode: 0100644, FileSize: 10}},
+			NewParentPath: "/dir",
+		},
+	}
+	if err := mc.ApplyMetadataResponse(context.Background(), update, LocalMetadataResponseApplyOptions); err != nil {
+		t.Fatal(err)
+	}
+	if mc.DirectoryGeneration("/dir") != generation+2 {
+		t.Fatalf("in-place update advanced generation to %d, want %d (once per event)", mc.DirectoryGeneration("/dir"), generation+2)
 	}
 }
 

@@ -230,8 +230,7 @@ func TestEmptyFolderCleaner_restoreFoldersWrittenDuringDelete(t *testing.T) {
 	lockRing.SetSnapshot([]pb.ServerAddress{"filer1:8888"}, 0)
 
 	newCleaner := func(mock *mockFilerOps) *EmptyFolderCleaner {
-		// These cases exercise deletion recovery in an opted-in S3 bucket,
-		// not the fork's default policy of preserving mount directories.
+		// Exercise deletion recovery in a bucket opted into empty-folder cleanup.
 		mock.attrsFn = optedInBucketAttrs
 		return &EmptyFolderCleaner{
 			filer:                 mock,

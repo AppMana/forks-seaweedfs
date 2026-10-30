@@ -64,13 +64,10 @@ func growVolumesOn(t *testing.T, masterPort int, dataNode string, count int) {
 	}, 30*time.Second, 200*time.Millisecond, "grow %d volumes on %s: %s", count, dataNode, last)
 }
 
-// A checkpoint written while one of the volume servers it is assigned to
-// stops answering must still close() successfully, inside the FUSE request
-// deadline: every chunk upload that stalls on that server is abandoned and
-// placed on a volume the other servers hold. On 2026-10-11 a trainer's
-// torch.save failed in close() with EIO twice because chunk uploads to one
-// stalled volume server were retried against the same server and fid until
-// the 60 s FLUSH deadline passed.
+// A file written while one of the volume servers it is assigned to stops
+// answering must still close() successfully inside the FUSE request deadline:
+// every chunk upload that stalls on that server is abandoned and placed on a
+// volume the other servers hold.
 func TestCloseSucceedsWhenAnAssignedVolumeServerStalls(t *testing.T) {
 	const (
 		fileSize = 64 << 20

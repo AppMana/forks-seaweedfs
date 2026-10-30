@@ -14,8 +14,8 @@ import (
 )
 
 // A log that is flushed after every line, by fsync or by reopening it, adds
-// one small chunk per flush. Without folding the appended tail, the entry kept
-// every chunk, so each commit rewrote a list that grew by one per flush.
+// one small chunk per flush; folding the appended tail keeps the entry's chunk
+// list bounded across flushes.
 func TestAppendFlushesKeepEntryChunkCountBounded(t *testing.T) {
 	const (
 		lines = 400

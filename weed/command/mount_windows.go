@@ -1,7 +1,6 @@
 package command
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"os"
@@ -13,15 +12,12 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
-	"google.golang.org/grpc/reflection"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/mount/winfsp"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/mount_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -133,34 +129,9 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
-	// try to connect to filer
-	filerAddresses := pb.ServerAddresses(*option.filer).ToAddresses()
-	util.LoadSecurityConfiguration()
-	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
-	var cipher bool
-	var bucketRootPath string
-	for i := 0; i < 10; i++ {
-		err = pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
-			if err != nil {
-				return fmt.Errorf("get filer grpc address %v configuration: %w", filerAddresses, err)
-			}
-			cipher = resp.Cipher
-			bucketRootPath = resp.DirBuckets
-			return nil
-		})
-		if err != nil {
-			glog.V(0).Infof("failed to talk to filer %v: %v", filerAddresses, err)
-			glog.V(0).Infof("wait for %d seconds ...", i+1)
-			time.Sleep(time.Duration(i+1) * time.Second)
-		}
-	}
-	if err != nil {
-		glog.Errorf("failed to talk to filer %v: %v", filerAddresses, err)
+	filerAddresses, grpcDialOption, cipher, bucketRootPath, ok := connectToFiler(option)
+	if !ok {
 		return true
-	}
-	if bucketRootPath == "" {
-		bucketRootPath = "/buckets"
 	}
 
 	filerMountRootPath := *option.filerMountRootPath
@@ -196,9 +167,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		glog.Fatalf("Failed to listen on %s: %v", *option.localSocket, err)
 	}
 
-	// uid/gid have no Windows equivalents; files are owned by the mount
-	// identity unless -map.uid/-map.gid translate filer-side ids.
-	uid, gid := uint32(0), uint32(0)
+	uid, gid := windowsMountIdentity(option)
 	mountMode := os.ModeDir | os.FileMode(0777)&^umask
 
 	uidGidMapper, err := meta_cache.NewUidGidMapper(*option.uidMap, *option.gidMap)
@@ -207,17 +176,8 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
-	// find mount point
-	mountRoot := filerMountRootPath
-	if mountRoot != "/" && strings.HasSuffix(mountRoot, "/") {
-		mountRoot = mountRoot[0 : len(mountRoot)-1]
-	}
-
-	cacheDirForRead := util.ResolvePath(*option.cacheDirForRead)
-	cacheDirForWrite := util.ResolvePath(*option.cacheDirForWrite)
-	if cacheDirForWrite == "" {
-		cacheDirForWrite = cacheDirForRead
-	}
+	mountRoot := resolveMountRoot(filerMountRootPath)
+	cacheDirForRead, cacheDirForWrite := resolveCacheDirs(option)
 
 	// The host is created after the filesystem, so the notifier closure
 	// captures a pointer assigned below (before StartBackgroundTasks
@@ -284,13 +244,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 		PeerRack:       peerStringOrEmpty(option.peerRack),
 	})
 
-	// create mount root
-	if err = ensureMountRoot(context.Background(), seaweedFileSystem, mountRoot, bucketRootPath); err != nil {
-		fmt.Printf("failed to create dir %s on filer %s: %v\n", mountRoot, filerAddresses, err)
-		return false
-	}
-	if err := ensureBucketAllowEmptyFolders(context.Background(), seaweedFileSystem, mountRoot, bucketRootPath); err != nil {
-		fmt.Printf("failed to set bucket auto-remove-empty-folders policy for %s: %v\n", mountRoot, err)
+	if !createMountRoot(seaweedFileSystem, mountRoot, bucketRootPath, filerAddresses) {
 		return false
 	}
 
@@ -308,10 +262,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 
 	seaweedFileSystem.Init(nil)
 
-	grpcS := pb.NewGrpcServer()
-	mount_pb.RegisterSeaweedMountServer(grpcS, seaweedFileSystem)
-	reflection.Register(grpcS)
-	go grpcS.Serve(montSocketListener)
+	serveMountGrpc(seaweedFileSystem, montSocketListener)
 
 	err = seaweedFileSystem.StartBackgroundTasks()
 	if err != nil {
@@ -425,7 +376,7 @@ func RunMountWindows(option *MountOptions, umask os.FileMode) bool {
 			}()
 		}
 	}
-	mountErr := host.Mount(mountPoint, *option.volumeLabel, extraOptions)
+	mountErr := host.Mount(mountPoint, windowsVolumeLabel(option, dir), extraOptions)
 	seaweedFileSystem.WaitForAsyncFlush()
 	if cleanupSymlink {
 		// host.Mount blocks until unmount; remove the staging symlink so

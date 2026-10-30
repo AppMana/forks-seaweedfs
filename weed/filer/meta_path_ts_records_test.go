@@ -20,7 +20,7 @@ func TestPathCommitStampedOnEntry(t *testing.T) {
 	if err := store.InsertEntry(ctx, entry); err != nil {
 		t.Fatalf("InsertEntry: %v", err)
 	}
-	f.releaseEntryCommitTsNs(entry.CommitTsNs)
+	f.ReleaseEntryCommitTsNs(entry.CommitTsNs)
 	if got, err := f.CommitTsNs(ctx, "/dir/file", 0); err != nil || got != entry.CommitTsNs {
 		t.Fatalf("CommitTsNs = %d,%v; want %d", got, err, entry.CommitTsNs)
 	}

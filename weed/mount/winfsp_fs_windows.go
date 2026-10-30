@@ -714,7 +714,6 @@ func (a *winfspFS) Readdir(path string,
 		glog.Errorf("winfsp readdir list %s: %v", dirPath, listErr)
 		return -cgofuse.EIO
 	}
-	_ = ino
 	return metadataError
 }
 

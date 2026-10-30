@@ -41,15 +41,10 @@ func blockShuffledOrder(numPages, pagesPerBlock int) []int {
 	return order
 }
 
-// TestMmapThroughputFloor is the throughput-floor companion to the
-// correctness tests in mmap_read_test.go: a pure correctness test with a
-// loose timeout can pass even when a regression makes reads catastrophically
-// slower (just not slow enough to hit the timeout). This test measures
-// wall-clock for a plain sequential read (the "dd" baseline) against a
-// concurrent, block-shuffled mmap touch of the same bytes, and asserts the
-// mmap path stays within a bounded multiple of the baseline -- the request-
-// count-explosion bug this whole fix series addresses shows up here as an
-// order-of-magnitude (not small-constant-factor) slowdown.
+// TestMmapThroughputFloor measures wall-clock time for a plain sequential read
+// against a concurrent, block-shuffled mmap touch of the same bytes, and
+// asserts the mmap path stays within a bounded multiple of the sequential
+// baseline.
 func TestMmapThroughputFloor(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping performance test in short mode")

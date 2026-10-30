@@ -88,3 +88,52 @@ func TestDemandJoiningDeclinedPrefetchRetries(t *testing.T) {
 		t.Fatal("demand failed to make progress")
 	}
 }
+
+func TestPrefetchWindowDoesNotDoubleCountActiveUnpinnedReader(t *testing.T) {
+	const size = 64 << 10
+	rc := NewReaderCache(32, (*chunk_cache.TieredChunkCache)(nil), func(context.Context, string) ([]string, error) {
+		return []string{"unused"}, nil
+	}, nil, NewReaderCacheBudget(2*size))
+	defer rc.destroy()
+
+	chunk0Entered := make(chan struct{})
+	releaseChunk0 := make(chan struct{})
+	chunk1Fetched := make(chan struct{}, 1)
+	rc.fetchChunkDataFn = func(_ context.Context, b []byte, _ []string, _ []byte, _ bool, _ bool, _ int64, fid string, _ util_http.RefreshUrlsFunc) (int, error) {
+		if fid == "chunk0" {
+			close(chunk0Entered)
+			<-releaseChunk0
+		} else if fid == "chunk1" {
+			chunk1Fetched <- struct{}{}
+		}
+		return len(b), nil
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := rc.ReadChunkAt(context.Background(), make([]byte, 16), "chunk0", nil, false, 0, size, false)
+		readDone <- err
+	}()
+	<-chunk0Entered
+
+	window := &Interval[*ChunkView]{
+		Value: &ChunkView{FileId: "chunk0", ChunkSize: size, ViewSize: size},
+		Next: &Interval[*ChunkView]{
+			Value: &ChunkView{FileId: "chunk1", ChunkSize: size, ViewSize: size},
+		},
+	}
+	rc.MaybeCache(window, 2)
+
+	select {
+	case <-chunk1Fetched:
+	case <-time.After(time.Second):
+		close(releaseChunk0)
+		<-readDone
+		t.Fatal("MaybeCache failed to prefetch chunk1 within a 2-chunk budget because active unpinned reader on chunk0 was double-counted")
+	}
+	close(releaseChunk0)
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+}
+

@@ -250,6 +250,36 @@ func lastSegment(p string) string {
 	return name
 }
 
+func windowsMountIdentity(option *MountOptions) (uint32, uint32) {
+	var uid, gid uint32
+	if option != nil && option.windowsUid != nil {
+		uid = uint32(*option.windowsUid)
+	}
+	if option != nil && option.windowsGid != nil {
+		gid = uint32(*option.windowsGid)
+	}
+	return uid, gid
+}
+
+func windowsVolumeLabel(option *MountOptions, dir string) string {
+	if option == nil {
+		return volumeName("", "", dir, "")
+	}
+	override := peerStringOrEmpty(option.volumeName)
+	if override == "" {
+		if label := peerStringOrEmpty(option.volumeLabel); label != "" && label != "SeaweedFS" {
+			override = label
+		}
+	}
+	return volumeName(
+		peerStringOrEmpty(option.filer),
+		peerStringOrEmpty(option.filerMountRootPath),
+		dir,
+		override,
+	)
+}
+
+
 func configureMountMemory(option *MountOptions) error {
 	if option.readerCacheSizeMB != nil && (*option.readerCacheSizeMB <= 0 || *option.readerCacheSizeMB > math.MaxInt64>>20) {
 		return fmt.Errorf("readerCacheSizeMB must be positive and fit in an int64 byte budget")

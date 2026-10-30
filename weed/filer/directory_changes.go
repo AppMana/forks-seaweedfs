@@ -95,7 +95,9 @@ func ChangedDirectories(event *filer_pb.SubscribeMetadataResponse) []util.FullPa
 	}
 	if message.NewEntry != nil {
 		parent, _ := newPath.DirAndName()
-		dirs = append(dirs, util.FullPath(parent))
+		if message.OldEntry == nil || util.FullPath(parent) != util.FullPath(event.Directory) {
+			dirs = append(dirs, util.FullPath(parent))
+		}
 		if message.NewEntry.IsDirectory && moved {
 			dirs = append(dirs, newPath)
 		}

@@ -15,33 +15,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
-// Scenario matrix for the mmap/FUSE read path (ChunkReadAt + ReaderPattern +
-// ReaderCache), as opposed to stream_benchmark_test.go's separate
-// PrepareStreamContentWithThrottler streaming path. These scenarios model
-// exactly the access patterns that originally triggered the false-random
-// classification (reader_pattern.go) and its cache-bypass consequence
-// (reader_at.go):
-//
-//	(i)   pure sequential single-threaded -- baseline
-//	(ii)  pure sequential, N concurrent goroutines on adjacent ranges --
-//	      reproduces the false-random trip even without mmap involved, since
-//	      WFS.Read's shared per-handle lock allows concurrent completions
-//	(iii) mmap-realistic: concurrent goroutines touching 4KB ranges in
-//	      file-offset order, completing out of order
-//	(iv)  mmap-realistic shuffled: non-contiguous access order, closer to
-//	      safetensors' actual dict-order tensor visitation
-//	(v)   genuinely random full-file offsets -- must legitimately stay
-//	      request-heavy; this scenario exists to prove the fix doesn't
-//	      over-correct into always caching, not to demand it be fast
+// Benchmarks and tests for the ChunkReadAt + ReaderPattern + ReaderCache read
+// path across sequential, concurrent sequential, mmap-ordered, mmap-shuffled,
+// and random access patterns.
 
 const benchPageSize = 4096
 
-// countingLatencyServer serves chunk data with per-request latency (matching
-// createMockVolumeServer's contract) while also counting requests reaching
-// the backend (matching createCountingMockVolumeServer's contract) -- the
-// bench scenarios need both: latency to make request-count differences
-// visible as wall-clock differences, and a counter to assert directly on
-// request-count ratios independent of timing noise.
+// countingLatencyServer serves chunk data with optional per-request latency
+// and counts backend requests.
 func countingLatencyServer(chunkData map[string][]byte, latency time.Duration) (server *httptest.Server, requestCount *int64) {
 	var mu sync.RWMutex
 	var count int64

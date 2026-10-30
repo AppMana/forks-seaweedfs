@@ -28,7 +28,13 @@ func TestChangedDirectories(t *testing.T) {
 			name: "update in place",
 			event: &filer_pb.SubscribeMetadataResponse{Directory: "/d", EventNotification: &filer_pb.EventNotification{
 				OldEntry: &filer_pb.Entry{Name: "sub", IsDirectory: true}, NewEntry: &filer_pb.Entry{Name: "sub", IsDirectory: true}, NewParentPath: "/d"}},
-			want: []util.FullPath{"/d", "/d"},
+			want: []util.FullPath{"/d"},
+		},
+		{
+			name: "rename within same directory",
+			event: &filer_pb.SubscribeMetadataResponse{Directory: "/d", EventNotification: &filer_pb.EventNotification{
+				OldEntry: &filer_pb.Entry{Name: "a"}, NewEntry: &filer_pb.Entry{Name: "b"}, NewParentPath: "/d"}},
+			want: []util.FullPath{"/d"},
 		},
 		{
 			name: "delete directory",

@@ -267,7 +267,7 @@ type sharedChunksStore interface {
 }
 
 func isNotFound(err error) bool {
-	return err != nil && (errors.Is(err, filer_pb.ErrNotFound) || err == filer_pb.ErrNotFound)
+	return errors.Is(err, filer_pb.ErrNotFound)
 }
 
 // ErrSharedChunksSourceChanged: the source of a link no longer carries the

@@ -230,14 +230,12 @@ func (l *SharedDiskCacheLayer) recordScopeEntry(relPath string, size int64, now 
 	l.scopeUsedBytes += size
 	l.writesSinceScan++
 
-	// Step 1: Enforce per-scope (per-mount / per-modality) quota first so a
-	// single noisy mount or modality evicts its own oldest chunks before
-	// contending on the shared whole-cache space.
+	// Enforce per-scope quota first so a single noisy scope evicts its own
+	// oldest chunks before contending on the shared whole-cache space.
 	if l.scopeLimitBytes > 0 && l.scopeUsedBytes > l.scopeLimitBytes {
 		l.evictScopeLocked(l.scopeLimitBytes)
 	}
 
-	// Step 2: Enforce whole-cache (node-wide) quota across the shared directory.
 	if l.wholeLimitBytes > 0 && (l.wholeUsedBytes > l.wholeLimitBytes || l.wholeLimitBytes < 64*1024*1024 || l.writesSinceScan >= 16) {
 		l.scanWholeCacheLocked()
 		if l.wholeUsedBytes > l.wholeLimitBytes {

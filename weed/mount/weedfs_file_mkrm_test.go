@@ -265,10 +265,9 @@ func newBucketRootEntry(name string) *filer_pb.Entry {
 	}
 }
 
-// A root-level mutation touches the mount root's mtime on the filer. The
-// mount only knows a synthetic root entry, so the rewrite used to drop the
-// bucket's extended attributes, including the flag that keeps the
-// empty-folder cleaner away from CSI volumes.
+// A root-level mutation touches the mount root's mtime on the filer and must
+// preserve the bucket's extended attributes rather than overwriting the root
+// with a synthetic entry.
 func TestRootTouchPreservesBucketAttributes(t *testing.T) {
 	wfs, testServer := newCreateTestWFSWithRoot(t, "/buckets/pvc-test")
 	testServer.rootEntry = newBucketRootEntry("pvc-test")

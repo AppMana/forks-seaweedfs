@@ -34,6 +34,7 @@ func TestUnresponsiveBackendAnswersWithinRequestTimeout(t *testing.T) {
 	config.MountOptions = []string{
 		"-cacheDir=" + cacheDir,
 		"-fuse.requestTimeout=" + requestTimeout.String(),
+		"-fuse.metadataRequestTimeout=" + requestTimeout.String(),
 		"-fuse.kernelRequestTimeout=0",
 	}
 	framework := NewFuseTestFramework(t, config)

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"time"
 
 	cgofuse "github.com/winfsp/cgofuse/fuse"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -36,6 +38,13 @@ type winfspFS struct {
 func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
 	return &winfspFS{wfs: wfs, readAhead: newReadAheadCache(), caseSensitive: caseSensitive}
 }
+
+// expireReferences returns the lookup references whose retention ended
+// before now.
+func (a *winfspFS) expireReferences(now time.Time) {}
+
+// entryChanged applies a metadata event to the adapter's own caches.
+func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {}
 
 // fullPath converts a cgofuse path ('/'-separated, relative to the
 // mount point) to the filer-space path that inodeToPath tracks.

@@ -139,8 +139,7 @@ func TestCheckDiskSpaceProbesWithTheDiskTypeThreshold(t *testing.T) {
 	}
 }
 
-// -dir.idx naming a directory that does not exist yet used to leave every
-// volume unable to open its index.
+// An index directory may be created during volume loading.
 func TestNewDiskLocation_CreatesIdxDirectory(t *testing.T) {
 	root := t.TempDir()
 	idxDir := filepath.Join(root, "idx", "nested")

@@ -42,7 +42,7 @@ MUTATIONS = {
     "scanner-body-error": (
         "weed/storage/volume_read.go",
         '''\t\t\t\treturn fmt.Errorf("cannot read needle body at offset %d: %w", offset, err)
-''', '''\t\t\t\terr = nil // MUTANT: reproduce the historical ignored body error
+''', '''\t\t\t\terr = nil // MUTANT: inject ignored body error
 '''),
 }
 

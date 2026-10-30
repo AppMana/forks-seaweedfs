@@ -224,11 +224,7 @@ func (s *fakeVolumeCopyStream) SetTrailer(metadata.MD)                          
 func (s *fakeVolumeCopyStream) SendMsg(any) error                               { return nil }
 func (s *fakeVolumeCopyStream) RecvMsg(any) error                               { return nil }
 
-// TestVolumeCopy_KeepsExistingReplicaWhenSourceUnreachable verifies the
-// verify-before-destroy invariant: a pre-existing healthy local replica must
-// NOT be deleted when the source cannot be reached. The pre-fix code deleted
-// the destination up front (and, on retry, could lose the volume entirely);
-// the fix defers the delete until the source ReadVolumeFileStatus succeeds.
+// An unreachable source must leave the destination replica intact.
 func TestVolumeCopy_KeepsExistingReplicaWhenSourceUnreachable(t *testing.T) {
 	dir := t.TempDir()
 	store := storage.NewStore(

@@ -214,7 +214,7 @@ func (l *DiskLocation) hasEcxFile(volumeName string) bool {
 // whether one was swept. A stub is an empty .dat (<= a superblock, i.e. zero
 // needles) whose .vif records an EC shard config. An EC volume keeps no local
 // .dat, so the stub holds no data -- its shards live on other servers. Such
-// stubs (phantoms from the pre-fix loader) otherwise load as phantom empty
+// stubs otherwise load as phantom empty
 // volumes, and a same-vid stub on two disks can shadow a real replica. The
 // .dat and its empty .idx are removed; non-EC empty .dat files are left alone.
 // The .vif is looked up in both the data and idx directories (which differ

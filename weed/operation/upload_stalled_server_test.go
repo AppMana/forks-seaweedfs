@@ -149,11 +149,8 @@ func mountChunkUploadOption(stallTimeout time.Duration) *UploadOption {
 	}
 }
 
-// A chunk assigned to a volume server that stalls must land on another
-// volume: the attempt ends at its timeout, and the retry takes a new fid on a
-// volume none of whose servers stalled, instead of posting the same fid to the
-// same server again. On 2026-10-11 a trainer checkpoint's close() failed with
-// EIO because every retry went back to the same stalled server and fid.
+// A stalled upload retries with a new fid on a volume whose servers
+// have not stalled.
 func TestUploadWithRetryMovesOffAStalledVolumeServer(t *testing.T) {
 	stalled := startStalledVolumeServer(t)
 	healthy := startHealthyVolumeServer(t, nil)

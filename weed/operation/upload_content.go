@@ -550,22 +550,9 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 	return uploadResult, err
 }
 
-// upload_content POSTs payload as the single part of a multipart/form-data
-// body. The body is streamed as preamble + payload + trailer, where preamble
-// and trailer are the few hundred bytes the multipart writer emits around the
-// part; the payload itself is never copied. A multipart part writer passes its
-// bytes through unchanged, so the wire body is identical to writing the
-// payload through the writer. The request carries an exact Content-Length:
-// a volume server reserves its 256 MiB per-request ceiling for a body of
-// unknown length.
-//
-// Buffering the whole body here gave a replicating primary one full copy of
-// every needle per replica, on top of the needle it had already parsed, while
-// transfer admission charged the needle once. On 2026-09-29 07:21-07:46 that
-// is how four DAS volume servers reached a 4.3 GiB heap and were OOMKilled at
-// their 5 GiB limit with 3 GiB of uploads and 1 GiB of downloads admitted.
-//
-// option.BytesBuffer no longer holds the body; it is left untouched.
+// upload_content streams multipart framing around the caller-owned payload.
+// An exact Content-Length lets admission reserve the actual body size.
+// BytesBuffer is left untouched.
 func (uploader *Uploader) upload_content(ctx context.Context, payload []byte, originalDataSize int, option *UploadOption) (*UploadResult, error) {
 	var framing bytes.Buffer
 	body_writer := multipart.NewWriter(&framing)

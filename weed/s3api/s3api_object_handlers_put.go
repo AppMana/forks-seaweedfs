@@ -540,7 +540,7 @@ func isMultipartPartRequest(r *http.Request) bool {
 // storageDestination overrides the path the filer resolves filer.conf storage
 // rules against, empty meaning filePath. MPU parts stage under the bucket's
 // .uploads folder but their bytes become the object, so they pass the object's
-// path the way the x-seaweedfs-destination header used to carry it.
+// path as the storage destination.
 func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader io.Reader, bucket string, object string, partNumber int, lifecycleTTLSec int32, finalize *putFinalize, uniqueWritePath bool, storageDestination string) (etag string, code s3err.ErrorCode, sseMetadata SSEResponseMetadata) {
 	if !s3_constants.IsValidBucketName(bucket) || (object != "" && !s3_constants.IsValidObjectKey(object)) {
 		return "", s3err.ErrInvalidRequest, SSEResponseMetadata{}

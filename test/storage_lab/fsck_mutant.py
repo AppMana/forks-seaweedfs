@@ -12,7 +12,7 @@ MUTATIONS = {
     "missing-delete-results": (
         """\t\t\tresultChan <- serverDeleteResults{server: server, results: deleteResults}
 """,
-        """\t\t\t// MUTANT: reproduce the historical silent omission of nil responses.
+        """\t\t\t// MUTANT: inject silent omission of nil responses.
 \t\t\tif deleteResults != nil {
 \t\t\t\tresultChan <- serverDeleteResults{server: server, results: deleteResults}
 \t\t\t}
@@ -24,7 +24,7 @@ MUTATIONS = {
 \t\t\t}
 """,
         """\t\t\tif applyPurging {
-\t\t\t\t// MUTANT: reproduce the historical log-and-continue behavior.
+\t\t\t\t// MUTANT: inject log-and-continue behavior.
 \t\t\t\t_ = c.httpDelete(itemPath)
 \t\t\t}
 """,

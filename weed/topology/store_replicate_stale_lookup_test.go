@@ -18,28 +18,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// This is the amplifier that turned the stale master read into the 2026-08-24
-// Harbor outage on appmana-cluster-03.
-//
-// A follower master whose vidMap had frozen answered LookupVolume for volume
-// 1335 with zero locations AND an explicit error, "volume id 1335 not found"
-// (master_server_handlers.go findVolumeLocation sets Error and NotFound when
-// the topology has no locations). GetWritableRemoteReplications reads only
-// lookupErr, the gRPC transport error, and drops lookupResult.Error entirely.
-// A definitive "I do not know this volume" is therefore indistinguishable from
-// "this volume has lost its replicas", and the volume server reported:
-//
-//	replicating operations [0] is less than volume 1335 replication copy count [3]
-//
-// ReplicatedWrite returns on that error BEFORE the local write, so the chunk
-// POST fails with HTTP 500 and Harbor's CompleteMultipartUpload surfaces
-// "s3aws: InternalError". 27,298 of these were logged on volume server
-// zxa1yssb between 14:00 and 20:07 UTC.
-//
-// The two cases need different handling and so must be distinguishable:
-// a not-found answer from one master out of three is a stale or wrong-peer
-// answer that should not be treated as authoritative about replica count,
-// whereas a genuine shortfall of registered replicas is a real topology fact.
+// An unknown-volume lookup must be distinguished from a replica shortfall.
+// One master's missing location data does not establish under-replication.
 
 // notFoundMasterServer models the stale follower: zero locations plus the
 // explicit not-found error the master sets alongside them.
@@ -73,12 +53,6 @@ func startMaster(t *testing.T, srv master_pb.SeaweedServer) pb.ServerAddress {
 	return pb.ServerAddress(fmt.Sprintf("127.0.0.1:0.%s", port))
 }
 
-// TestNotFoundFromMasterIsNotReportedAsUnderReplication asserts the two cases
-// are distinguishable.
-//
-// RED against the current tree: the error says "replicating operations [0] is
-// less than volume 1335 replication copy count [3]", claiming a replica
-// shortfall, when the master in fact said it does not know the volume.
 func TestNotFoundFromMasterIsNotReportedAsUnderReplication(t *testing.T) {
 	dir := t.TempDir()
 	store := storage.NewStore(
@@ -90,9 +64,8 @@ func TestNotFoundFromMasterIsNotReportedAsUnderReplication(t *testing.T) {
 		0, stats.DiskIOProbeConfig{},
 	)
 
-	const vid = needle.VolumeId(1335)
-	// ReplicaPlacement 020 is what the harbor-registry collection uses: three copies.
-	if err := store.AddVolume(vid, "harbor-registry", storage.NeedleMapInMemory, "020", "", 0,
+	const vid = needle.VolumeId(12)
+	if err := store.AddVolume(vid, "registry", storage.NeedleMapInMemory, "020", "", 0,
 		needle.GetCurrentVersion(), 0, types.HardDriveType, 0); err != nil {
 		t.Fatalf("AddVolume: %v", err)
 	}

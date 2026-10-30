@@ -46,15 +46,9 @@ func parseNotifyLab(output string) ([]notifyLabIteration, error) {
 	return results, nil
 }
 
-// A kernel name invalidation for a directory takes that directory's lock
-// uninterruptibly. If a local rename or create in the same directory holds the
-// lock while it waits for this mount's reply, the notifying thread cannot run
-// or be killed until the reply comes, so a slow filer becomes a hung task, and
-// a mount that is exiting can never close /dev/fuse to abort the request.
-// appmana-008 and appmana-031 panicked on exactly this on 2026-10-08.
-//
-// The VM is disposable and offline. Hung-task reports are lowered to 10 s and
-// never panic; the host's settings are untouched.
+// A kernel name invalidation takes the directory lock uninterruptibly.
+// A request holding that lock must receive its reply before notification.
+// The disposable guest reports hung tasks after 10 s without panicking.
 func TestFuseReverseInvalidationLab(t *testing.T) {
 	if os.Getenv("SEAWEEDFS_NOTIFY_LAB_LIVE") != "1" {
 		t.Skip("set SEAWEEDFS_NOTIFY_LAB_LIVE=1")

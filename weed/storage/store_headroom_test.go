@@ -141,9 +141,7 @@ func TestAddVolumeAllowsPreallocationWhereUnsupported(t *testing.T) {
 	}
 }
 
-// Replays the incident in miniature: the master keeps asking for volumes
-// while the disk sits just above its floor. Each created volume reserves its
-// full size, so the disk must not be driven below the floor.
+// Repeated volume creation must preserve the disk headroom floor.
 func TestGrowthLoopStopsAtFloorWhenVolumesPreallocate(t *testing.T) {
 	const floor = 1000 * testMiB
 	const preallocate = 1 * testMiB

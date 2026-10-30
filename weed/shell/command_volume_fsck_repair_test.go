@@ -163,10 +163,8 @@ func TestFsckRepairFailsOnWriteError(t *testing.T) {
 	}
 }
 
-// Each replica index is an in-memory LevelDB with its own goroutines and
-// write buffer. A whole-cluster repair walks ~1300 volumes; holding every
-// volume's indexes until the run ends exhausted a 4 GiB job on 2026-10-23.
-// A volume's indexes must be closed before the next volume's are loaded.
+// Close each volume's replica indexes before opening the next volume's
+// indexes to bound LevelDB buffers and goroutines.
 func TestFsckRepairReleasesEachVolumeIndexesBeforeTheNext(t *testing.T) {
 	tempFolder := t.TempDir()
 	volumes := map[string]map[uint32]VInfo{"dnA": {}, "dnB": {}}

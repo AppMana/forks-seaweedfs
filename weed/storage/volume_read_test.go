@@ -259,9 +259,7 @@ func TestReadNeedleDataIntoChecksumMismatchHoldsLastPage(t *testing.T) {
 	}
 	defer v.Close()
 
-	// 2048 is two pages (one buffer swap), 3000 is three, and 2500 with a
-	// buffer larger than the needle is the single Write that used to commit
-	// the whole body before the CRC check.
+	// Exercise reads spanning two pages, three pages and a single buffer.
 	cases := []struct {
 		name string
 		size int

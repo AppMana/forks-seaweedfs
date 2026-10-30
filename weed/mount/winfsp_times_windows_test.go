@@ -81,3 +81,9 @@ func TestWinfspUtimensKeepsTimesWindowsDidNotSet(t *testing.T) {
 		t.Fatal("a date before 1970 was not written to atime")
 	}
 }
+
+func TestWinfspUtimeOmitMatchesCgofuse(t *testing.T) {
+	if winfspUtimeOmit != cgofuse.UTIME_OMIT {
+		t.Fatalf("winfspUtimeOmit = %d, cgofuse UTIME_OMIT = %d", winfspUtimeOmit, cgofuse.UTIME_OMIT)
+	}
+}

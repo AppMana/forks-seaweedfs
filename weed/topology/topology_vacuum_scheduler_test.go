@@ -62,7 +62,7 @@ func testVacuumSchedulerQuota(t *testing.T, volumes, quota int) {
 	}
 	topo := &Topology{volumeSizeLimit: 10000}
 	start := time.Now()
-	topo.vacuumOneVolumeLayout(grpc.WithTransportCredentials(insecure.NewCredentials()), layout, &Collection{Name: "test"}, 0.3, quota, 0, false, 0)
+	topo.vacuumOneVolumeLayout(grpc.WithTransportCredentials(insecure.NewCredentials()), layout, &Collection{Name: "test"}, 0.3, quota, 0, 0, false, 0)
 	elapsed := time.Since(start)
 	if fake.calls.Load() != int32(volumes) || fake.peak.Load() != int32(quota) {
 		t.Fatalf("calls=%d peak=%d; require %d checks with per-server concurrency %d", fake.calls.Load(), fake.peak.Load(), volumes, quota)

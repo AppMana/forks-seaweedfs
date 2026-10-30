@@ -59,6 +59,7 @@ type DiskLocation struct {
 
 	isDiskSpaceLow    atomic.Bool
 	isDiskUnavailable atomic.Bool
+	syncBatch         SyncBatchOption
 	closeCh           chan struct{}
 }
 
@@ -120,6 +121,7 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 		MaxVolumeCount:         maxVolumeCount,
 		OriginalMaxVolumeCount: maxVolumeCount,
 		MinFreeSpace:           minFreeSpace,
+		syncBatch:              DefaultSyncBatchOption,
 	}
 	location.volumes = make(map[needle.VolumeId]*Volume)
 	location.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
@@ -705,6 +707,8 @@ func (l *DiskLocation) UnUsedSpace(volumeSizeLimit uint64) (unUsedSpace uint64) 
 			continue
 		}
 		datSize, idxSize, _ := vol.FileStat()
+		// A preallocated volume already holds its space on disk.
+		datSize = max(datSize, vol.datAllocatedSize())
 		unUsedSpaceVolume := int64(volumeSizeLimit) - int64(datSize+idxSize)
 		glog.V(4).Infof("Volume stats for %d: volumeSizeLimit=%d, datSize=%d idxSize=%d unused=%d", vol.Id, volumeSizeLimit, datSize, idxSize, unUsedSpaceVolume)
 		if unUsedSpaceVolume >= 0 {

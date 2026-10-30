@@ -50,6 +50,7 @@ type MasterOptions struct {
 	portGrpc                      *int
 	ip                            *string
 	ipBind                        *string
+	listenOnLocalhost             *bool
 	metaFolder                    *string
 	peers                         *string
 	mastersDeprecated             *string // deprecated, for backward compatibility in master.follower
@@ -81,6 +82,15 @@ type MasterOptions struct {
 	// is cancelled. Used by integration tests and by weed mini; nil for
 	// standalone weed master.
 	shutdownCtx context.Context
+	// releaseAllocOnFirstReport lifts the post-mint allocation hold as soon as
+	// one full volume-server inventory has been applied. weed mini sets it in
+	// single-master mode, with singleReporterAddr pinning the embedded volume
+	// server as the only admitted reporter: any other volume server is refused,
+	// so the warmup window after a fresh topology id is dead time.
+	// Standalone weed master / weed server can face late-arriving veterans and
+	// must keep the window.
+	releaseAllocOnFirstReport bool
+	singleReporterAddr        string
 }
 
 func init() {
@@ -94,7 +104,7 @@ func init() {
 	m.volumeSizeLimitMB = cmdMaster.Flag.Uint("volumeSizeLimitMB", util.DefaultVolumeSizeLimitMB, "Master stops directing writes to oversized volumes.")
 	m.fileSizeLimitMB = cmdMaster.Flag.Int("fileSizeLimitMB", 256, "limit the file size accepted by /submit, should match the volume servers' -fileSizeLimitMB (-volume.fileSizeLimitMB under weed server or weed mini, which set this for you)")
 	m.volumePreallocate = cmdMaster.Flag.Bool("volumePreallocate", false, "Preallocate disk space for volumes.")
-	m.maxParallelVacuumPerServer = cmdMaster.Flag.Int("maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel per volume server")
+	m.maxParallelVacuumPerServer = cmdMaster.Flag.Int("maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel per volume server; 0 for no limit (deprecated, use master.vacuum.max_parallel_per_server in master.toml)")
 	m.vacuumIntervalSeconds = cmdMaster.Flag.Int("vacuumIntervalSeconds", 840, "seconds between automatic vacuum sweeps")
 	m.vacuumDeleteEmptyAfterSeconds = cmdMaster.Flag.Int("vacuumDeleteEmptyAfterSeconds", 0, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
 	// m.pulseSeconds = cmdMaster.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats")
@@ -191,6 +201,13 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	if *masterOption.portGrpc == 0 {
 		*masterOption.portGrpc = 10000 + *masterOption.port
 	}
+	// The loopback companion listener is only kept while -ip.bind is unset
+	// and the bind address falls back to -ip. An explicit -ip.bind pins each
+	// port to exactly that address.
+	listenOnLocalhost := *masterOption.ipBind == ""
+	if masterOption.listenOnLocalhost != nil {
+		listenOnLocalhost = *masterOption.listenOnLocalhost
+	}
 	if *masterOption.ipBind == "" {
 		*masterOption.ipBind = *masterOption.ip
 	}
@@ -207,7 +224,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	ms := weed_server.NewMasterServer(r, masterOption.toMasterOption(masterWhiteList), masterPeers)
 	listeningAddress := util.JoinHostPort(*masterOption.ipBind, *masterOption.port)
 	glog.V(0).Infof("Start Seaweed Master %s at %s", version.Version(), listeningAddress)
-	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0)
+	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0, listenOnLocalhost)
 	if e != nil {
 		glog.Fatalf("Master startup error: %v", e)
 	}
@@ -264,7 +281,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 	// starting grpc server
 	grpcPort := *masterOption.portGrpc
-	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*masterOption.ipBind, grpcPort, 0)
+	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*masterOption.ipBind, grpcPort, 0, listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("master failed to listen on grpc port %d: %v", grpcPort, err)
 	}
@@ -480,13 +497,16 @@ func (m *MasterOptions) toMasterOption(whiteList []string) *weed_server.MasterOp
 		VacuumIntervalSeconds:         *m.vacuumIntervalSeconds,
 		VacuumDeleteEmptyAfterSeconds: *m.vacuumDeleteEmptyAfterSeconds,
 		// PulseSeconds:            *m.pulseSeconds,
-		DefaultReplicaPlacement: *m.defaultReplication,
-		GarbageThreshold:        *m.garbageThreshold,
-		WhiteList:               whiteList,
-		DisableHttp:             *m.disableHttp,
-		MetricsAddress:          *m.metricsAddress,
-		MetricsIntervalSec:      *m.metricsIntervalSec,
-		TelemetryUrl:            *m.telemetryUrl,
-		TelemetryEnabled:        *m.telemetryEnabled,
+		DefaultReplicaPlacement:   *m.defaultReplication,
+		GarbageThreshold:          *m.garbageThreshold,
+		WhiteList:                 whiteList,
+		DisableHttp:               *m.disableHttp,
+		MetricsAddress:            *m.metricsAddress,
+		MetricsIntervalSec:        *m.metricsIntervalSec,
+		TelemetryUrl:              *m.telemetryUrl,
+		TelemetryEnabled:          *m.telemetryEnabled,
+		SingleMaster:              isSingleMasterMode(*m.peers),
+		ReleaseAllocOnFirstReport: m.releaseAllocOnFirstReport,
+		SingleVolumeReporter:      m.singleReporterAddr,
 	}
 }

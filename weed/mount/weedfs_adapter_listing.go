@@ -14,7 +14,7 @@ import (
 // adapters too. An oversized cache build must read through, never enumerate
 // the incomplete local cache as if it were a complete directory.
 func (wfs *WFS) listDirectoryForAdapter(ctx context.Context, dir util.FullPath, each filer.ListEachEntryFunc) error {
-	err := wfs.ensureDirectoryVisited(dir)
+	err := wfs.ensureDirectoryVisited(ctx, dir)
 	if err == nil {
 		// The cache holds its read lock while visiting entries. Adapter
 		// callbacks may read local file handles; Flush holds those handles

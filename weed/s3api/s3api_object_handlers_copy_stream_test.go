@@ -34,7 +34,7 @@ func TestStreamCopyChunkRangeHonorsAssignedDurability(t *testing.T) {
 			defer dst.Close()
 			assignment := assignTo(t, dst)
 			assignment.Fsync = durable
-			err := (&S3ApiServer{}).streamCopyChunkRange(context.Background(), src.URL, "7,src", 0, int64(len(payload)), true, assignment)
+			err := (&S3ApiServer{}).streamCopyChunkRange(context.Background(), src.URL, "7,src", 0, int64(len(payload)), true, assignment, nil)
 			want := ""
 			if durable {
 				want = "true"
@@ -140,7 +140,7 @@ func TestStreamCopyChunkRange_DestinationPostCarriesContentLength(t *testing.T) 
 
 	s3a := &S3ApiServer{}
 	err := s3a.streamCopyChunkRange(context.Background(), src.URL+"/7,src", "7,src",
-		0, int64(len(payload)), true, assignTo(t, dst))
+		0, int64(len(payload)), true, assignTo(t, dst), nil)
 	if err != nil {
 		t.Fatalf("stream copy: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestStreamCopyChunkRange_GzipPassThroughCarriesCompressedLength(t *testing.
 
 	s3a := &S3ApiServer{}
 	err := s3a.streamCopyChunkRange(context.Background(), src.URL+"/7,src", "7,src",
-		0, int64(wire.Len()*4), true, assignTo(t, dst))
+		0, int64(wire.Len()*4), true, assignTo(t, dst), nil)
 	if err != nil {
 		t.Fatalf("stream copy: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestStreamCopyChunkRange_UnsizedSourceStillCopies(t *testing.T) {
 
 	s3a := &S3ApiServer{}
 	err := s3a.streamCopyChunkRange(context.Background(), src.URL+"/7,src", "7,src",
-		0, int64(len(payload)), false, assignTo(t, dst))
+		0, int64(len(payload)), false, assignTo(t, dst), nil)
 	if err != nil {
 		t.Fatalf("stream copy: %v", err)
 	}

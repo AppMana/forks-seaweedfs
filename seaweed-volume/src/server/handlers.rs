@@ -161,9 +161,10 @@ impl SourceReadRequest {
 
     /// HEAD, a range, or a stream.
     fn served_from_source(&self, n: &Needle) -> bool {
-        // HEAD is meta-only unless the payload is needed to expand a manifest.
         if self.is_head {
-            return !(n.is_chunk_manifest() && !self.bypass_cm);
+            // HEAD is meta-only unless the payload is needed to expand a
+            // manifest or to answer an image transform's length.
+            return !self.has_image_ops && !(n.is_chunk_manifest() && !self.bypass_cm);
         }
         self.direct(n) && (self.has_range || n.data_size > STREAMING_THRESHOLD)
     }
@@ -171,8 +172,10 @@ impl SourceReadRequest {
     /// Meta first only if the needle could be served from source; its data
     /// size is below its index size.
     fn try_meta_first(&self, size: Size) -> bool {
-        self.is_head
-            || (!self.has_image_ops && (self.has_range || size.0 > STREAMING_THRESHOLD as i32))
+        if self.has_image_ops {
+            return false;
+        }
+        self.is_head || self.has_range || size.0 > STREAMING_THRESHOLD as i32
     }
 }
 
@@ -204,9 +207,15 @@ fn read_needle_for_get(
     if request.try_meta_first(plan.size()) {
         plan.read_meta(&mut n)?;
         if n.cookie != cookie {
+            // The meta read answered the request.
+            plan.note_meta_only_success();
             return Ok(None);
         }
         if request.served_from_source(&n) {
+            if request.is_head {
+                // HEAD ends here; no payload read will record the success.
+                plan.note_meta_only_success();
+            }
             let info = plan.into_stream_info(&n);
             return Ok(Some((n, Some(info))));
         }
@@ -234,6 +243,9 @@ struct StreamingBody {
     hold_read_lock_for_stream: bool,
     _held_read_lease: Option<crate::storage::volume::DataFileReadLease>,
     io_unavailable: Arc<crate::storage::volume::IoUnavailable>,
+    /// Chunk read failures feed the volume's io-error streak, and finishing
+    /// the stream clears it — Go readNeedleDataInto parity.
+    io_errors: Arc<crate::storage::io_error::IoErrorTracker>,
     /// Pending chunk read; it hands `buf` back with the result.
     pending: Option<tokio::task::JoinHandle<(bytes::BytesMut, std::io::Result<bytes::Bytes>)>>,
     /// Chunk buffer, reclaimed once the previous frame has been written out.
@@ -295,12 +307,18 @@ impl http_body::Body for StreamingBody {
                                             ),
                                         )));
                                     }
+                                    // Hyper may not poll again once Content-Length is
+                                    // satisfied, so the read's success is recorded here.
+                                    self.io_errors.check_read_write_error(None);
                                 }
                                 return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
                                     chunk,
                                 ))));
                             }
-                            Ok(Err(e)) => return std::task::Poll::Ready(Some(Err(e))),
+                            Ok(Err(e)) => {
+                                self.io_errors.check_read_write_error(Some(&e));
+                                return std::task::Poll::Ready(Some(Err(e)));
+                            }
                             Err(e) => {
                                 return std::task::Poll::Ready(Some(Err(std::io::Error::other(e))));
                             }
@@ -311,6 +329,7 @@ impl http_body::Body for StreamingBody {
 
             let total = self.data_size as usize;
             if self.pos >= total {
+                self.io_errors.check_read_write_error(None);
                 return std::task::Poll::Ready(None);
             }
 
@@ -600,7 +619,7 @@ async fn batch_delete_file_ids(
             let locations = lookup_volume(
                 &state.http_client,
                 &state.outgoing_http_scheme,
-                &state.master_url,
+                &state.current_master().await,
                 volume_id,
             )
             .await
@@ -672,7 +691,7 @@ async fn do_replicated_request(
     let locations = lookup_volume(
         &state.http_client,
         &state.outgoing_http_scheme,
-        &state.master_url,
+        &state.current_master().await,
         vid,
     )
     .await
@@ -680,9 +699,9 @@ async fn do_replicated_request(
 
     let copy_count = {
         let store = state.store.read().unwrap();
-        store
-            .find_volume(VolumeId(vid))
-            .map_or(1, |(_, v)| v.super_block.replica_placement.get_copy_count())
+        store.find_volume(VolumeId(vid)).map_or(1, |(_, v)| {
+            v.super_block().replica_placement.get_copy_count()
+        })
     };
     let allow_delete = method == axum::http::Method::DELETE;
     let eligible_locations: Vec<_> = locations
@@ -829,7 +848,7 @@ async fn proxy_or_redirect_to_target(
     let locations = match lookup_volume(
         &state.http_client,
         &state.outgoing_http_scheme,
-        &state.master_url,
+        &state.current_master().await,
         vid.0,
     )
     .await
@@ -1101,7 +1120,15 @@ async fn get_or_head_handler_inner(
     };
 
     let (etag, last_modified_str) = etag_and_last_modified(&n);
+    // A Range whose If-Range no longer matches is ignored and the whole
+    // content is sent, so a resumed download restarts instead of mixing
+    // two versions.
+    let range = range.filter(|_| if_range_matches(&headers, &etag, &last_modified_str));
     if let Some(resp) = not_modified_response(&n, &headers, &etag, &last_modified_str) {
+        // A request that ends here was answered by the meta read alone.
+        if let Some(io_errors) = strategy.io_errors() {
+            io_errors.check_read_write_error(None);
+        }
         return resp;
     }
 
@@ -1144,14 +1171,20 @@ async fn get_or_head_handler_inner(
             return head_from_meta_response(&info, response_headers);
         }
         ReadStrategy::RangeFromSource(info) => {
-            return range_from_source_response(
-                &state,
-                range.as_deref().unwrap_or_default(),
-                info,
-                response_headers,
-                track_download,
-            )
-            .await;
+            return match range.as_deref() {
+                Some(range) => {
+                    range_from_source_response(
+                        &state,
+                        range,
+                        info,
+                        response_headers,
+                        track_download,
+                    )
+                    .await
+                }
+                // If-Range dropped the range; serve the whole content.
+                None => stream_response(&state, info, response_headers, track_download),
+            };
         }
         ReadStrategy::Buffered => {}
     }
@@ -1195,6 +1228,19 @@ struct ReadPlan {
     strategy: ReadStrategy,
 }
 
+impl ReadStrategy {
+    /// The tracker a terminal meta read reports success to, when the reply
+    /// is served from the data file.
+    fn io_errors(&self) -> Option<&Arc<crate::storage::io_error::IoErrorTracker>> {
+        match self {
+            ReadStrategy::Stream(info)
+            | ReadStrategy::HeadFromMeta(info)
+            | ReadStrategy::RangeFromSource(info) => Some(&info.io_errors),
+            ReadStrategy::Buffered => None,
+        }
+    }
+}
+
 /// The 401 reply for a bad read JWT; Go checks it before NewVolumeId, so a
 /// bad path with JWT enabled is a 401, not a 400.
 fn reject_read_jwt(
@@ -1235,7 +1281,7 @@ async fn proxy_missing_volume(
     let query_string = uri.query().unwrap_or("").to_string();
     if is_proxied_query(&query_string)
         || state.read_mode == ReadMode::Local
-        || state.master_url.is_empty()
+        || state.current_master().await.is_empty()
     {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -1279,11 +1325,11 @@ async fn check_download_limit(
         // Go tries proxy to replica once before the wait loop
         // (checkDownloadLimit); it does not retry on each wakeup.
         let should_try_replica =
-            !is_proxied_query(&query_string) && !state.master_url.is_empty() && {
+            !is_proxied_query(&query_string) && !state.current_master().await.is_empty() && {
                 let store = state.store.read().unwrap();
                 store
                     .find_volume(vid)
-                    .is_some_and(|(_, vol)| vol.super_block.replica_placement.has_replication())
+                    .is_some_and(|(_, vol)| vol.super_block().replica_placement.has_replication())
             };
         if should_try_replica
             && let Some(info) = build_proxy_request_info(path, request_headers, &query_string)
@@ -1483,39 +1529,101 @@ fn not_modified_response(
     etag: &str,
     last_modified_str: &Option<String>,
 ) -> Option<Response> {
-    // If-Modified-Since first (Go order), then If-None-Match.
+    let not_modified = || {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        resp.headers_mut()
+            .insert(header::ETAG, etag.parse().unwrap());
+        if let Some(lm) = last_modified_str {
+            resp.headers_mut()
+                .insert(header::LAST_MODIFIED, lm.parse().unwrap());
+        }
+        resp
+    };
+
+    // If-Modified-Since applies only when there is no If-None-Match (RFC 9110 13.2.2).
+    if headers.contains_key(header::IF_NONE_MATCH) {
+        let inm = headers
+            .get_all(header::IF_NONE_MATCH)
+            .iter()
+            .map(|v| v.to_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(",");
+        return etag_list_matches(&inm, etag).then(not_modified);
+    }
+
     if n.last_modified > 0
-        && let Some(ims_header) = headers.get(header::IF_MODIFIED_SINCE)
-        && let Ok(ims_str) = ims_header.to_str()
+        && let Some(ims_str) = headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok())
     {
         // Parse HTTP date format: "Mon, 02 Jan 2006 15:04:05 GMT"
         if let Ok(ims_time) =
             chrono::NaiveDateTime::parse_from_str(ims_str, "%a, %d %b %Y %H:%M:%S GMT")
             && (n.last_modified as i64) <= ims_time.and_utc().timestamp()
         {
-            let mut resp = StatusCode::NOT_MODIFIED.into_response();
-            if let Some(lm) = last_modified_str {
-                resp.headers_mut()
-                    .insert(header::LAST_MODIFIED, lm.parse().unwrap());
-            }
-            // Go sets ETag after the 304 paths, so a 304 has no ETag.
-            return Some(resp);
+            return Some(not_modified());
         }
-    }
-
-    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH)
-        && let Ok(inm) = if_none_match.to_str()
-        && inm == etag
-    {
-        let mut resp = StatusCode::NOT_MODIFIED.into_response();
-        if let Some(lm) = last_modified_str {
-            resp.headers_mut()
-                .insert(header::LAST_MODIFIED, lm.parse().unwrap());
-        }
-        // Go sets ETag after the 304 paths, so a 304 has no ETag.
-        return Some(resp);
     }
     None
+}
+
+/// If-Range (RFC 9110 13.1.5): an entity-tag by strong comparison, or a date
+/// equal to Last-Modified. The response etag here is always a strong tag.
+fn if_range_matches(headers: &HeaderMap, etag: &str, last_modified_str: &Option<String>) -> bool {
+    let Some(raw) = headers.get(header::IF_RANGE) else {
+        return true;
+    };
+    let Ok(if_range) = raw.to_str() else {
+        return false;
+    };
+    let if_range = if_range.trim();
+    if if_range.is_empty() {
+        return true;
+    }
+    if if_range.starts_with('"') || if_range.starts_with("W/") {
+        return if_range == etag;
+    }
+    let Ok(date) = httpdate::parse_http_date(if_range) else {
+        return false;
+    };
+    last_modified_str
+        .as_deref()
+        .and_then(|lm| httpdate::parse_http_date(lm).ok())
+        .is_some_and(|lm| date == lm)
+}
+
+/// Weak comparison against "*" or a comma-separated entity-tag list (RFC 9110 13.1.2).
+fn etag_list_matches(header: &str, etag: &str) -> bool {
+    if header.trim() == "*" {
+        return true;
+    }
+    let etag = etag.trim_matches('"');
+    split_etag_list(header).into_iter().any(|tag| {
+        let tag = tag.trim();
+        let tag = tag.strip_prefix("W/").unwrap_or(tag);
+        // Empty list elements are ignored, so padding like a trailing
+        // comma cannot match an empty opaque tag.
+        !tag.is_empty() && tag.trim_matches('"') == etag
+    })
+}
+
+/// Splits an entity-tag list on the commas between tags; a comma inside a
+/// quoted opaque tag does not split.
+fn split_etag_list(header: &str) -> Vec<&str> {
+    let mut tags = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (i, b) in header.bytes().enumerate() {
+        match b {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                tags.push(&header[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    tags.push(&header[start..]);
+    tags
 }
 
 /// The 200 reply headers, and the extension, which falls back to the stored name's.
@@ -1719,6 +1827,7 @@ fn stream_response(
         data_file_access_control: info.data_file_access_control,
         hold_read_lock_for_stream: !state.has_slow_read,
         io_unavailable: info.io_unavailable,
+        io_errors: info.io_errors,
         pending: None,
         buf: bytes::BytesMut::new(),
         state: tracking_state,
@@ -2118,9 +2227,21 @@ fn handle_range_request_from_source(
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; length as usize];
-        info.source
-            .read_exact_at(&mut buf, info.data_file_offset + start as u64)?;
-        Ok(buf)
+        match info
+            .source
+            .read_exact_at(&mut buf, info.data_file_offset + start as u64)
+        {
+            // A finished range read clears the streak a failed meta read
+            // counted, like readNeedleDataInto's terminal report.
+            Ok(()) => {
+                info.io_errors.check_read_write_error(None);
+                Ok(buf)
+            }
+            Err(e) => {
+                info.io_errors.check_read_write_error(Some(&e));
+                Err(e)
+            }
+        }
     };
 
     if ranges.len() == 1 {
@@ -2430,6 +2551,9 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+/// Store an uploaded needle on the local volume — durable (fsync) uploads
+/// through the per-volume write queue, the rest synchronously — and then
+/// replicate it if the volume's placement calls for more copies.
 pub async fn post_handler(
     State(state): State<Arc<VolumeServerState>>,
     request: Request<Body>,
@@ -2950,53 +3074,62 @@ pub async fn post_handler(
     let needle_etag = n.etag();
     let needle_has_name = n.has_name();
 
-    let write_result = if let Some(wq) = state.write_queue.get() {
-        wq.submit(vid, n, fsync).await
-    } else {
-        let mut store = state.store.write().unwrap();
-        store.write_volume_needle(vid, &mut n, fsync)
-    };
-
     // Replicate to remote volume servers if this volume has replicas.
     // Matches Go's GetWritableRemoteReplications: skip if copy_count == 1.
-    if !is_replicate && write_result.is_ok() && !state.master_url.is_empty() {
-        let needs_replication = {
-            let store = state.store.read().unwrap();
-            store
-                .find_volume(vid)
-                .is_some_and(|(_, v)| v.super_block.replica_placement.get_copy_count() > 1)
-        };
-        if needs_replication {
-            let state_clone = state.clone();
-            let path_clone = path.clone();
-            let query_clone = query.clone();
-            let headers_clone = headers.clone();
-            let body_clone = body.clone();
-            let replication = tokio::spawn(async move {
-                do_replicated_request(
-                    &state_clone,
-                    vid.0,
-                    Method::POST,
-                    &path_clone,
-                    &query_clone,
-                    &headers_clone,
-                    Some(body_clone),
-                )
-                .await
-            });
-            let replication_result = replication
-                .await
+    let needs_replication = !is_replicate && {
+        let store = state.store.read().unwrap();
+        store
+            .find_volume(vid)
+            .is_some_and(|(_, v)| v.super_block().replica_placement.get_copy_count() > 1)
+    };
+
+    // The fan-out runs concurrently with the local needle write, like Go's
+    // ReplicatedWrite: it reads the already-buffered request body, so the two
+    // sides share no mutable state. The ack still waits for both.
+    let replication = if needs_replication {
+        let state_clone = state.clone();
+        let path_clone = path.clone();
+        let query_clone = query.clone();
+        let headers_clone = headers.clone();
+        let body_clone = body.clone();
+        Some(tokio::spawn(async move {
+            do_replicated_request(
+                &state_clone,
+                vid.0,
+                Method::POST,
+                &path_clone,
+                &query_clone,
+                &headers_clone,
+                Some(body_clone),
+            )
+            .await
+        }))
+    } else {
+        None
+    };
+
+    let write_result = write_upload_needle(&state, vid, n, fsync).await;
+
+    // No leader-known gate: when the lookup cannot run, the write must fail
+    // rather than be acknowledged on fewer copies than required. The local
+    // write result takes precedence, matching Go's error ordering.
+    let replication_result = match replication {
+        Some(task) => Some(
+            task.await
                 .map_err(|e| format!("replication task failed: {}", e))
-                .flatten();
-            if let Err(e) = replication_result {
-                tracing::error!("replicated write failed: {}", e);
-                return json_error_with_query(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("replication failed: {}", e),
-                    Some(&query),
-                );
-            }
-        }
+                .flatten(),
+        ),
+        None => None,
+    };
+    if write_result.is_ok()
+        && let Some(Err(e)) = replication_result
+    {
+        tracing::error!("replicated write failed: {}", e);
+        return json_error_with_query(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("replication failed: {}", e),
+            Some(&query),
+        );
     }
 
     let resp = match write_result {
@@ -3049,6 +3182,28 @@ pub async fn post_handler(
     resp
 }
 
+/// Append an uploaded needle the way Go's `writeNeedle2` does: a durable
+/// write goes to the volume's batching worker, which group-commits the
+/// batch's .dat/.idx syncs, while anything else — a non-durable write, or a
+/// durable one landing while the server is stopping and the workers are
+/// winding down — takes the synchronous path and fsyncs inline.
+async fn write_upload_needle(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+    mut n: Needle,
+    fsync: bool,
+) -> Result<(u64, Size, bool), crate::storage::volume::VolumeError> {
+    let queued = fsync && !*state.is_stopping.read().unwrap();
+    if queued && let Some(wq) = state.write_queue.get() {
+        return wq.submit(vid, n, fsync).await;
+    }
+    let vol = {
+        let store = state.store.read().unwrap();
+        store.writable_volume(vid)
+    };
+    vol.and_then(|vol| vol.write_needle(&mut n, true, fsync))
+}
+
 // ============================================================================
 // Delete Handler
 // ============================================================================
@@ -3056,6 +3211,20 @@ pub async fn post_handler(
 #[derive(Serialize)]
 struct DeleteResult {
     size: i64,
+}
+
+/// Read option for deletes: read only the needle's header and trailer.
+///
+/// A delete needs to know that the needle exists, what its cookie is, and
+/// whether it is a chunk manifest. None of that requires the payload. If the
+/// needle turns out to be a chunk manifest, the read loads its data as well,
+/// because the delete needs the manifest to delete the chunks.
+pub(crate) fn delete_read_option() -> ReadOption {
+    ReadOption {
+        attempt_meta_only: true,
+        must_meta_only: true,
+        ..ReadOption::default()
+    }
 }
 
 pub async fn delete_handler(
@@ -3225,8 +3394,14 @@ pub async fn delete_handler(
     // Read needle first to validate cookie (matching Go behavior)
     let original_cookie = cookie;
     {
-        let store = state.store.read().unwrap();
-        match store.read_volume_needle(vid, &mut n) {
+        let vol = {
+            let store = state.store.read().unwrap();
+            store.find_volume(vid).map(|(_, vol)| vol)
+        };
+        match vol
+            .ok_or(crate::storage::volume::VolumeError::NotFound)
+            .and_then(|vol| vol.read_needle_with_option(&mut n, &mut delete_read_option()))
+        {
             Ok(_) => {}
             Err(_) => {
                 let result = DeleteResult { size: 0 };
@@ -3297,17 +3472,30 @@ pub async fn delete_handler(
     }
 
     let delete_result = {
-        let mut store = state.store.write().unwrap();
-        store.delete_volume_needle(vid, &mut n)
+        let vol = {
+            let store = state.store.read().unwrap();
+            store
+                .find_volume(vid)
+                .map(|(_, vol)| vol)
+                .ok_or(crate::storage::volume::VolumeError::NotFound)
+        };
+        match vol {
+            Err(e) => Err(e),
+            // Matches Store::delete_volume_needle: noWriteOrDelete rejects first.
+            Ok(vol) if vol.is_no_write_or_delete() => {
+                Err(crate::storage::volume::VolumeError::ReadOnly(vid))
+            }
+            Ok(vol) => vol.delete_needle(&mut n),
+        }
     };
 
     let is_replicate = del_query.split('&').any(|p| p == "type=replicate");
-    if !is_replicate && delete_result.is_ok() && !state.master_url.is_empty() {
+    if !is_replicate && delete_result.is_ok() {
         let needs_replication = {
             let store = state.store.read().unwrap();
             store
                 .find_volume(vid)
-                .is_some_and(|(_, v)| v.super_block.replica_placement.get_copy_count() > 1)
+                .is_some_and(|(_, v)| v.super_block().replica_placement.get_copy_count() > 1)
         };
         if needs_replication
             && let Err(e) = do_replicated_request(
@@ -3394,7 +3582,7 @@ pub async fn status_handler(
             );
             vol_info.insert(
                 "CompactRevision".to_string(),
-                serde_json::Value::from(vol.super_block.compaction_revision),
+                serde_json::Value::from(vol.super_block().compaction_revision),
             );
             vol_info.insert(
                 "ModifiedAtSecond".to_string(),
@@ -3405,7 +3593,7 @@ pub async fn status_handler(
                 serde_json::Value::from(loc.disk_type.to_string()),
             );
 
-            let replica = &vol.super_block.replica_placement;
+            let replica = &vol.super_block().replica_placement;
             let mut replica_value = serde_json::Map::new();
             if replica.diff_data_center_count > 0 {
                 replica_value.insert(
@@ -3430,7 +3618,7 @@ pub async fn status_handler(
                 serde_json::Value::Object(replica_value),
             );
 
-            let ttl = vol.super_block.ttl;
+            let ttl = vol.super_block().ttl;
             let mut ttl_value = serde_json::Map::new();
             if ttl.count > 0 {
                 ttl_value.insert("Count".to_string(), serde_json::Value::from(ttl.count));
@@ -4097,20 +4285,12 @@ async fn read_chunk_needle(
     enum Placement {
         Ec,
         Remote,
+        Local(std::sync::Arc<crate::storage::volume::Volume>),
     }
     let placement = {
         let store = state.store.read().unwrap();
-        if store.find_volume(vid).is_some() {
-            let mut n = Needle {
-                id: nid,
-                cookie,
-                ..Needle::default()
-            };
-            return store
-                .read_volume_needle(vid, &mut n)
-                .map_err(|e| format!("{}", e))
-                .and_then(|_| cookie_checked_chunk(n, cookie))
-                .map(|data| ChunkBytes { origin: 0, data });
+        if let Some((_, vol)) = store.find_volume(vid) {
+            Placement::Local(vol)
         } else if store.find_ec_volume(vid).is_some() {
             Placement::Ec
         } else {
@@ -4119,6 +4299,17 @@ async fn read_chunk_needle(
     };
 
     match placement {
+        Placement::Local(vol) => {
+            let mut n = Needle {
+                id: nid,
+                cookie,
+                ..Needle::default()
+            };
+            vol.read_needle(&mut n)
+                .map_err(|e| format!("{}", e))
+                .and_then(|_| cookie_checked_chunk(n, cookie))
+                .map(|data| ChunkBytes { origin: 0, data })
+        }
         Placement::Ec => {
             match crate::server::store_ec::read_ec_shard_needle_distributed(state, vid, nid).await {
                 Ok(Some(n)) => {
@@ -4173,7 +4364,7 @@ async fn read_remote_chunk_needle(
     let locations = lookup_volume(
         &state.http_client,
         &state.outgoing_http_scheme,
-        &state.master_url,
+        &state.current_master().await,
         vid.0,
     )
     .await?;
@@ -5164,6 +5355,7 @@ mod tests {
             hold_read_lock_for_stream: true,
             _held_read_lease: None,
             io_unavailable: Arc::default(),
+            io_errors: Arc::default(),
             pending: None,
             buf: bytes::BytesMut::new(),
             state: None,
@@ -5268,6 +5460,8 @@ mod tests {
             rack: String::new(),
             file_size_limit_bytes: 0,
             maintenance_byte_per_second: 0,
+            vacuum_commit_slots: None,
+            vacuum_commits_waiting: std::sync::atomic::AtomicU32::new(0),
             is_heartbeating: AtomicBool::new(false),
             has_master: false,
             pre_stop_seconds: 0,
@@ -5457,7 +5651,7 @@ mod tests {
         use crate::storage::volume::{Volume, VolumeSpec};
 
         let dir = tmp.path().to_str().unwrap();
-        let mut v = Volume::new(
+        let v = Volume::new(
             dir,
             dir,
             VolumeId(2),
@@ -5521,6 +5715,138 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, body)
+    }
+
+    /// The public router does not accept DELETE requests, so this calls the
+    /// handler directly, the same way the admin router does.
+    async fn send_delete(state: &Arc<VolumeServerState>, path: &str) -> StatusCode {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        delete_handler(State(state.clone()), request).await.status()
+    }
+
+    #[test]
+    fn test_not_modified_checks_if_none_match_first() {
+        let n = Needle {
+            last_modified: 1700000000,
+            ..Needle::default()
+        };
+        let (etag, last_modified_str) = etag_and_last_modified(&n);
+        let bare = n.etag();
+        let before = "Tue, 14 Nov 2023 22:12:20 GMT".to_string();
+        let after = "Tue, 14 Nov 2023 22:14:20 GMT".to_string();
+
+        let cases: Vec<(Vec<(axum::http::HeaderName, String)>, bool)> = vec![
+            (vec![(header::IF_NONE_MATCH, format!("\"{bare}\""))], true),
+            (vec![(header::IF_NONE_MATCH, format!("W/\"{bare}\""))], true),
+            (
+                vec![(header::IF_NONE_MATCH, format!("\"x\", \"{bare}\""))],
+                true,
+            ),
+            (vec![(header::IF_NONE_MATCH, "*".into())], true),
+            (vec![(header::IF_NONE_MATCH, "\"x\"".into())], false),
+            (
+                vec![
+                    (header::IF_NONE_MATCH, "\"x\"".into()),
+                    (header::IF_NONE_MATCH, format!("\"{bare}\"")),
+                ],
+                true,
+            ),
+            (
+                vec![(header::IF_NONE_MATCH, format!("\"{bare},old\""))],
+                false,
+            ),
+            (
+                vec![(header::IF_NONE_MATCH, format!("\"x\",,\"{bare}\""))],
+                true,
+            ),
+            (
+                vec![
+                    (header::IF_NONE_MATCH, "\"x\"".into()),
+                    (header::IF_MODIFIED_SINCE, after.clone()),
+                ],
+                false,
+            ),
+            (
+                vec![
+                    (header::IF_NONE_MATCH, "".into()),
+                    (header::IF_MODIFIED_SINCE, after.clone()),
+                ],
+                false,
+            ),
+            (vec![(header::IF_MODIFIED_SINCE, after)], true),
+            (vec![(header::IF_MODIFIED_SINCE, before)], false),
+        ];
+        for (pairs, want) in cases {
+            let mut headers = HeaderMap::new();
+            for (name, value) in &pairs {
+                headers.append(name, value.parse().unwrap());
+            }
+            assert_eq!(
+                not_modified_response(&n, &headers, &etag, &last_modified_str).is_some(),
+                want,
+                "{pairs:?}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_NONE_MATCH,
+            format!("\"{bare}\"").parse().unwrap(),
+        );
+        let resp = not_modified_response(&n, &headers, &etag, &last_modified_str).unwrap();
+        assert!(resp.headers().contains_key(header::ETAG));
+        assert!(resp.headers().contains_key(header::LAST_MODIFIED));
+    }
+
+    #[test]
+    fn test_if_range_matches() {
+        let etag = "\"v2\"".to_string();
+        let last_modified_str = Some("Sat, 24 Oct 2026 22:01:04 GMT".to_string());
+        let cases: Vec<(Option<&str>, bool)> = vec![
+            (None, true),
+            (Some("\"v2\""), true),
+            (Some("Sat, 24 Oct 2026 22:01:04 GMT"), true),
+            (Some("Saturday, 24-Oct-26 22:01:04 GMT"), true),
+            (Some("Sat Oct 24 22:01:04 2026"), true),
+            (Some("\"v1\""), false),
+            (Some("W/\"v2\""), false),
+            (Some("Sat, 24 Oct 2026 22:01:03 GMT"), false),
+            (Some("not a date"), false),
+        ];
+        for (if_range, want) in cases {
+            let mut headers = HeaderMap::new();
+            if let Some(v) = if_range {
+                headers.insert(header::IF_RANGE, v.parse().unwrap());
+            }
+            assert_eq!(
+                if_range_matches(&headers, &etag, &last_modified_str),
+                want,
+                "{if_range:?}"
+            );
+        }
+
+        // A present value that is not valid UTF-8 fails the condition.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_RANGE,
+            header::HeaderValue::from_bytes(b"\"\xff\xfev2\"").unwrap(),
+        );
+        assert!(!if_range_matches(&headers, &etag, &last_modified_str));
+
+        // No Last-Modified on the representation: a date validator fails,
+        // an entity-tag still applies.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_RANGE, "\"v2\"".parse().unwrap());
+        assert!(if_range_matches(&headers, &etag, &None));
+        headers.insert(
+            header::IF_RANGE,
+            "Sat, 24 Oct 2026 22:01:04 GMT".parse().unwrap(),
+        );
+        assert!(!if_range_matches(&headers, &etag, &None));
     }
 
     /// A GET whose needle read is parked must not hold the store lock: a
@@ -5627,6 +5953,43 @@ mod tests {
         );
     }
 
+    /// A delete needs the needle's cookie and its chunk-manifest flag. Both
+    /// are stored in the header and trailer, so the delete must not read the
+    /// payload.
+    #[tokio::test]
+    async fn test_delete_reads_needle_meta_only() {
+        use crate::storage::volume::needle_read_hook;
+        use std::sync::Mutex;
+
+        const ID: u64 = 0x6e7a_0a01;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        let path = put_test_needle(&state, ID, &data);
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let _hook = needle_read_hook::register(NeedleId(ID), {
+            let reads = reads.clone();
+            move |len| reads.lock().unwrap().push(len)
+        });
+
+        let wrong_cookie = format!("/1,{:x}{:08x}", ID, TEST_COOKIE + 1);
+        assert_eq!(
+            send_delete(&state, &wrong_cookie).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(send_delete(&state, &path).await, StatusCode::ACCEPTED);
+
+        let reads = reads.lock().unwrap().clone();
+        assert!(
+            !reads.is_empty() && reads.iter().all(|&len| len < 4096),
+            "a delete must not read the needle's payload ({} bytes): {reads:?}",
+            data.len()
+        );
+        let (status, _, _) = send_read(&state, Method::GET, &path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     /// HEAD and ranged reads keep answering from the needle meta and the
     /// data file, and a missing or wrong-cookie needle is still a 404.
     #[tokio::test]
@@ -5658,6 +6021,44 @@ mod tests {
         let missing = format!("/1,{:x}{:08x}", ID + 1, TEST_COOKIE);
         let (status, _, _) = send_read(&state, Method::GET, &missing, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A ranged read served from the data file reports its outcome to the
+    /// io-error streak, like readNeedleDataInto: a finished range clears the
+    /// count a failed meta read left.
+    #[test]
+    fn test_range_from_source_reports_to_io_error_streak() {
+        use std::io::Write;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(tmp.path().join("1.dat"))
+            .unwrap();
+        let data: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        (&file).write_all(&data).unwrap();
+
+        let io_errors = Arc::new(crate::storage::io_error::IoErrorTracker::default());
+        let eio = crate::storage::volume::media_error_for_test();
+        io_errors.check_read_write_error(Some(&eio));
+        io_errors.check_read_write_error(Some(&eio));
+        assert_eq!(io_errors.get_io_error_state().1, 2);
+
+        let info = crate::storage::volume::NeedleStreamInfo {
+            source: crate::storage::volume::NeedleStreamSource::Local(file),
+            data_file_offset: 0,
+            data_size: data.len() as u32,
+            data_file_access_control: Arc::default(),
+            io_unavailable: Arc::default(),
+            io_errors: io_errors.clone(),
+            needle_id: NeedleId(1),
+            checksum: 0,
+        };
+        let resp = handle_range_request_from_source("bytes=10-19", info, HeaderMap::new(), None);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(io_errors.get_io_error_state().1, 0);
     }
 
     /// Range is read as Go reads it: a byte its parseRange cannot parse is a
@@ -5715,7 +6116,7 @@ mod tests {
         let state = volume_test_state(&tmp);
         let dir = tmp.path().to_str().unwrap();
         let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-        let mut v = Volume::new(
+        let v = Volume::new(
             dir,
             dir,
             VolumeId(2),
@@ -6103,6 +6504,29 @@ mod tests {
         let (status, _, _) = send_read(&state, Method::GET, &crop, Some(past.as_bytes())).await;
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(taken(&reads), vec![1]);
+    }
+
+    /// A HEAD asking for an image transform needs the payload too: a
+    /// meta-only read could not produce the transformed length.
+    #[tokio::test]
+    async fn test_head_with_image_op_reads_full() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let png = solid_png(8, 8);
+        let stored = put_test_needle(&state, 0x6e7a_0a30, &png);
+        let crop = format!(
+            "{}.png?crop_x1=0&crop_y1=0&crop_x2=2&crop_y2=2",
+            stored
+        );
+
+        let (get_status, _, cropped) = send_read(&state, Method::GET, &crop, None).await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_ne!(cropped.len(), png.len(), "the crop must change the length");
+
+        let (status, headers, body) = send_read(&state, Method::HEAD, &crop, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(headers[header::CONTENT_LENGTH], cropped.len().to_string());
     }
 
     /// Go takes the transform extension from the URL first — including a fid
@@ -6539,7 +6963,8 @@ mod tests {
         let s = Arc::get_mut(&mut state).unwrap();
         // Empty self_url makes `url.contains(self_url)` true for every peer.
         s.self_url = "198.51.100.8:8080".to_string();
-        s.master_url = master_url;
+        s.master_url = master_url.clone();
+        s.current_master_url = tokio::sync::RwLock::new(master_url);
         state
     }
 
@@ -6969,8 +7394,8 @@ mod tests {
         );
 
         {
-            let mut store = state.store.write().unwrap();
-            let (_, vol) = store.find_volume_mut(VolumeId(1)).unwrap();
+            let store = state.store.read().unwrap();
+            let (_, vol) = store.find_volume(VolumeId(1)).unwrap();
             vol.fail_next_fsync_for_test(true);
             vol.fail_next_truncate_for_test(true);
             let mut n = Needle {
@@ -6983,7 +7408,7 @@ mod tests {
             store
                 .write_volume_needle(VolumeId(1), &mut n, true)
                 .unwrap_err();
-            let (_, vol) = store.find_volume_mut(VolumeId(1)).unwrap();
+            let (_, vol) = store.find_volume(VolumeId(1)).unwrap();
             vol.fail_next_fsync_for_test(false);
             vol.fail_next_truncate_for_test(false);
             assert!(vol.unavailable_error().is_some());
@@ -7001,8 +7426,9 @@ mod tests {
         }
     }
 
-    /// A vacuum committed mid-stream must not change the bytes served: the
-    /// stream's handle pins the inode its offset was resolved against.
+    /// A leased stream blocks the compaction commit instead of racing the
+    /// file swap, and still delivers the needle's bytes; the commit goes
+    /// through once the stream releases its read lease.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_streaming_body_survives_a_vacuum_that_moves_the_needle() {
@@ -7048,13 +7474,77 @@ mod tests {
         {
             let mut store = state.store.write().unwrap();
             store.compact_volume(VolumeId(1), 0, 0, |_| true).unwrap();
-            store.commit_compact_volume(VolumeId(1)).unwrap();
+            let err = store.commit_compact_volume(VolumeId(1)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(crate::storage::volume::COMMIT_WAITS_FOR_READS),
+                "the leased stream must hold the commit back: {err}"
+            );
         }
-        assert_ne!(data_offset(), before, "the vacuum must move the needle");
 
         while let Some(chunk) = stream.next().await {
             got.extend_from_slice(&chunk.expect("the stream failed across a vacuum"));
         }
         assert_eq!(got, data);
+        drop(stream);
+
+        {
+            let mut store = state.store.write().unwrap();
+            store.commit_compact_volume(VolumeId(1)).unwrap();
+        }
+        assert_ne!(
+            data_offset(),
+            before,
+            "the vacuum moves the needle once the stream drains"
+        );
+    }
+
+    /// Issue #801: an fsync upload takes the per-volume worker so its sync is
+    /// shared across the batch (Go's `writeNeedle2` split); a non-fsync write,
+    /// or an fsync write landing while the server is stopping, takes the
+    /// synchronous path instead.
+    #[tokio::test]
+    async fn test_write_upload_needle_routes_fsync_to_queue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        assert!(
+            state
+                .write_queue
+                .set(crate::server::write_queue::WriteQueue::new(
+                    state.clone(),
+                    128,
+                    crate::server::write_queue::SyncBatchOption::default(),
+                ))
+                .is_ok()
+        );
+        let queue = state.write_queue.get().unwrap();
+
+        let needle = |id: u64| {
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(TEST_COOKIE),
+                data: vec![id as u8; 8],
+                data_size: 8,
+                ..Needle::default()
+            };
+            n.checksum = CRC::new(&n.data);
+            n
+        };
+
+        write_upload_needle(&state, VolumeId(1), needle(0x6e7a_0b01), true)
+            .await
+            .unwrap();
+        assert_eq!(queue.submits_for_test(), 1);
+
+        write_upload_needle(&state, VolumeId(1), needle(0x6e7a_0b02), false)
+            .await
+            .unwrap();
+        assert_eq!(queue.submits_for_test(), 1);
+
+        *state.is_stopping.write().unwrap() = true;
+        write_upload_needle(&state, VolumeId(1), needle(0x6e7a_0b03), true)
+            .await
+            .unwrap();
+        assert_eq!(queue.submits_for_test(), 1);
     }
 }

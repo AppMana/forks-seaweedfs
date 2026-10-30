@@ -433,7 +433,7 @@ func TestLookupDeferredCreateSurvivesMetadataCacheEviction(t *testing.T) {
 		t.Fatalf("evict parent metadata cache: %v", err)
 	}
 
-	entry, _, status := wfs.lookupEntry(fullPath)
+	entry, _, status := wfs.lookupEntry(context.Background(), fullPath)
 	if status != fuse.OK {
 		t.Fatalf("lookup after metadata cache eviction = %v, want OK", status)
 	}
@@ -827,7 +827,7 @@ func TestAcquireHandleHonorsDefaultPermissions(t *testing.T) {
 			}
 			inode := wfs.inodeToPath.Lookup(util.FullPath("/secret.txt"), entry.Attributes.Crtime, false, false, entry.Attributes.Inode, true)
 
-			fh, status := wfs.AcquireHandle(inode, syscall.O_RDONLY, 999, 999)
+			fh, status := wfs.AcquireHandle(context.Background(), inode, syscall.O_RDONLY, 999, 999)
 			if status != tc.want {
 				t.Fatalf("AcquireHandle status = %v, want %v", status, tc.want)
 			}
@@ -848,7 +848,7 @@ func TestCreateRegularFileValidatesParentUnderDefaultPermissions(t *testing.T) {
 	wfs, _ := newCreateTestWFS(t)
 	wfs.option.DefaultPermissions = true
 
-	if _, _, code := wfs.createRegularFile(util.FullPath("/ghost"), "f.txt", 0o644, 99, 100, 0, false, false); code == fuse.OK {
+	if _, _, code := wfs.createRegularFile(context.Background(), util.FullPath("/ghost"), "f.txt", 0o644, 99, 100, 0, false, false); code == fuse.OK {
 		t.Fatal("createRegularFile returned OK for a missing parent directory")
 	}
 }

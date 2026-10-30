@@ -233,11 +233,11 @@ func TestNegativeLookupWaitsForAcknowledgedCreate(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), relayedCreate(dir, "mp_rank_03_model_states.pt", 11, 5000), meta_cache.SubscriberMetadataResponseApplyOptions)
 	}()
-	entry, _, st := wfs.lookupEntry(dir.Child("mp_rank_03_model_states.pt"))
+	entry, _, st := wfs.lookupEntry(context.Background(), dir.Child("mp_rank_03_model_states.pt"))
 	if st != fuse.OK || entry == nil {
 		t.Fatalf("lookup of an acknowledged create: %v", st)
 	}
-	if _, _, st := wfs.lookupEntry(dir.Child("never-created")); st != fuse.ENOENT {
+	if _, _, st := wfs.lookupEntry(context.Background(), dir.Child("never-created")); st != fuse.ENOENT {
 		t.Fatalf("lookup of an absent name: %v, want ENOENT", st)
 	}
 }

@@ -2,17 +2,21 @@ package s3api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +69,14 @@ func resolveDestinationMime(reqHeader http.Header, sourceMime string, replaceMet
 // rejected, not silently downgraded.
 func isValidDirective(value string) bool {
 	return value == "" || value == DirectiveCopy || value == DirectiveReplace
+}
+
+// copyChangesStorageClass reports whether a copy request asks for a storage
+// class other than the source object's. That makes copying an object onto
+// itself a change AWS accepts, even with the COPY directive.
+func (s3a *S3ApiServer) copyChangesStorageClass(h http.Header, src *filer_pb.Entry) bool {
+	sc := h.Get(s3_constants.AmzStorageClass)
+	return sc != "" && sc != s3a.getStorageClassFromExtended(src.Extended)
 }
 
 // hasPrefixFold reports whether s starts with prefix, ignoring case.
@@ -193,6 +205,11 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if sc := r.Header.Get(s3_constants.AmzStorageClass); sc != "" && !validateStorageClass(sc) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidStorageClass)
+		return
+	}
+
 	replaceMeta, replaceTagging := replaceDirective(r.Header)
 
 	// If source object is empty or bucket is empty, reply back invalid copy source.
@@ -203,10 +220,14 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 
 	// CopyObject requires s3:GetObject on the source in addition to s3:PutObject
 	// on the destination. The Auth middleware only checked the destination, so
-	// verify the source explicitly here.
+	// verify the source explicitly here. A first-phase deny decided without
+	// object tags can still flip on a tag-conditioned Allow, so when a bucket
+	// policy exists the tag-aware recheck gets the last word.
 	if errCode := s3a.authorizeCopySource(r, srcBucket, srcObject, srcVersionId); errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, r, errCode)
-		return
+		if s3a.recheckPolicyForKeyWithLookup(r, http.MethodGet, srcBucket, srcObject, srcVersionId, string(s3_constants.ACTION_READ), "CopyObjectHandler") != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
 	}
 
 	// A copy creates destination ownership and grants independently of the
@@ -240,6 +261,11 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if errCode := s3a.recheckCopySourcePolicy(r, srcBucket, srcObject, srcVersionId, entry.Extended, "CopyObjectHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
 	// Cache remote-only sources before copying; otherwise the copy path below
 	// writes a destination with FileSize > 0 but no chunks/content.
 	if entry.IsInRemoteOnly() {
@@ -255,9 +281,10 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	sameDestination := srcBucket == dstBucket && srcObject == dstObject
+	changesStorageClass := s3a.copyChangesStorageClass(r.Header, entry)
 	// A self-copy into a versioned bucket writes a new version instead of overwriting in
 	// place, so it is not the no-op AWS rejects. It is how an earlier version is restored.
-	if sameDestination && !(replaceMeta || replaceTagging) && srcVersioningState != s3_constants.VersioningEnabled {
+	if sameDestination && !(replaceMeta || replaceTagging || changesStorageClass) && srcVersioningState != s3_constants.VersioningEnabled {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopyDest)
 		return
 	}
@@ -289,7 +316,16 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 
 	replacesSource := copyReplacesSourceEntry(sameDestination, dstVersioningState, srcVersionId)
 
-	if replacesSource && (replaceMeta || replaceTagging) && s3a.canUseMetadataOnlySelfCopy(entry, r, dstBucket, dstObject) {
+	// A self-copy that only changes the storage class updates the object in
+	// place and has to keep its encryption as stored. The direct strategy
+	// compares only KMS key IDs, so SSE-KMS requests stay rejected too.
+	if replacesSource && changesStorageClass && !(replaceMeta || replaceTagging) &&
+		(IsSSEKMSRequest(r) || !s3a.canUseMetadataOnlySelfCopy(entry, r, dstBucket, dstObject)) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopyDest)
+		return
+	}
+
+	if replacesSource && (replaceMeta || replaceTagging || changesStorageClass) && s3a.canUseMetadataOnlySelfCopy(entry, r, dstBucket, dstObject) {
 		var dstVersionId string
 		var etag string
 		// Bind the entire self-copy update to the snapshot read on each attempt.
@@ -345,6 +381,12 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 				updatedEntry = cloneProtoEntry(rawEntry)
 			}
 			updatedEntry.Extended = mergeCopyMetadata(updatedEntry.Extended, updatedMetadata)
+			// The update keeps the object's existing lock state, but request
+			// lock headers still need validating so a disallowed combination
+			// is rejected rather than silently ignored.
+			if errCode := s3a.applyCopyObjectLockHeaders(r, dstBucket, dstObject, updatedEntry); errCode != s3err.ErrNone {
+				return errCode
+			}
 			if updatedEntry.Attributes == nil {
 				updatedEntry.Attributes = &filer_pb.FuseAttributes{}
 			}
@@ -448,6 +490,12 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		if k == s3_constants.ExtAmzOwnerKey || k == s3_constants.ExtAmzAclKey {
 			continue
 		}
+		// Retention and legal hold are destination settings, not object
+		// metadata: the copy takes its own lock headers or the destination
+		// bucket's default instead.
+		if isCopyLockKey(k) {
+			continue
+		}
 		// Skip encryption-specific headers that might conflict with destination encryption type
 		skipHeader := false
 
@@ -490,6 +538,10 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	// so REPLACE doesn't leak source values through the merge, as on self-copies.
 	dstEntry.Extended = mergeCopyMetadata(dstEntry.Extended, processedMetadata)
 
+	if errCode := s3a.applyCopyObjectLockHeaders(r, dstBucket, dstObject, dstEntry); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
 	// copyChunkBytes gives dstEntry a copy of the source's data.
 	copyChunkBytes := func() s3err.ErrorCode {
 		// Use unified copy strategy approach
@@ -631,6 +683,39 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 // all need the chunks copied for real, as does any copy to a different key.
 func copyReplacesSourceEntry(sameDestination bool, dstVersioningState, srcVersionId string) bool {
 	return sameDestination && dstVersioningState == "" && srcVersionId == ""
+}
+
+// isCopyLockKey marks the extended attributes that carry object lock state; a
+// copy never inherits them from the source.
+func isCopyLockKey(key string) bool {
+	switch key {
+	case s3_constants.ExtObjectLockModeKey, s3_constants.ExtRetentionUntilDateKey, s3_constants.ExtLegalHoldKey:
+		return true
+	}
+	return false
+}
+
+// applyCopyObjectLockHeaders resolves the copied object's retention: explicit
+// copy-request lock headers win, then the destination bucket's default, and
+// the source's own retention never carries over.
+func (s3a *S3ApiServer) applyCopyObjectLockHeaders(r *http.Request, dstBucket, dstObject string, dstEntry *filer_pb.Entry) s3err.ErrorCode {
+	objectLockEnabled, lockErr := s3a.isObjectLockEnabled(dstBucket)
+	if lockErr != nil && !errors.Is(lockErr, filer_pb.ErrNotFound) {
+		glog.Errorf("CopyObjectHandler: failed to check object lock for bucket %s: %v", dstBucket, lockErr)
+		return s3err.ErrInternalError
+	}
+	if validationErr := s3a.validateObjectLockHeaders(r, dstBucket, dstObject, objectLockEnabled); validationErr != nil {
+		glog.V(2).Infof("CopyObjectHandler: object lock header validation failed for %s/%s: %v", dstBucket, dstObject, validationErr)
+		return mapValidationErrorToS3Error(validationErr)
+	}
+	if !objectLockEnabled {
+		return s3err.ErrNone
+	}
+	if err := s3a.extractObjectLockMetadataFromRequest(r, dstEntry); err != nil {
+		glog.Errorf("CopyObjectHandler: failed to extract object lock metadata for %s/%s: %v", dstBucket, dstObject, err)
+		return mapValidationErrorToS3Error(err)
+	}
+	return s3err.ErrNone
 }
 
 func cloneProtoEntry(entry *filer_pb.Entry) *filer_pb.Entry {
@@ -880,13 +965,13 @@ func pathToBucketObjectAndVersion(rawPath, decodedPath string) (bucket, object, 
 				}
 
 				bucket, object = pathToBucketAndObject(pathForBucket)
-				return bucket, object, versionId
+				return bucket, s3_constants.NormalizeObjectKey(object), versionId
 			}
 		}
 	}
 
 	bucket, object = pathToBucketAndObject(pathForBucket)
-	return bucket, object, versionId
+	return bucket, s3_constants.NormalizeObjectKey(object), versionId
 }
 
 type CopyPartResult struct {
@@ -974,8 +1059,10 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 	// UploadPartCopy requires s3:GetObject on the source. The Auth middleware
 	// only verified s3:PutObject (s3:UploadPart) on the destination.
 	if errCode := s3a.authorizeCopySource(r, srcBucket, srcObject, srcVersionId); errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, r, errCode)
-		return
+		if s3a.recheckPolicyForKeyWithLookup(r, http.MethodGet, srcBucket, srcObject, srcVersionId, string(s3_constants.ACTION_READ), "CopyObjectPartHandler") != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
 	}
 
 	partIDString := r.URL.Query().Get("partNumber")
@@ -1040,6 +1127,11 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	if errCode := classifyCopySourceError(entry, err); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	if errCode := s3a.recheckCopySourcePolicy(r, srcBucket, srcObject, srcVersionId, entry.Extended, "CopyObjectPartHandler"); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
@@ -1123,7 +1215,9 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if uploadEntryHasSSE(uploadEntry) || sourceEntryIsEncrypted(entry) || uploadEntryHasChecksum(uploadEntry) {
+	// Inline-Content sources have no chunks for the raw-byte path to copy;
+	// the plaintext stream serves their range instead.
+	if uploadEntryHasSSE(uploadEntry) || sourceEntryIsEncrypted(entry) || uploadEntryHasChecksum(uploadEntry) || len(entry.Content) > 0 {
 		etag, sseMetadata, errCode := s3a.copyObjectPartViaReencryption(r, entry, startOffset, endOffset, dstBucket, dstObject, uploadID, partID, uploadEntry)
 		if errCode != s3err.ErrNone {
 			s3err.WriteErrorResponse(w, r, errCode)
@@ -1181,15 +1275,24 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		// For zero-size files or invalid ranges, create an empty part with size 0
 		dstEntry.Attributes.FileSize = 0
 		dstEntry.Chunks = nil
+		dstEntry.Attributes.Md5 = md5.New().Sum(nil)
 	} else {
 		// Copy chunks that overlap with the range
-		dstChunks, err := s3a.copyChunksForRange(r.Context(), entry, startOffset, endOffset, dstAssignPath)
+		dstChunks, partMd5, err := s3a.copyChunksForRange(r.Context(), entry, startOffset, endOffset, dstAssignPath)
 		if err != nil {
 			glog.Errorf("CopyObjectPartHandler copy chunks error: %v", err)
 			s3err.WriteErrorResponse(w, r, s3a.mapCopyErrorToS3Error(err))
 			return
 		}
 		dstEntry.Chunks = dstChunks
+		dstEntry.Attributes.Md5 = partMd5
+	}
+
+	// Mirror putToFiler: the part entry carries the MD5 of its bytes so
+	// CopyPartResult, ListParts and complete's composite ETag all describe
+	// the copied range rather than the source chunks.
+	if len(dstEntry.Attributes.Md5) > 0 {
+		dstEntry.Extended[s3_constants.ExtETagKey] = []byte(fmt.Sprintf("%x", dstEntry.Attributes.Md5))
 	}
 
 	// Save the part entry to the multipart uploads folder
@@ -1495,7 +1598,7 @@ func (s3a *S3ApiServer) copySingleChunk(ctx context.Context, chunk *filer_pb.Fil
 		// the source volume for compressed bytes, so a gzipped chunk is
 		// forwarded to the destination without anyone having to decompress.
 		if canStreamCopyChunk(chunk) {
-			if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, 0, int64(chunk.Size), true /*isFullChunk*/, assignResult); err != nil {
+			if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, 0, int64(chunk.Size), true /*isFullChunk*/, assignResult, nil); err != nil {
 				return fmt.Errorf("stream chunk: %w", err)
 			}
 			return nil
@@ -1535,6 +1638,9 @@ func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChu
 	offsetInChunk := overlapStart - chunkStart
 
 	fileId := originalChunk.GetFileIdString()
+	// A partial range stores different bytes than the source chunk, so its
+	// ETag has to be recomputed; a whole-chunk copy reuses it.
+	var digest hash.Hash
 	assignResult, err := s3a.copyChunkToNewVolume(ctx, fileId, dstPath, rangeChunk.Size, func(ctx context.Context, srcUrl string, assignResult *filer_pb.AssignVolumeResponse) error {
 		// Stream the byte range through io.Pipe when there's no in-transit
 		// transformation required (see canStreamCopyChunk for the eligibility
@@ -1549,11 +1655,18 @@ func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChu
 		// part-size = chunk-size assemble pattern hits this branch.
 		if canStreamCopyChunk(originalChunk) {
 			isFullChunk := offsetInChunk == 0 && rangeChunk.Size == originalChunk.Size
-			if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), isFullChunk, assignResult); err != nil {
+			// Each attempt hashes only the bytes it sent.
+			digest = nil
+			if !isFullChunk {
+				digest = md5.New()
+			}
+			if err := s3a.streamCopyChunkRange(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), isFullChunk, assignResult, digest); err != nil {
 				return fmt.Errorf("stream chunk range: %w", err)
 			}
 			return nil
 		}
+
+		digest = nil
 
 		// Download and upload the chunk portion
 		chunkData, err := s3a.downloadChunkData(ctx, srcUrl, fileId, offsetInChunk, int64(rangeChunk.Size), originalChunk.CipherKey)
@@ -1566,6 +1679,13 @@ func (s3a *S3ApiServer) copySingleChunkForRange(ctx context.Context, originalChu
 		}
 		return nil
 	})
+	if err == nil && digest != nil {
+		dstChunk.ETag = base64.StdEncoding.EncodeToString(digest.Sum(nil))
+		// The range fetch returns raw bytes and the destination stores them
+		// uncompressed, so the source chunk's gzip flag must not carry over
+		// onto a partial copy.
+		dstChunk.IsCompressed = false
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1635,9 +1755,17 @@ func parseRangeHeader(rangeHeader string, fileSize int64) (startOffset, endOffse
 	return startOffset, endOffset, nil
 }
 
-// copyChunksForRange copies chunks that overlap with the specified range; see
+// partMd5Result carries the whole-part MD5 the copiedRangeMd5 goroutine
+// computes beside the per-chunk copies.
+type partMd5Result struct {
+	sum []byte
+	err error
+}
+
+// copyChunksForRange copies chunks that overlap with the specified range and
+// returns the MD5 of the copied bytes for the part entry's Attributes.Md5; see
 // copyChunksConcurrently for concurrency and cancellation.
-func (s3a *S3ApiServer) copyChunksForRange(ctx context.Context, entry *filer_pb.Entry, startOffset, endOffset int64, dstPath string) ([]*filer_pb.FileChunk, error) {
+func (s3a *S3ApiServer) copyChunksForRange(ctx context.Context, entry *filer_pb.Entry, startOffset, endOffset int64, dstPath string) ([]*filer_pb.FileChunk, []byte, error) {
 	var relevantChunks []*filer_pb.FileChunk
 	var originalChunks []*filer_pb.FileChunk
 
@@ -1668,10 +1796,113 @@ func (s3a *S3ApiServer) copyChunksForRange(ctx context.Context, entry *filer_pb.
 		}
 	}
 
+	// The part's Attributes.Md5 must cover the copied range in byte order,
+	// and md5 cannot combine per-chunk digests. A single chunk's own digest
+	// is the answer only when it supplies the whole range; anything else —
+	// several chunks, or gaps a sparse source zero-fills — needs an ordered
+	// pass the concurrent copies cannot feed, so a second stream of the
+	// source range hashes beside them.
+	partSize := endOffset - startOffset + 1
+	singleChunkCovers := len(relevantChunks) == 1 &&
+		relevantChunks[0].Offset == 0 && int64(relevantChunks[0].Size) == partSize
+
+	md5Ctx, cancelMd5 := context.WithCancel(ctx)
+	defer cancelMd5()
+
+	var partMd5 []byte
+	var partMd5Ch chan partMd5Result
+	switch {
+	case singleChunkCovers:
+		// resolved below from the copied chunk's own digest
+	case len(entry.GetChunks()) == 0:
+		// no chunks to read at all: the part is partSize zero bytes (the
+		// stream helper returns empty for a chunkless entry, not zero-fill)
+		partMd5 = md5Zeros(partSize)
+	default:
+		partMd5Ch = make(chan partMd5Result, 1)
+		go func() {
+			sum, err := s3a.copiedRangeMd5(md5Ctx, entry, startOffset, endOffset)
+			partMd5Ch <- partMd5Result{sum, err}
+		}()
+	}
+
 	// Copy the relevant chunks using a specialized method for range copies
-	return copyChunksConcurrently(ctx, len(relevantChunks), func(ctx context.Context, i int) (*filer_pb.FileChunk, error) {
+	dstChunks, err := copyChunksConcurrently(ctx, len(relevantChunks), func(ctx context.Context, i int) (*filer_pb.FileChunk, error) {
 		return s3a.copySingleChunkForRange(ctx, originalChunks[i], relevantChunks[i], startOffset, endOffset, dstPath)
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Reads resolve overlapping chunks by ModifiedTsNs, and the concurrent
+	// copies stamped arbitrary finish times: rank the destination chunks by
+	// the source's timestamps so the part resolves overlaps the way the
+	// source did (and the way copiedRangeMd5 hashed it).
+	if len(dstChunks) > 1 {
+		order := make([]int, len(dstChunks))
+		for i := range order {
+			order[i] = i
+		}
+		slices.SortStableFunc(order, func(a, b int) int {
+			return cmp.Compare(originalChunks[a].ModifiedTsNs, originalChunks[b].ModifiedTsNs)
+		})
+		now := time.Now().UnixNano()
+		for rank, i := range order {
+			dstChunks[i].ModifiedTsNs = now + int64(rank)
+		}
+	}
+
+	if partMd5Ch != nil {
+		if res := <-partMd5Ch; res.err != nil {
+			return nil, nil, fmt.Errorf("md5 of copied range: %w", res.err)
+		} else {
+			partMd5 = res.sum
+		}
+	} else if singleChunkCovers {
+		if partMd5 = util.Base64Md5ToBytes(dstChunks[0].ETag); len(partMd5) != md5.Size {
+			// TUS and mount writes leave chunks without an ETag; hash the
+			// copied range when the inherited digest is missing or malformed.
+			sum, err := s3a.copiedRangeMd5(md5Ctx, entry, startOffset, endOffset)
+			if err != nil {
+				return nil, nil, fmt.Errorf("md5 of copied range: %w", err)
+			}
+			partMd5 = sum
+		}
+	}
+
+	return dstChunks, partMd5, nil
+}
+
+// md5Zeros hashes size zero bytes without a volume read — a copied range
+// that overlaps no source chunk assembles to all zeros.
+func md5Zeros(size int64) []byte {
+	h := md5.New()
+	var zeros [1 << 16]byte
+	for size > 0 {
+		n := min(size, int64(len(zeros)))
+		h.Write(zeros[:n])
+		size -= n
+	}
+	return h.Sum(nil)
+}
+
+// copiedRangeMd5 streams the source range once and hashes its plaintext —
+// exactly the bytes the non-SSE part copy assembles on the destination.
+func (s3a *S3ApiServer) copiedRangeMd5(ctx context.Context, entry *filer_pb.Entry, startOffset, endOffset int64) ([]byte, error) {
+	size := endOffset - startOffset + 1
+	// The copy walks the chunks, so the hash must too: on an entry that also
+	// carries inline Content the stream helper would prefer Content instead.
+	chunked := &filer_pb.Entry{Chunks: entry.GetChunks()}
+	reader, err := s3a.getEncryptedStreamFromVolumes(ctx, chunked, startOffset, size)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, reader); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
 
 // Helper methods for copy operations to avoid code duplication

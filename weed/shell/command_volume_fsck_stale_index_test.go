@@ -42,6 +42,7 @@ func TestFsckRejectsIncompleteNeedleMetadata(t *testing.T) {
 	binary.BigEndian.PutUint32(header[12:16], uint32(len(path)))
 	fid.Write(header[:])
 	fid.WriteString(path)
+	fid.Write([]byte{0, 0, 0, 0}) // no hard link id
 	if err := os.WriteFile(getFilerFileIdFile(tempFolder, volumeId), fid.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}

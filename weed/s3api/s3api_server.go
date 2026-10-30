@@ -20,6 +20,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/credential"
@@ -30,6 +32,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
@@ -107,6 +110,14 @@ type S3ApiServerOption struct {
 	// AllowUntrustedRemoteEndpoints lets a read of a remote-only object dial a
 	// mounted endpoint that resolves to a loopback / private / metadata host.
 	AllowUntrustedRemoteEndpoints bool
+	// AllowBackslashInKey keeps '\' a literal object-key character instead of
+	// normalizing it to '/', matching AWS S3 where the two are distinct keys.
+	AllowBackslashInKey bool
+	// IamSelfServiceRequiresGrant makes managing one's own access keys
+	// (CreateAccessKey, DeleteAccessKey, UpdateAccessKey, ListAccessKeys,
+	// GetUser) need an explicit iam: grant instead of being allowed to every
+	// authenticated identity.
+	IamSelfServiceRequiresGrant bool
 }
 
 // s3ChunkCacheChunkSizeMB is the assumed chunk size (in MiB) used to convert
@@ -126,6 +137,7 @@ type S3ApiServer struct {
 	randomClientId        int32
 	filerGuard            *security.Guard
 	filerClient           *wdclient.FilerClient
+	masterClient          *wdclient.MasterClient
 	client                util_http_client.HTTPClientInterface
 	bucketRegistry        *BucketRegistry
 	credentialManager     *credential.CredentialManager
@@ -384,6 +396,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		randomClientId:        util.RandomInt32(),
 		filerGuard:            security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec),
 		filerClient:           filerClient,
+		masterClient:          masterClient,
 		cb:                    NewCircuitBreaker(option),
 		credentialManager:     iam.credentialManager,
 		bucketConfigCache:     NewBucketConfigCache(60 * time.Minute), // Increased TTL since cache is now event-driven
@@ -549,8 +562,12 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	} else {
 		s3ApiServer.client = &http.Client{
 			Transport: &http.Transport{
-				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-					return net.Dial("unix", option.LocalFilerSocket)
+				DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+					conn, err := (&net.Dialer{}).DialContext(ctx, "unix", option.LocalFilerSocket)
+					if err != nil {
+						return util.OutboundDialContext(ctx, "tcp", addr)
+					}
+					return conn, nil
 				},
 			},
 		}
@@ -583,6 +600,10 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	// Start the versioning reconciler that drains stranded .versions/
 	// pointer-to-missing-file states without waiting for a client GET.
 	s3ApiServer.versionsReconcilerStop = s3ApiServer.startVersioningReconciler()
+
+	// Publish the key mode only once the server is fully constructed so a
+	// failed construction cannot flip the mode of a running server.
+	SetAllowBackslashInObjectKey(option.AllowBackslashInKey)
 
 	return s3ApiServer, nil
 }
@@ -713,7 +734,10 @@ func (s3a *S3ApiServer) checkPolicyWithEntry(r *http.Request, bucket, object, ac
 // Returns s3err.ErrNone if allowed, or an error code if denied or on error.
 func (s3a *S3ApiServer) recheckPolicyWithObjectEntry(r *http.Request, bucket, object, action string, objectEntry map[string][]byte, handlerName string) s3err.ErrorCode {
 	if isAnonymousObjectRead(r) {
-		return s3a.authorizeAnonymousObjectRead(r, bucket, object, objectEntry)
+		// Refined like writeAnonymousAwareNotFound's masked miss, so a denied
+		// existing key and a missing key answer alike on a malformed name.
+		identity, _ := GetIdentityFromContext(r).(*Identity)
+		return refineDenialForBucketName(r, identity, s3a.authorizeAnonymousObjectRead(r, bucket, object, objectEntry))
 	}
 	identityRaw := GetIdentityFromContext(r)
 	var identity *Identity
@@ -728,6 +752,92 @@ func (s3a *S3ApiServer) recheckPolicyWithObjectEntry(r *http.Request, bucket, ob
 	principal := buildPrincipalARN(identity, r)
 	errCode, _ := s3a.checkPolicyWithEntry(r, bucket, object, action, principal, objectEntry)
 	return errCode
+}
+
+// checkVersionReadGrant enforces the version read grant AWS requires alongside
+// a version-scoped action such as s3:GetObjectVersionAttributes. The check runs
+// on a request shaped like a plain versioned GET so the s3:GetObjectVersion
+// action resolves from the request instead of the caller's subresource, and a
+// legacy Read grant still applies.
+func (s3a *S3ApiServer) checkVersionReadGrant(r *http.Request, bucket, object, versionId string, objectEntry map[string][]byte) s3err.ErrorCode {
+	versionReadReq := objectKeyPolicyRequest(r, http.MethodGet, bucket, object, versionId)
+	if identity, ok := GetIdentityFromContext(r).(*Identity); ok && identity != nil {
+		if errCode := s3a.iam.VerifyActionPermission(versionReadReq, identity, ACTION_READ, bucket, object); errCode != s3err.ErrNone {
+			return errCode
+		}
+	}
+	return s3a.recheckPolicyWithObjectEntry(versionReadReq, bucket, object, ACTION_READ, objectEntry, "checkVersionReadGrant")
+}
+
+// recheckCopySourcePolicy repeats the source object's policy check once its
+// entry is fetched, so conditions on the object's existing tags apply to a
+// CopyObject / UploadPartCopy / RenameObject source the same way they do to a
+// plain GET. The synthesized GET keeps the destination's request shape (PUT,
+// partNumber, ...) from resolving a different action.
+func (s3a *S3ApiServer) recheckCopySourcePolicy(r *http.Request, bucket, object, versionId string, objectEntry map[string][]byte, handlerName string) s3err.ErrorCode {
+	keyReq := objectKeyPolicyRequest(r, http.MethodGet, bucket, object, versionId)
+	return s3a.recheckPolicyWithObjectEntry(keyReq, bucket, object, string(ACTION_READ), objectEntry, handlerName)
+}
+
+// recheckTagConditionedPolicyWithLookup repeats policy evaluation with the
+// object's entry in hand so s3:ExistingObjectTag conditions apply to
+// operations that did not otherwise fetch the entry. It only does the extra
+// lookup when the bucket has a policy; entry misses return ErrNone because
+// the handler reports its own NoSuchKey.
+func (s3a *S3ApiServer) recheckTagConditionedPolicyWithLookup(r *http.Request, bucket, object, versionId, action, handlerName string) s3err.ErrorCode {
+	if s3a.policyEngine == nil || !s3a.policyEngine.HasPolicyForBucket(bucket) {
+		return s3err.ErrNone
+	}
+	entry, err := s3a.resolveObjectEntry(bucket, object, versionId)
+	if err != nil {
+		// The tag conditions cannot be evaluated without the entry; failing
+		// open would let a tag-gated Deny slip through a transient miss.
+		if errors.Is(err, filer_pb.ErrNotFound) || status.Code(err) == codes.NotFound {
+			return s3err.ErrNone
+		}
+		glog.Errorf("%s: recheck lookup for %s/%s failed: %v", handlerName, bucket, object, err)
+		return s3err.ErrInternalError
+	}
+	if entry == nil {
+		return s3err.ErrNone
+	}
+	return s3a.recheckPolicyWithObjectEntry(r, bucket, object, action, entry.Extended, handlerName)
+}
+
+// recheckPolicyForKeyWithLookup re-decides a first-phase deny on one key for a
+// synthesized method, resolving the entry the way the read path does (versions
+// included) so s3:ExistingObjectTag conditions see the object's real tags.
+// Unlike the deny-side rechecks, an indeterminate result does not grant: the
+// caller reports the original verdict either way, so only a statement that
+// matches with tags in hand can turn a deny into an allow, and a missed lookup
+// never widens access or reveals whether the key exists.
+func (s3a *S3ApiServer) recheckPolicyForKeyWithLookup(r *http.Request, method, bucket, object, versionId, action, handlerName string) s3err.ErrorCode {
+	if s3a.policyEngine == nil || !s3a.policyEngine.HasPolicyForBucket(bucket) {
+		return s3err.ErrAccessDenied
+	}
+	versioningState, err := s3a.getVersioningState(bucket)
+	if err != nil {
+		glog.Errorf("%s: recheck versioning state for %s: %v", handlerName, bucket, err)
+		return s3err.ErrAccessDenied
+	}
+	entry, err := s3a.resolveCopySourceEntry(bucket, object, versionId, versioningState)
+	entry = prefixObjectSource(entry)
+	if err != nil || entry == nil {
+		return s3err.ErrAccessDenied
+	}
+	keyReq := objectKeyPolicyRequest(r, method, bucket, object, versionId)
+	errCode, checked := s3a.checkPolicyWithEntry(keyReq, bucket, object, action, "", entry.Extended)
+	if errCode != s3err.ErrNone || !checked {
+		return s3err.ErrAccessDenied
+	}
+	// A bucket-policy Allow never overrides an explicit Deny in the caller's
+	// own attached or session policies — the first phase applied that veto,
+	// so the tag-aware recheck must too.
+	identity, _ := GetIdentityFromContext(r).(*Identity)
+	if s3a.iam != nil && s3a.iam.isActionExplicitlyDeniedByApplicablePolicies(keyReq, identity, Action(action), bucket, object) {
+		return s3err.ErrAccessDenied
+	}
+	return s3err.ErrNone
 }
 
 // classifyDomainNames classifies domains into path-style and virtual-host style domains.
@@ -872,6 +982,9 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 	// runs before subrouter matching so Queries() matchers see the fixed query
 	router.Use(util_http.EscapeSemicolonsInQuery)
+	// a request naming two subresources routes one way and authorizes another;
+	// reject it rather than guess
+	router.Use(rejectAmbiguousSubresource)
 	// API Router
 	apiRouter := router.PathPrefix("/").Subrouter()
 	apiRouter.Use(request_id.Middleware)
@@ -889,6 +1002,17 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 	// Object path pattern with (?s) flag to match newlines in object keys
 	const objectPath = "/{object:(?s).+}"
 
+	// CORS preflight for service-level requests, answered from the global
+	// AllowedOrigins rather than a bucket's CORS configuration
+	serviceOptionsHandler := func(w http.ResponseWriter, r *http.Request) {
+		if s3a.handleCORSOriginValidation(w, r) {
+			writeSuccessResponseEmpty(w, r)
+		}
+	}
+	// A path-style bucket router would take the health probe paths as bucket
+	// names, so their preflight is registered ahead of each one
+	const healthProbePath = "/{probe:status|healthz|readyz}"
+
 	var routers []*mux.Router
 	if s3a.option.DomainName != "" {
 		domainNames := strings.Split(s3a.option.DomainName, ",")
@@ -896,6 +1020,7 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 
 		// Register path-style domains
 		for _, domain := range pathStyleDomains {
+			apiRouter.Host(domain).Methods(http.MethodOptions).Path(healthProbePath).HandlerFunc(serviceOptionsHandler)
 			routers = append(routers, apiRouter.Host(domain).PathPrefix("/{bucket}").Subrouter())
 			apiRouter.Host(domain).
 				Methods(http.MethodGet).
@@ -913,6 +1038,7 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 	// arrive via an IP, an unlisted hostname, or a reverse proxy that rewrites
 	// the Host header still match bucket routes. Host-specific routers above
 	// take precedence because they were registered first.
+	apiRouter.Methods(http.MethodOptions).Path(healthProbePath).HandlerFunc(serviceOptionsHandler)
 	routers = append(routers, apiRouter.PathPrefix("/{bucket}").Subrouter())
 
 	// Get CORS middleware instance with caching
@@ -928,8 +1054,9 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		bucket.Use(corsMiddleware.Handler)
 
 		// Bucket-specific OPTIONS handler for CORS preflight requests
-		// Use PathPrefix to catch all bucket-level preflight routes including /bucket/object
-		bucket.PathPrefix("/").Methods(http.MethodOptions).HandlerFunc(corsMiddleware.HandleOptionsRequest)
+		// No path matcher, so it also catches the path-style bucket root (/bucket),
+		// which PathPrefix("/") would miss, as well as /bucket/ and /bucket/object
+		bucket.Methods(http.MethodOptions).HandlerFunc(corsMiddleware.HandleOptionsRequest)
 
 		// each case should follow the next rule:
 		// - requesting object with query must precede any other methods
@@ -1164,9 +1291,7 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 				return
 			}
 
-			if s3a.handleCORSOriginValidation(w, r) {
-				writeSuccessResponseEmpty(w, r)
-			}
+			serviceOptionsHandler(w, r)
 		})
 
 	// STS API endpoint for AssumeRoleWithWebIdentity

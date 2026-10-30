@@ -21,6 +21,7 @@ import (
 )
 
 func TestS3MakeUsesAnonymousCredentialsWhenKeysAreEmpty(t *testing.T) {
+	clearAWSCredentialEnv(t)
 	maker := s3RemoteStorageMaker{}
 	conf := &remote_pb.RemoteConf{
 		Type:             "s3",
@@ -38,6 +39,74 @@ func TestS3MakeUsesAnonymousCredentialsWhenKeysAreEmpty(t *testing.T) {
 	s3Client, ok := client.conn.(*awss3.S3)
 	require.True(t, ok)
 	require.Same(t, credentials.AnonymousCredentials, s3Client.Config.Credentials)
+}
+
+func clearAWSCredentialEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"AWS_ACCESS_KEY_ID",
+		"AWS_PROFILE",
+		"AWS_DEFAULT_PROFILE",
+		"AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+		"AWS_SHARED_CREDENTIALS_FILE",
+		"AWS_CONFIG_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+func TestS3MakeUsesDefaultCredentialChainWhenKeysAreEmptyAndSourceIsConfigured(t *testing.T) {
+	for name, value := range map[string]string{
+		"AWS_ACCESS_KEY_ID":                      "env-access",
+		"AWS_PROFILE":                            "some-profile",
+		"AWS_WEB_IDENTITY_TOKEN_FILE":            "/var/run/secrets/token",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI":     "http://127.0.0.1:1/creds",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/creds",
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearAWSCredentialEnv(t)
+			t.Setenv(name, value)
+			t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+
+			remoteClient, err := s3RemoteStorageMaker{}.Make(&remote_pb.RemoteConf{
+				Type:             "s3",
+				S3Region:         "us-east-1",
+				S3Endpoint:       "http://localhost:8333",
+				S3ForcePathStyle: true,
+			})
+			require.NoError(t, err)
+
+			s3Client, ok := remoteClient.(*s3RemoteStorageClient).conn.(*awss3.S3)
+			require.True(t, ok)
+			require.NotSame(t, credentials.AnonymousCredentials, s3Client.Config.Credentials)
+		})
+	}
+}
+
+// A caller that pins a custom http.Client still gets the default chain, so
+// remote providers resolve on an unguarded client while S3 requests use the
+// pinned one.
+func TestS3MakeResolvesEnvCredentialsWithCustomHTTPClient(t *testing.T) {
+	clearAWSCredentialEnv(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "env-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
+
+	remoteClient, err := MakeWithHTTPClient(&remote_pb.RemoteConf{
+		Type:             "s3",
+		S3Region:         "us-east-1",
+		S3Endpoint:       "http://localhost:8333",
+		S3ForcePathStyle: true,
+	}, &http.Client{})
+	require.NoError(t, err)
+
+	s3Client, ok := remoteClient.(*s3RemoteStorageClient).conn.(*awss3.S3)
+	require.True(t, ok)
+	require.NotSame(t, credentials.AnonymousCredentials, s3Client.Config.Credentials)
+	value, err := s3Client.Config.Credentials.Get()
+	require.NoError(t, err)
+	require.Equal(t, "env-access", value.AccessKeyID)
 }
 
 func TestS3MakeUsesStaticCredentialsWhenKeysAreProvided(t *testing.T) {
@@ -295,31 +364,89 @@ func TestS3UpdateFileMetadataSkipsTaggingWhenUnsupported(t *testing.T) {
 	client, rt := newRecordingS3Client(t, false)
 	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/dir/file.bin"}
 	plain := &filer_pb.Entry{}
-	tagged := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v1")}}
+	tagged := &filer_pb.Entry{Extended: map[string][]byte{"X-Amz-Tagging-k1": []byte("v1")}}
 
-	require.NoError(t, client.UpdateFileMetadata(loc, plain, tagged))
+	_, err := client.UpdateFileMetadata(loc, plain, tagged)
+	require.NoError(t, err)
 	require.Empty(t, rt.requests, "adding attributes must not send PutObjectTagging")
 
-	require.NoError(t, client.UpdateFileMetadata(loc, tagged, plain))
+	_, err = client.UpdateFileMetadata(loc, tagged, plain)
+	require.NoError(t, err)
 	require.Empty(t, rt.requests, "removing attributes must not send DeleteObjectTagging")
+}
+
+func TestS3UpdateFileMetadataIgnoresNonTagAttributes(t *testing.T) {
+	client, rt := newRecordingS3Client(t, true)
+	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/dir/file.bin"}
+	old := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v1")}}
+	updated := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v2")}}
+
+	_, err := client.UpdateFileMetadata(loc, old, updated)
+	require.NoError(t, err)
+	require.Empty(t, rt.requests, "non-tag attribute changes must not send tagging calls")
 }
 
 func TestS3UpdateFileMetadataSendsTaggingWhenSupported(t *testing.T) {
 	client, rt := newRecordingS3Client(t, true)
 	loc := &remote_pb.RemoteStorageLocation{Name: "test", Bucket: "bucket", Path: "/dir/file.bin"}
 	plain := &filer_pb.Entry{}
-	tagged := &filer_pb.Entry{Extended: map[string][]byte{"k1": []byte("v1")}}
+	tagged := &filer_pb.Entry{Extended: map[string][]byte{"X-Amz-Tagging-k1": []byte("v1")}}
 
-	require.NoError(t, client.UpdateFileMetadata(loc, plain, tagged))
+	_, err := client.UpdateFileMetadata(loc, plain, tagged)
+	require.NoError(t, err)
 	require.Len(t, rt.requests, 1)
 	require.Equal(t, http.MethodPut, rt.requests[0].Method)
 	require.Contains(t, rt.requests[0].URL.RawQuery, "tagging")
 
 	rt.requests = nil
-	require.NoError(t, client.UpdateFileMetadata(loc, tagged, plain))
+	_, err = client.UpdateFileMetadata(loc, tagged, plain)
+	require.NoError(t, err)
 	require.Len(t, rt.requests, 1)
 	require.Equal(t, http.MethodDelete, rt.requests[0].Method)
 	require.Contains(t, rt.requests[0].URL.RawQuery, "tagging")
+}
+
+func TestS3WriteFileSendsOnlyTagAttributes(t *testing.T) {
+	rt := &captureRoundTripper{}
+	client := newS3ClientWithTransport(t, rt, true)
+	loc := &remote_pb.RemoteStorageLocation{
+		Name:   "test",
+		Bucket: "bucket",
+		Path:   "/dir/test.bin",
+	}
+	entry := &filer_pb.Entry{
+		Extended: map[string][]byte{
+			"X-Amz-Tagging-a b":  []byte("x=y"),
+			"Seaweed-X-Amz-Acl":  []byte(`[{"Permission":"FULL_CONTROL"}]`),
+			"Seaweed-X-Amz-ETag": []byte("etag-1"),
+			"Cache-Control":      []byte("no-cache"),
+		},
+	}
+
+	_, err := client.WriteFile(loc, entry, bytes.NewReader([]byte("data")))
+	require.NoError(t, err)
+
+	require.NotNil(t, rt.uploadReq, "uploader should have issued a PUT")
+	require.Equal(t, "a%20b=x%3Dy", rt.uploadReq.Header.Get("X-Amz-Tagging"))
+}
+
+func TestS3WriteFileOmitsTaggingWhenNoTagAttributes(t *testing.T) {
+	rt := &captureRoundTripper{}
+	client := newS3ClientWithTransport(t, rt, true)
+	loc := &remote_pb.RemoteStorageLocation{
+		Name:   "test",
+		Bucket: "bucket",
+		Path:   "/dir/test.bin",
+	}
+	entry := &filer_pb.Entry{
+		Extended: map[string][]byte{"Seaweed-X-Amz-Acl": []byte(`[{"Permission":"FULL_CONTROL"}]`)},
+	}
+
+	_, err := client.WriteFile(loc, entry, bytes.NewReader([]byte("data")))
+	require.NoError(t, err)
+
+	require.NotNil(t, rt.uploadReq, "uploader should have issued a PUT")
+	require.Empty(t, rt.uploadReq.Header.Get("X-Amz-Tagging"))
 }
 
 func TestS3WriteFileOmitsContentTypeWhenMimeMissing(t *testing.T) {
@@ -391,4 +518,25 @@ func TestS3ReadNotFoundClassification(t *testing.T) {
 func TestIsNoSuchKey(t *testing.T) {
 	require.True(t, isNoSuchKey(fmt.Errorf("download: %w", awserr.New(awss3.ErrCodeNoSuchKey, "missing", nil))))
 	require.False(t, isNoSuchKey(awserr.New(awss3.ErrCodeNoSuchBucket, "missing", nil)))
+}
+
+func TestS3MakeResolvesEnvCredentialsWhenAnonymousDefault(t *testing.T) {
+	clearAWSCredentialEnv(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "env-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
+
+	remoteClient, err := s3RemoteStorageMaker{}.Make(&remote_pb.RemoteConf{
+		Type:             "s3",
+		S3Region:         "us-east-1",
+		S3Endpoint:       "http://localhost:8333",
+		S3ForcePathStyle: true,
+	})
+	require.NoError(t, err)
+
+	s3Client, ok := remoteClient.(*s3RemoteStorageClient).conn.(*awss3.S3)
+	require.True(t, ok)
+	value, err := s3Client.Config.Credentials.Get()
+	require.NoError(t, err)
+	require.Equal(t, "env-access", value.AccessKeyID)
+	require.Equal(t, "env-secret", value.SecretAccessKey)
 }

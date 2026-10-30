@@ -25,6 +25,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -67,6 +68,11 @@ type IdentityAccessManagement struct {
 
 	// IAM Integration for advanced features
 	iamIntegration IAMIntegration
+
+	// selfServiceRequiresGrant makes the self-service IAM actions (an
+	// identity's own access keys, GetUser on itself) need an iam:<Action>
+	// grant like every other IAM action. Off by default.
+	selfServiceRequiresGrant bool
 
 	// Serializes resyncs of the policy set into the advanced IAM manager so that
 	// concurrent policy updates can't apply stale views out of order. See
@@ -113,8 +119,9 @@ type IdentityAccessManagement struct {
 	// reloadCh coalesces failed-reload retries handled by reloadRetryLoop
 	reloadCh chan struct{}
 
-	// reloadMu serializes configuration loads end-to-end (store snapshot
-	// through commit) so an older snapshot cannot overwrite a newer one
+	// reloadMu serializes configuration loads and pushes end-to-end (store
+	// snapshot through commit) so an older snapshot cannot overwrite a newer
+	// one
 	reloadMu sync.Mutex
 }
 
@@ -335,6 +342,7 @@ func NewIdentityAccessManagementWithStore(option *S3ApiServerOption, filerClient
 		hashCounters: make(map[string]*int32),
 		filerClient:  filerClient,
 	}
+	iam.selfServiceRequiresGrant = option.IamSelfServiceRequiresGrant
 
 	// Always initialize credential manager with fallback to defaults
 	credentialManager, err := credential.NewCredentialManagerWithDefaults(credential.CredentialStoreTypeName(explicitStore))
@@ -1046,10 +1054,6 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 	for k, v := range iam.nameToIdentity {
 		nameToIdentity[k] = v
 	}
-	policies := make(map[string]*iam_pb.Policy)
-	for k, v := range iam.policies {
-		policies[k] = v
-	}
 	accounts := make(map[string]*Account)
 	for k, v := range iam.accounts {
 		accounts[k] = v
@@ -1265,22 +1269,6 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 		glog.V(3).Infof("Loaded service account %s for dynamic parent %s (expiration: %d)", sa.Id, sa.ParentUser, sa.Expiration)
 	}
 
-	for _, policy := range config.Policies {
-		policies[policy.Name] = policy
-	}
-	// full snapshot: drop dynamic policies the store no longer has
-	if isFullState {
-		presentPolicies := make(map[string]bool, len(config.Policies))
-		for _, policy := range config.Policies {
-			presentPolicies[policy.Name] = true
-		}
-		for name := range policies {
-			if !staticPolicies[name] && !presentPolicies[name] {
-				delete(policies, name)
-			}
-		}
-	}
-
 	iam.m.Lock()
 	// atomically switch
 	iam.identities = identities
@@ -1289,7 +1277,28 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 	iam.emailAccount = emailAccount
 	iam.nameToIdentity = nameToIdentity
 	iam.accessKeyIdent = accessKeyIdent
-	iam.policies = policies
+
+	// Apply policy changes to the live map rather than swapping in a snapshot
+	// taken before this merge prepared: a policy committed in the meantime (a
+	// pushed inline document or a PutPolicy update) must not be discarded.
+	if iam.policies == nil {
+		iam.policies = make(map[string]*iam_pb.Policy)
+	}
+	for _, policy := range config.Policies {
+		iam.policies[policy.Name] = policy
+	}
+	// full snapshot: drop dynamic policies the store no longer has
+	if isFullState {
+		presentPolicies := make(map[string]bool, len(config.Policies))
+		for _, policy := range config.Policies {
+			presentPolicies[policy.Name] = true
+		}
+		for name := range iam.policies {
+			if !staticPolicies[name] && !presentPolicies[name] {
+				delete(iam.policies, name)
+			}
+		}
+	}
 
 	// Groups: a full snapshot is authoritative even when empty (last group
 	// deleted); partial updates pass nil Groups and preserve existing state.
@@ -1385,9 +1394,51 @@ func (iam *IdentityAccessManagement) UpsertIdentity(ident *iam_pb.Identity) erro
 		return fmt.Errorf("upsert identity failed: empty identity name")
 	}
 	glog.V(1).Infof("IAM: upsert identity %s", ident.Name)
-	return iam.MergeS3ApiConfiguration(&iam_pb.S3ApiConfiguration{
+	// Serialize the store reads below with the merge that publishes them:
+	// reloadMu already gives full reloads the same snapshot-through-commit
+	// ordering, so a document read here cannot overwrite a newer copy that a
+	// concurrent push or reload committed in the meantime.
+	iam.reloadMu.Lock()
+	defer iam.reloadMu.Unlock()
+	config := &iam_pb.S3ApiConfiguration{
 		Identities: []*iam_pb.Identity{ident},
-	}, false, false)
+	}
+	// The wire proto lacks runtime inline policy names; merging it raw would
+	// drop them until the next reload and authorize by flattened Actions.
+	// Reattach the names and their documents, scoped to this identity: a name
+	// without its document would deny requests the policy allows until the
+	// next reload.
+	if iam.credentialManager != nil {
+		if store, ok := iam.credentialManager.GetStore().(credential.InlinePolicyStore); ok {
+			policyNames, err := store.ListUserInlinePolicies(context.Background(), ident.Name)
+			if err != nil {
+				return err
+			}
+			for _, policyName := range policyNames {
+				runtimeName := inlinePolicyRuntimeName(ident.Name, policyName)
+				ident.PolicyNames = appendUniquePolicyName(ident.PolicyNames, runtimeName)
+				doc, err := store.GetUserInlinePolicy(context.Background(), ident.Name, policyName)
+				if err != nil {
+					return err
+				}
+				if doc == nil {
+					continue
+				}
+				content, err := json.Marshal(doc)
+				if err != nil {
+					return fmt.Errorf("failed to marshal inline policy %q for user %q: %w", policyName, ident.Name, err)
+				}
+				config.Policies = append(config.Policies, &iam_pb.Policy{Name: runtimeName, Content: string(content)})
+			}
+		}
+	}
+	if err := iam.MergeS3ApiConfiguration(config, false, false); err != nil {
+		return err
+	}
+	if len(config.Policies) > 0 {
+		iam.resyncIAMManagerPolicies()
+	}
+	return nil
 }
 
 // isEnabled reports whether S3 auth should be enforced for this server.
@@ -1620,8 +1671,32 @@ func (iam *IdentityAccessManagement) GetAccountIdByEmail(email string) string {
 	return ""
 }
 
+// isConfiguredAccountID reports whether id names a configured local identity
+// or account — the reserved accounts included — i.e. an owner string that was
+// never an OIDC subject.
+func (iam *IdentityAccessManagement) isConfiguredAccountID(id string) bool {
+	if id == "" || id == s3_constants.AccountAdminId || id == s3_constants.AccountAnonymousId {
+		return true
+	}
+	iam.m.RLock()
+	defer iam.m.RUnlock()
+	if _, ok := iam.nameToIdentity[id]; ok {
+		return true
+	}
+	if _, ok := iam.accounts[id]; ok {
+		return true
+	}
+	for _, identity := range iam.identities {
+		if identity.Account != nil && identity.Account.Id == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (iam *IdentityAccessManagement) Auth(f http.HandlerFunc, action Action) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		scrubInternalHeaders(r)
 		if !iam.isEnabled() {
 			f(w, r)
 			return
@@ -1631,6 +1706,7 @@ func (iam *IdentityAccessManagement) Auth(f http.HandlerFunc, action Action) htt
 		// succeeds but authZ denies, so the denied request still audits its
 		// requester; a failed authN resolves no identity at all.
 		identity, errCode, _ := iam.authRequestWithAuthType(r, action)
+		errCode = refineDenialForBucketName(r, identity, errCode)
 		if errCode != s3err.ErrNone {
 			glog.V(3).Infof("auth error: %v", errCode)
 		}
@@ -1647,6 +1723,7 @@ func (iam *IdentityAccessManagement) Auth(f http.HandlerFunc, action Action) htt
 // signature verification, which is mandatory for all PostPolicy uploads.
 func (iam *IdentityAccessManagement) AuthPostPolicy(f http.HandlerFunc, action Action) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		scrubInternalHeaders(r)
 		if !iam.isEnabled() {
 			f(w, r)
 			return
@@ -1669,12 +1746,46 @@ func (iam *IdentityAccessManagement) AuthPostPolicy(f http.HandlerFunc, action A
 			}
 		}
 
+		errCode = refineDenialForBucketName(r, identity, errCode)
 		if errCode != s3err.ErrNone {
 			glog.V(3).Infof("auth error: %v", errCode)
 		}
 
 		iam.handleAuthResult(w, r, identity, errCode, f)
 	}
+}
+
+// refineDenialForBucketName answers 400 InvalidBucketName, as AWS S3 does,
+// when an authenticated caller is denied on a bucket whose name breaks the S3
+// naming rules. The rules are public and the answer depends on the name alone,
+// so it tells the caller nothing about which buckets exist. Authentication
+// failures (no identity resolved) and every other answer are left unchanged.
+func refineDenialForBucketName(r *http.Request, identity *Identity, errCode s3err.ErrorCode) s3err.ErrorCode {
+	if errCode != s3err.ErrAccessDenied || identity == nil {
+		return errCode
+	}
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	if bucket == "" {
+		return errCode
+	}
+	if !isASCIIBucketName(bucket) || s3bucket.VerifyS3BucketName(bucket) != nil {
+		return s3err.ErrInvalidBucketName
+	}
+	return errCode
+}
+
+// isASCIIBucketName reports whether name uses only the characters S3 allows
+// in a bucket name. VerifyS3BucketName checks with unicode.IsLower and
+// unicode.IsNumber, which also accept letters such as 'ü' and digits such as
+// '²' that S3 refuses.
+func isASCIIBucketName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // recordIdentityInContext stores the authenticated identity, its name and its
@@ -1732,19 +1843,33 @@ func (iam *IdentityAccessManagement) AuthenticateRequest(r *http.Request) (*Iden
 	return ident, err
 }
 
+// scrubInternalHeaders drops internal headers only the server may set, so
+// client-supplied values cannot spoof identity claims or reach the handlers'
+// internal consumers (putToFiler persists the object-lock and version-id ones
+// into authoritative metadata; the SSE ones carry key material between handler
+// stages of a request). The server sets them itself after this point.
+func scrubInternalHeaders(r *http.Request) {
+	r.Header.Del(s3_constants.SeaweedFSPrincipalHeader)
+	r.Header.Del(s3_constants.SeaweedFSSessionTokenHeader)
+	r.Header.Del(s3_constants.ExtObjectLockModeKey)
+	r.Header.Del(s3_constants.ExtRetentionUntilDateKey)
+	r.Header.Del(s3_constants.ExtLegalHoldKey)
+	r.Header.Del(s3_constants.ExtVersionIdKey)
+	r.Header.Del(s3_constants.SeaweedFSSSEKMSBaseIVHeader)
+	r.Header.Del(s3_constants.SeaweedFSSSES3BaseIVHeader)
+	r.Header.Del(s3_constants.SeaweedFSSSES3KeyDataHeader)
+}
+
 func (iam *IdentityAccessManagement) authenticateRequestInternal(r *http.Request) (*Identity, s3err.ErrorCode, authType) {
 	var identity *Identity
 	var s3Err s3err.ErrorCode
 	var found bool
 	var amzAuthType string
 
-	// SECURITY: Prevent clients from spoofing internal IAM headers.
-	// These headers are only set by the server after successful JWT authentication
-	// and are trusted by downstream authorization (including S3Tables IAM checks
-	// reached via AuthSignatureOnly). Clearing them here — the shared entry point
-	// for every auth path — prevents privilege escalation via header injection.
-	r.Header.Del(s3_constants.SeaweedFSPrincipalHeader)
-	r.Header.Del(s3_constants.SeaweedFSSessionTokenHeader)
+	// Clearing them here — the shared entry point for every auth path —
+	// prevents privilege escalation via header injection, including through
+	// the S3Tables checks reached via AuthSignatureOnly.
+	scrubInternalHeaders(r)
 	// Deferred so signature verification can still read a client-signed value.
 	defer r.Header.Del(s3_constants.AmzAccountId)
 
@@ -1830,6 +1955,27 @@ func isBucketListingRequest(r *http.Request, action Action) bool {
 	}
 	_, object := s3_constants.GetBucketAndObject(r)
 	return object == "" || object == "/"
+}
+
+// multipartListingAction returns the scoped action for a request the router
+// sends to ListObjectPartsHandler or ListMultipartUploadsHandler, or "" for
+// any other request. It follows the route order in s3api_server.go and reads
+// the object from the route vars, so a ?prefix promoted into the
+// authorization object, or extra subresource parameters such as ?policy, do
+// not change which operation the grant has to name.
+func multipartListingAction(r *http.Request, action Action) Action {
+	if action != s3_constants.ACTION_READ || r == nil || r.Method != http.MethodGet || r.URL == nil {
+		return ""
+	}
+	query := r.URL.Query()
+	_, object := s3_constants.GetBucketAndObject(r)
+	if object != "" && object != "/" && query.Has("uploadId") {
+		return s3_constants.ACTION_LIST_PARTS
+	}
+	if query.Has("uploads") {
+		return s3_constants.ACTION_LIST_MULTIPART_UPLOADS
+	}
+	return ""
 }
 
 // authRequestWithAuthType authenticates and then authorizes a request for a given action.
@@ -2845,7 +2991,12 @@ func (iam *IdentityAccessManagement) VerifyActionPermission(r *http.Request, ide
 		}
 	case authorizeViaLegacyActions:
 		if !identity.CanDo(action, bucket, object) {
-			return s3err.ErrAccessDenied
+			// The multipart listing routes are gated on ACTION_READ, but a
+			// grant may name the listing operation itself.
+			listing := multipartListingAction(r, action)
+			if listing == "" || !identity.CanDo(listing, bucket, object) {
+				return s3err.ErrAccessDenied
+			}
 		}
 		return s3err.ErrNone
 	default:
@@ -2935,16 +3086,22 @@ func (iam *IdentityAccessManagement) bucketsNamedByAttachedPolicies(r *http.Requ
 // its query describe. versionId, when set, and the STS session token ride along
 // for policy conditions. Returns ErrNone when auth is disabled (checked by the
 // callers) or the identity is an admin.
-func (iam *IdentityAccessManagement) authorizeObjectKeyAction(r *http.Request, identity *Identity, method string, action Action, bucket, objectKey, versionId string) s3err.ErrorCode {
-	if identity == nil {
-		return s3err.ErrAccessDenied
-	}
-	if identity.isAdmin() {
-		return s3err.ErrNone
-	}
+// authQueryParams are the query keys carrying a request's authentication
+// material (SigV2 and SigV4 presign parameters). None steer ResolveS3Action,
+// so they can ride along on a synthesized request.
+var authQueryParams = []string{
+	"AWSAccessKeyId", "Signature", "Expires",
+	"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+	"X-Amz-Signature", "X-Amz-SignedHeaders", "X-Amz-Security-Token",
+}
 
-	// Shallow copy: authorization only reads headers, so sharing the header map
-	// with the original request is safe, and this can run once per key.
+// objectKeyPolicyRequest synthesizes a <method> /<bucket>/<objectKey> request
+// for policy evaluation against a key the real URL does not name. The query is
+// built from scratch so a param on the real request (delete, uploadId,
+// partNumber, ...) cannot steer ResolveS3Action off the intended action; the
+// versionId and the auth-material params ride along so auth-derived policy
+// conditions (s3:authType) evaluate as they did on the real request.
+func objectKeyPolicyRequest(r *http.Request, method, bucket, objectKey, versionId string) *http.Request {
 	keyReq := new(http.Request)
 	*keyReq = *r
 	keyURL := &url.URL{
@@ -2952,16 +3109,13 @@ func (iam *IdentityAccessManagement) authorizeObjectKeyAction(r *http.Request, i
 		Host:   r.URL.Host,
 		Path:   "/" + bucket + "/" + objectKey,
 	}
-	// Build the query from scratch so a param on the real request (delete,
-	// uploadId, partNumber, ...) cannot steer ResolveS3Action off the intended
-	// action; keep the STS token and per-key versionId for policy conditions.
 	keyQuery := make(url.Values)
 	if versionId != "" {
 		keyQuery.Set("versionId", versionId)
 	}
-	if strings.Contains(r.URL.RawQuery, "X-Amz-Security-Token") {
-		if token := r.URL.Query().Get("X-Amz-Security-Token"); token != "" {
-			keyQuery.Set("X-Amz-Security-Token", token)
+	for _, key := range authQueryParams {
+		if vals, ok := r.URL.Query()[key]; ok {
+			keyQuery[key] = vals
 		}
 	}
 	if len(keyQuery) > 0 {
@@ -2973,6 +3127,18 @@ func (iam *IdentityAccessManagement) authorizeObjectKeyAction(r *http.Request, i
 	keyReq.Body = nil
 	keyReq.GetBody = nil
 	keyReq.ContentLength = 0
+	return keyReq
+}
+
+func (iam *IdentityAccessManagement) authorizeObjectKeyAction(r *http.Request, identity *Identity, method string, action Action, bucket, objectKey, versionId string) s3err.ErrorCode {
+	if identity == nil {
+		return s3err.ErrAccessDenied
+	}
+	if identity.isAdmin() {
+		return s3err.ErrNone
+	}
+
+	keyReq := objectKeyPolicyRequest(r, method, bucket, objectKey, versionId)
 
 	if iam.policyEngine != nil {
 		principal := buildPrincipalARN(identity, keyReq)
@@ -3034,6 +3200,20 @@ func (iam *IdentityAccessManagement) AuthorizeObjectWrite(r *http.Request, ident
 		return s3err.ErrNone
 	}
 	return iam.authorizeObjectKeyAction(r, identity, http.MethodPut, s3_constants.ACTION_WRITE, bucket, objectKey, "")
+}
+
+// AuthorizeObjectAclWrite authorizes setting an ACL on one key the request URL
+// does not name: a POST Object upload promotes its acl form field and any
+// x-amz-grant-* fields onto the upload's ACL headers, which the PUT path only
+// applies after an s3:PutObjectAcl grant.
+func (iam *IdentityAccessManagement) AuthorizeObjectAclWrite(r *http.Request, identity *Identity, bucket, objectKey string) s3err.ErrorCode {
+	if !iam.isEnabled() {
+		return s3err.ErrNone
+	}
+	if bucket == "" || objectKey == "" {
+		return s3err.ErrNone
+	}
+	return iam.authorizeObjectKeyAction(r, identity, http.MethodPut, s3_constants.ACTION_WRITE_ACP, bucket, objectKey, "")
 }
 
 // authorizeWithIAM authorizes requests using the IAM integration policy engine
@@ -3178,8 +3358,42 @@ func (iam *IdentityAccessManagement) PutGroup(group *iam_pb.Group) error {
 	}
 	glog.V(1).Infof("IAM: put group %s", group.Name)
 
+	// Serialize the store reads below with their installation under iam.m:
+	// the same reloadMu ordering that identity pushes and full reloads use,
+	// so a document read here cannot overwrite a newer committed copy.
+	iam.reloadMu.Lock()
+	defer iam.reloadMu.Unlock()
+
+	// As for identity pushes, the wire proto lacks the group's runtime
+	// inline policy names; reattach them with their documents, scoped to
+	// this group.
+	var inlinePolicies []*iam_pb.Policy
+	if iam.credentialManager != nil {
+		if store, ok := iam.credentialManager.GetStore().(credential.GroupInlinePolicyStore); ok {
+			policyNames, err := store.ListGroupInlinePolicies(context.Background(), group.Name)
+			if err != nil {
+				return err
+			}
+			for _, policyName := range policyNames {
+				runtimeName := inlineGroupPolicyRuntimeName(group.Name, policyName)
+				group.PolicyNames = appendUniquePolicyName(group.PolicyNames, runtimeName)
+				doc, err := store.GetGroupInlinePolicy(context.Background(), group.Name, policyName)
+				if err != nil {
+					return err
+				}
+				if doc == nil {
+					continue
+				}
+				content, err := json.Marshal(doc)
+				if err != nil {
+					return fmt.Errorf("failed to marshal inline policy %q for group %q: %w", policyName, group.Name, err)
+				}
+				inlinePolicies = append(inlinePolicies, &iam_pb.Policy{Name: runtimeName, Content: string(content)})
+			}
+		}
+	}
+
 	iam.m.Lock()
-	defer iam.m.Unlock()
 
 	// Remove old reverse index entries for this group
 	if old, ok := iam.groups[group.Name]; ok && !old.Disabled {
@@ -3197,6 +3411,20 @@ func (iam *IdentityAccessManagement) PutGroup(group *iam_pb.Group) error {
 		}
 	}
 
+	if len(inlinePolicies) > 0 {
+		if iam.policies == nil {
+			iam.policies = make(map[string]*iam_pb.Policy)
+		}
+		for _, policy := range inlinePolicies {
+			iam.policies[policy.Name] = policy
+		}
+		iam.rebuildIAMPolicyEngineLocked()
+	}
+	iam.m.Unlock()
+
+	if len(inlinePolicies) > 0 {
+		iam.resyncIAMManagerPolicies()
+	}
 	return nil
 }
 

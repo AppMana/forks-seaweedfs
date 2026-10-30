@@ -6,7 +6,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "weed/storage/backend/volume_create_linux.go"
-FIXED = '''\t\tif err := syscall.Fallocate(int(file.Fd()), 1, 0, preallocate); err != nil {
+FIXED = '''\t\tif err := unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, preallocate); err != nil {
 \t\t\tcleanupErr := errors.Join(file.Close(), os.Remove(fileName))
 \t\t\treturn nil, errors.Join(
 \t\t\t\tfmt.Errorf("preallocate %d bytes for %s: %w", preallocate, fileName, err),
@@ -17,7 +17,7 @@ FIXED = '''\t\tif err := syscall.Fallocate(int(file.Fd()), 1, 0, preallocate); e
 BROKEN = '''\t\t// MUTANT: reproduce the historical ignored reservation failure.
 \t\t_ = errors.Join
 \t\t_ = fmt.Sprintf
-\t\tsyscall.Fallocate(int(file.Fd()), 1, 0, preallocate)
+\t\tunix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, preallocate)
 '''
 
 def revert(source):

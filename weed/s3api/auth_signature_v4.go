@@ -19,6 +19,7 @@ package s3api
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -354,11 +355,25 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 	// 8. Verify the signature for each plausible host value: when X-Forwarded-Host carries
 	// no port, the client may have signed the Host header the proxy kept or the forwarded
 	// host and port, and the headers alone cannot tell which.
-	pathForSignature := r.URL.EscapedPath()
+	// A router that rewrote the request path (e.g. the Iceberg catalog's
+	// doubled-/v1 collapse) records the client-sent path in the context;
+	// the signature covers that original path.
+	pathForSignature := s3_constants.GetOriginalRequestPathFromContext(r)
 	if pathForSignature == "" {
-		pathForSignature = r.URL.Path
+		pathForSignature = r.URL.EscapedPath()
+		if pathForSignature == "" {
+			pathForSignature = r.URL.Path
+		}
 	}
-	forwardedPrefix := r.Header.Get("X-Forwarded-Prefix")
+	// The signature is checked against prefix+path but the request is routed
+	// and authorized on path alone, so only a trusted proxy may set the prefix.
+	iam.m.RLock()
+	trustedPeer := iam.trustedProxies.IsTrustedPeer(r)
+	iam.m.RUnlock()
+	forwardedPrefix := ""
+	if trustedPeer {
+		forwardedPrefix = r.Header.Get("X-Forwarded-Prefix")
+	}
 	var matchedHost string
 	for i, hostCandidate := range extractHostHeaderCandidates(r, iam.externalHost) {
 		if i > 0 && !replaceSignedHostHeader(extractedSignedHeaders, hostCandidate) {
@@ -393,6 +408,13 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 	}
 
 	if matchedHost != "" {
+		// The key of the credential that verified: the audit log and the
+		// catalog's vended sessions name it (never a key re-read from the request).
+		// Recorded before the retarget check so that refusal names it too.
+		s3_constants.RecordAccessKeyId(r.Context(), cred.AccessKey)
+		if found {
+			s3_constants.RecordStoredAccessKeyId(r.Context(), cred.AccessKey, cred.SecretKey)
+		}
 		if signedBucket, ok := bucketFromVirtualHost(matchedHost, iam.domain); ok {
 			if routedBucket, _ := s3_constants.GetBucketAndObject(r); routedBucket != "" && routedBucket != signedBucket {
 				glog.V(2).Infof("reject %s %s: signed host %q implies bucket %q but routed to %q",
@@ -477,6 +499,19 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 		return nil, nil, s3err.ErrExpiredToken
 	}
 
+	// A session the table catalog vended for a static access key is bound to
+	// that key, as a role session is bound to its role's ID: deleting or
+	// deactivating the key, or deleting or disabling its identity, ends the
+	// session at its next request instead of at its expiry. Sessions minted
+	// before the binding existed carry only the audit field and stay unbound.
+	if sessionInfo.IdentityProvider == icebergVendedCredentialsProvider && sessionInfo.BoundAccessKeyId != "" {
+		if errCode := iam.vendedSessionKeyLive(sessionInfo.ExternalUserId, sessionInfo.BoundAccessKeyId, sessionInfo.BoundAccessKeyFingerprint); errCode != s3err.ErrNone {
+			glog.V(2).Infof("vended STS session %s: identity %q or the access key it was vended for is gone, disabled or inactive",
+				sessionInfo.SessionId, sessionInfo.ExternalUserId)
+			return nil, nil, errCode
+		}
+	}
+
 	// Validate required credential fields
 	if sessionInfo.Credentials.SecretAccessKey == "" {
 		glog.Warningf("STS service returned empty SecretAccessKey in credentials")
@@ -533,6 +568,38 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 	glog.V(2).Infof("Successfully validated STS session token for principal: %s, assumed role user: %s",
 		sessionInfo.Principal, sessionInfo.AssumedRoleUser)
 	return identity, cred, s3err.ErrNone
+}
+
+// vendedSessionKeyLive answers ErrNone while owner is a known, enabled
+// identity holding accessKey as an active, unexpired credential, and
+// ErrInvalidAccessKeyID (as for an unknown key) otherwise. A fingerprint set
+// at mint time must still match, so a key re-created under the same id does
+// not revive sessions the deleted original had carried. One map lookup under
+// the read lock.
+func (iam *IdentityAccessManagement) vendedSessionKeyLive(owner, accessKey, fingerprint string) s3err.ErrorCode {
+	if owner == "" || accessKey == "" {
+		return s3err.ErrInvalidAccessKeyID
+	}
+	fingerprintKey := iam.stsSigningKey()
+	iam.m.RLock()
+	defer iam.m.RUnlock()
+	identity, ok := iam.nameToIdentity[owner]
+	if !ok || identity == nil || identity.Disabled {
+		return s3err.ErrInvalidAccessKeyID
+	}
+	for _, credential := range identity.Credentials {
+		if credential == nil || credential.AccessKey != accessKey {
+			continue
+		}
+		if credential.Status == iamAccessKeyStatusInactive || credential.isCredentialExpired() {
+			return s3err.ErrInvalidAccessKeyID
+		}
+		if fingerprint != "" && s3_constants.StoredCredentialFingerprint(fingerprintKey, accessKey, credential.SecretKey) != fingerprint {
+			return s3err.ErrInvalidAccessKeyID
+		}
+		return s3err.ErrNone
+	}
+	return s3err.ErrInvalidAccessKeyID
 }
 
 // calculateAndVerifySignature contains the core logic for creating the canonical request,
@@ -816,7 +883,7 @@ func parseSignedHeaderList(signedHeadersValue string) ([]string, s3err.ErrorCode
 	return signedHeaders, s3err.ErrNone
 }
 
-func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.Header) (*Identity, s3err.ErrorCode) {
+func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(ctx context.Context, formValues http.Header) (*Identity, s3err.ErrorCode) {
 
 	// Parse credential tag.
 	credHeader, err := parseCredentialHeader("Credential=" + formValues.Get("X-Amz-Credential"))
@@ -844,11 +911,6 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 		return nil, s3err.ErrAccessDenied
 	}
 
-	bucket := formValues.Get("bucket")
-	if !identity.CanDo(s3_constants.ACTION_WRITE, bucket, "") {
-		return nil, s3err.ErrAccessDenied
-	}
-
 	// Get signing key.
 	signingKey := getSigningKey(cred.SecretKey, credHeader.scope.date.Format(yyyymmdd), credHeader.scope.region, credHeader.scope.service)
 
@@ -859,6 +921,8 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 	if !compareSignatureV4(newSignature, formValues.Get("X-Amz-Signature")) {
 		return nil, s3err.ErrSignatureDoesNotMatch
 	}
+	s3_constants.RecordAccessKeyId(ctx, cred.AccessKey)
+	s3_constants.RecordStoredAccessKeyId(ctx, cred.AccessKey, cred.SecretKey)
 	return identity, s3err.ErrNone
 }
 
@@ -943,6 +1007,12 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request, externalHost 
 			// Get host value.
 			hostHeaderValue := extractHostHeader(r, externalHost)
 			extractedSignedHeaders[header] = []string{hostHeaderValue}
+			continue
+		}
+		// The Go server strips Content-Length into r.ContentLength; clients do
+		// sign it, so rebuild the value the same way the client saw it.
+		if strings.EqualFold(header, "content-length") && r.ContentLength >= 0 {
+			extractedSignedHeaders[header] = []string{strconv.FormatInt(r.ContentLength, 10)}
 			continue
 		}
 		// For all other headers we need to find them in the HTTP headers and copy them over.

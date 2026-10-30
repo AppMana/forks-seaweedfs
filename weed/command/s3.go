@@ -6,12 +6,12 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -48,6 +48,7 @@ type S3Options struct {
 	filer                     *string
 	ip                        *string
 	bindIp                    *string
+	listenOnLocalhost         *bool
 	port                      *int
 	portHttps                 *int
 	portGrpc                  *int
@@ -94,10 +95,20 @@ type S3Options struct {
 	sharedReaderCache         *filer.ReaderCache
 
 	allowUntrustedRemoteEndpoints *bool
+	allowBackslashInKey           *bool
+	iamSelfServiceRequiresGrant   *bool
 	// shutdownCtx, when non-nil, tells startS3Server to gracefully shut down
 	// its HTTP/gRPC servers once the ctx is cancelled, in addition to on
 	// interrupt. Used by weed mini to orchestrate an ordered shutdown.
 	shutdownCtx context.Context
+
+	// icebergBound/lanceBound record whether the auxiliary catalog listeners
+	// bound their ports. The aux binds happen before the S3 listener serves,
+	// so once the S3 port answers these are final; mini reads them to probe
+	// and advertise only catalogs that are actually running instead of
+	// whatever process may hold the configured port.
+	icebergBound atomic.Bool
+	lanceBound   atomic.Bool
 }
 
 func init() {
@@ -126,7 +137,7 @@ func init() {
 	s3StandaloneOptions.metricsHttpPort = cmdS3.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	s3StandaloneOptions.metricsHttpIp = cmdS3.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	cmdS3.Flag.Bool("allowEmptyFolder", true, "deprecated, ignored. Empty folder cleanup is now automatic.")
-	s3StandaloneOptions.allowDeleteBucketNotEmpty = cmdS3.Flag.Bool("allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	s3StandaloneOptions.allowDeleteBucketNotEmpty = cmdS3.Flag.Bool("allowDeleteBucketNotEmpty", false, "allow recursive deleting all entries along with bucket")
 	s3StandaloneOptions.shareCopyChunks = cmdS3.Flag.Bool("shareCopyChunks", false, shareCopyChunksUsage)
 	s3StandaloneOptions.surfaceEmptyDirectories = cmdS3.Flag.Bool("surfaceEmptyDirectories", false, "list a real but empty directory as a zero-byte <dir>/ marker when the prefix ends in '/'. Off by default: real S3 returns no keys for an emptied prefix, and the synthesised key has an empty basename, which breaks clients that walk trees with trailing-slash prefixes (e.g. docker/distribution's upload purger). Enable for hadoop-aws/Spark getFileStatus probes")
 	s3StandaloneOptions.autoCreateBucket = cmdS3.Flag.Bool("autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
@@ -148,6 +159,8 @@ func init() {
 	s3StandaloneOptions.readerCacheSizeMB = cmdS3.Flag.Int64("readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
 	s3StandaloneOptions.sessionReaderCacheSizeMB = cmdS3.Flag.Int64("sessionReaderCacheSizeMB", 0, "per-request/session memory budget in MiB for an individual S3 GET stream (0 defaults to 1/4 of readerCacheSizeMB)")
 	s3StandaloneOptions.allowUntrustedRemoteEndpoints = cmdS3.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
+	s3StandaloneOptions.allowBackslashInKey = cmdS3.Flag.Bool("allowBackslashInKey", false, allowBackslashInKeyUsage)
+	s3StandaloneOptions.iamSelfServiceRequiresGrant = cmdS3.Flag.Bool("iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
 }
 
 var cmdS3 = &Command{
@@ -348,7 +361,8 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	router := mux.NewRouter().SkipClean(true)
 	var localFilerSocket string
-	if s3opt.localFilerSocket != nil {
+	// The filer only listens on its local socket outside Windows.
+	if s3opt.localFilerSocket != nil && runtime.GOOS != "windows" {
 		localFilerSocket = *s3opt.localFilerSocket
 	}
 	var s3ApiServer *s3api.S3ApiServer
@@ -365,6 +379,12 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	if *s3opt.portGrpc == 0 {
 		*s3opt.portGrpc = 10000 + *s3opt.port
+	}
+	// The loopback companion listener is only kept while -ip.bind is unset.
+	// An explicit -ip.bind pins each port to exactly that address.
+	listenOnLocalhost := *s3opt.bindIp == ""
+	if s3opt.listenOnLocalhost != nil {
+		listenOnLocalhost = *s3opt.listenOnLocalhost
 	}
 	if *s3opt.bindIp == "" {
 		*s3opt.bindIp = "0.0.0.0"
@@ -419,6 +439,8 @@ func (s3opt *S3Options) startS3Server() bool {
 		MaxMB:                     filerMaxMB,
 
 		AllowUntrustedRemoteEndpoints: *s3opt.allowUntrustedRemoteEndpoints,
+		AllowBackslashInKey:           *s3opt.allowBackslashInKey,
+		IamSelfServiceRequiresGrant:   *s3opt.iamSelfServiceRequiresGrant,
 	})
 	if s3ApiServer_err != nil {
 		glog.Fatalf("S3 API Server startup error: %v", s3ApiServer_err)
@@ -428,38 +450,38 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	// Start Iceberg REST Catalog server if enabled
 	if *s3opt.portIceberg > 0 {
-		httpServers = append(httpServers, s3opt.startIcebergServer(s3ApiServer))
+		if httpS := s3opt.startIcebergServer(s3ApiServer, listenOnLocalhost); httpS != nil {
+			httpServers = append(httpServers, httpS)
+		}
 	}
 
 	// Start Lance Namespace server if enabled
 	if s3opt.portLance != nil && *s3opt.portLance > 0 {
-		httpServers = append(httpServers, s3opt.startLanceServer(s3ApiServer))
+		if httpS := s3opt.startLanceServer(s3ApiServer, listenOnLocalhost); httpS != nil {
+			httpServers = append(httpServers, httpS)
+		}
 	}
 
 	if runtime.GOOS != "windows" {
 		localSocket := *s3opt.localSocket
-		if localSocket == "" {
+		explicit := localSocket != ""
+		if !explicit {
 			localSocket = fmt.Sprintf("/tmp/seaweedfs-s3-%d.sock", *s3opt.port)
 		}
-		if err := os.Remove(localSocket); err != nil && !os.IsNotExist(err) {
-			glog.Fatalf("Failed to remove %s, error: %s", localSocket, err.Error())
+		if s3SocketListener := pb.ListenOnLocalSocket(localSocket); s3SocketListener != nil {
+			socketServer := newHttpServer(router, nil)
+			httpServers = append(httpServers, socketServer)
+			go func() {
+				if err := socketServer.Serve(s3SocketListener); err != nil && err != http.ErrServerClosed {
+					glog.Fatalf("Failed to start S3 http server: %v", err)
+				}
+			}()
 		}
-		s3SocketListener, err := net.Listen("unix", localSocket)
-		if err != nil {
-			glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
-		}
-		socketServer := newHttpServer(router, nil)
-		httpServers = append(httpServers, socketServer)
-		go func() {
-			if err := socketServer.Serve(s3SocketListener); err != nil && err != http.ErrServerClosed {
-				glog.Fatalf("Failed to start S3 http server: %v", err)
-			}
-		}()
 	}
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.port)
 	s3ApiListener, s3ApiLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.port, time.Duration(*s3opt.idleTimeout)*time.Second)
+		*s3opt.bindIp, *s3opt.port, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("S3 API Server listener on %s error: %v", listenAddress, err)
 	}
@@ -473,7 +495,7 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	// starting grpc server
 	grpcPort := *s3opt.portGrpc
-	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*s3opt.bindIp, grpcPort, 0)
+	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*s3opt.bindIp, grpcPort, 0, listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("s3 failed to listen on grpc port %d: %v", grpcPort, err)
 	}
@@ -546,7 +568,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		} else {
 			glog.V(0).Infof("Start Seaweed S3 API Server %s at https port %d", version.Version(), *s3opt.portHttps)
 			s3ApiListenerHttps, s3ApiLocalListenerHttps, err := util.NewIpAndLocalListeners(
-				*s3opt.bindIp, *s3opt.portHttps, time.Duration(*s3opt.idleTimeout)*time.Second)
+				*s3opt.bindIp, *s3opt.portHttps, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
 			if err != nil {
 				glog.Fatalf("S3 API HTTPS listener on %s:%d error: %v", *s3opt.bindIp, *s3opt.portHttps, err)
 			}
@@ -606,7 +628,7 @@ func (s3opt *S3Options) newShutdown(stopGrpc func(), s3ApiServer *s3api.S3ApiSer
 }
 
 // startIcebergServer starts the Iceberg REST Catalog server on a separate port.
-func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) *http.Server {
+func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer, listenOnLocalhost bool) *http.Server {
 	icebergRouter := mux.NewRouter().SkipClean(true)
 	// warehouse/parent query values may legally contain ';', which Go's
 	// url.ParseQuery would otherwise drop
@@ -628,10 +650,14 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) *http
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portIceberg)
 	icebergListener, icebergLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.portIceberg, time.Duration(*s3opt.idleTimeout)*time.Second)
+		*s3opt.bindIp, *s3opt.portIceberg, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
 	if err != nil {
-		glog.Fatalf("Iceberg REST Catalog listener on %s error: %v", listenAddress, err)
+		// The catalog is auxiliary to the S3 gateway; a port conflict must not
+		// take the whole server down.
+		glog.Errorf("Iceberg REST Catalog listener on %s error: %v", listenAddress, err)
+		return nil
 	}
+	s3opt.icebergBound.Store(true)
 
 	glog.V(0).Infof("Start Iceberg REST Catalog Server at http://%s", listenAddress)
 
@@ -646,7 +672,7 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) *http
 	}
 	go func() {
 		if err := httpS.Serve(icebergListener); err != nil && err != http.ErrServerClosed {
-			glog.Fatalf("Iceberg REST Catalog Server Fail to serve: %v", err)
+			glog.Errorf("Iceberg REST Catalog Server Fail to serve: %v", err)
 		}
 	}()
 	return httpS
@@ -655,7 +681,7 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) *http
 // startLanceServer starts the Lance Namespace server on a separate port. It
 // shares the Iceberg catalog's credential role: one deployment vends table
 // credentials one way, whichever catalog the client speaks to.
-func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer) *http.Server {
+func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer, listenOnLocalhost bool) *http.Server {
 	lanceRouter := mux.NewRouter().SkipClean(true)
 	lanceRouter.Use(util_http.EscapeSemicolonsInQuery)
 
@@ -670,10 +696,12 @@ func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer) *http.S
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portLance)
 	lanceListener, lanceLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.portLance, time.Duration(*s3opt.idleTimeout)*time.Second)
+		*s3opt.bindIp, *s3opt.portLance, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
 	if err != nil {
-		glog.Fatalf("Lance Namespace listener on %s error: %v", listenAddress, err)
+		glog.Errorf("Lance Namespace listener on %s error: %v", listenAddress, err)
+		return nil
 	}
+	s3opt.lanceBound.Store(true)
 
 	glog.V(0).Infof("Start Lance Namespace Server at http://%s", listenAddress)
 
@@ -687,7 +715,7 @@ func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer) *http.S
 	}
 	go func() {
 		if err := httpS.Serve(lanceListener); err != nil && err != http.ErrServerClosed {
-			glog.Fatalf("Lance Namespace Server Fail to serve: %v", err)
+			glog.Errorf("Lance Namespace Server Fail to serve: %v", err)
 		}
 	}()
 	return httpS
@@ -792,8 +820,8 @@ type icebergCredentialVendor struct {
 	server *s3api.S3ApiServer
 }
 
-func (v icebergCredentialVendor) VendTableCredentials(ctx context.Context, principal, bucket, prefix string) (*iceberg.VendedCredentials, error) {
-	credentials, err := v.server.VendTableCredentials(ctx, principal, bucket, prefix)
+func (v icebergCredentialVendor) VendTableCredentials(ctx context.Context, principal, bucket, prefix string, readOnly bool) (*iceberg.VendedCredentials, error) {
+	credentials, err := v.server.VendTableCredentials(ctx, principal, bucket, prefix, readOnly)
 	if err != nil || credentials == nil {
 		return nil, err
 	}
@@ -811,8 +839,8 @@ type lanceCredentialVendor struct {
 	server *s3api.S3ApiServer
 }
 
-func (v lanceCredentialVendor) VendTableCredentials(ctx context.Context, principal, bucket, prefix string) (*lance.VendedCredentials, error) {
-	credentials, err := v.server.VendTableCredentials(ctx, principal, bucket, prefix)
+func (v lanceCredentialVendor) VendTableCredentials(ctx context.Context, principal, bucket, prefix string, readOnly bool) (*lance.VendedCredentials, error) {
+	credentials, err := v.server.VendTableCredentials(ctx, principal, bucket, prefix, readOnly)
 	if err != nil || credentials == nil {
 		return nil, err
 	}

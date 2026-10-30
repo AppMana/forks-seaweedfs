@@ -45,6 +45,7 @@ func writeFilerRefs(t *testing.T, tempFolder string, volumeId uint32, refs map[s
 		util.Uint32toBytes(record[12:], uint32(len(p)))
 		buf.Write(record)
 		buf.WriteString(p)
+		buf.Write([]byte{0, 0, 0, 0}) // no hard link id
 	}
 	if err := writeToFile(buf.Bytes(), getFilerFileIdFile(tempFolder, volumeId)); err != nil {
 		t.Fatal(err)

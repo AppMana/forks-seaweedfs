@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,13 +49,16 @@ type MiniOptions struct {
 }
 
 const (
-	bytesPerMB                = 1024 * 1024 // Bytes per MB
-	miniVolumeMinFreeSpace    = "1"         // 1% minimum free space
-	minVolumeSizeMB           = 64          // Minimum volume size in MB
-	defaultMiniVolumeSizeMB   = 128         // Default volume size for mini mode
-	maxVolumeSizeMB           = 1024        // Maximum volume size in MB (1GB)
-	GrpcPortOffset            = 10000       // Offset used to calculate gRPC port from HTTP port
-	defaultMiniPluginJobTypes = "all"
+	bytesPerMB                 = 1024 * 1024 // Bytes per MB
+	miniVolumeMinFreeSpace     = "1"         // 1% minimum free space
+	minVolumeSizeMB            = 64          // Minimum volume size in MB
+	defaultMiniVolumeSizeMB    = 128         // Default volume size for mini mode
+	maxVolumeSizeMB            = 1024        // Maximum volume size in MB (1GB)
+	GrpcPortOffset             = 10000       // Offset used to calculate gRPC port from HTTP port
+	linuxEphemeralPortFloor    = 32768       // Default net.ipv4.ip_local_port_range floor on Linux
+	defaultAdminHTTPPort       = 12535       // Keeps the derived admin gRPC port (port+GrpcPortOffset) below linuxEphemeralPortFloor
+	defaultAdminHTTPLegacyPort = 23646       // Pre-12535 default; served alongside the new port for backward compatibility
+	defaultMiniPluginJobTypes  = "all"
 )
 
 var (
@@ -64,8 +68,9 @@ var (
 	miniS3Options     S3Options
 	miniWebDavOptions WebDavOption
 	miniAdminOptions  AdminOptions
-	// Track which port flags were explicitly passed on CLI before config file is applied
-	explicitPortFlags             map[string]bool
+	// Flags explicitly provided on the command line or via WEED_* env vars,
+	// captured before the saved options file is applied
+	explicitFlags                 map[string]bool
 	miniEnableWebDAV              *bool
 	miniEnableS3                  *bool
 	miniEnableAdminUI             *bool
@@ -369,12 +374,25 @@ After starting, you can access:
 - S3 Endpoint:     http://localhost:8333
 - Iceberg Catalog: http://localhost:8181
 - WebDAV:          http://localhost:7333
-- Admin UI:        http://localhost:23646
+- Admin UI:        http://localhost:12535
 
 S3 Access:
 The S3 endpoint is available at http://localhost:8333. For client
 configuration and IAM setup, see the project documentation or use the
-Admin UI (http://localhost:23646) to manage users and policies.
+Admin UI (http://localhost:12535) to manage users and policies.
+
+Notes:
+- Values mini computes itself (currently master.volumeSizeLimitMB) are
+  pinned in <dir>/mini.options and applied again on the next start to
+  keep them stable; applied values are printed at startup. Command-line
+  flags are never saved and always win over saved values. Edit or
+  delete mini.options to reset a computed value.
+- The official Docker image ships /etc/seaweedfs/filer.toml, which keeps
+  the filer metadata in /data/filerldb2 regardless of -dir; mini warns
+  at startup when a configured store dir is outside -dir. If you set
+  -dir to another path, keep /data on a persistent volume as well.
+  Otherwise the metadata is lost when the container is recreated, and
+  buckets list no objects although the volume files are still in -dir.
 
 `,
 }
@@ -392,7 +410,7 @@ var (
 	miniMetricsHttpIp               = cmdMini.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	miniS3Config                    = cmdMini.Flag.String("s3.config", "", "path to the S3 config file")
 	miniIamConfig                   = cmdMini.Flag.String("s3.iam.config", "", "path to the advanced IAM config file for S3")
-	miniS3AllowDeleteBucketNotEmpty = cmdMini.Flag.Bool("s3.allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	miniS3AllowDeleteBucketNotEmpty = cmdMini.Flag.Bool("s3.allowDeleteBucketNotEmpty", false, "allow recursive deleting all entries along with bucket")
 	miniS3AutoCreateBucket          = cmdMini.Flag.Bool("s3.autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	miniBucket                      = cmdMini.Flag.String("bucket", "", "comma-separated S3 bucket names to create on startup if they do not already exist; leave empty to skip. Falls back to S3_BUCKET env var.")
 	miniTableBucket                 = cmdMini.Flag.String("tableBucket", "", "comma-separated S3 Tables buckets to create on startup if they do not already exist, each name[:FORMAT] with FORMAT one of ICEBERG (default) or LANCE, e.g. warehouse,vectors:LANCE; leave empty to skip. Falls back to S3_TABLE_BUCKET env var.")
@@ -427,7 +445,7 @@ func initMiniMasterFlags() {
 	miniMasterOptions.peers = cmdMini.Flag.String("master.peers", "", "all master nodes in comma separated ip:masterPort list (default: none for single master)")
 	miniMasterOptions.volumeSizeLimitMB = cmdMini.Flag.Uint("master.volumeSizeLimitMB", defaultMiniVolumeSizeMB, "Master stops directing writes to oversized volumes (default: 128MB for mini)")
 	miniMasterOptions.volumePreallocate = cmdMini.Flag.Bool("master.volumePreallocate", false, "Preallocate disk space for volumes.")
-	miniMasterOptions.maxParallelVacuumPerServer = cmdMini.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server")
+	miniMasterOptions.maxParallelVacuumPerServer = cmdMini.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server; 0 for no limit (deprecated, use master.vacuum.max_parallel_per_server in master.toml)")
 	miniMasterOptions.vacuumIntervalSeconds = cmdMini.Flag.Int("master.vacuumIntervalSeconds", 840, "seconds between automatic vacuum sweeps")
 	miniMasterOptions.vacuumDeleteEmptyAfterSeconds = cmdMini.Flag.Int("master.vacuumDeleteEmptyAfterSeconds", 0, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
 	miniMasterOptions.defaultReplication = cmdMini.Flag.String("master.defaultReplication", "", "Default replication type if not specified.")
@@ -486,6 +504,7 @@ func initMiniVolumeFlags() {
 	miniOptions.v.readMode = cmdMini.Flag.String("volume.readMode", "proxy", "[local|proxy|redirect] how to deal with non-local volume: 'not found|read in remote node|redirect volume location'.")
 	miniOptions.v.compactionMBPerSecond = cmdMini.Flag.Int("volume.compactionMBps", 0, "limit compaction speed in mega bytes per second")
 	miniOptions.v.maintenanceMBPerSecond = cmdMini.Flag.Int("volume.maintenanceMBps", 0, "limit maintenance IO rate in MB/s")
+	miniOptions.v.maxParallelVacuumCommits = cmdMini.Flag.Int("volume.compactionMaxParallelCommits", 0, "limit how many vacuum commits run at once on this server; queued commits hold no volume lock. 0 means unlimited")
 	miniOptions.v.fileSizeLimitMB = cmdMini.Flag.Int("volume.fileSizeLimitMB", 256, "limit file size to avoid out of memory")
 	miniOptions.v.ldbTimeout = cmdMini.Flag.Int64("volume.index.leveldbTimeout", 0, "alive time for leveldb")
 	miniOptions.v.concurrentUploadLimitMB = cmdMini.Flag.Int("volume.concurrentUploadLimitMB", 0, "limit total concurrent upload size")
@@ -497,6 +516,9 @@ func initMiniVolumeFlags() {
 	miniOptions.v.hasSlowRead = cmdMini.Flag.Bool("volume.hasSlowRead", true, "if true, prevents slow reads from blocking other requests")
 	miniOptions.v.readBufferSizeMB = cmdMini.Flag.Int("volume.readBufferSizeMB", 4, "read buffer size in MB")
 	miniOptions.v.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
+	miniOptions.v.fsyncMinBatchBytes = cmdMini.Flag.Int64("volume.fsyncMinBatchBytes", 1*1024*1024, "minimum bytes an fsync batch gathers before a drained queue flushes without waiting")
+	miniOptions.v.fsyncMinBatchRequests = cmdMini.Flag.Int("volume.fsyncMinBatchRequests", 128, "minimum requests an fsync batch gathers before a drained queue flushes without waiting")
+	miniOptions.v.fsyncBatchWait = cmdMini.Flag.Duration("volume.fsyncBatchWait", 500*time.Microsecond, "how long a below-minimum fsync batch waits for more requests once the queue drains; 0 flushes immediately")
 	miniOptions.v.preStopSeconds = cmdMini.Flag.Int("volume.preStopSeconds", 1, "number of seconds between stop send heartbeats and stop volume server (default: 1 for mini)")
 	miniOptions.v.setDiskIOProbeDefaults()
 }
@@ -541,6 +563,8 @@ func initMiniS3Flags() {
 	miniS3Options.readerCacheSizeMB = cmdMini.Flag.Int64("s3.readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
 	miniS3Options.sessionReaderCacheSizeMB = cmdMini.Flag.Int64("s3.sessionReaderCacheSizeMB", 0, "per-request/session memory budget in MiB for an individual S3 GET stream")
 	miniS3Options.allowUntrustedRemoteEndpoints = cmdMini.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
+	miniS3Options.allowBackslashInKey = cmdMini.Flag.Bool("s3.allowBackslashInKey", false, allowBackslashInKeyUsage)
+	miniS3Options.iamSelfServiceRequiresGrant = cmdMini.Flag.Bool("s3.iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
 	// In mini mode, S3 uses the shared debug server started at line 681, not its own separate debug server
 	miniS3Options.debug = new(bool) // explicitly false
 	miniS3Options.debugPort = cmdMini.Flag.Int("s3.debug.port", 6060, "http port for debugging (unused in mini mode)")
@@ -562,8 +586,9 @@ func initMiniWebDAVFlags() {
 
 // initMiniAdminFlags initializes Admin server flag options
 func initMiniAdminFlags() {
-	miniAdminOptions.port = cmdMini.Flag.Int("admin.port", 23646, "admin server http listen port")
+	miniAdminOptions.port = cmdMini.Flag.Int("admin.port", defaultAdminHTTPPort, "admin server http listen port")
 	miniAdminOptions.grpcPort = cmdMini.Flag.Int("admin.port.grpc", 0, "admin server grpc listen port (default: admin http port + GrpcPortOffset)")
+	miniAdminOptions.legacyPort = cmdMini.Flag.Int("admin.port.legacy", defaultAdminHTTPLegacyPort, "also serve admin http and grpc (port + GrpcPortOffset) on this port for backward compatibility (0 to disable)")
 	miniAdminOptions.master = cmdMini.Flag.String("admin.master", "", "master server address (automatically set)")
 	// admin discovery must query the same group the co-located filer registers under
 	miniAdminOptions.filerGroup = miniFilerOptions.filerGroup
@@ -800,10 +825,20 @@ func isPortAvailable(port int) bool {
 	return true
 }
 
+// isPortUsableOnIP reports whether port can be bound on ip. While mini also
+// opens a loopback listener, the port must additionally be free on every
+// interface so that listener cannot collide with a holder on another address.
+func isPortUsableOnIP(ip string, port int, listenOnLocalhost bool) bool {
+	if !isPortOpenOnIP(ip, port) {
+		return false
+	}
+	return !listenOnLocalhost || isPortAvailable(port)
+}
+
 // findAvailablePortOnIP finds the next available port on a specific IP starting from the given port
 // It skips any ports that are in the reservedPorts map (for gRPC port collision avoidance)
 // It returns the first available port found within maxAttempts, or 0 if none found
-func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPorts map[int]bool) int {
+func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPorts map[int]bool, listenOnLocalhost bool) int {
 	for i := 0; i < maxAttempts; i++ {
 		port := startPort + i
 		if port > 65535 {
@@ -815,7 +850,7 @@ func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPo
 			continue
 		}
 		// Check on both the specific IP and on all interfaces for maximum reliability
-		if isPortOpenOnIP(ip, port) && isPortAvailable(port) {
+		if isPortUsableOnIP(ip, port, listenOnLocalhost) {
 			return port
 		}
 	}
@@ -826,9 +861,9 @@ func findAvailablePortOnIP(ip string, startPort int, maxAttempts int, reservedPo
 // ensurePortAvailableOnIP ensures a port pointer points to an available port on a specific IP
 // If the port is not available, it finds the next available port and updates the pointer
 // The reservedPorts map contains ports that should not be allocated (for gRPC collision avoidance)
-func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reservedPorts map[int]bool, flagName string) error {
-	// Check if this port was explicitly specified by the user (from CLI, before config file was applied)
-	isExplicitPort := explicitPortFlags[flagName]
+func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reservedPorts map[int]bool, flagName string, listenOnLocalhost bool) error {
+	// Check if this port was explicitly specified by the user (from CLI or env, before the config file was applied)
+	isExplicitPort := explicitFlags[flagName]
 
 	if *portPtr == 0 {
 		return nil
@@ -842,7 +877,7 @@ func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reserv
 			return fmt.Errorf("port %d for %s (specified by flag %s) is reserved for gRPC calculation and cannot be used", original, serviceName, flagName)
 		}
 		glog.Warningf("Port %d for %s is reserved for gRPC calculation, finding alternative...", original, serviceName)
-		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts)
+		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts, listenOnLocalhost)
 		if newPort == 0 {
 			glog.Errorf("Could not find available port for %s starting from %d, will use original %d and fail on binding", serviceName, original+1, original)
 		} else {
@@ -853,14 +888,14 @@ func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reserv
 	}
 
 	// Check on both the specific IP and on all interfaces (0.0.0.0) for maximum reliability
-	if !isPortOpenOnIP(ip, original) || !isPortAvailable(original) {
+	if !isPortUsableOnIP(ip, original, listenOnLocalhost) {
 		// If explicitly specified, fail immediately with the originally requested port
 		if isExplicitPort {
 			return fmt.Errorf("port %d for %s (specified by flag %s) is not available on %s and cannot be used", original, serviceName, flagName, ip)
 		}
 		// For default ports, try to find an alternative
 		glog.Warningf("Port %d for %s is not available on %s, finding alternative port...", original, serviceName, ip)
-		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts)
+		newPort := findAvailablePortOnIP(ip, original+1, 100, reservedPorts, listenOnLocalhost)
 		if newPort == 0 {
 			glog.Errorf("Could not find available port for %s starting from %d, will use original %d and fail on binding", serviceName, original+1, original)
 		} else {
@@ -876,53 +911,61 @@ func ensurePortAvailableOnIP(portPtr *int, serviceName string, ip string, reserv
 // ensureAllPortsAvailableOnIP ensures all mini service ports are available on a specific IP
 // Returns an error if an explicitly specified port is unavailable.
 // This should be called before starting any services
-func ensureAllPortsAvailableOnIP(bindIp string) error {
+func ensureAllPortsAvailableOnIP(bindIp string, listenOnLocalhost bool) error {
 	portConfigs := []struct {
-		port     *int
-		name     string
-		flagName string
-		grpcPtr  *int
+		port      *int
+		name      string
+		flagName  string
+		grpcPtr   *int
+		localhost bool
 	}{
-		{miniMasterOptions.port, "Master", "master.port", miniMasterOptions.portGrpc},
-		{miniFilerOptions.port, "Filer", "filer.port", miniFilerOptions.portGrpc},
-		{miniOptions.v.port, "Volume", "volume.port", miniOptions.v.portGrpc},
+		{miniMasterOptions.port, "Master", "master.port", miniMasterOptions.portGrpc, listenOnLocalhost},
+		{miniFilerOptions.port, "Filer", "filer.port", miniFilerOptions.portGrpc, listenOnLocalhost},
+		{miniOptions.v.port, "Volume", "volume.port", miniOptions.v.portGrpc, listenOnLocalhost},
 	}
 	if *miniEnableS3 {
 		portConfigs = append(portConfigs, struct {
-			port     *int
-			name     string
-			flagName string
-			grpcPtr  *int
-		}{miniS3Options.port, "S3", "s3.port", miniS3Options.portGrpc})
+			port      *int
+			name      string
+			flagName  string
+			grpcPtr   *int
+			localhost bool
+		}{miniS3Options.port, "S3", "s3.port", miniS3Options.portGrpc, listenOnLocalhost})
 		if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 {
 			portConfigs = append(portConfigs, struct {
-				port     *int
-				name     string
-				flagName string
-				grpcPtr  *int
-			}{miniS3Options.portIceberg, "Iceberg", "s3.port.iceberg", nil})
+				port      *int
+				name      string
+				flagName  string
+				grpcPtr   *int
+				localhost bool
+			}{miniS3Options.portIceberg, "Iceberg", "s3.port.iceberg", nil, listenOnLocalhost})
 		}
 		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
 			portConfigs = append(portConfigs, struct {
-				port     *int
-				name     string
-				flagName string
-				grpcPtr  *int
-			}{miniS3Options.portLance, "Lance", "s3.port.lance", nil})
+				port      *int
+				name      string
+				flagName  string
+				grpcPtr   *int
+				localhost bool
+			}{miniS3Options.portLance, "Lance", "s3.port.lance", nil, listenOnLocalhost})
 		}
 	}
+	// WebDAV and the Admin UI bind only -ip.bind; they never open a loopback
+	// companion listener, so ports held elsewhere cannot collide with them.
 	portConfigs = append(portConfigs, struct {
-		port     *int
-		name     string
-		flagName string
-		grpcPtr  *int
-	}{miniWebDavOptions.port, "WebDAV", "webdav.port", nil},
+		port      *int
+		name      string
+		flagName  string
+		grpcPtr   *int
+		localhost bool
+	}{miniWebDavOptions.port, "WebDAV", "webdav.port", nil, false},
 		struct {
-			port     *int
-			name     string
-			flagName string
-			grpcPtr  *int
-		}{miniAdminOptions.port, "Admin", "admin.port", miniAdminOptions.grpcPort})
+			port      *int
+			name      string
+			flagName  string
+			grpcPtr   *int
+			localhost bool
+		}{miniAdminOptions.port, "Admin", "admin.port", miniAdminOptions.grpcPort, false})
 
 	// First, reserve all gRPC ports that will be calculated to prevent HTTP port allocation from using them
 	// This prevents collisions like: HTTP port moves to X, then gRPC port is calculated as Y where Y == X
@@ -935,13 +978,20 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 		}
 	}
 
+	applyMiniAdminCredentialFallback(&miniAdminOptions)
+	adminBindIP := miniAdminEffectiveBindIP(bindIp)
+
 	// Check all HTTP ports sequentially to avoid race conditions
 	// Each port check and allocation must complete before the next one starts
 	// to prevent multiple goroutines from claiming the same available port
 	// Also avoid allocating ports that are reserved for gRPC calculation
 	for _, config := range portConfigs {
+		checkIP := bindIp
+		if config.name == "Admin" {
+			checkIP = adminBindIP
+		}
 		original := *config.port
-		if err := ensurePortAvailableOnIP(config.port, config.name, bindIp, reservedPorts, config.flagName); err != nil {
+		if err := ensurePortAvailableOnIP(config.port, config.name, checkIP, reservedPorts, config.flagName, config.localhost); err != nil {
 			return err
 		}
 		// If port was changed, update the reserved gRPC ports mapping
@@ -954,7 +1004,7 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 	// Initialize all gRPC ports before services start
 	// This ensures they won't be recalculated and cause conflicts
 	// All gRPC port handling (calculation, validation, and assignment) is performed exclusively in initializeGrpcPortsOnIP
-	initializeGrpcPortsOnIP(bindIp)
+	allocatedPorts := initializeGrpcPortsOnIP(bindIp, listenOnLocalhost)
 
 	// Every other service binds within a moment of this check, but the admin
 	// waits for all of them first. The admin gRPC port sits inside the Linux
@@ -972,6 +1022,33 @@ func ensureAllPortsAvailableOnIP(bindIp string) error {
 		glog.Warningf("Could not reserve Admin gRPC port %d: %v", *miniAdminOptions.grpcPort, err)
 	} else {
 		miniAdminOptions.workerGrpcListener = listener
+	}
+
+	// Same early reservation for the legacy compat gRPC port — but never take
+	// a port a mini service already owns: compat is a convenience, not a
+	// startup requirement. Failure is only a warning — the legacy port sits
+	// inside the ephemeral range. Without a reservation the admin's late
+	// best-effort bind simply fails harmlessly if the port is taken by then.
+	miniAdminOptions.workerGrpcLegacyListener = nil
+	miniAdminOptions.workerGrpcLegacySkip = false
+	miniAdminOptions.adminHttpLegacySkip = false
+	if *miniAdminOptions.legacyPort > 0 && *miniAdminOptions.legacyPort != *miniAdminOptions.port {
+		if allocatedPorts[*miniAdminOptions.legacyPort] {
+			glog.Warningf("Legacy Admin HTTP port %d is used by another mini service, skipping compat listener", *miniAdminOptions.legacyPort)
+			miniAdminOptions.adminHttpLegacySkip = true
+		}
+		legacyGrpcPort := *miniAdminOptions.legacyPort + GrpcPortOffset
+		switch {
+		case allocatedPorts[legacyGrpcPort]:
+			glog.Warningf("Legacy Admin gRPC port %d is used by another mini service, skipping compat listener", legacyGrpcPort)
+			miniAdminOptions.workerGrpcLegacySkip = true
+		default:
+			if listener, err := listenMiniAdminWorker(workerGrpcBindIP, legacyGrpcPort); err != nil {
+				glog.Warningf("Could not reserve legacy Admin gRPC port %d: %v", legacyGrpcPort, err)
+			} else {
+				miniAdminOptions.workerGrpcLegacyListener = listener
+			}
+		}
 	}
 
 	// Log the final port configuration
@@ -1004,7 +1081,9 @@ func listenMiniAdminWorker(bindIP string, port int) (net.Listener, error) {
 // initializeGrpcPortsOnIP initializes all gRPC ports based on their HTTP ports on a specific IP
 // If a gRPC port is 0, it will be set to httpPort + GrpcPortOffset
 // This must be called after HTTP ports are finalized and before services start
-func initializeGrpcPortsOnIP(bindIp string) {
+// Returns the set of ports allocated to mini services, for callers that must
+// keep optional listeners from stealing them.
+func initializeGrpcPortsOnIP(bindIp string, listenOnLocalhost bool) map[int]bool {
 	// Track all ports allocated (both HTTP and gRPC) to prevent collisions.
 	// We must reserve HTTP ports so that gRPC fallback allocation never picks
 	// a port already assigned to an HTTP service (which hasn't bound yet).
@@ -1027,26 +1106,34 @@ func initializeGrpcPortsOnIP(bindIp string) {
 	}
 
 	grpcConfigs := []struct {
-		httpPort *int
-		grpcPort *int
-		name     string
+		httpPort  *int
+		grpcPort  *int
+		name      string
+		ip        string
+		localhost bool
 	}{
-		{miniMasterOptions.port, miniMasterOptions.portGrpc, "Master"},
-		{miniFilerOptions.port, miniFilerOptions.portGrpc, "Filer"},
-		{miniOptions.v.port, miniOptions.v.portGrpc, "Volume"},
+		{miniMasterOptions.port, miniMasterOptions.portGrpc, "Master", bindIp, listenOnLocalhost},
+		{miniFilerOptions.port, miniFilerOptions.portGrpc, "Filer", bindIp, listenOnLocalhost},
+		{miniOptions.v.port, miniOptions.v.portGrpc, "Volume", bindIp, listenOnLocalhost},
 	}
 	if *miniEnableS3 {
 		grpcConfigs = append(grpcConfigs, struct {
-			httpPort *int
-			grpcPort *int
-			name     string
-		}{miniS3Options.port, miniS3Options.portGrpc, "S3"})
+			httpPort  *int
+			grpcPort  *int
+			name      string
+			ip        string
+			localhost bool
+		}{miniS3Options.port, miniS3Options.portGrpc, "S3", bindIp, listenOnLocalhost})
 	}
+	// The Admin worker gRPC binds workerGrpcBindIp (loopback by default), not
+	// -ip.bind, and never opens a companion listener.
 	grpcConfigs = append(grpcConfigs, struct {
-		httpPort *int
-		grpcPort *int
-		name     string
-	}{miniAdminOptions.port, miniAdminOptions.grpcPort, "Admin"})
+		httpPort  *int
+		grpcPort  *int
+		name      string
+		ip        string
+		localhost bool
+	}{miniAdminOptions.port, miniAdminOptions.grpcPort, "Admin", miniAdminOptions.workerGrpcBindIp, false})
 
 	for _, config := range grpcConfigs {
 		if config.grpcPort == nil {
@@ -1060,10 +1147,10 @@ func initializeGrpcPortsOnIP(bindIp string) {
 
 		// Verify the gRPC port is available (whether calculated or explicitly set)
 		// Check on both specific IP and all interfaces, and check against already allocated ports
-		if !isPortOpenOnIP(bindIp, *config.grpcPort) || !isPortAvailable(*config.grpcPort) || allocatedPorts[*config.grpcPort] {
+		if !isPortUsableOnIP(config.ip, *config.grpcPort, config.localhost) || allocatedPorts[*config.grpcPort] {
 			glog.Warningf("gRPC port %d for %s is not available, finding alternative...", *config.grpcPort, config.name)
 			originalPort := *config.grpcPort
-			newPort := findAvailablePortOnIP(bindIp, originalPort+1, 100, allocatedPorts)
+			newPort := findAvailablePortOnIP(config.ip, originalPort+1, 100, allocatedPorts, config.localhost)
 			if newPort == 0 {
 				glog.Errorf("Could not find available gRPC port for %s starting from %d, will use %d and fail on binding", config.name, originalPort+1, originalPort)
 			} else {
@@ -1074,12 +1161,27 @@ func initializeGrpcPortsOnIP(bindIp string) {
 		allocatedPorts[*config.grpcPort] = true
 		glog.V(1).Infof("%s gRPC port set to %d", config.name, *config.grpcPort)
 	}
+
+	// The Linux kernel draws outbound source ports from the ephemeral range.
+	// A gRPC port inside it can be claimed by one of mini's own startup dials
+	// before the service binds it.
+	if *miniAdminOptions.grpcPort >= linuxEphemeralPortFloor {
+		glog.Warningf("Admin gRPC port %d is at or above the Linux ephemeral floor %d; an outbound connection may claim it before Admin binds it. Pick a lower -admin.port.", *miniAdminOptions.grpcPort, linuxEphemeralPortFloor)
+	}
+
+	return allocatedPorts
+}
+
+// miniOptionsFilePath returns the path of the mini.options file under the
+// first -dir folder.
+func miniOptionsFilePath(dataFolder string) string {
+	return filepath.Join(util.ResolvePath(util.StringSplit(dataFolder, ",")[0]), "mini.options")
 }
 
 // loadMiniConfigurationFile reads the mini.options file and returns parsed options
 // File format: one option per line, without leading dash (e.g., "ip=127.0.0.1")
 func loadMiniConfigurationFile(dataFolder string) (map[string]string, error) {
-	configFile := filepath.Join(util.ResolvePath(util.StringSplit(dataFolder, ",")[0]), "mini.options")
+	configFile := miniOptionsFilePath(dataFolder)
 
 	options := make(map[string]string)
 
@@ -1127,31 +1229,112 @@ func loadMiniConfigurationFile(dataFolder string) (map[string]string, error) {
 	return options, nil
 }
 
-// applyConfigFileOptions sets command-line flags from loaded configuration file
-func applyConfigFileOptions(options map[string]string) {
-	for key, value := range options {
-		// Skip port flags that were explicitly passed on CLI
-		if explicitPortFlags[key] {
-			glog.V(2).Infof("Skipping config file option %s=%s (explicitly specified on command line)", key, value)
+// applyConfigFileOptions sets command-line flags from loaded configuration
+// file. Options for flags the user provided explicitly (command line or
+// WEED_* env var) are skipped, so passing a flag always wins over the saved
+// value — including passing it at its default value. Returns a map of the
+// applied keys to their display values (secrets redacted).
+func applyConfigFileOptions(options map[string]string) map[string]string {
+	keys := make([]string, 0, len(options))
+	for key := range options {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	applied := make(map[string]string)
+	for _, key := range keys {
+		value := options[key]
+		// Redact secrets (admin.password, admin.readOnlyPassword, ...) in
+		// logs and the startup message; only flag.Value.Set sees the value.
+		display := value
+		if isSensitiveOption(key) {
+			display = "*****"
+		}
+		if explicitFlags[key] {
+			glog.V(2).Infof("Skipping config file option %s=%s (explicitly specified)", key, display)
 			continue
 		}
-		// Set the flag value if it hasn't been explicitly set on command line
 		flag := cmdMini.Flag.Lookup(key)
-		if flag != nil {
-			// Only set if not already set (by command line)
-			if flag.Value.String() == flag.DefValue {
-				if err := flag.Value.Set(value); err != nil {
-					glog.Warningf("Failed to apply config file option: %s=%s: %v", key, value, err)
-				} else {
-					glog.V(2).Infof("Applied config file option: %s=%s", key, value)
+		if flag == nil {
+			continue
+		}
+		if err := flag.Value.Set(value); err != nil {
+			glog.Warningf("Failed to apply config file option: %s=%s: %v", key, display, err)
+			continue
+		}
+		glog.V(2).Infof("Applied config file option: %s=%s", key, display)
+		applied[key] = display
+	}
+	return applied
+}
+
+// isSensitiveOption reports whether a saved option holds a secret that must
+// not appear in logs or the startup message.
+func isSensitiveOption(key string) bool {
+	k := strings.ToLower(key)
+	return strings.Contains(k, "password") || strings.Contains(k, "secret") || strings.Contains(k, "token")
+}
+
+// warnIfFilerStoreOutsideDir warns when a filer.toml configures a local
+// filer store outside the -dir folders and the master meta folder. When a
+// filer.toml is found the filer skips defaultLevelDbDirectory, so metadata
+// can silently land on a path the volume data doesn't use — in a container
+// that path is lost on recreate unless it is persisted separately.
+func warnIfFilerStoreOutsideDir(dataFolders string, metaFolder string) {
+	if !util.LoadConfiguration("filer", false) {
+		return
+	}
+	v := util.GetViper()
+	folders := append(util.StringSplit(dataFolders, ","), metaFolder)
+	inside := func(storeDir string) bool {
+		// The filer stores open the configured dir verbatim, so absolutize it
+		// the same way (relative to the working directory) rather than
+		// expanding "~", which the store never expands.
+		resolved, err := filepath.Abs(storeDir)
+		if err != nil {
+			return false
+		}
+		for _, folder := range folders {
+			base, err := filepath.Abs(util.ResolvePath(folder))
+			if err != nil {
+				continue
+			}
+			// Resolve symlinks only when both sides exist, so a not-yet-
+			// created store dir under a symlinked -dir still compares
+			// lexically against the same spelling.
+			r, b := resolved, base
+			if er, err := filepath.EvalSymlinks(resolved); err == nil {
+				if eb, err := filepath.EvalSymlinks(base); err == nil {
+					r, b = er, eb
 				}
 			}
+			if rel, err := filepath.Rel(b, r); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+	// Local filer stores keep metadata under a "dir" key; check both the
+	// default store (leveldb2.enabled) and path-specific stores
+	// (leveldb2.<id>.enabled, keyed under <section>.location).
+	localStores := map[string]bool{"leveldb": true, "leveldb2": true, "leveldb3": true}
+	for _, key := range v.AllKeys() {
+		if !strings.HasSuffix(key, ".enabled") || !v.GetBool(key) {
+			continue
+		}
+		section := strings.TrimSuffix(key, ".enabled")
+		if !localStores[strings.Split(section, ".")[0]] {
+			continue
+		}
+		if storeDir := v.GetString(section + ".dir"); storeDir != "" && !inside(storeDir) {
+			glog.Warningf("filer store %s uses dir %s from filer.toml, outside -dir %s; persist that path or filer metadata will be lost when the container is recreated", section, storeDir, dataFolders)
 		}
 	}
 }
 
-// saveMiniConfiguration saves the current mini configuration to a file
-// The file format uses option=value format without leading dashes
+// saveMiniConfiguration writes values mini computed itself to mini.options.
+// Command-line flags are never saved, so a dropped flag cannot resurrect on
+// the next start; the file exists to pin environment-derived values.
 func saveMiniConfiguration(dataFolder string) error {
 	configDir := util.ResolvePath(util.StringSplit(dataFolder, ",")[0])
 	if err := os.MkdirAll(configDir, 0755); err != nil {
@@ -1163,29 +1346,15 @@ func saveMiniConfiguration(dataFolder string) error {
 
 	var sb strings.Builder
 	sb.WriteString("#!/bin/bash\n")
-	sb.WriteString("# Mini server configuration\n")
+	sb.WriteString("# Mini server auto-computed options\n")
 	sb.WriteString("# Format: option=value (no leading dash)\n")
-	sb.WriteString("# This file is loaded on startup if it exists\n\n")
+	sb.WriteString("# This file is loaded on startup if it exists\n")
+	sb.WriteString("# Command-line flags are not saved; only values mini computed itself.\n\n")
 
-	// Collect all flags that were explicitly passed (except "dir")
-	cmdMini.Flag.Visit(func(f *flag.Flag) {
-		// Skip the "dir" option - it's environment-specific
-		if f.Name == "dir" {
-			return
-		}
-		value := f.Value.String()
-		// Quote the value if it contains spaces
-		if strings.Contains(value, " ") {
-			sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", f.Name, value))
-		} else {
-			sb.WriteString(fmt.Sprintf("%s=%s\n", f.Name, value))
-		}
-	})
-
-	// Add auto-calculated volume size if it was computed
+	// Pin the auto-calculated volume size so it stays stable across restarts
+	// even as free disk space changes. Delete this line to force
+	// recalculation on the next startup.
 	if !isFlagPassed("master.volumeSizeLimitMB") && miniMasterOptions.volumeSizeLimitMB != nil {
-		sb.WriteString(fmt.Sprintf("\n# Auto-calculated volume size based on total disk capacity\n"))
-		sb.WriteString(fmt.Sprintf("# Delete this line to force recalculation on next startup\n"))
 		sb.WriteString(fmt.Sprintf("master.volumeSizeLimitMB=%d\n", *miniMasterOptions.volumeSizeLimitMB))
 	}
 
@@ -1207,21 +1376,32 @@ func runMini(cmd *Command, args []string) bool {
 	// can opt back into verbose output.
 	quietMiniLogs()
 
-	// Capture which port flags were explicitly passed on CLI BEFORE config file is applied
-	// This is necessary to distinguish user-specified ports from defaults or config file options
-	explicitPortFlags = make(map[string]bool)
-	portFlagNames := []string{"master.port", "filer.port", "volume.port", "s3.port", "s3.port.iceberg", "webdav.port", "admin.port", "s3.iam.readOnly"}
-	for _, flagName := range portFlagNames {
-		explicitPortFlags[flagName] = isFlagPassed(flagName)
-	}
+	// Capture which flags were explicitly provided on the command line or via
+	// WEED_* env vars BEFORE the saved options file is applied. Saved options
+	// only fill in flags the user did not provide this run, so passing a flag
+	// at its default value also resets a saved value.
+	explicitFlags = make(map[string]bool)
+	cmdMini.Flag.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
 
-	// Load configuration from file if it exists
+	// Load configuration from file if it exists. Capture the path before
+	// applying: a saved "dir" option can change miniDataFolders.
+	optionsFile := miniOptionsFilePath(*miniDataFolders)
 	configOptions, err := loadMiniConfigurationFile(*miniDataFolders)
 	if err != nil {
 		glog.Warningf("Error loading configuration file: %v", err)
 	}
-	// Apply loaded options to flags (CLI flags will override these)
-	applyConfigFileOptions(configOptions)
+	// Apply loaded options to flags (explicitly provided flags win)
+	appliedOptions := applyConfigFileOptions(configOptions)
+	if len(appliedOptions) > 0 {
+		pairs := make([]string, 0, len(appliedOptions))
+		for k, v := range appliedOptions {
+			pairs = append(pairs, k+"="+v)
+		}
+		sort.Strings(pairs)
+		fmt.Printf("  Applying %d saved option(s) from %s: %s\n", len(appliedOptions), optionsFile, strings.Join(pairs, " "))
+	}
 
 	if *miniOptions.debug {
 		grace.StartDebugServer(*miniOptions.debugPort)
@@ -1261,8 +1441,14 @@ func runMini(cmd *Command, args []string) bool {
 		miniAdminOptions.workerGrpcBindIp = "127.0.0.1"
 	}
 
+	// Services keep the loopback companion listener only while -ip.bind is
+	// unset and the bind address falls back to -ip. While it is on, each
+	// service port must be free on every interface, not just bindIp. This
+	// must be captured before *miniBindIp is filled in below.
+	listenOnLocalhost := *miniBindIp == "" && !util.IsLoopbackOrWildcardAddress(bindIp)
+
 	// Ensure all ports are available, find alternatives if needed
-	if err := ensureAllPortsAvailableOnIP(bindIp); err != nil {
+	if err := ensureAllPortsAvailableOnIP(bindIp, listenOnLocalhost); err != nil {
 		glog.Errorf("Port allocation failed: %v", err)
 		os.Exit(1)
 	}
@@ -1287,14 +1473,18 @@ func runMini(cmd *Command, args []string) bool {
 	// ip address
 	miniMasterOptions.ip = miniIp
 	miniMasterOptions.ipBind = miniBindIp
+	miniMasterOptions.listenOnLocalhost = &listenOnLocalhost
 	miniFilerOptions.masters = pb.ServerAddresses(actualPeersForComponents).ToServiceDiscovery()
 	miniFilerOptions.ip = miniIp
 	miniFilerOptions.bindIp = miniBindIp
+	miniFilerOptions.listenOnLocalhost = &listenOnLocalhost
 	miniS3Options.ip = miniIp
 	miniS3Options.bindIp = miniBindIp
+	miniS3Options.listenOnLocalhost = &listenOnLocalhost
 	miniWebDavOptions.ipBind = miniBindIp
 	miniOptions.v.ip = miniIp
 	miniOptions.v.bindIp = miniBindIp
+	miniOptions.v.listenOnLocalhost = &listenOnLocalhost
 	miniOptions.v.masters = pb.ServerAddresses(actualPeersForComponents).ToAddresses()
 	miniOptions.v.idleConnectionTimeout = miniTimeout
 	// Admin server binds to the same address as the other mini services.
@@ -1311,7 +1501,6 @@ func runMini(cmd *Command, args []string) bool {
 
 	miniFilerOptions.dataCenter = miniDataCenter
 	miniFilerOptions.rack = miniRack
-	miniS3Options.dataCenter = miniDataCenter
 	miniFilerOptions.disableHttp = miniDisableHttp
 	miniMasterOptions.disableHttp = miniDisableHttp
 
@@ -1350,10 +1539,14 @@ func runMini(cmd *Command, args []string) bool {
 		glog.Fatalf("Check Meta Folder (-dir=\"%s\") Writable: %s", *miniMasterOptions.metaFolder, err)
 	}
 	miniFilerOptions.defaultLevelDbDirectory = miniMasterOptions.metaFolder
+	warnIfFilerStoreOutsideDir(*miniDataFolders, *miniMasterOptions.metaFolder)
 
-	// Calculate and set optimal volume size limit based on available disk space
-	// Only auto-calculate if user didn't explicitly specify a value via -master.volumeSizeLimitMB
-	if !isFlagPassed("master.volumeSizeLimitMB") {
+	// Calculate and set optimal volume size limit based on available disk space.
+	// Skip when the user passed -master.volumeSizeLimitMB explicitly, and when
+	// the value was loaded from mini.options — file-applied flags are not in
+	// Visit, and the saved pin must survive restarts.
+	_, sizeLimitFromFile := appliedOptions["master.volumeSizeLimitMB"]
+	if !isFlagPassed("master.volumeSizeLimitMB") && !sizeLimitFromFile {
 		// User didn't override, use auto-calculated value
 		// The -dir flag can accept comma-separated directories; use the first one for disk space calculation.
 		// miniDataFolders was already tilde-resolved at the top of runMini.
@@ -1375,6 +1568,22 @@ func runMini(cmd *Command, args []string) bool {
 	// tear those services down too. On Ctrl+C they rely on their own
 	// OnInterrupt hooks (see grace's LIFO ordering).
 	miniMasterOptions.shutdownCtx = MiniClusterCtx
+	// In single-master mode mini's embedded volume server is the only reporter
+	// of prior cluster state; its first heartbeat already carries the full
+	// inventory, so the post-mint allocation hold ends there instead of
+	// running the whole warmup window on every fresh start. The master pins
+	// the embedded address and refuses any other volume server, keeping the
+	// single-reporter assumption true. Multi-master minis can field
+	// late-reporting volume servers and keep the regular hold.
+	// Both fields are re-derived on every run: the package-level options
+	// survive in-process reruns, so a multi-master mini after a
+	// single-master one must not inherit the release or the stale pin.
+	singleMaster := isSingleMasterMode(*miniMasterOptions.peers)
+	miniMasterOptions.releaseAllocOnFirstReport = singleMaster
+	miniMasterOptions.singleReporterAddr = ""
+	if singleMaster {
+		miniMasterOptions.singleReporterAddr = util.JoinHostPort(*miniIp, *miniOptions.v.port)
+	}
 	miniOptions.v.shutdownCtx = MiniClusterCtx
 	miniFilerOptions.shutdownCtx = MiniClusterCtx
 	// Mini is a small/dev setup with short-lived RPCs; cap the filer's
@@ -1528,13 +1737,30 @@ func startMiniServices(miniWhiteList []string, allServicesReady chan struct{}) {
 			if miniProgressBoard != nil {
 				miniProgressBoard.starting("Iceberg")
 			}
-			waitForServiceReady("Iceberg", *miniS3Options.portIceberg, bindIp)
+			// Probe only when the catalog listener actually bound; otherwise the
+			// port may answer as an unrelated process and get advertised as the
+			// catalog.
+			if miniS3Options.icebergBound.Load() {
+				waitForServiceReady("Iceberg", *miniS3Options.portIceberg, bindIp)
+			} else {
+				if miniProgressBoard != nil {
+					miniProgressBoard.failed("Iceberg")
+				}
+				glog.Warningf("Iceberg catalog on port %d did not start; see S3 startup log", *miniS3Options.portIceberg)
+			}
 		}
 		if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 {
 			if miniProgressBoard != nil {
 				miniProgressBoard.starting("Lance")
 			}
-			waitForServiceReady("Lance", *miniS3Options.portLance, bindIp)
+			if miniS3Options.lanceBound.Load() {
+				waitForServiceReady("Lance", *miniS3Options.portLance, bindIp)
+			} else {
+				if miniProgressBoard != nil {
+					miniProgressBoard.failed("Lance")
+				}
+				glog.Warningf("Lance namespace server on port %d did not start; see S3 startup log", *miniS3Options.portLance)
+			}
 		}
 	}
 	if *miniEnableWebDAV {
@@ -1613,6 +1839,14 @@ func miniAdminBindIP(requestedIP string, passwordConfigured, mtlsConfigured, all
 	return "127.0.0.1"
 }
 
+func miniAdminEffectiveBindIP(requestedIP string) string {
+	hasMTLS := util.GetViper().GetString("https.admin.key") != "" &&
+		util.GetViper().GetString("https.admin.ca") != ""
+	allowInsecure := miniAdminOptions.allowInsecureBind != nil &&
+		*miniAdminOptions.allowInsecureBind
+	return miniAdminBindIP(requestedIP, *miniAdminOptions.adminPassword != "", hasMTLS, allowInsecure)
+}
+
 // miniAdminWorkerAddress encodes the finalized HTTP and gRPC ports in the
 // server-address format understood by pb.ServerToGrpcAddress.
 func miniAdminWorkerAddress(bindIP string, httpPort, grpcPort int) string {
@@ -1670,16 +1904,11 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 	applyMiniAdminCredentialFallback(&miniAdminOptions)
 
 	requestedBindIP := getBindIp()
+	bindIP := miniAdminEffectiveBindIP(requestedBindIP)
 	hasMTLS := util.GetViper().GetString("https.admin.key") != "" &&
 		util.GetViper().GetString("https.admin.ca") != ""
 	allowInsecure := miniAdminOptions.allowInsecureBind != nil &&
 		*miniAdminOptions.allowInsecureBind
-	bindIP := miniAdminBindIP(
-		requestedBindIP,
-		*miniAdminOptions.adminPassword != "",
-		hasMTLS,
-		allowInsecure,
-	)
 	miniAdminOptions.ip = &bindIP
 	if bindIP != requestedBindIP {
 		glog.Warningf(
@@ -1749,10 +1978,10 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 		// the admin UI would otherwise print an endpoint nothing is listening on.
 		var icebergPort, lancePort int
 		if miniEnableS3 != nil && *miniEnableS3 {
-			if miniS3Options.portIceberg != nil {
+			if miniS3Options.portIceberg != nil && *miniS3Options.portIceberg > 0 && miniS3Options.icebergBound.Load() {
 				icebergPort = *miniS3Options.portIceberg
 			}
-			if miniS3Options.portLance != nil {
+			if miniS3Options.portLance != nil && *miniS3Options.portLance > 0 && miniS3Options.lanceBound.Load() {
 				lancePort = *miniS3Options.portLance
 			}
 		}
@@ -1763,6 +1992,9 @@ func startMiniAdminWithWorker(allServicesReady chan struct{}) {
 		// startAdminServer bailed out before that.
 		if adminOptions.workerGrpcListener != nil {
 			adminOptions.workerGrpcListener.Close()
+		}
+		if adminOptions.workerGrpcLegacyListener != nil {
+			adminOptions.workerGrpcLegacyListener.Close()
 		}
 	}()
 

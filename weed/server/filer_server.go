@@ -154,6 +154,13 @@ type FilerServer struct {
 	recentCopyRequestsMu sync.Mutex
 	recentCopyRequests   map[string]recentCopyRequest
 
+	// outcomes of recently applied object transactions keyed by request_id, so
+	// a failover replay of the same transaction replays its outcome instead of
+	// re-applying its mutations over a newer entry
+	recentObjectTxnsMu      sync.Mutex
+	recentObjectTxns        map[string]recentObjectTxn
+	recentObjectTxnsSweepAt time.Time
+
 	// credential manager for IAM operations
 	CredentialManager *credential.CredentialManager
 
@@ -180,6 +187,12 @@ type FilerServer struct {
 	// this filer announced itself; AnnounceOnceCaughtUp waits for their
 	// replayed backlogs before the filer joins the master's list.
 	startupPeers []pb.ServerAddress
+
+	// peerBootstrapPending marks a fresh store whose startup peer scan came
+	// back empty: an empty answer during a master restart can just mean the
+	// existing filers have not reconnected yet, so AnnounceOnceCaughtUp
+	// re-checks membership before registering.
+	peerBootstrapPending bool
 
 	// entryLockTable serializes mutations to the same entry path on this filer.
 	// CreateEntry takes it today; UpdateEntry and DeleteEntry are intended to take
@@ -248,6 +261,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		subscribers:           make(map[int32]*metadataSubscriber),
 		inFlightDataLimitCond: sync.NewCond(new(sync.Mutex)),
 		recentCopyRequests:    make(map[string]recentCopyRequest),
+		recentObjectTxns:      make(map[string]recentObjectTxn),
 		CredentialManager:     option.CredentialManager,
 		entryLockTable:        util.NewLockTable[util.FullPath](),
 		posixLocks:            posixlock.NewManager(),
@@ -280,6 +294,9 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	maxFilenameLength := v.GetUint32("filer.options.max_file_name_length")
 	glog.V(0).Infof("max_file_name_length %d", maxFilenameLength)
 	fs.filer = filer.NewFiler(*option.Masters, fs.grpcDialOption, option.Host, option.FilerGroup, option.Collection, option.DefaultReplication, option.DataCenter, maxFilenameLength, nil)
+	// Peer metadata replay takes the same per-path locks, so a replayed change
+	// cannot split a local mutation's read-modify-write.
+	fs.entryLockTable = fs.filer.EntryLockTable
 	fs.filer.Cipher = option.Cipher
 	fs.filer.DefaultDiskType = option.DiskType
 	fs.filer.BuildGuardedRemoteClient = BuildGuardedRemoteStorageClient
@@ -393,9 +410,12 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	startFromTime := time.Now().Add(-filer.LogFlushInterval)
 	if isFresh {
 		glog.V(0).Infof("%s bootstrap from peers %+v", option.Host, existingNodes)
-		if err := fs.filer.MaybeBootstrapFromOnePeer(option.Host, existingNodes, startFromTime); err != nil {
+		if err := fs.filer.MaybeBootstrapFromOnePeer(context.Background(), option.Host, existingNodes, startFromTime); err != nil {
 			glog.Fatalf("%s bootstrap from %+v: %v", option.Host, existingNodes, err)
 		}
+		// An empty scan can be a settling master rather than an empty cluster;
+		// the announce gate then re-checks membership before registering.
+		fs.peerBootstrapPending = len(existingNodes) == 0
 	}
 	v.SetDefault("filer.options.s3.empty_folder_cleanup_delay", "2m")
 	if d, err := time.ParseDuration(v.GetString("filer.options.s3.empty_folder_cleanup_delay")); err == nil {
@@ -520,16 +540,26 @@ const announceCatchUpCap = time.Minute
 // routed traffic is answerable the moment the filer is listed.
 func (fs *FilerServer) AnnounceOnceCaughtUp(announce chan struct{}, waitStart time.Time) {
 	defer close(announce)
-	if len(fs.startupPeers) == 0 || fs.filer.MetaAggregator == nil {
+	ma := fs.filer.MetaAggregator
+	if ma == nil {
 		return
 	}
+	// The bootstrap re-check and the catch-up wait share one deadline so a
+	// late peer cannot stretch the registration hold past the cap.
 	deadline := time.Now().Add(announceCatchUpCap)
+	peers := fs.startupPeers
+	if fs.peerBootstrapPending {
+		peers = append(peers, fs.awaitPeerBootstrap(deadline)...)
+	}
+	if len(peers) == 0 {
+		return
+	}
 	for {
 		// Take the channel before reading the watermarks so a rise in
 		// between still wakes this wait (see DeliveryWatermarkAdvancedChan).
-		advanced := fs.filer.MetaAggregator.DeliveryWatermarkAdvancedChan()
-		if fs.filer.MetaAggregator.PeersCaughtUpTo(fs.startupPeers, waitStart.UnixNano()) {
-			glog.V(0).Infof("%s caught up with %d startup peers, announcing to masters", fs.option.Host, len(fs.startupPeers))
+		advanced := ma.DeliveryWatermarkAdvancedChan()
+		if ma.PeersCaughtUpTo(peers, waitStart.UnixNano()) {
+			glog.V(0).Infof("%s caught up with %d startup peers, announcing to masters", fs.option.Host, len(peers))
 			return
 		}
 		remaining := time.Until(deadline)
@@ -542,6 +572,60 @@ func (fs *FilerServer) AnnounceOnceCaughtUp(announce chan struct{}, waitStart ti
 		case <-time.After(min(remaining, time.Second)):
 		}
 	}
+}
+
+// emptyMembershipConfirmTimeout bounds the announce hold for a peer to
+// disprove an empty startup scan on a fresh store. This runs after the ports
+// already serve, so a genuinely empty cluster pays a delayed master listing,
+// not a stalled startup.
+const emptyMembershipConfirmTimeout = 10 * time.Second
+
+// awaitPeerBootstrap re-polls membership while a fresh store's empty startup
+// scan can still be disproved: masters restarted or re-elected report no
+// filers until the existing ones reconnect. Peers found late are backfilled
+// from before their streams start, then reported so the caller waits for
+// their catch-up like startup peers. The whole wait — including each peer
+// metadata copy — is bounded by the shared announce deadline.
+func (fs *FilerServer) awaitPeerBootstrap(deadline time.Time) (peers []pb.ServerAddress) {
+	confirmBy := time.Now().Add(emptyMembershipConfirmTimeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		nodes, listErr := fs.filer.ListExistingPeerUpdates(ctx)
+		cancel()
+		if listErr != nil {
+			glog.Warningf("%s cannot re-check existing peers: %v; announcing anyway", fs.option.Host, listErr)
+			return nil
+		}
+		var remotes []*master_pb.ClusterNodeUpdate
+		for _, node := range nodes {
+			if !pb.ServerAddress(node.Address).Equals(fs.option.Host) {
+				remotes = append(remotes, node)
+			}
+		}
+		if len(remotes) == 0 {
+			if !time.Now().Before(confirmBy) {
+				return nil
+			}
+			time.Sleep(time.Second)
+			continue
+		}
+		bootstrapFrom := time.Now().Add(-filer.LogFlushInterval)
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+		err := fs.filer.MaybeBootstrapFromOnePeer(ctx, fs.option.Host, remotes, bootstrapFrom)
+		cancel()
+		if err != nil {
+			glog.Warningf("%s bootstrap from late peers %+v: %v; retrying", fs.option.Host, remotes, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		glog.V(0).Infof("%s bootstrap from late-arriving peers %+v", fs.option.Host, remotes)
+		for _, node := range remotes {
+			peers = append(peers, pb.ServerAddress(node.Address))
+			fs.filer.MetaAggregator.OnPeerUpdate(node, bootstrapFrom)
+		}
+		return peers
+	}
+	return nil
 }
 
 // masterRemovalWaitBudget bounds how long shutdown waits for masters to

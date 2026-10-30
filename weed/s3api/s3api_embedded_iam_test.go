@@ -372,13 +372,13 @@ func TestEmbeddedIamGetUserImplicitUsername(t *testing.T) {
 		t.Fatalf("failed to load iam config: %v", err)
 	}
 
-	// GetUser request with NO UserName, but signed by accessKey.
+	// GetUser request with NO UserName, carrying the identity authentication
+	// verified for accessKey, the way the middleware records it.
 	form := url.Values{}
 	form.Set("Action", "GetUser")
 	req, _ := http.NewRequest(http.MethodPost, "/", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+accessKey+
-		"/20220420/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=fakesig")
+	req = req.WithContext(SetIdentityNameInContext(req.Context(), "TestUser"))
 
 	out := iamGetUserResponse{}
 	rr, err := executeEmbeddedIamRequest(api, req, &out)
@@ -1578,29 +1578,15 @@ func TestEmbeddedIamDeleteAccessKey(t *testing.T) {
 	assert.Len(t, api.mockConfig.Identities[0].Credentials, 0)
 }
 
-// TestEmbeddedIamHandleImplicitUsername tests implicit username extraction from authorization header
+// TestEmbeddedIamHandleImplicitUsername checks that the implicit user name is
+// taken from the authenticated identity in the request context, never from
+// re-parsing the Authorization header.
 func TestEmbeddedIamHandleImplicitUsername(t *testing.T) {
-	// Create IAM with test credentials - the handleImplicitUsername function now looks
-	// up the username from the credential store based on AccessKeyId
-	// Note: Using obviously fake access keys to avoid secret scanner false positives
-	iam := &IdentityAccessManagement{}
-	testConfig := &iam_pb.S3ApiConfiguration{
-		Identities: []*iam_pb.Identity{
-			{
-				Name: "testuser1",
-				Credentials: []*iam_pb.Credential{
-					{AccessKey: UserAccessKeyPrefix + "TESTFAKEKEY000001", SecretKey: "testsecretfake"},
-				},
-			},
-		},
-	}
-	err := iam.LoadS3ApiConfigurationFromBytes(mustMarshalJSON(testConfig))
-	if err != nil {
-		t.Fatalf("Failed to load test config: %v", err)
-	}
+	embeddedApi := &EmbeddedIamApi{}
 
-	embeddedApi := &EmbeddedIamApi{
-		iam: iam,
+	withIdentity := func(name string) *http.Request {
+		r := &http.Request{Header: http.Header{}}
+		return r.WithContext(SetIdentityNameInContext(r.Context(), name))
 	}
 
 	var tests = []struct {
@@ -1608,14 +1594,14 @@ func TestEmbeddedIamHandleImplicitUsername(t *testing.T) {
 		values   url.Values
 		userName string
 	}{
-		// No authorization header - should not set username
+		// No authenticated identity - should not set username
 		{&http.Request{}, url.Values{}, ""},
-		// Valid auth header with known access key - should look up and find "testuser1"
-		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 Credential=" + UserAccessKeyPrefix + "TESTFAKEKEY000001/20220420/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=fakesignature0123456789abcdef"}}}, url.Values{}, "testuser1"},
-		// Malformed auth header (no Credential=) - should not set username
-		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 =" + UserAccessKeyPrefix + "TESTFAKEKEY000001/20220420/test1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=fakesignature0123456789abcdef"}}}, url.Values{}, ""},
-		// Unknown access key - should not set username
-		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 Credential=" + UserAccessKeyPrefix + "TESTUNKNOWN000000/20220420/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=fakesignature0123456789abcdef"}}}, url.Values{}, ""},
+		// Authenticated identity in context - sets its name
+		{withIdentity("testuser1"), url.Values{}, "testuser1"},
+		// A client-controlled Authorization header naming another user is ignored
+		{&http.Request{Header: http.Header{"Authorization": []string{"AWS4-HMAC-SHA256 Credential=" + UserAccessKeyPrefix + "TESTFAKEKEY000001/20220420/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=fakesignature0123456789abcdef"}}}, url.Values{}, ""},
+		// An explicit UserName is left alone
+		{withIdentity("testuser1"), url.Values{"UserName": {"other"}}, "other"},
 	}
 
 	for i, test := range tests {
@@ -1993,6 +1979,56 @@ func TestEmbeddedIamGetUserPolicyFallback(t *testing.T) {
 	assert.ElementsMatch(t, []string{"arn:aws:s3:::b-le*", "arn:aws:s3:::b-le*/*"}, stmt.Resource.Strings())
 }
 
+// TestEmbeddedIamGetUserPolicyMissingName checks that a policy name the user does not have
+// is NoSuchEntity, not a policy rebuilt from the user's other inline policies.
+func TestEmbeddedIamGetUserPolicyMissingName(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	s3cfg := &iam_pb.S3ApiConfiguration{
+		Identities: []*iam_pb.Identity{{Name: "steward"}},
+	}
+	api.mockConfig = s3cfg
+
+	_, iamErr := api.PutUserPolicy(s3cfg, url.Values{
+		"UserName":       []string{"steward"},
+		"PolicyName":     []string{"read"},
+		"PolicyDocument": []string{`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`},
+	})
+	require.Nil(t, iamErr)
+
+	_, iamErr = api.GetUserPolicy(s3cfg, url.Values{
+		"UserName":   []string{"steward"},
+		"PolicyName": []string{"write"},
+	})
+	require.NotNil(t, iamErr)
+	assert.Equal(t, iam.ErrCodeNoSuchEntityException, iamErr.Code)
+}
+
+// TestEmbeddedIamGetUserPolicyStoreError checks that a store failure surfaces as
+// ServiceFailure instead of rebuilding a policy from the identity's actions.
+func TestEmbeddedIamGetUserPolicyStoreError(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	s3cfg := &iam_pb.S3ApiConfiguration{
+		Identities: []*iam_pb.Identity{{Name: "steward"}},
+	}
+	api.mockConfig = s3cfg
+
+	_, iamErr := api.PutUserPolicy(s3cfg, url.Values{
+		"UserName":       []string{"steward"},
+		"PolicyName":     []string{"read"},
+		"PolicyDocument": []string{`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`},
+	})
+	require.Nil(t, iamErr)
+
+	api.credentialManager = &credential.CredentialManager{Store: &memory.MemoryStore{}}
+
+	_, iamErr = api.GetUserPolicy(s3cfg, url.Values{
+		"UserName":   []string{"steward"},
+		"PolicyName": []string{"read"},
+	})
+	require.NotNil(t, iamErr)
+	assert.Equal(t, iam.ErrCodeServiceFailureException, iamErr.Code)
+}
+
 // TestEmbeddedIamGetUserPolicyUserNotFound tests GetUserPolicy with non-existent user
 func TestEmbeddedIamGetUserPolicyUserNotFound(t *testing.T) {
 	api := NewEmbeddedIamApiForTest()
@@ -2158,6 +2194,114 @@ func TestEmbeddedIamGetActionsPrefixScopedResource(t *testing.T) {
 		"GetObject under the allowed prefix should be authorized")
 	assert.False(t, identity.CanDo(ACTION_WRITE, "mcp-upload", "other/logo.png"),
 		"PutObject outside the allowed prefix should be denied")
+}
+
+// TestEmbeddedIamGetActionsMultipartListing covers the AWS names for
+// listing multipart uploads and parts: they grant only the named listing
+// operation, never a general Read on the bucket.
+func TestEmbeddedIamGetActionsMultipartListing(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	iam := NewIdentityAccessManagementWithStore(&S3ApiServerOption{}, nil, "memory")
+
+	// Check each action on its own so a correct mapping for one cannot hide
+	// a wrong mapping for the other.
+	for _, tc := range []struct {
+		policyAction string
+		grant        string
+		url          string
+		object       string
+	}{
+		{"s3:ListBucketMultipartUploads", "ListBucketMultipartUploads:demo", "/demo?uploads", ""},
+		{"s3:ListMultipartUploadParts", "ListMultipartUploadParts:demo", "/demo/key?uploadId=u1", "key"},
+	} {
+		t.Run(tc.policyAction, func(t *testing.T) {
+			policyDoc := `{
+				"Version": "2012-10-17",
+				"Statement": [{
+					"Effect": "Allow",
+					"Action": ["` + tc.policyAction + `"],
+					"Resource": ["arn:aws:s3:::demo", "arn:aws:s3:::demo/*"]
+				}]
+			}`
+
+			policy, err := api.GetPolicyDocument(&policyDoc)
+			require.NoError(t, err)
+
+			actions, err := api.getActions(&policy)
+			require.NoError(t, err)
+			require.NotEmpty(t, actions)
+			for _, a := range actions {
+				assert.Equal(t, tc.grant, a,
+					"%s should only grant its own listing operation", tc.policyAction)
+			}
+
+			identity := &Identity{Name: "bob"}
+			for _, a := range actions {
+				identity.Actions = append(identity.Actions, Action(a))
+			}
+
+			// The listing routes are gated on ACTION_READ, but the grant must
+			// not authorize object reads or anything else.
+			assert.False(t, identity.CanDo(ACTION_READ, "demo", "key"),
+				"a listing grant must not allow object reads")
+			assert.False(t, identity.CanDo(ACTION_WRITE, "demo", "key"),
+				"a listing grant must not allow writes")
+			assert.False(t, identity.CanDo(ACTION_LIST, "demo", ""),
+				"a listing grant must not allow ListObjects")
+
+			routed := func(url, object string) *http.Request {
+				return mux.SetURLVars(httptest.NewRequest(http.MethodGet, url, nil),
+					map[string]string{"bucket": "demo", "object": object})
+			}
+
+			req := routed(tc.url, tc.object)
+			assert.Equal(t, s3err.ErrNone, iam.VerifyActionPermission(req, identity, ACTION_READ, "demo", tc.object),
+				"the listing action should be authorized")
+			assert.Equal(t, s3err.ErrAccessDenied, iam.VerifyActionPermission(req, identity, ACTION_READ, "other", tc.object),
+				"the grant must stay scoped to the policy's bucket")
+
+			getReq := routed("/demo/key", "key")
+			assert.Equal(t, s3err.ErrAccessDenied, iam.VerifyActionPermission(getReq, identity, ACTION_READ, "demo", "key"),
+				"the grant must not authorize GetObject")
+
+			// Other ACTION_READ routes must not be authorized by a listing
+			// grant, whatever query parameters ride along.
+			policyReq := routed("/demo?policy", "")
+			assert.Equal(t, s3err.ErrAccessDenied, iam.VerifyActionPermission(policyReq, identity, ACTION_READ, "demo", ""),
+				"the grant must not authorize GetBucketPolicy")
+		})
+	}
+
+	grant := func(a string) *Identity { return &Identity{Name: "bob", Actions: []Action{Action(a)}} }
+	routed := func(url, object string) *http.Request {
+		return mux.SetURLVars(httptest.NewRequest(http.MethodGet, url, nil),
+			map[string]string{"bucket": "demo", "object": object})
+	}
+
+	// authRequestWithAuthType promotes ?prefix into the object for upload
+	// listings; the operation must still come from the route, not the prefix.
+	t.Run("upload listing with prefix", func(t *testing.T) {
+		req := routed("/demo?uploads&prefix=foo/", "")
+		assert.Equal(t, s3err.ErrNone,
+			iam.VerifyActionPermission(req, grant("ListBucketMultipartUploads:demo"), ACTION_READ, "demo", "foo/"))
+		assert.Equal(t, s3err.ErrAccessDenied,
+			iam.VerifyActionPermission(req, grant("ListMultipartUploadParts:demo"), ACTION_READ, "demo", "foo/"))
+	})
+
+	// The ?uploads route is registered before ?policy, so this reaches the
+	// upload listing handler and needs the upload listing grant.
+	t.Run("upload listing with extra subresource", func(t *testing.T) {
+		req := routed("/demo?policy&uploads", "")
+		assert.Equal(t, s3err.ErrNone,
+			iam.VerifyActionPermission(req, grant("ListBucketMultipartUploads:demo"), ACTION_READ, "demo", ""))
+		assert.Equal(t, s3err.ErrAccessDenied,
+			iam.VerifyActionPermission(req, grant("GetBucketPolicy:demo"), ACTION_READ, "demo", ""))
+	})
+
+	// Policies rebuilt from these grants must use valid action names.
+	for _, a := range []string{ACTION_LIST_MULTIPART_UPLOADS, ACTION_LIST_PARTS} {
+		assert.Equal(t, a, iamMapToIdentitiesAction(a))
+	}
 }
 
 // TestEmbeddedIamPutUserPolicyAllResourceWildcard reproduces issue #9209:

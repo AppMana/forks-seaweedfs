@@ -84,7 +84,9 @@ func clearSupplementaryGroupCache() {
 func (wfs *WFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) (code fuse.Status) {
 	wfs.holdKernelLock(input.NodeId)
 	defer wfs.releaseKernelLock(input.NodeId)
-	_, _, entry, code := wfs.maybeReadEntry(input.NodeId)
+	ctx, cancelFunc := ctxFromCancel(cancel)
+	defer cancelFunc()
+	_, _, entry, code := wfs.maybeReadEntry(ctx, input.NodeId)
 	if code != fuse.OK {
 		return code
 	}

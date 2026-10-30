@@ -84,6 +84,11 @@ type Filer struct {
 	dirChanges                    directoryChanges
 	dirWriters                    directoryWriterChanges
 	remoteTombstones              *remoteDeletionTombstones
+	// EntryLockTable serializes mutations per entry path. The filer server
+	// holds it across local read-modify-write mutations and the meta
+	// aggregator across a replayed peer change's check-and-apply, so the two
+	// cannot interleave on the same path.
+	EntryLockTable *util.LockTable[util.FullPath]
 	// remoteTombstonesDone, when non-nil, is closed once the startup tombstone
 	// rebuild finishes; lazy remote reads wait on it so a pending delete
 	// cannot resurrect in the gap.
@@ -135,6 +140,7 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 		DeletionRetryQueue:  NewDeletionRetryQueue(),
 		persistedLogCache:   newPersistedLogCache(persistedLogCacheMaxBytes),
 		remoteTombstones:    newRemoteDeletionTombstones(),
+		EntryLockTable:      util.NewLockTable[util.FullPath](),
 	}
 	f.flushCtx, f.flushCancel = context.WithCancel(context.Background())
 	if f.UniqueFilerId < 0 {
@@ -181,7 +187,7 @@ func (f *Filer) buildRemoteStorageClient(ctx context.Context, remoteConf *remote
 	return remote_storage.GetRemoteStorage(remoteConf)
 }
 
-func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, snapshotTime time.Time) (err error) {
+func (f *Filer) MaybeBootstrapFromOnePeer(ctx context.Context, self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, snapshotTime time.Time) (err error) {
 	if len(existingNodes) == 0 {
 		return
 	}
@@ -196,8 +202,13 @@ func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes [
 	glog.V(0).Infof("bootstrap from %v clientId:%d", earliestNode.Address, f.UniqueFilerId)
 
 	return pb.WithFilerClient(false, f.UniqueFilerId, pb.ServerAddress(earliestNode.Address), f.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		return filer_pb.StreamBfs(client, "/", snapshotTime.UnixNano(), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
-			return f.Store.InsertEntry(context.Background(), FromPbEntry(string(parentPath), entry))
+		return filer_pb.StreamBfs(ctx, client, "/", snapshotTime.UnixNano(), func(parentPath util.FullPath, pbEntry *filer_pb.Entry, entryTsNs int64) error {
+			entry := FromPbEntry(string(parentPath), pbEntry)
+			peerTsNs := entryTsNs
+			if peerTsNs == 0 {
+				peerTsNs = entry.Attr.Mtime.UnixNano()
+			}
+			return f.applyTraversedEntry(ctx, entry, peerTsNs)
 		})
 	})
 
@@ -262,19 +273,19 @@ func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*maste
 const peerLookupTimeout = 10 * time.Second
 
 // leaderSettleTimeout bounds how long an empty peer list from the leader is
-// re-polled: a freshly elected leader has not yet received the filers'
-// reconnects, so an immediate empty answer can just mean membership has not
-// migrated yet. A persistent empty answer is then checked against the other
-// masters below before it is accepted as an empty cluster.
-const leaderSettleTimeout = 10 * time.Second
+// re-polled: a freshly elected leader may not yet have the filers' reconnects,
+// so an immediate empty answer can just mean membership has not migrated yet.
+// It must stay below the health window a fresh filer gets to start serving
+// (weed mini allows 6s) — a filerless cluster pays the whole window per start.
+const leaderSettleTimeout = 3 * time.Second
 const leaderSettleInterval = time.Second
 
 // ListExistingPeerUpdates returns the peer list to bootstrap from. The
 // leader's list is authoritative: after a leader change an old master keeps
 // its registrations until its streams end, so the longest answer is not
-// necessarily the current one. The leader's answer wins whenever it can be
-// found and queried; only when the leader is unreachable does the scan fall
-// back to the fullest answer from the other masters. It returns an error when
+// necessarily the current one. A non-empty answer from the leader wins; a
+// leader that is unreachable or reports an empty list falls back to the
+// fullest answer from the other masters. It returns an error when
 // no master answers, so a failed lookup is not mistaken for an empty cluster.
 func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*master_pb.ClusterNodeUpdate, err error) {
 	masters := f.MasterClient.ListMasters()
@@ -404,6 +415,28 @@ func (f *Filer) RollbackTransaction(ctx context.Context) error {
 	return f.Store.RollbackTransaction(ctx)
 }
 
+type syncWriteKey struct{}
+
+// WithSyncWrite marks the entry writes under ctx durable-on-ack: a store that
+// buffers writes by default must flush them before returning.
+func WithSyncWrite(ctx context.Context) context.Context {
+	return context.WithValue(ctx, syncWriteKey{}, true)
+}
+
+// SyncWrite reports whether ctx carries a durability request for entry writes.
+func SyncWrite(ctx context.Context) bool {
+	return ctx.Value(syncWriteKey{}) != nil
+}
+
+// syncWriteContext flags ctx when the storage rule on p asks for fsync, so the
+// store write is held to the same durability as the data path.
+func (f *Filer) syncWriteContext(ctx context.Context, p util.FullPath) context.Context {
+	if f.FilerConf != nil && f.FilerConf.MatchStorageRule(string(p)).GetFsync() {
+		return WithSyncWrite(ctx)
+	}
+	return ctx
+}
+
 // CreateEntry creates or replaces an entry. When existing is non-nil the caller
 // has already fetched the current entry at this path under a path lock, and it
 // is reused instead of looking the store up again; pass nil to have CreateEntry
@@ -413,6 +446,8 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 	if string(entry.FullPath) == "/" {
 		return nil
 	}
+
+	ctx = f.syncWriteContext(ctx, entry.FullPath)
 
 	if entry.FullPath.IsLongerFileName(maxFilenameLength) {
 		return filer_pb.ErrEntryNameTooLong
@@ -445,8 +480,20 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 		}
 	*/
 
+	emitted := false
+	stamped := false
+	// On abort, release the stamp this call made — one the entry already
+	// carried is a concurrent mutation's and stays for its own event.
+	defer func() {
+		if !emitted && stamped {
+			f.releaseEntryCommitTsNs(entry.CommitTsNs)
+		}
+	}()
+
 	if oldEntry == nil {
 		f.ensureEntryInode(entry)
+		f.stampEntryCommitTsNs(entry)
+		stamped = true
 
 		glog.V(4).InfofCtx(ctx, "InsertEntry %s: new entry: %v", entry.FullPath, entry.Name())
 		if err := f.Store.InsertEntry(ctx, entry); err != nil {
@@ -479,6 +526,8 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 			return fmt.Errorf("%s: %w", entry.FullPath, filer_pb.ErrEntryAlreadyExists)
 		}
 		glog.V(4).InfofCtx(ctx, "UpdateEntry %s: old entry: %v", entry.FullPath, oldEntry.Name())
+		f.stampEntryCommitTsNs(entry)
+		stamped = true
 		if err := f.UpdateEntry(ctx, oldEntry, entry, isFromOtherCluster); err != nil {
 			if errors.Is(err, filer_pb.ErrExistingIsDirectory) || errors.Is(err, filer_pb.ErrExistingIsFile) {
 				glog.V(2).InfofCtx(ctx, "update entry %s: %v", entry.FullPath, err)
@@ -490,6 +539,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 	}
 
 	f.NotifyUpdateEvent(ctx, oldEntry, entry, true, isFromOtherCluster, signatures)
+	emitted = true
 
 	f.deleteChunksIfNotNew(ctx, oldEntry, entry)
 
@@ -554,16 +604,18 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 		}
 
 		glog.V(2).InfofCtx(ctx, "create directory: %s %v", dirPath, dirEntry.Mode)
+		f.stampEntryCommitTsNs(dirEntry)
 		mkdirErr := f.Store.InsertEntry(ctx, dirEntry)
 		if mkdirErr != nil {
+			f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 			if fEntry, err := f.FindEntry(ctx, util.FullPath(dirPath)); err == filer_pb.ErrNotFound || fEntry == nil {
 				glog.V(3).InfofCtx(ctx, "mkdir %s: %v", dirPath, mkdirErr)
 				return fmt.Errorf("mkdir %s: %v", dirPath, mkdirErr)
 			}
+		} else if !strings.HasPrefix("/"+util.Join(dirParts[:]...), SystemLogDir) {
+			f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
 		} else {
-			if !strings.HasPrefix("/"+util.Join(dirParts[:]...), SystemLogDir) {
-				f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
-			}
+			f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 		}
 
 	} else if !dirEntry.IsDirectory() {
@@ -583,7 +635,9 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 			dirEntry.Extended = make(map[string][]byte)
 		}
 		dirEntry.Extended[s3_constants.SeaweedFSPrefixObject] = []byte("true")
+		f.stampEntryCommitTsNs(dirEntry)
 		if updateErr := f.Store.UpdateEntry(ctx, dirEntry); updateErr != nil {
+			f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 			return fmt.Errorf("promote %s to directory: %v", dirPath, updateErr)
 		}
 		f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
@@ -619,6 +673,7 @@ func (f *Filer) DirectoryAttributes(ctx context.Context, dirPath util.FullPath) 
 // deleted with, so a restore cannot hand back a directory more permissive than the one
 // it replaces - including when someone else already put it back with wider ones.
 func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath, attrs empty_folder_cleanup.DirectoryAttributes) error {
+	ctx = f.syncWriteContext(ctx, dirPath)
 	existing, err := f.FindEntry(ctx, dirPath)
 	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
 		return err
@@ -634,7 +689,9 @@ func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath,
 		narrowed := existing.ShallowClone()
 		narrowed.Mode = existing.Mode&^restorableModeBits | kept
 		glog.V(1).InfofCtx(ctx, "restore directory %s: narrowing %v to %v", dirPath, existing.Mode, narrowed.Mode)
+		f.stampEntryCommitTsNs(narrowed)
 		if err := f.UpdateEntry(ctx, existing, narrowed, false); err != nil {
+			f.releaseEntryCommitTsNs(narrowed.CommitTsNs)
 			return err
 		}
 		f.NotifyUpdateEvent(ctx, existing, narrowed, false, false, nil)
@@ -659,7 +716,9 @@ func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath,
 		UserName: attrs.UserName, GroupNames: attrs.GroupNames,
 	}}
 	f.ensureEntryInode(dirEntry)
+	f.stampEntryCommitTsNs(dirEntry)
 	if err := f.Store.InsertEntry(ctx, dirEntry); err != nil {
+		f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 		return fmt.Errorf("restore directory %s: %v", dirPath, err)
 	}
 	f.NotifyUpdateEvent(ctx, nil, dirEntry, false, false, nil)
@@ -668,6 +727,7 @@ func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath,
 }
 
 func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry, isFromOtherCluster bool) (err error) {
+	ctx = f.syncWriteContext(ctx, entry.FullPath)
 	if oldEntry != nil {
 		entry.Attr.Crtime = oldEntry.Attr.Crtime
 		if oldEntry.Attr.Inode != 0 {
@@ -881,7 +941,7 @@ func (f *Filer) DeleteEmptyParentDirectories(ctx context.Context, dirPath util.F
 	glog.V(2).InfofCtx(ctx, "DeleteEmptyParentDirectories: deleting empty directory %s", dirPath)
 	parentDir, _ := dirPath.DirAndName()
 	if dirEntry, findErr := f.FindEntry(ctx, dirPath); findErr == nil {
-		if delErr := f.doDeleteEntryMetaAndData(ctx, dirEntry, false, false, nil); delErr == nil {
+		if delErr := f.doDeleteEntryMetaAndData(f.emptyFolderDeleteContext(ctx, dirPath), dirEntry, false, false, nil); delErr == nil {
 			// Successfully deleted, continue checking upwards
 			f.DeleteEmptyParentDirectories(ctx, util.FullPath(parentDir), stopAtPath)
 		} else {
@@ -916,6 +976,12 @@ func (f *Filer) Shutdown() {
 	f.LocalMetaLogBuffer.ShutdownLogBuffer()
 	// The final metadata-log flush still needs the store to append its entry.
 	f.LocalMetaLogBuffer.WaitForShutdown()
+	// Stop peer subscriptions and let each persist its last applied offset;
+	// the replay on the next start otherwise resumes from a stale offset and
+	// applies those old events over newer local state.
+	if f.MetaAggregator != nil {
+		f.MetaAggregator.Shutdown()
+	}
 	// Persist the deletion ledger one last time before the store closes, so a
 	// clean shutdown leaves the recovery set exactly consistent with reality.
 	f.snapshotDeletionLedger()

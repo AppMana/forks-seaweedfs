@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -51,11 +50,21 @@ var (
 // S3 gateway, whose remote-mount read paths dial the mounted endpoint directly.
 const allowUntrustedRemoteEndpointsUsage = "if true, a read of a remote-only entry accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints."
 
+// iamSelfServiceRequiresGrantUsage documents the flag shared by every command
+// that runs the embedded IAM API.
+const iamSelfServiceRequiresGrantUsage = "if true, an identity needs an explicit iam: grant to manage its own access keys (CreateAccessKey, DeleteAccessKey, UpdateAccessKey, ListAccessKeys, GetUser), as on AWS. Default allows it to every authenticated identity."
+
+// allowBackslashInKeyUsage documents the S3 flag keeping '\' a literal
+// object-key character instead of normalizing it to '/'. Repeated '//' in a
+// key still collapses: a filer entry name cannot contain an empty segment.
+const allowBackslashInKeyUsage = "treat backslash as a regular object-key character instead of converting it to '/' (aws-compatible; '//' still collapses)"
+
 type FilerOptions struct {
 	masters                   *pb.ServerDiscovery
 	mastersString             *string
 	ip                        *string
 	bindIp                    *string
+	listenOnLocalhost         *bool
 	port                      *int
 	portGrpc                  *int
 	publicPort                *int
@@ -164,7 +173,7 @@ func init() {
 	filerS3Options.metricsHttpPort = cmdFiler.Flag.Int("s3.metricsPort", 0, "Prometheus metrics listen port")
 	filerS3Options.metricsHttpIp = cmdFiler.Flag.String("s3.metricsIp", "", "metrics listen ip. If empty, default to same as -s3.ip.bind option.")
 	cmdFiler.Flag.Bool("s3.allowEmptyFolder", true, "deprecated, ignored. Empty folder cleanup is now automatic.")
-	filerS3Options.allowDeleteBucketNotEmpty = cmdFiler.Flag.Bool("s3.allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	filerS3Options.allowDeleteBucketNotEmpty = cmdFiler.Flag.Bool("s3.allowDeleteBucketNotEmpty", false, "allow recursive deleting all entries along with bucket")
 	filerS3Options.shareCopyChunks = cmdFiler.Flag.Bool("s3.shareCopyChunks", false, shareCopyChunksUsage)
 	filerS3Options.autoCreateBucket = cmdFiler.Flag.Bool("s3.autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	filerS3Options.localSocket = cmdFiler.Flag.String("s3.localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
@@ -187,6 +196,8 @@ func init() {
 	filerS3Options.readerCacheSizeMB = cmdFiler.Flag.Int64("s3.readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
 	filerS3Options.sessionReaderCacheSizeMB = cmdFiler.Flag.Int64("s3.sessionReaderCacheSizeMB", 0, "per-request/session memory budget in MiB for an individual S3 GET stream")
 	filerS3Options.allowUntrustedRemoteEndpoints = cmdFiler.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
+	filerS3Options.allowBackslashInKey = cmdFiler.Flag.Bool("s3.allowBackslashInKey", false, allowBackslashInKeyUsage)
+	filerS3Options.iamSelfServiceRequiresGrant = cmdFiler.Flag.Bool("s3.iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
 
 	// start webdav on filer
 	filerStartWebDav = cmdFiler.Flag.Bool("webdav", false, "whether to start webdav gateway")
@@ -205,6 +216,7 @@ func init() {
 	filerStartIam = cmdFiler.Flag.Bool("iam", false, "whether to start IAM service")
 	filerIamOptions.ip = cmdFiler.Flag.String("iam.ip", *f.ip, "iam server http listen ip address")
 	filerIamOptions.port = cmdFiler.Flag.Int("iam.port", 8111, "iam server http listen port")
+	filerIamOptions.selfServiceRequiresGrant = filerS3Options.iamSelfServiceRequiresGrant
 
 	filerStartSftp = cmdFiler.Flag.Bool("sftp", false, "whether to start the SFTP server")
 	filerSftpOptions.port = cmdFiler.Flag.Int("sftp.port", 2022, "SFTP server listen port")
@@ -285,18 +297,20 @@ func runFiler(cmd *Command, args []string) bool {
 	}
 	go stats_collect.StartMetricsServer(*f.metricsHttpIp, *f.metricsHttpPort)
 
+	// Embedded services keep their loopback companion listener only while
+	// -ip.bind is unset and the bind address falls back to -ip. This must be
+	// captured before startFiler fills *f.bindIp in place.
+	filerBindIpUnset := *f.bindIp == ""
 	filerAddress := pb.NewServerAddress(*f.ip, *f.port, *f.portGrpc).String()
 	startDelay := time.Duration(2)
 	if *filerStartS3 {
 		filerS3Options.filer = &filerAddress
 		filerS3Options.ip = f.ip
 		if *filerS3Options.bindIp == "" {
+			filerS3Options.listenOnLocalhost = &filerBindIpUnset
 			filerS3Options.bindIp = f.bindIp
 		}
 		filerS3Options.localFilerSocket = f.localSocket
-		if *f.dataCenter != "" && *filerS3Options.dataCenter == "" {
-			filerS3Options.dataCenter = f.dataCenter
-		}
 		// Set S3 metrics IP based on bind IP if not explicitly set
 		if *filerS3Options.metricsHttpIp == "" {
 			*filerS3Options.metricsHttpIp = *filerS3Options.bindIp
@@ -326,6 +340,7 @@ func runFiler(cmd *Command, args []string) bool {
 	if *filerStartIam {
 		filerIamOptions.filer = &filerAddress
 		filerIamOptions.masters = f.mastersString
+		filerIamOptions.listenOnLocalhost = &filerBindIpUnset
 		go func(delay time.Duration) {
 			time.Sleep(delay * time.Second)
 			filerIamOptions.startIamServer()
@@ -336,10 +351,8 @@ func runFiler(cmd *Command, args []string) bool {
 	if *filerStartSftp {
 		filerSftpOptions.filer = &filerAddress
 		if *filerSftpOptions.bindIp == "" {
+			filerSftpOptions.listenOnLocalhost = &filerBindIpUnset
 			filerSftpOptions.bindIp = f.bindIp
-		}
-		if *f.dataCenter != "" && *filerSftpOptions.dataCenter == "" {
-			filerSftpOptions.dataCenter = f.dataCenter
 		}
 		go func(delay time.Duration) {
 			time.Sleep(delay * time.Second)
@@ -364,6 +377,13 @@ func (fo *FilerOptions) startFiler() {
 	}
 	if *fo.portGrpc == 0 {
 		*fo.portGrpc = 10000 + *fo.port
+	}
+	// The loopback companion listener is only kept while -ip.bind is unset
+	// and the bind address falls back to -ip. An explicit -ip.bind pins each
+	// port to exactly that address.
+	listenOnLocalhost := *fo.bindIp == ""
+	if fo.listenOnLocalhost != nil {
+		listenOnLocalhost = *fo.listenOnLocalhost
 	}
 	if *fo.bindIp == "" {
 		*fo.bindIp = *fo.ip
@@ -474,7 +494,7 @@ func (fo *FilerOptions) startFiler() {
 	if *fo.publicPort != 0 {
 		publicListeningAddress := util.JoinHostPort(*fo.bindIp, *fo.publicPort)
 		glog.V(0).Infoln("Start Seaweed filer server", version.Version(), "public at", publicListeningAddress)
-		publicListener, localPublicListener, e := util.NewIpAndLocalListeners(*fo.bindIp, *fo.publicPort, 0)
+		publicListener, localPublicListener, e := util.NewIpAndLocalListeners(*fo.bindIp, *fo.publicPort, 0, listenOnLocalhost)
 		if e != nil {
 			glog.Fatalf("Filer server public listener error on port %d:%v", *fo.publicPort, e)
 		}
@@ -500,7 +520,7 @@ func (fo *FilerOptions) startFiler() {
 	glog.V(0).Infof("Start Seaweed Filer %s at %s:%d", version.Version(), *fo.ip, *fo.port)
 	filerListener, filerLocalListener, e := util.NewIpAndLocalListeners(
 		*fo.bindIp, *fo.port,
-		time.Duration(10)*time.Second,
+		time.Duration(10)*time.Second, listenOnLocalhost,
 	)
 	if e != nil {
 		glog.Fatalf("Filer listener error: %v", e)
@@ -508,7 +528,7 @@ func (fo *FilerOptions) startFiler() {
 
 	// starting grpc server
 	grpcPort := *fo.portGrpc
-	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*fo.bindIp, grpcPort, 0)
+	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*fo.bindIp, grpcPort, 0, listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("failed to listen on grpc port %d: %v", grpcPort, err)
 	}
@@ -562,22 +582,17 @@ func (fo *FilerOptions) startFiler() {
 	}
 	stopGrpcServer := func() { gracefulStopGrpc(grpcS, gracefulTimeout) }
 
-	var socketServer *http.Server
 	if runtime.GOOS != "windows" {
 		localSocket := *fo.localSocket
-		if localSocket == "" {
+		explicit := localSocket != ""
+		if !explicit {
 			localSocket = fmt.Sprintf("/tmp/seaweedfs-filer-%d.sock", *fo.port)
 		}
-		if err := os.Remove(localSocket); err != nil && !os.IsNotExist(err) {
-			glog.Fatalf("Failed to remove %s, error: %s", localSocket, err.Error())
+		if filerSocketListener := pb.ListenOnLocalSocket(localSocket); filerSocketListener != nil {
+			socketServer := newHttpServer(defaultHandler, nil)
+			httpServers = append(httpServers, socketServer)
+			go socketServer.Serve(filerSocketListener)
 		}
-		filerSocketListener, err := net.Listen("unix", localSocket)
-		if err != nil {
-			glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
-		}
-		socketServer = newHttpServer(defaultHandler, nil)
-		httpServers = append(httpServers, socketServer)
-		go socketServer.Serve(filerSocketListener)
 	}
 
 	if viper.GetString("https.filer.key") != "" {

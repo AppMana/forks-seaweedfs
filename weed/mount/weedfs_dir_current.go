@@ -177,8 +177,11 @@ func (wfs *WFS) awaitDirectoryCurrent(ctx context.Context, dir util.FullPath) di
 // A directory not cached again reads through.
 func (wfs *WFS) relistDirectory(ctx context.Context, dir util.FullPath, positions []*filer_pb.FilerDirectoryPosition) directoryCurrency {
 	wfs.inodeToPath.InvalidateChildrenCache(dir)
+	// The rebuild runs detached from ctx: a caller that stops waiting leaves it
+	// to finish and warm the cache.
+	buildCtx := context.WithoutCancel(ctx)
 	_, err := awaitFilerReply(ctx, "relist "+string(dir), func() (struct{}, error) {
-		if err := wfs.ensureDirectoryVisited(dir); err != nil {
+		if err := wfs.ensureDirectoryVisited(buildCtx, dir); err != nil {
 			return struct{}{}, err
 		}
 		if len(positions) > 0 {

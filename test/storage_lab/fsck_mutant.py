@@ -19,14 +19,11 @@ MUTATIONS = {
 """,
     ),
     "ignored-filer-delete": (
-        """\t\t\tif applyPurging {
-\t\t\t\treturn c.httpDelete(itemPath)
-\t\t\t}
+        """\t\t\t\t\tfirstErrOnce.Do(func() { firstErr = err })
+\t\t\t\t\tfailed.Store(true)
 """,
-        """\t\t\tif applyPurging {
-\t\t\t\t// MUTANT: inject log-and-continue behavior.
-\t\t\t\t_ = c.httpDelete(itemPath)
-\t\t\t}
+        """\t\t\t\t\t// MUTANT: inject log-and-continue behavior.
+\t\t\t\t\t_ = &firstErrOnce
 """,
     ),
 }

@@ -15,6 +15,8 @@ import (
 func TestWinfspUtimensKeepsTimesWindowsDidNotSet(t *testing.T) {
 	wfs := newPagingWFS(t, "/d", []string{"f"}, 0)
 	wfs.atimeMap = make(map[uint64]time.Time)
+	// The entry belongs to root; open it as root to write it.
+	wfs.option.MountUid, wfs.option.MountGid = 0, 0
 	a := newWinfspFS(wfs, false)
 	status, fh := a.Open("/d/f", cgofuse.O_RDWR)
 	if status != 0 {

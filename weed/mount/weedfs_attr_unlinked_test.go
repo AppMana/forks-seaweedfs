@@ -123,7 +123,7 @@ func TestGetAttrOnUnlinkedOpenFile(t *testing.T) {
 // descriptor whose file has been unlinked.
 func TestXAttrOnUnlinkedOpenFile(t *testing.T) {
 	wfs, inode, fh := newUnlinkedOpenFile(t)
-	if runtime.GOOS == "windows" || runtime.GOOS == "freebsd" {
+	if runtime.GOOS == "freebsd" {
 		assertUnlinkedXAttrsUnsupported(t, wfs, inode, fh.GetEntry().GetEntry())
 		if fh.dirtyMetadata {
 			t.Fatal("unsupported xattr operation dirtied the open file")
@@ -242,7 +242,7 @@ func TestSetAttrOnRemovedOpenDir(t *testing.T) {
 // descriptor whose directory has been removed.
 func TestXAttrOnRemovedOpenDir(t *testing.T) {
 	wfs, inode := newRemovedOpenDir(t)
-	if runtime.GOOS == "windows" || runtime.GOOS == "freebsd" {
+	if runtime.GOOS == "freebsd" {
 		assertUnlinkedXAttrsUnsupported(t, wfs, inode, wfs.removedDirs[inode])
 		return
 	}

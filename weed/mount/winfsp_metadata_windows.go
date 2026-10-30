@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"context"
 	"encoding/binary"
 	"time"
 
@@ -57,7 +58,7 @@ func (a *winfspFS) updateWindowsMetadata(path string, update func(*filer_pb.Entr
 	if status != fuse.OK {
 		return toWinErrno(status)
 	}
-	fullPath, fh, entry, status := a.wfs.maybeReadEntry(ino)
+	fullPath, fh, entry, status := a.wfs.maybeReadEntry(context.Background(), ino)
 	if status != fuse.OK {
 		return toWinErrno(status)
 	}
@@ -97,7 +98,7 @@ func (a *winfspFS) updateWindowsMetadata(path string, update func(*filer_pb.Entr
 }
 
 func (a *winfspFS) getattrWindowsFlags(ino uint64, st *cgofuse.Stat_t) int {
-	_, fh, entry, status := a.wfs.maybeReadEntry(ino)
+	_, fh, entry, status := a.wfs.maybeReadEntry(context.Background(), ino)
 	if status != fuse.OK {
 		return toWinErrno(status)
 	}

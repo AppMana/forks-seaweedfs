@@ -91,6 +91,9 @@ func TestCloseSucceedsWhenAnAssignedVolumeServerStalls(t *testing.T) {
 	config.MiniOptions = []string{
 		"-master.port=" + strconv.Itoa(masterPort),
 		"-master.port.grpc=" + strconv.Itoa(masterPort+grpcPortOffset),
+		// The single-master mini fast-start mode admits only its embedded
+		// volume server. Use normal membership for this multi-server fixture.
+		"-master.peers=127.0.0.1:" + strconv.Itoa(masterPort),
 		"-master.volumeSizeLimitMB=64",
 	}
 	require.NoError(t, framework.Setup(config))

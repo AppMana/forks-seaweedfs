@@ -205,12 +205,13 @@ func TestFsckRepairReleasesEachVolumeIndexesBeforeTheNext(t *testing.T) {
 }
 
 // A needle that is still referenced by the filer, live on one replica, and
-// tombstoned on another replica cannot be overwritten by WriteNeedleBlobIfAbsent.
-// Repair must fail the run rather than treat AlreadyExists as success, or a
-// subsequent tombstone sync would delete the remaining live copy.
-func TestFsckRepairFailsWhenReferencedNeedleIsTombstonedOnAReplica(t *testing.T) {
+// tombstoned on another cannot be restored there: WriteNeedleBlobIfAbsent
+// never undeletes. Repair must not count that AlreadyExists as success, or
+// the tombstone sync that follows a clean repair would delete the live copy.
+// It must not stop either: the volumes after it are still repaired.
+func TestFsckRepairCountsReferencedNeedleTombstonedOnAReplica(t *testing.T) {
 	tempFolder := t.TempDir()
-	const volumeId = uint32(11)
+	const volumeId, laterVolumeId = uint32(11), uint32(12)
 	writeReplicaIdx(t, tempFolder, "dnA", volumeId, 1)
 
 	// dnB holds a tombstone record in its .idx for needle 1.
@@ -219,9 +220,16 @@ func TestFsckRepairFailsWhenReferencedNeedleIsTombstonedOnAReplica(t *testing.T)
 		t.Fatal(err)
 	}
 	writeFilerRefs(t, tempFolder, volumeId, map[string]uint64{"/buckets/b/one": 1})
+	// The later volume lacks a referenced needle on dnB.
+	writeReplicaIdx(t, tempFolder, "dnA", laterVolumeId, 1)
+	if err := writeToFile(nil, getVolumeFileIdFile(tempFolder, "dnB", laterVolumeId)); err != nil {
+		t.Fatal(err)
+	}
+	writeFilerRefs(t, tempFolder, laterVolumeId, map[string]uint64{"/buckets/b/two": 1})
 
 	verbose := false
 	var out bytes.Buffer
+	var written []uint32
 	c := &commandVolumeFsck{
 		writer:     &out,
 		tempFolder: tempFolder,
@@ -229,20 +237,30 @@ func TestFsckRepairFailsWhenReferencedNeedleIsTombstonedOnAReplica(t *testing.T)
 		readNeedleBlob: func(pb.ServerAddress, uint32, needle_map.NeedleValue) ([]byte, error) {
 			return []byte("blob"), nil
 		},
-		writeNeedleBlobIfAbsent: func(pb.ServerAddress, uint32, needle_map.NeedleValue, []byte) error {
-			// WriteNeedleBlobIfAbsent refuses tombstones in .idx with AlreadyExists.
-			return status.Error(codes.AlreadyExists, "needle already has an index entry")
+		writeNeedleBlobIfAbsent: func(_ pb.ServerAddress, vid uint32, _ needle_map.NeedleValue, _ []byte) error {
+			if vid == volumeId {
+				// WriteNeedleBlobIfAbsent refuses tombstones in .idx with AlreadyExists.
+				return status.Error(codes.AlreadyExists, "needle already has an index entry")
+			}
+			written = append(written, vid)
+			return nil
 		},
 	}
 	volumes := map[string]map[uint32]VInfo{
-		"dnA": {volumeId: {server: "a:8080", collection: "b"}},
-		"dnB": {volumeId: {server: "b:8080", collection: "b"}},
+		"dnA": {volumeId: {server: "a:8080", collection: "b"}, laterVolumeId: {server: "a:8080", collection: "b"}},
+		"dnB": {volumeId: {server: "b:8080", collection: "b"}, laterVolumeId: {server: "b:8080", collection: "b"}},
 	}
 	repaired, _, err := c.repairMissingFromReplicas(volumes, getFilerFileIdFile)
-	if err == nil {
-		t.Fatalf("repair succeeded (repaired=%d) when referenced needle 1 is tombstoned on dnB:\n%s", repaired, out.String())
+	if err != nil {
+		t.Fatalf("repair stopped: %v\n%s", err, out.String())
 	}
-	if !strings.Contains(err.Error(), "tombstoned") || !strings.Contains(err.Error(), "b:8080") {
-		t.Fatalf("unexpected error %v, want tombstoned replica b:8080 named", err)
+	if c.tombstonedReferenced != 1 {
+		t.Fatalf("tombstoned referenced needles counted %d, want 1\n%s", c.tombstonedReferenced, out.String())
+	}
+	if !strings.Contains(out.String(), "11,1 /buckets/b/one: tombstoned on b:8080 while live on a:8080") {
+		t.Fatalf("the tombstoned replica is not named:\n%s", out.String())
+	}
+	if repaired != 1 || len(written) != 1 || written[0] != laterVolumeId {
+		t.Fatalf("repaired %d, written %v; the later volume must still be repaired", repaired, written)
 	}
 }

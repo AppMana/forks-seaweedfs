@@ -127,9 +127,9 @@ func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsck
 				}
 			}
 		}
-		if len(tombstoned) > 0 {
-			target := replicas[tombstoned[0]]
-			return fmt.Errorf("repair %d,%x (%s) on %s: needle is tombstoned while live on %s", vid, uint64(needleId), itemPath, target.info.server, sourceServer)
+		for _, i := range tombstoned {
+			c.tombstonedReferenced++
+			fmt.Fprintf(c.writer, "%d,%x %s: tombstoned on %s while live on %s\n", vid, uint64(needleId), itemPath, replicas[i].info.server, sourceServer)
 		}
 		return nil
 	})

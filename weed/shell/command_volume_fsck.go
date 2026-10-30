@@ -68,6 +68,9 @@ type commandVolumeFsck struct {
 	verifyNeedle              *bool
 	filerSigningKey           string
 	unresolvedManifestEntries atomic.Int64
+	// tombstonedReferenced counts filer-referenced needles live on one replica
+	// and tombstoned on another; a deletion sync would remove the live copy.
+	tombstonedReferenced int
 	// Missing-reference scans may encounter chunks outside the bucket's
 	// collection. Keep their real locations before filtering the topology;
 	// lazily inspect those referenced volumes instead of calling them absent.
@@ -177,6 +180,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	// unresolved-manifest counter so a previous failed run can't permanently
 	// suppress -reallyDeleteFromVolume in this session.
 	c.unresolvedManifestEntries.Store(0)
+	c.tombstonedReferenced = 0
 	c.purgedDirs = make(map[util.FullPath]struct{})
 	c.indexRevisions = nil
 
@@ -409,24 +413,37 @@ func (c *commandVolumeFsck) checkVolumes(dataNodeVolumeIdToVInfo map[string]map[
 		}
 		// volume file ids subtract filer file ids
 		extraErr := c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, applyPurgingEffective, uint64(checks.modifyFromAtNs), uint64(checks.cutoffFromAtNs), checks.maxOrphanPercent)
-		if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 {
-			unresolvedErr := fmt.Errorf("incomplete fsck: %d entries have unresolved chunk manifests; no purge was authorized", unresolved)
-			if extraErr != nil {
-				return fmt.Errorf("%w; findExtraChunksInVolumeServers: %w", unresolvedErr, extraErr)
-			}
-			return unresolvedErr
-		}
-		if extraErr != nil {
-			return fmt.Errorf("findExtraChunksInVolumeServers: %w", extraErr)
+		if err := c.runError(extraErr); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
+// runError assembles the run's failure. A tombstoned referenced needle is
+// reported first, so a caller matching only the leading error does not take
+// this run for one that is safe to sync deletions after.
+func (c *commandVolumeFsck) runError(extraErr error) error {
+	var errs []string
+	if c.tombstonedReferenced > 0 {
+		errs = append(errs, fmt.Sprintf("%d referenced needle(s) are tombstoned on a replica while live on another", c.tombstonedReferenced))
+	}
+	if unresolved := c.unresolvedManifestEntries.Load(); unresolved > 0 {
+		errs = append(errs, fmt.Sprintf("incomplete fsck: %d entries have unresolved chunk manifests; no purge was authorized", unresolved))
+	}
+	if extraErr != nil {
+		errs = append(errs, fmt.Sprintf("findExtraChunksInVolumeServers: %v", extraErr))
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(errs, "; "))
+}
+
 func (c *commandVolumeFsck) repairAndReport(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, refsFile func(tempFolder string, vid uint32) string) error {
 	repaired, lost, err := c.repairMissingFromReplicas(dataNodeVolumeIdToVInfo, refsFile)
-	fmt.Fprintf(c.writer, "repaired %d missing replica needle(s); %d referenced needle(s) on no replica\n", repaired, lost)
+	fmt.Fprintf(c.writer, "repaired %d missing replica needle(s); %d referenced needle(s) on no replica; %d referenced needle(s) tombstoned on a replica\n", repaired, lost, c.tombstonedReferenced)
 	return err
 }
 

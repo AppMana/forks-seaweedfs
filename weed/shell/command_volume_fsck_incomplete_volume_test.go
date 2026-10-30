@@ -159,3 +159,22 @@ func TestFsckMultiReplicaIncompleteVolumeAndPurgeFailureAreBothReported(t *testi
 		t.Fatalf("error %q must report both incomplete purge on [8] and incomplete scan on [7]\n%s", err.Error(), out.String())
 	}
 }
+
+// The divergence job syncs deletions after a run whose only error is an
+// incomplete volume scan. A tombstoned referenced needle makes that sync
+// delete a live copy, so its error must lead and keep the run from matching.
+func TestFsckRunErrorLeadsWithTombstonedReferencedNeedles(t *testing.T) {
+	c := &commandVolumeFsck{}
+	incomplete := errors.New("incomplete scan on volumes [7]: read needle meta")
+	if got := c.runError(incomplete).Error(); got != "findExtraChunksInVolumeServers: incomplete scan on volumes [7]: read needle meta" {
+		t.Fatalf("incomplete-scan error = %q", got)
+	}
+	c.tombstonedReferenced = 2
+	c.unresolvedManifestEntries.Store(1)
+	got := c.runError(incomplete).Error()
+	if !strings.HasPrefix(got, "2 referenced needle(s) are tombstoned") ||
+		!strings.Contains(got, "1 entries have unresolved chunk manifests") ||
+		!strings.Contains(got, "incomplete scan on volumes [7]") {
+		t.Fatalf("run error = %q, want the tombstoned needles first and every other error kept", got)
+	}
+}

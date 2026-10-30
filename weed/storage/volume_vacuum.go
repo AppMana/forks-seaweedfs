@@ -111,6 +111,8 @@ func (v *Volume) validateCompactSource() error {
 }
 
 func (v *Volume) checkCompactSource() error {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 	return v.validateCompactSource()

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -75,6 +76,7 @@ func newSilentFilerWFS(t *testing.T) *WFS {
 	wfs.option.FilerAddresses = []pb.ServerAddress{
 		pb.NewServerAddressWithGrpcPort("127.0.0.1:1", listener.Addr().(*net.TCPAddr).Port),
 	}
+	wfs.dhMap = NewDirectoryHandleToInode()
 	wfs.streamMutate = newStreamMutateMux(wfs)
 	old := filerReplyTimeout
 	filerReplyTimeout = 300 * time.Millisecond
@@ -129,6 +131,62 @@ func TestFilerRequestsGiveUpOnASilentFiler(t *testing.T) {
 		var out fuse.EntryOut
 		if status := wfs.Lookup(nil, &fuse.InHeader{NodeId: parent}, "missing", &out); status == fuse.OK {
 			t.Error("lookup succeeded against a silent filer")
+		}
+	})
+	withinDeadline(t, "refreshEntryForRead", func() {
+		fileInode := wfs.inodeToPath.Lookup(util.FullPath("/dir/f"), time.Now().Unix(), false, false, 0, true)
+		fh, _, _, _ := wfs.fhMap.AcquireFileHandle(wfs, fileInode, &filer_pb.Entry{
+			Name:       "f",
+			Attributes: &filer_pb.FuseAttributes{Inode: fileInode, FileMode: 0100644},
+		}, 1, 0)
+		if fh.refreshEntryForRead(context.Background()) {
+			t.Error("refreshEntryForRead succeeded against a silent filer")
+		}
+	})
+	withinDeadline(t, "syncHardLinkSiblings", func() {
+		hlId := []byte("hl-group-1")
+		linkInode := wfs.inodeToPath.Lookup(util.FullPath("/dir/hl1"), time.Now().Unix(), false, true, 0, true)
+		wfs.inodeToPath.AddPath(linkInode, util.FullPath("/dir/hl2"))
+		if err := wfs.metaCache.InsertEntry(context.Background(), &filer.Entry{
+			FullPath:        "/dir/hl2",
+			Attr:            filer.Attr{Mode: 0100644, Inode: linkInode},
+			HardLinkId:      hlId,
+			HardLinkCounter: 2,
+		}, 1); err != nil {
+			t.Fatalf("InsertEntry: %v", err)
+		}
+		wfs.syncHardLinkSiblings(context.Background(), linkInode, &filer_pb.Entry{
+			Name:            "hl1",
+			HardLinkId:      hlId,
+			HardLinkCounter: 1,
+			Attributes:      &filer_pb.FuseAttributes{Ctime: time.Now().Unix()},
+		}, 100, "/dir/hl1")
+		updated, _, err := wfs.metaCache.FindEntry(context.Background(), "/dir/hl2")
+		if err != nil || updated == nil || updated.HardLinkCounter != 1 {
+			t.Errorf("syncHardLinkSiblings did not fall back to local counter patch: entry=%+v err=%v", updated, err)
+		}
+	})
+	withinDeadline(t, "rootEntry", func() {
+		prevRoot := wfs.option.FilerMountRootPath
+		wfs.option.FilerMountRootPath = "/mnt"
+		wfs.invalidateStoredRootEntry()
+		defer func() { wfs.option.FilerMountRootPath = prevRoot }()
+		entry, _, status := wfs.maybeLoadEntry(context.Background(), "/mnt")
+		if status != fuse.OK || entry == nil {
+			t.Errorf("maybeLoadEntry(/mnt) = %v, %v; want fallback root entry", entry, status)
+		}
+	})
+	withinDeadline(t, "readdir", func() {
+		dhid, _ := wfs.AcquireDirectoryHandle()
+		defer wfs.ReleaseDirectoryHandle(dhid)
+		var out fuse.DirEntryList
+		if status := wfs.ReadDir(nil, &fuse.ReadIn{
+			InHeader: fuse.InHeader{NodeId: parent},
+			Fh:       uint64(dhid),
+			Offset:   0,
+			Size:     4096,
+		}, &out); status == fuse.OK {
+			t.Error("readdir succeeded against a silent filer")
 		}
 	})
 }

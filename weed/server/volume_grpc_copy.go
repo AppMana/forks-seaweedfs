@@ -57,7 +57,8 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 	var dataBaseFileName, indexBaseFileName, idxFileName, datFileName string
 	var hasRemoteDatFile bool
 	var location *storage.DiskLocation
-	var copyReservedSpace uint64
+	var copyReservedSpace, copyCommittedSpace uint64
+	var volumeMounted bool
 	err = operation.WithVolumeServerClientOptions(true, pb.ServerAddress(req.SourceDataNode), func(client volume_server_pb.VolumeServerClient) (err error) {
 		sourceVolumeStatus, err = client.VolumeStatus(stream.Context(), &volume_server_pb.VolumeStatusRequest{
 			VolumeId: req.VolumeId,
@@ -123,6 +124,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			if n > 0 {
 				vs.store.CommitFreeLocation(location, n)
 				copyReservedSpace -= n
+				copyCommittedSpace += n
 			}
 		}
 		newCopyProgress := func(skip uint64) func(int64) {
@@ -134,15 +136,6 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 				}
 			}
 		}
-		defer func() {
-			if err != nil {
-				// The staging directory is removed below. Zero the charge
-				// before the outer defer sees the same error, or it would be
-				// released twice.
-				vs.store.ReleaseFreeLocation(location, copyReservedSpace)
-				copyReservedSpace = 0
-			}
-		}()
 
 		dataBaseFileName = storage.StagedVolumeFileName(location.Directory, volFileInfoResp.Collection, int(req.VolumeId))
 		indexBaseFileName = storage.StagedVolumeFileName(location.IdxDirectory, volFileInfoResp.Collection, int(req.VolumeId))
@@ -245,20 +238,22 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		return nil
 	}, vs.grpcDialOption, vs.guardedGrpcDialOption(req.SourceDataNode))
 
-	if dataBaseFileName != "" {
-		defer func() {
+	defer func() {
+		if dataBaseFileName != "" {
 			os.RemoveAll(filepath.Dir(dataBaseFileName))
 			os.RemoveAll(filepath.Dir(indexBaseFileName))
-		}()
-	}
-	defer func() {
+		}
 		if location == nil {
 			return
 		}
-		// A copy that did not land returns its headroom; a landed one settles
-		// it, the charge and the new usage cancelling out.
-		if err != nil {
+		// A copy that did not land returns its headroom after the staging
+		// files are removed; a landed one settles it, the charge and the new
+		// usage cancelling out.
+		if !volumeMounted {
 			vs.store.ReleaseFreeLocation(location, copyReservedSpace)
+			if copyCommittedSpace > 0 {
+				location.AvailableSpace.Add(copyCommittedSpace)
+			}
 		} else {
 			vs.store.CommitFreeLocation(location, copyReservedSpace)
 		}
@@ -309,6 +304,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 	if err != nil {
 		return fmt.Errorf("failed to mount or validate volume %d: %w", req.VolumeId, err)
 	}
+	volumeMounted = true
 
 	if err = stream.Send(&volume_server_pb.VolumeCopyResponse{
 		LastAppendAtNs: lastAppendAtNs,

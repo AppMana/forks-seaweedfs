@@ -331,7 +331,9 @@ func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetad
 	event.TsNs = tsNs
 	// Still before the mutation's caller is answered, and at the position a
 	// reader of this log meets the event.
-	f.dirWriters.note(tsNs, slices.Clone(event.EventNotification.GetSignatures()), ChangedDirectories(event)...)
+	dirs := ChangedDirectories(event)
+	f.dirChanges.note(tsNs, dirs...)
+	f.dirWriters.note(tsNs, slices.Clone(event.EventNotification.GetSignatures()), dirs...)
 
 }
 

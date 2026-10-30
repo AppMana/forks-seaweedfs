@@ -678,7 +678,7 @@ func (wfs *WFS) maybeLoadEntry(ctx context.Context, fullpath util.FullPath) (*fi
 
 	// return a valid entry for the mount root
 	if string(fullpath) == wfs.option.FilerMountRootPath {
-		return wfs.rootEntry(name), entryVersion{}, fuse.OK
+		return wfs.rootEntry(ctx, name), entryVersion{}, fuse.OK
 	}
 
 	entry, version, status := wfs.lookupEntry(ctx, fullpath)
@@ -693,7 +693,7 @@ func (wfs *WFS) maybeLoadEntry(ctx context.Context, fullpath util.FullPath) (*fi
 // attributes come from the mount options; everything else the filer stores
 // for the root (extended attributes, quota, times) is carried along so a
 // rewrite of the root does not erase it.
-func (wfs *WFS) rootEntry(name string) *filer_pb.Entry {
+func (wfs *WFS) rootEntry(ctx context.Context, name string) *filer_pb.Entry {
 	entry := &filer_pb.Entry{
 		Name:        name,
 		IsDirectory: true,
@@ -705,7 +705,7 @@ func (wfs *WFS) rootEntry(name string) *filer_pb.Entry {
 			Crtime:   wfs.option.MountCtime.Unix(),
 		},
 	}
-	stored := wfs.storedRootEntry()
+	stored := wfs.storedRootEntry(ctx)
 	if stored == nil {
 		return entry
 	}
@@ -723,11 +723,29 @@ func (wfs *WFS) rootEntry(name string) *filer_pb.Entry {
 // storedRootEntry returns a copy of the filer's entry for the mount root, or
 // nil when the filer has none. The entry is refetched after
 // storedRootValidity and after every save of the root.
-func (wfs *WFS) storedRootEntry() *filer_pb.Entry {
+func (wfs *WFS) storedRootEntry(ctx context.Context) *filer_pb.Entry {
 	wfs.storedRootMu.Lock()
 	defer wfs.storedRootMu.Unlock()
 	if wfs.storedRootFetched.IsZero() || time.Since(wfs.storedRootFetched) > storedRootValidity {
-		entry, _, _, err := filer_pb.GetEntry(context.Background(), wfs, util.FullPath(wfs.option.FilerMountRootPath))
+		rootPath := util.FullPath(wfs.option.FilerMountRootPath)
+		rootDir, rootName := rootPath.DirAndName()
+		waitCtx, cancel := filerReplyContext(ctx)
+		defer cancel()
+		entry, err := awaitFilerReply(waitCtx, "load mount root "+string(rootPath), func() (*filer_pb.Entry, error) {
+			var fetched *filer_pb.Entry
+			err := wfs.withFilerClient(waitCtx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+				resp, lookupErr := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
+					Directory: rootDir,
+					Name:      rootName,
+				})
+				if lookupErr != nil {
+					return lookupErr
+				}
+				fetched = resp.Entry
+				return nil
+			})
+			return fetched, err
+		})
 		if err != nil && err != filer_pb.ErrNotFound {
 			// Keep the last known entry rather than presenting a root without
 			// its attributes on a transient filer error.

@@ -76,7 +76,7 @@ func beginReplicaRead(ctx context.Context, host string) func(bytes int, err erro
 	start := time.Now()
 	return func(bytes int, err error) {
 		l.inflight.Add(-1)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || (err != nil && bytes <= 0) {
 			return
 		}
 		recordReadCost(host, time.Since(start), bytes)

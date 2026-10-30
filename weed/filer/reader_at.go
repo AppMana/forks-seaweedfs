@@ -159,15 +159,7 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 }
 
 func NewChunkReaderAtFromClient(ctx context.Context, readerCache *ReaderCache, chunkViews *IntervalList[*ChunkView], fileSize int64, prefetchCount int) *ChunkReadAt {
-
-	return &ChunkReadAt{
-		chunkViews:    chunkViews,
-		fileSize:      fileSize,
-		readerCache:   readerCache,
-		readerPattern: NewReaderPattern(),
-		prefetchCount: prefetchCount,
-		ctx:           ctx,
-	}
+	return NewChunkReaderAtFromClientWithMode(ctx, readerCache, chunkViews, fileSize, prefetchCount, ReaderCacheModeAuto)
 }
 
 // NewChunkReaderAtFromClientWithMode is like NewChunkReaderAtFromClient but
@@ -177,12 +169,17 @@ func NewChunkReaderAtFromClient(ctx context.Context, readerCache *ReaderCache, c
 // so a known-mmap-heavy workload can be configured to always cache whole
 // chunks rather than depend on the heuristic classifying it correctly.
 func NewChunkReaderAtFromClientWithMode(ctx context.Context, readerCache *ReaderCache, chunkViews *IntervalList[*ChunkView], fileSize int64, prefetchCount int, readerCacheMode ReaderCacheMode) *ChunkReadAt {
-
+	rp := NewReaderPatternWithMode(readerCacheMode)
+	if chunkViews != nil {
+		if front := chunkViews.Front(); front != nil && front.StartOffset > 0 {
+			rp.readFrontier = front.StartOffset
+		}
+	}
 	return &ChunkReadAt{
 		chunkViews:    chunkViews,
 		fileSize:      fileSize,
 		readerCache:   readerCache,
-		readerPattern: NewReaderPatternWithMode(readerCacheMode),
+		readerPattern: rp,
 		prefetchCount: prefetchCount,
 		ctx:           ctx,
 	}
@@ -285,6 +282,22 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		n += zero(p, gap.start, gap.length)
 	}
 
+	// If the stream is currently positioned in the first task's chunk (e.g. an
+	// unaligned sequential read straddling a chunk boundary), finish reading
+	// that chunk first so its stream pin and budget slot are released before
+	// advancing to the next chunk(s).
+	if len(tasks) > 1 && !c.readerPattern.IsRandomMode() && c.stream.isPinnedTo(tasks[0].chunk.FileId) {
+		first := tasks[0]
+		copied, readErr := c.readChunkSliceAt(ctx, p[first.bufferStart:first.bufferEnd], first.chunk, nil, first.chunkOffset)
+		ts = max(ts, first.chunk.ModifiedTsNs)
+		if readErr != nil {
+			glog.Errorf("fetching chunk %+v: %v\n", first.chunk, readErr)
+			return n + copied, ts, readErr
+		}
+		n += copied
+		tasks = tasks[1:]
+	}
+
 	// If only one chunk or random access mode, use sequential reading
 	if len(tasks) <= 1 || c.readerPattern.IsRandomMode() {
 		for _, task := range tasks {
@@ -297,6 +310,12 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 			n += copied
 		}
 	} else {
+		// Release any stale pin before starting parallel chunk reads; the final
+		// task in the slice will pin the chunk the stream ends in.
+		if !c.stream.isPinnedTo(tasks[len(tasks)-1].chunk.FileId) {
+			c.readerCache.releaseStream(&c.stream)
+		}
+
 		// Parallel chunk fetching for multiple chunks
 		// This significantly improves throughput when chunks are on different volume servers
 		g, gCtx := errgroup.WithContext(ctx)
@@ -311,10 +330,17 @@ func (c *ChunkReadAt) doReadAt(ctx context.Context, p []byte, offset int64) (n i
 		}
 		g.SetLimit(concurrency)
 
-		for _, task := range tasks {
+		for i, task := range tasks {
+			isLastTask := i == len(tasks)-1
 			g.Go(func() error {
 				// Read directly into the correct position in the output buffer
-				copied, readErr := c.readChunkSliceAtForParallel(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, task.chunkOffset)
+				var copied int
+				var readErr error
+				if isLastTask {
+					copied, readErr = c.readChunkSliceAt(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, nil, task.chunkOffset)
+				} else {
+					copied, readErr = c.readChunkSliceAtForParallel(gCtx, p[task.bufferStart:task.bufferEnd], task.chunk, task.chunkOffset)
+				}
 				task.bytesRead = copied
 				task.modifiedTsNs = task.chunk.ModifiedTsNs
 				return readErr
@@ -414,7 +440,7 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 		// A promoted random read is not a stream position: pinning it would
 		// drop the chunk as soon as the next random read moved the pin, and
 		// every revisit would download it again.
-		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+		shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 		return c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 	}
 
@@ -424,7 +450,7 @@ func (c *ChunkReadAt) readChunkSliceAt(ctx context.Context, buffer []byte, chunk
 	// in the same chunk each paid a separate network round-trip. Promotion
 	// preserves that fix without forcing a whole-chunk transfer for a chunk
 	// that was touched only once.
-	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+	shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	// The previous chunk is released through the stream pin rather than
 	// UnCache: the buffer is shared, and other streams may still be reading it.
 	n, err = c.readerCache.readChunkAt(ctx, &c.stream, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
@@ -454,7 +480,7 @@ func (c *ChunkReadAt) readChunkSliceAtForParallel(ctx context.Context, buffer []
 		}
 		return c.readerCache.fetchChunkRange(ctx, buffer, chunkView, int64(offset))
 	}
-	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+	shouldCache := chunkView.ChunkSize <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	return c.readerCache.ReadChunkAt(ctx, buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 }
 

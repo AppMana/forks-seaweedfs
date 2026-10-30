@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -75,7 +76,13 @@ func LookupFileId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, fileId s
 		}
 	}
 
-	return "http://" + localUrls[rand.IntN(len(localUrls))] + "/" + fileId, lookup.Jwt, nil
+	fullUrls := make([]string, len(localUrls))
+	perm := rand.Perm(len(localUrls))
+	for i, idx := range perm {
+		fullUrls[i] = "http://" + localUrls[idx] + "/" + fileId
+	}
+	ordered := util_http.ReachableFirst(fullUrls)
+	return ordered[0], lookup.Jwt, nil
 }
 
 func LookupVolumeId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid string) (*LookupResult, error) {

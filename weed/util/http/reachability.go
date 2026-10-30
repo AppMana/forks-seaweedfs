@@ -23,6 +23,21 @@ func recordReachable(host string) {
 	unreachable.Delete(host)
 }
 
+// RecordUnreachable marks rawUrl's host as unreachable so subsequent
+// ReachableFirst calls try healthy replicas first.
+func RecordUnreachable(rawUrl string) {
+	if host := hostOf(rawUrl); host != "" {
+		recordUnreachable(host)
+	}
+}
+
+// RecordReachable clears any unreachable mark for rawUrl's host.
+func RecordReachable(rawUrl string) {
+	if host := hostOf(rawUrl); host != "" {
+		recordReachable(host)
+	}
+}
+
 // ReachableFirst orders urls so that hosts which recently failed to answer
 // come last, keeping the order within each group. Once the retry interval has
 // passed, the first read to ask claims the probe and tries that host first;

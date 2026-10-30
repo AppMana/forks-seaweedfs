@@ -273,10 +273,10 @@ func sortedKeys(keys []uint64) string {
 	return fmt.Sprint(sorted)
 }
 
-// Production 2026-10-29: the master vacuumed eleven volumes during one
-// ~70 min filer walk. Every needle after the first garbage moved, the
-// orphan candidates' copied offsets no longer held them, and the run failed
-// with "incomplete fsck for volume 67885: 4 needle metadata reads failed".
+// The master's periodic vacuum can compact volumes during a long filer walk.
+// Every needle after the first garbage moves, the orphan candidates' copied
+// offsets no longer hold them, and the run used to fail with "incomplete fsck
+// for volume N: M needle metadata reads failed".
 // A compaction is not lost metadata: the replica's index is copied again
 // and the candidates are read at their new offsets. A needle deleted and
 // vacuumed away meanwhile is no longer an orphan and is not purged.

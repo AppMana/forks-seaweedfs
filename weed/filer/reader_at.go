@@ -159,15 +159,7 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 }
 
 func NewChunkReaderAtFromClient(ctx context.Context, readerCache *ReaderCache, chunkViews *IntervalList[*ChunkView], fileSize int64, prefetchCount int) *ChunkReadAt {
-
-	return &ChunkReadAt{
-		chunkViews:    chunkViews,
-		fileSize:      fileSize,
-		readerCache:   readerCache,
-		readerPattern: NewReaderPattern(),
-		prefetchCount: prefetchCount,
-		ctx:           ctx,
-	}
+	return NewChunkReaderAtFromClientWithMode(ctx, readerCache, chunkViews, fileSize, prefetchCount, ReaderCacheModeAuto)
 }
 
 // NewChunkReaderAtFromClientWithMode is like NewChunkReaderAtFromClient but
@@ -177,12 +169,17 @@ func NewChunkReaderAtFromClient(ctx context.Context, readerCache *ReaderCache, c
 // so a known-mmap-heavy workload can be configured to always cache whole
 // chunks rather than depend on the heuristic classifying it correctly.
 func NewChunkReaderAtFromClientWithMode(ctx context.Context, readerCache *ReaderCache, chunkViews *IntervalList[*ChunkView], fileSize int64, prefetchCount int, readerCacheMode ReaderCacheMode) *ChunkReadAt {
-
+	rp := NewReaderPatternWithMode(readerCacheMode)
+	if chunkViews != nil {
+		if front := chunkViews.Front(); front != nil && front.StartOffset > 0 {
+			rp.readFrontier = front.StartOffset
+		}
+	}
 	return &ChunkReadAt{
 		chunkViews:    chunkViews,
 		fileSize:      fileSize,
 		readerCache:   readerCache,
-		readerPattern: NewReaderPatternWithMode(readerCacheMode),
+		readerPattern: rp,
 		prefetchCount: prefetchCount,
 		ctx:           ctx,
 	}

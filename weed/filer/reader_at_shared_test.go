@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
@@ -474,5 +475,123 @@ func TestChunkReadAtPinnedEvictionFallsBackWhenAllPinned(t *testing.T) {
 	}
 	if !isRetained(rc, "chunk2") {
 		t.Fatal("new downloader missing after pinned fallback eviction")
+	}
+}
+
+// An open-ended or large HTTP Range request starting past SeqTolerance (8 MiB)
+// builds a ChunkReadAt whose first ChunkView starts at the range offset. Reading
+// sequentially from the start of that range must not be misclassified as random
+// access (which range-fetches slice 0 and then re-downloads the whole chunk on
+// slice 1).
+func TestRangedChunkReadAtStartingPastSeqToleranceStaysSequential(t *testing.T) {
+	const rangeStart = 10 << 20 // 10 MiB > SeqTolerance (8 MiB)
+	const chunkSize = 1 << 20
+	const sliceSize = 256 << 10
+	const numChunks = 4
+
+	var mu sync.Mutex
+	fetches := map[string]int{}
+	rc := NewReaderCache(32, newMockChunkCacheForReaderCache(), func(context.Context, string) ([]string, error) {
+		return []string{"unused"}, nil
+	}, nil)
+	defer rc.destroy()
+	rc.fetchChunkDataFn = func(_ context.Context, buffer []byte, _ []string, _ []byte, _ bool, _ bool, _ int64, fileId string, _ util_http.RefreshUrlsFunc) (int, error) {
+		mu.Lock()
+		fetches[fileId]++
+		mu.Unlock()
+		return len(buffer), nil
+	}
+
+	views := NewIntervalList[*ChunkView]()
+	for i := 0; i < numChunks; i++ {
+		off := int64(rangeStart + i*chunkSize)
+		views.AppendInterval(&Interval[*ChunkView]{
+			StartOffset: off,
+			StopOffset:  off + chunkSize,
+			Value: &ChunkView{
+				FileId:     fmt.Sprintf("range-chunk-%d", i),
+				ViewSize:   chunkSize,
+				ViewOffset: off,
+				ChunkSize:  chunkSize,
+			},
+		})
+	}
+
+	reader := NewChunkReaderAtFromClient(context.Background(), rc, views, int64(rangeStart+numChunks*chunkSize), DefaultPrefetchCount)
+	defer reader.ReleaseStream()
+
+	buf := make([]byte, sliceSize)
+	for off := int64(rangeStart); off < int64(rangeStart+numChunks*chunkSize); off += sliceSize {
+		n, err := reader.ReadAt(buf, off)
+		if (err != nil && err != io.EOF) || n != sliceSize {
+			t.Fatalf("ReadAt(%d): n=%d err=%v", off, n, err)
+		}
+	}
+
+	if reader.readerPattern.IsRandomMode() {
+		t.Fatalf("ranged sequential reader entered RandomMode")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 0; i < numChunks; i++ {
+		fid := fmt.Sprintf("range-chunk-%d", i)
+		if fetches[fid] != 1 {
+			t.Errorf("%s fetched %d times, want 1", fid, fetches[fid])
+		}
+	}
+}
+
+// A sequential stream reading across a 64 MiB FileChunkSection boundary in
+// ChunkGroup must preserve its sequential ReaderPattern across sections rather
+// than dropping into RandomMode at 64 MiB, 128 MiB, etc.
+func TestChunkGroupSequentialAcrossSectionBoundaryStaysSequential(t *testing.T) {
+	const chunkSize = 1 << 20
+	const sliceSize = 256 << 10
+
+	var mu sync.Mutex
+	fetches := map[string]int{}
+
+	chunks := []*filer_pb.FileChunk{
+		{
+			FileId: "sec0-last",
+			Offset: SectionSize - chunkSize,
+			Size:   chunkSize,
+		},
+		{
+			FileId: "sec1-first",
+			Offset: SectionSize,
+			Size:   chunkSize,
+		},
+	}
+
+	group, err := NewChunkGroup(func(context.Context, string) ([]string, error) {
+		return []string{"unused"}, nil
+	}, (*chunk_cache.TieredChunkCache)(nil), chunks, 16, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+
+	group.readerCache.fetchChunkDataFn = func(_ context.Context, buffer []byte, _ []string, _ []byte, _ bool, _ bool, _ int64, fileId string, _ util_http.RefreshUrlsFunc) (int, error) {
+		mu.Lock()
+		fetches[fileId]++
+		mu.Unlock()
+		return len(buffer), nil
+	}
+
+	fileSize := int64(SectionSize + chunkSize)
+	buf := make([]byte, sliceSize)
+	for off := int64(SectionSize - chunkSize); off < fileSize; off += sliceSize {
+		n, _, err := group.ReadDataAt(context.Background(), fileSize, buf, off)
+		if (err != nil && err != io.EOF) || n != sliceSize {
+			t.Fatalf("ReadDataAt(%d): n=%d err=%v", off, n, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fetches["sec1-first"] != 1 {
+		t.Errorf("sec1-first at 64 MiB boundary fetched %d times, want 1", fetches["sec1-first"])
 	}
 }

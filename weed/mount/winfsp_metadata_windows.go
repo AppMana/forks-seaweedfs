@@ -30,6 +30,9 @@ func applyWindowsFlags(st *cgofuse.Stat_t, extended map[string][]byte) int {
 }
 
 func (a *winfspFS) Chflags(path string, flags uint32) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	if flags & ^uint32(windowsFlagsMask) != 0 {
 		return -cgofuse.EINVAL
 	}
@@ -44,6 +47,9 @@ func (a *winfspFS) Chflags(path string, flags uint32) int {
 }
 
 func (a *winfspFS) Setcrtime(path string, timestamp cgofuse.Timespec) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	if timestamp.Nsec < 0 || timestamp.Nsec >= 1e9 {
 		return -cgofuse.EINVAL
 	}

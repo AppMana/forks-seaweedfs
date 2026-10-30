@@ -28,7 +28,9 @@ type winfspFS struct {
 	caseSensitive    bool
 	identityError    error
 	basicPermissions bool
-	readOnly         bool
+	// WinFsp has no read-only option for FUSE file systems, so the adapter
+	// refuses mutations itself.
+	readOnly bool
 }
 
 func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
@@ -273,6 +275,9 @@ func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 }
 
 func (a *winfspFS) Mkdir(path string, mode uint32) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	defer track(opMkdir)()
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
@@ -293,6 +298,9 @@ func (a *winfspFS) Mkdir(path string, mode uint32) int {
 // WinFsp converts NFS special-file reparse points through Mknod and Rename.
 // Store the type and device number in the filer; no host device is created.
 func (a *winfspFS) Mknod(path string, mode uint32, device uint64) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	if device > uint64(^uint32(0)) {
 		return -cgofuse.EINVAL
 	}
@@ -316,6 +324,9 @@ func (a *winfspFS) Mknod(path string, mode uint32, device uint64) int {
 }
 
 func (a *winfspFS) Rmdir(path string) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	defer track(opRmdir)()
 	parent, name, st := a.resolveExistingParent(path)
 	if st != fuse.OK {
@@ -326,6 +337,9 @@ func (a *winfspFS) Rmdir(path string) int {
 }
 
 func (a *winfspFS) Unlink(path string) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	defer track(opUnlink)()
 	parent, name, st := a.resolveExistingParent(path)
 	if st != fuse.OK {
@@ -336,6 +350,9 @@ func (a *winfspFS) Unlink(path string) int {
 }
 
 func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	defer track(opRename)()
 	stage := "resolve source"
 	defer func() {
@@ -382,6 +399,9 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 }
 
 func (a *winfspFS) Symlink(target string, newpath string) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	parent, name, st := a.resolveParent(newpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -412,6 +432,9 @@ func (a *winfspFS) Readlink(path string) (int, string) {
 }
 
 func (a *winfspFS) Link(oldpath string, newpath string) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	oldIno, st := a.resolveInode(oldpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -433,6 +456,9 @@ func (a *winfspFS) Link(oldpath string, newpath string) int {
 }
 
 func (a *winfspFS) Chmod(path string, mode uint32) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -447,6 +473,9 @@ func (a *winfspFS) Chmod(path string, mode uint32) int {
 }
 
 func (a *winfspFS) Chown(path string, uid uint32, gid uint32) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -471,6 +500,9 @@ func (a *winfspFS) Chown(path string, uid uint32, gid uint32) int {
 }
 
 func (a *winfspFS) Utimens(path string, tmsp []cgofuse.Timespec) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -500,6 +532,9 @@ func (a *winfspFS) Access(path string, mask uint32) int {
 }
 
 func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	if a.readOnly {
+		return -cgofuse.EROFS, invalidFh
+	}
 	defer track(opCreate)()
 	parent, name, st := a.resolveParent(path)
 	if st != fuse.OK {
@@ -539,6 +574,9 @@ func (a *winfspFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (a *winfspFS) Truncate(path string, size int64, fh uint64) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	defer track(opTruncate)()
 	common := fuse.SetAttrInCommon{
 		Valid: fuse.FATTR_SIZE,
@@ -604,6 +642,9 @@ func (a *winfspFS) readDirect(ino, fh uint64, buff []byte, ofst int64) int {
 }
 
 func (a *winfspFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	defer track(opWrite)()
 	ino, ok := a.inodeFromFh(fh)
 	if !ok {
@@ -731,6 +772,9 @@ func (a *winfspFS) Fsyncdir(path string, datasync bool, fh uint64) int {
 }
 
 func (a *winfspFS) Setxattr(path string, name string, value []byte, flags int) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
@@ -760,6 +804,9 @@ func (a *winfspFS) Getxattr(path string, name string) (int, []byte) {
 }
 
 func (a *winfspFS) Removexattr(path string, name string) int {
+	if a.readOnly {
+		return -cgofuse.EROFS
+	}
 	ino, st := a.resolveInode(path)
 	if st != fuse.OK {
 		return toWinErrno(st)

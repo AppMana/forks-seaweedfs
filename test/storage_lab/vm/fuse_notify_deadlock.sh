@@ -31,7 +31,7 @@ allow_new() { while iptables -D OUTPUT -o lo -p tcp --dport $FILER_GRPC --syn -j
 allow_new
 
 pkill -x weed; sleep 1
-rm -rf /srv/data/*
+rm -rf /srv/data && mkdir -p /srv/data
 $W server -dir=/srv/data -ip=127.0.0.1 -ip.bind=127.0.0.1 -filer -filer.port=8888 \
   -master.port=9333 -volume.port=8080 -volume.max=20 >$LOG/server.log 2>&1 &
 SERVER=$!

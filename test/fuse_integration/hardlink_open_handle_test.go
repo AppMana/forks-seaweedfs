@@ -251,3 +251,44 @@ func TestOpenHandleBeforeFirstLinkWritesThroughBothNames(t *testing.T) {
 	require.NoError(t, err, "the last name lost the file")
 	require.Equal(t, "onetwo", string(got))
 }
+
+// Another mount linking a file this mount holds open with unflushed metadata:
+// the handle keeps its own attributes, but the link belongs to the file, and a
+// flush without it would split the names.
+func TestDirtyOpenHandleKeepsRemoteLink(t *testing.T) {
+	config := DefaultTestConfig()
+	fw := NewFuseTestFramework(t, config)
+	defer fw.Cleanup()
+	require.NoError(t, fw.Setup(config))
+	mountB, unmountB := fw.mountSecond(t, 0)
+	defer unmountB()
+	dirA := filepath.Join(fw.GetMountPoint(), "hardlink_dirty_remote_link")
+	dirB := filepath.Join(mountB, "hardlink_dirty_remote_link")
+	require.NoError(t, os.Mkdir(dirA, 0755))
+	a := filepath.Join(dirA, "a")
+	require.NoError(t, os.WriteFile(a, []byte("one"), 0644))
+	f, err := os.OpenFile(a, os.O_RDWR, 0)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(a, 0600))
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dirB, "a"))
+		return err == nil
+	}, 10*time.Second, 50*time.Millisecond)
+	require.NoError(t, os.Link(filepath.Join(dirB, "a"), filepath.Join(dirB, "c")))
+	require.Eventually(t, func() bool {
+		var st unix.Stat_t
+		return unix.Stat(a, &st) == nil && st.Nlink == 2
+	}, 10*time.Second, 100*time.Millisecond, "the open file's link count missed the other mount's link")
+	_, err = f.WriteAt([]byte("two"), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	c := filepath.Join(dirA, "c")
+	require.Eventually(t, func() bool {
+		got, err := os.ReadFile(c)
+		return err == nil && string(got) == "two"
+	}, 10*time.Second, 100*time.Millisecond, "the other name lost the write")
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(c, &st))
+	require.EqualValues(t, 0600, st.Mode&0777, "the other name lost the held chmod")
+	require.EqualValues(t, 2, st.Nlink)
+}

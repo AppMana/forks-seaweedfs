@@ -842,45 +842,49 @@ func TestSharedChunksConcurrentCopiesOfOneSourceAcrossTwoFilers(t *testing.T) {
 
 func TestSharedChunksConcurrentCopyAndDeleteOfTheSource(t *testing.T) {
 	for round := 0; round < 20; round++ {
-		fs, _ := newSharedStore(t)
-		filers := []*filer.Filer{newSharedFiler(t, fs), newSharedFiler(t, fs)}
-		chunks := newChunks(2)
-		putObject(t, filers[0], "/buckets/bkt/src", chunks, nil)
+		// Each round is a subtest so its store is shut down when the round
+		// ends, not when all rounds have run.
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			fs, _ := newSharedStore(t)
+			filers := []*filer.Filer{newSharedFiler(t, fs), newSharedFiler(t, fs)}
+			chunks := newChunks(2)
+			putObject(t, filers[0], "/buckets/bkt/src", chunks, nil)
 
-		var wg sync.WaitGroup
-		var linked bool
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			linked, _ = link(filers[0], "/buckets/bkt/src", "/buckets/bkt/dst", 0)
-		}()
-		go func() {
-			defer wg.Done()
-			_ = deleteObjectErr(filers[1], "/buckets/bkt/src")
-		}()
-		wg.Wait()
+			var wg sync.WaitGroup
+			var linked bool
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				linked, _ = link(filers[0], "/buckets/bkt/src", "/buckets/bkt/dst", 0)
+			}()
+			go func() {
+				defer wg.Done()
+				_ = deleteObjectErr(filers[1], "/buckets/bkt/src")
+			}()
+			wg.Wait()
 
-		deleted := append(drainDeleted(filers[0]), drainDeleted(filers[1])...)
-		if linked {
-			if e, err := filers[0].FindEntry(testCtx(), "/buckets/bkt/dst"); err == nil {
-				assertNoneDeleted(t, deleted, fids(e.GetChunks()), fmt.Sprintf("round %d: copy raced the source delete", round))
+			deleted := append(drainDeleted(filers[0]), drainDeleted(filers[1])...)
+			if linked {
+				if e, err := filers[0].FindEntry(testCtx(), "/buckets/bkt/dst"); err == nil {
+					assertNoneDeleted(t, deleted, fids(e.GetChunks()), fmt.Sprintf("round %d: copy raced the source delete", round))
+				}
 			}
-		}
-		rest := []string{}
-		for _, p := range []string{"/buckets/bkt/src", "/buckets/bkt/dst"} {
-			if _, err := filers[0].FindEntry(testCtx(), util.FullPath(p)); err == nil {
-				rest = append(rest, p)
+			rest := []string{}
+			for _, p := range []string{"/buckets/bkt/src", "/buckets/bkt/dst"} {
+				if _, err := filers[0].FindEntry(testCtx(), util.FullPath(p)); err == nil {
+					rest = append(rest, p)
+				}
 			}
-		}
-		for _, p := range rest {
-			deleteObject(t, filers[0], p)
-		}
-		deleted = append(deleted, drainDeleted(filers[0])...)
-		for _, id := range fids(chunks) {
-			if c := countOf(deleted, id); c > 2 {
-				t.Fatalf("round %d: chunk %s freed %d times", round, id, c)
+			for _, p := range rest {
+				deleteObject(t, filers[0], p)
 			}
-		}
+			deleted = append(deleted, drainDeleted(filers[0])...)
+			for _, id := range fids(chunks) {
+				if c := countOf(deleted, id); c > 2 {
+					t.Fatalf("round %d: chunk %s freed %d times", round, id, c)
+				}
+			}
+		})
 	}
 }
 
@@ -946,12 +950,16 @@ func concurrentDeleteAll(t *testing.T, filers []*filer.Filer, paths []string, ch
 
 func TestSharedChunksConcurrentDeletesOfTwoLinks(t *testing.T) {
 	for round := 0; round < 20; round++ {
-		fs, _ := newSharedStore(t)
-		filers := []*filer.Filer{newSharedFiler(t, fs), newSharedFiler(t, fs)}
-		chunks := newChunks(2)
-		putObject(t, filers[0], "/buckets/bkt/src", chunks, nil)
-		mustLink(t, filers[0], "/buckets/bkt/src", "/buckets/bkt/dst")
-		concurrentDeleteAll(t, filers, []string{"/buckets/bkt/src", "/buckets/bkt/dst"}, chunks)
+		// Each round is a subtest so its store is shut down when the round
+		// ends, not when all rounds have run.
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			fs, _ := newSharedStore(t)
+			filers := []*filer.Filer{newSharedFiler(t, fs), newSharedFiler(t, fs)}
+			chunks := newChunks(2)
+			putObject(t, filers[0], "/buckets/bkt/src", chunks, nil)
+			mustLink(t, filers[0], "/buckets/bkt/src", "/buckets/bkt/dst")
+			concurrentDeleteAll(t, filers, []string{"/buckets/bkt/src", "/buckets/bkt/dst"}, chunks)
+		})
 	}
 }
 

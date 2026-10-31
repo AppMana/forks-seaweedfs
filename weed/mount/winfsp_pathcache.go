@@ -177,16 +177,6 @@ func (c *winfspPathCache[S]) purge(key util.FullPath, prefix bool) []uint64 {
 	return pending
 }
 
-// isDir reports whether key is held and names a directory.
-func (c *winfspPathCache[S]) isDir(key util.FullPath) (dir, found bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if element, ok := c.entries[key]; ok {
-		return element.Value.(*winfspPathEntry[S]).dir, true
-	}
-	return false, false
-}
-
 // forgetStat drops the attributes cached for key, keeping its reference.
 func (c *winfspPathCache[S]) forgetStat(key util.FullPath) {
 	c.mu.Lock()

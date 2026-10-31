@@ -76,6 +76,101 @@ func (s *treeFiler) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequ
 	}}, nil
 }
 
+func (s *treeFiler) CreateEntry(_ context.Context, req *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	s.mu.Lock()
+	if req.OExcl && s.dirs[req.Directory][req.Entry.Name] != nil {
+		s.mu.Unlock()
+		return &filer_pb.CreateEntryResponse{ErrorCode: filer_pb.FilerError_ENTRY_ALREADY_EXISTS}, nil
+	}
+	s.tsNs++
+	tsNs := s.tsNs
+	s.mu.Unlock()
+	cloned := proto.Clone(req.Entry).(*filer_pb.Entry)
+	s.add(req.Directory, cloned)
+	return &filer_pb.CreateEntryResponse{MetadataEvent: &filer_pb.SubscribeMetadataResponse{
+		Directory: req.Directory, TsNs: tsNs,
+		EventNotification: &filer_pb.EventNotification{
+			NewEntry: cloned, NewParentPath: req.Directory, Signatures: req.Signatures,
+		},
+	}}, nil
+}
+
+func (s *treeFiler) DeleteEntry(_ context.Context, req *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+	s.mu.Lock()
+	old := s.dirs[req.Directory][req.Name]
+	if old == nil {
+		s.mu.Unlock()
+		return nil, filer_pb.ErrNotFound
+	}
+	delete(s.dirs[req.Directory], req.Name)
+	if len(old.HardLinkId) > 0 && old.HardLinkCounter > 1 {
+		for _, entries := range s.dirs {
+			for _, e := range entries {
+				if string(e.HardLinkId) == string(old.HardLinkId) {
+					e.HardLinkCounter = old.HardLinkCounter - 1
+				}
+			}
+		}
+	}
+	s.tsNs++
+	tsNs := s.tsNs
+	s.mu.Unlock()
+	return &filer_pb.DeleteEntryResponse{MetadataEvent: &filer_pb.SubscribeMetadataResponse{
+		Directory: req.Directory, TsNs: tsNs,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: old, Signatures: req.Signatures,
+		},
+	}}, nil
+}
+
+func (s *treeFiler) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest, stream filer_pb.SeaweedFiler_StreamRenameEntryServer) error {
+	s.mu.Lock()
+	old := s.dirs[req.OldDirectory][req.OldName]
+	if old == nil {
+		s.mu.Unlock()
+		return filer_pb.ErrNotFound
+	}
+	var replaced *filer_pb.Entry
+	if s.dirs[req.NewDirectory] != nil {
+		replaced = s.dirs[req.NewDirectory][req.NewName]
+	}
+	delete(s.dirs[req.OldDirectory], req.OldName)
+	moved := proto.Clone(old).(*filer_pb.Entry)
+	moved.Name = req.NewName
+	if s.dirs[req.NewDirectory] == nil {
+		s.dirs[req.NewDirectory] = map[string]*filer_pb.Entry{}
+	}
+	s.dirs[req.NewDirectory][req.NewName] = moved
+	if replaced != nil && len(replaced.HardLinkId) > 0 && replaced.HardLinkCounter > 1 {
+		for _, entries := range s.dirs {
+			for _, e := range entries {
+				if string(e.HardLinkId) == string(replaced.HardLinkId) {
+					e.HardLinkCounter = replaced.HardLinkCounter - 1
+				}
+			}
+		}
+	}
+	s.tsNs++
+	tsNs := s.tsNs
+	s.mu.Unlock()
+	if replaced != nil {
+		if err := stream.Send(&filer_pb.StreamRenameEntryResponse{
+			Directory: req.NewDirectory, TsNs: tsNs,
+			EventNotification: &filer_pb.EventNotification{
+				OldEntry: replaced, Signatures: req.Signatures,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return stream.Send(&filer_pb.StreamRenameEntryResponse{
+		Directory: req.OldDirectory, TsNs: tsNs + 1,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: old, NewEntry: moved, NewParentPath: req.NewDirectory, Signatures: req.Signatures,
+		},
+	})
+}
+
 func (s *treeFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -396,7 +491,7 @@ func TestWinfspConcurrentWalksReturnEveryReference(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				a.expireReferences(time.Now())
+				a.expireReferences(time.Now().Add(2 * winfspCacheTTL))
 				time.Sleep(time.Millisecond)
 			}
 		}
@@ -439,5 +534,121 @@ func TestWinfspConcurrentWalksReturnEveryReference(t *testing.T) {
 	a.expireReferences(time.Now().Add(time.Hour))
 	if size := inodeTableSize(wfs.inodeToPath); size != 1 {
 		t.Fatalf("inode table holds %d entries after concurrent walks: %v", size, trackedPaths(wfs))
+	}
+}
+
+func TestWinfspFailedCreateReturnsReference(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	ro := treeFile("readonly", 0o444)
+	ro.Attributes.Uid = 1
+	ro.Attributes.Gid = 1
+	fake.add("/d", ro)
+	wfs, a := newWinfspTreeWFS(t, fake)
+
+	if status, fh := a.Create("/d/readonly", cgofuse.O_RDWR, 0o644); status != -cgofuse.EACCES || fh != invalidFh {
+		t.Fatalf("Create on read-only file = (%d, %d), want (%d, %d)", status, fh, -cgofuse.EACCES, invalidFh)
+	}
+	a.expireReferences(time.Now().Add(time.Hour))
+	if size := inodeTableSize(wfs.inodeToPath); size != 1 {
+		t.Fatalf("inode table holds %d entries after failed Create, want 1: %v", size, trackedPaths(wfs))
+	}
+}
+
+func TestWinfspLocalRenameAndUnlinkMaintainReferencesAndPaths(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	src := treeFile("src", 0o644)
+	src.Content = []byte("new")
+	src.Attributes.FileSize = 3
+	dst := treeFile("dst", 0o644)
+	dst.Content = []byte("x")
+	dst.Attributes.FileSize = 1
+	fake.add("/d", src)
+	fake.add("/d", dst)
+	wfs, a := newWinfspTreeWFS(t, fake)
+	wfs.option.MountUid, wfs.option.MountGid = 0, 0
+
+	// Open /d/dst so its inode stays in inodeToPath, while /d/src has no
+	// cached reference when Rename runs.
+	status, fhDst := a.Open("/d/dst", cgofuse.O_RDONLY)
+	if status != 0 {
+		t.Fatalf("open /d/dst: %d", status)
+	}
+	a.expireReferences(time.Now().Add(time.Hour))
+
+	if code := a.Rename("/d/src", "/d/dst"); code != 0 {
+		t.Fatalf("rename /d/src -> /d/dst: %d", code)
+	}
+	var stat cgofuse.Stat_t
+	if code := a.Getattr("/d/dst", &stat, invalidFh); code != 0 || stat.Size != 3 {
+		t.Fatalf("getattr /d/dst after rename = %d size %d, want 0 size 3", code, stat.Size)
+	}
+	a.Release("/d/dst", fhDst)
+
+	if code := a.Link("/d/dst", "/d/linked"); code != 0 {
+		t.Fatalf("link /d/dst -> /d/linked: %d", code)
+	}
+	if !wfs.inodeToPath.HasPath("/d/linked") {
+		t.Fatal("Link did not keep /d/linked in inodeToPath")
+	}
+
+	csAdapter := newWinfspFS(wfs, true)
+	if code := csAdapter.Unlink("/d/nonexistent"); code != -cgofuse.ENOENT {
+		t.Fatalf("case-sensitive Unlink of missing file = %d, want %d", code, -cgofuse.ENOENT)
+	}
+
+	a.expireReferences(time.Now().Add(2 * time.Hour))
+	csAdapter.expireReferences(time.Now().Add(2 * time.Hour))
+	if size := inodeTableSize(wfs.inodeToPath); size != 1 {
+		t.Fatalf("inode table holds %d entries after expiry, want 1: %v", size, trackedPaths(wfs))
+	}
+}
+
+func TestWinfspRemoteHardLinkDeleteDetachesDeletedName(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	for _, name := range []string{"first", "second"} {
+		entry := treeFile(name, 0o644)
+		entry.HardLinkId = []byte("hl-remote")
+		entry.HardLinkCounter = 2
+		entry.Attributes.Inode = 4242
+		fake.add("/d", entry)
+	}
+	wfs, a := newWinfspTreeWFS(t, fake)
+
+	var stat cgofuse.Stat_t
+	for _, path := range []string{"/d/first", "/d/second"} {
+		if code := a.Getattr(path, &stat, invalidFh); code != 0 {
+			t.Fatalf("initial getattr %s: %d", path, code)
+		}
+	}
+
+	fake.remove("/d", "first")
+	surviving := treeFile("second", 0o644)
+	surviving.HardLinkId = []byte("hl-remote")
+	surviving.HardLinkCounter = 1
+	surviving.Attributes.Inode = 4242
+	fake.add("/d", surviving)
+
+	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
+		Directory: "/d", TsNs: 1000,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: treeFile("first", 0o644),
+		},
+	}, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+		t.Fatal(err)
+	}
+	wfs.metaCache.WaitForEntryInvalidations()
+
+	if code := a.Getattr("/d/first", &stat, invalidFh); code != -cgofuse.ENOENT {
+		t.Fatalf("getattr deleted link /d/first = %d, want %d", code, -cgofuse.ENOENT)
+	}
+	if code := a.Getattr("/d/second", &stat, invalidFh); code != 0 {
+		t.Fatalf("getattr surviving link /d/second = %d, want 0", code)
+	}
+	a.expireReferences(time.Now().Add(time.Hour))
+	if size := inodeTableSize(wfs.inodeToPath); size != 1 {
+		t.Fatalf("inode table holds %d entries after expiry, want 1: %v", size, trackedPaths(wfs))
 	}
 }

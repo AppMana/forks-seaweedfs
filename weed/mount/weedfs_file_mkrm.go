@@ -58,11 +58,13 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
 		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
+			wfs.Forget(inode, 1)
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
 			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
 				wfs.ReleaseHandle(openFh)
+				wfs.Forget(inode, 1)
 				return code
 			}
 			newEntry = fileHandle.GetEntry().GetEntry()
@@ -107,11 +109,13 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
 		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
+			wfs.Forget(inode, 1)
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
 			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
 				wfs.ReleaseHandle(openFh)
+				wfs.Forget(inode, 1)
 				return code
 			}
 			newEntry = fileHandle.GetEntry().GetEntry()
@@ -145,6 +149,10 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// A prior incarnation's deferred flush is still draining on this
 		// inode; wait for it to release the handle before attaching ours.
 		if !wfs.waitForPendingAsyncFlush(ctx, inode) {
+			if dlmLock != nil {
+				dlmLock.Stop()
+			}
+			wfs.Forget(inode, 1)
 			return fuse.EINTR
 		}
 	}

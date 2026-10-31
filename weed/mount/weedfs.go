@@ -1153,8 +1153,15 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 	// on addressing a moved inode by nodeid whether or not anything holds it
 	// open.
 	handled, replacedInode := wfs.invalidateOpenFileHandle(invalidation)
-	if !handled && invalidation.RenamedTo != "" {
-		_, replacedInode = wfs.inodeToPath.MovePath(invalidation.Path, invalidation.RenamedTo)
+	if !handled {
+		switch {
+		case invalidation.RenamedTo != "":
+			_, replacedInode = wfs.inodeToPath.MovePath(invalidation.Path, invalidation.RenamedTo)
+		case invalidation.Deleted && !wfs.entrySurvivedDelete(invalidation):
+			if inode, found := wfs.inodeToPath.GetInode(invalidation.Path); found {
+				wfs.inodeToPath.RemovePathForInode(invalidation.Path, inode)
+			}
+		}
 	}
 	// A rename over an existing file destroys it, so its handle must not flush
 	// the old content back over what took the name. Marked from here, holding
@@ -1261,6 +1268,18 @@ func (wfs *WFS) MountRoot() util.FullPath {
 	return util.FullPath(wfs.option.FilerMountRootPath)
 }
 
+func (wfs *WFS) entrySurvivedDelete(invalidation meta_cache.EntryInvalidation) bool {
+	if wfs.metaCache == nil {
+		return false
+	}
+	dir, _ := invalidation.Path.DirAndName()
+	if !wfs.metaCache.IsDirectoryCached(util.FullPath(dir)) {
+		return false
+	}
+	storeEntry, storeVersionTsNs, err := wfs.metaCache.FindEntry(context.Background(), invalidation.Path)
+	return err == nil && storeEntry != nil && storeVersionTsNs >= invalidation.TsNs
+}
+
 // invalidateOpenFileHandle applies one event to the handle that has the entry
 // open, reporting whether it found one: a handle owns its inode's rename
 // bookkeeping, and the caller moves the table only for inodes without one. Any
@@ -1341,11 +1360,15 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		// so no flush recreates the unlinked name. Either way the entry and
 		// dirty pages stay, so the open fd still reads its buffered writes.
 		if invalidation.Deleted {
-			fh.isDeleted = true
-			fh.deleteEpoch++
 			// A descriptor survives unlink, but a pathname must not resolve
 			// back to that descriptor (notably WinFsp's path-based Getattr).
 			wfs.inodeToPath.RemovePathForInode(filePath, inode)
+			if survivingPath, status := wfs.inodeToPath.GetPath(inode); status == fuse.OK {
+				fh.RememberPath(survivingPath)
+			} else {
+				fh.isDeleted = true
+				fh.deleteEpoch++
+			}
 		}
 		if !fh.dirtyMetadata {
 			fh.dirtyPages.Destroy()

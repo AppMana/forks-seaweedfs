@@ -83,7 +83,12 @@ func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {
 	// Every event outdates the attributes of its path, of the inode's other
 	// names (a hard link's nlink and contents), and of the parent directory.
 	if ino, found := a.wfs.inodeToPath.GetInode(event.Path); found {
-		a.forgetInodeStat(ino)
+		a.invalidateInode(ino)
+	}
+	if event.RenamedTo != "" {
+		if ino, found := a.wfs.inodeToPath.GetInode(event.RenamedTo); found {
+			a.invalidateInode(ino)
+		}
 	}
 	a.forgetStatWithParent(event.Path)
 	if event.RenamedTo != "" {
@@ -92,9 +97,13 @@ func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {
 	if event.Entry != nil && event.PreviousEntry != nil {
 		return // an update in place keeps the name
 	}
-	a.paths.purge(event.Path, event.Entry == nil && event.WasDirectory)
+	for _, ino := range a.paths.purge(event.Path, event.Entry == nil && event.WasDirectory) {
+		a.invalidateInode(ino)
+	}
 	if event.RenamedTo != "" {
-		a.paths.purge(event.RenamedTo, false)
+		for _, ino := range a.paths.purge(event.RenamedTo, false) {
+			a.invalidateInode(ino)
+		}
 	}
 }
 
@@ -112,6 +121,15 @@ func (a *winfspFS) forgetInodeStat(ino uint64) {
 	for _, path := range a.wfs.inodeToPath.GetAllPaths(ino) {
 		a.paths.forgetStat(path)
 	}
+}
+
+// invalidateInode drops cached attributes and read-ahead data for ino.
+func (a *winfspFS) invalidateInode(ino uint64) {
+	if ino <= 1 {
+		return
+	}
+	a.forgetInodeStat(ino)
+	a.readAhead.Invalidate(ino)
 }
 
 // fullPath converts a cgofuse path ('/'-separated, relative to the
@@ -339,17 +357,21 @@ func (a *winfspFS) resolveParent(path string) (uint64, string, fuse.Status) {
 	return parent, name, fuse.OK
 }
 
-func (a *winfspFS) resolveExistingParent(path string) (uint64, string, fuse.Status) {
-	parent, name, status := a.resolveParent(path)
-	if status != fuse.OK || a.caseSensitive {
-		return parent, name, status
+// resolveExisting resolves path's parent and target child, holding a lookup
+// reference on both for the caller to release. Keeping the child referenced
+// across the mutation ensures WFS sees it in inodeToPath (for MovePath and
+// hard-link sibling updates) even when the path cache had not retained it.
+func (a *winfspFS) resolveExisting(path string) (uint64, uint64, string, bool, fuse.Status) {
+	parent, requested, status := a.resolveParent(path)
+	if status != fuse.OK {
+		return 0, 0, "", false, status
 	}
-	_, actual, status := a.canonicalChildName(parent, name)
+	child, actual, dir, status := a.lookupChild(parent, requested)
 	if status != fuse.OK {
 		a.release(parent)
-		return 0, name, status
+		return 0, 0, requested, false, status
 	}
-	return parent, actual, fuse.OK
+	return parent, child, actual, dir, fuse.OK
 }
 
 func (a *winfspFS) resolveMutationName(parent uint64, requested string) (string, bool, fuse.Status) {
@@ -564,11 +586,12 @@ func (a *winfspFS) Rmdir(path string) int {
 		return -cgofuse.EROFS
 	}
 	defer track(opRmdir)()
-	parent, name, st := a.resolveExistingParent(path)
+	parent, child, name, _, st := a.resolveExisting(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
 	defer a.release(parent)
+	defer a.release(child)
 	key, keyed := a.childKey(parent, name)
 	hdr := a.header(parent)
 	status := a.wfs.Rmdir(nil, &hdr, name)
@@ -584,19 +607,17 @@ func (a *winfspFS) Unlink(path string) int {
 		return -cgofuse.EROFS
 	}
 	defer track(opUnlink)()
-	parent, name, st := a.resolveExistingParent(path)
+	parent, child, name, _, st := a.resolveExisting(path)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
 	defer a.release(parent)
+	defer a.release(child)
 	key, keyed := a.childKey(parent, name)
-	// The inode's other names lose a link.
-	ino, tracked := a.wfs.inodeToPath.GetInode(key)
 	hdr := a.header(parent)
 	status := a.wfs.Unlink(nil, &hdr, name)
-	if tracked {
-		a.forgetInodeStat(ino)
-	}
+	// The inode's other names lose a link, and any cached read-ahead is gone.
+	a.invalidateInode(child)
 	a.forgetChildStat(parent, name)
 	if status == fuse.OK && keyed {
 		a.paths.purge(key, false)
@@ -615,7 +636,7 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 			glog.V(1).Infof("winfsp rename failed at %s: %q => %q: errno %d", stage, oldpath, newpath, result)
 		}
 	}()
-	oldParent, oldName, st := a.resolveExistingParent(oldpath)
+	oldParent, oldIno, oldName, oldDir, st := a.resolveExisting(oldpath)
 	if st != fuse.OK {
 		return toWinErrno(st)
 	}
@@ -623,28 +644,24 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 	stage = "resolve destination parent"
 	newParent, newName, st := a.resolveParent(newpath)
 	if st != fuse.OK {
+		a.release(oldIno)
 		return toWinErrno(st)
 	}
 	defer a.release(newParent)
-	if !a.caseSensitive {
-		oldIno, _, oldStatus := a.canonicalChildName(oldParent, oldName)
-		newIno, canonicalNewName, newStatus := a.canonicalChildName(newParent, newName)
-		if oldStatus != fuse.OK {
-			stage = "recheck source"
-			return toWinErrno(oldStatus)
+	targetIno, canonicalNewName, _, newStatus := a.lookupChild(newParent, newName)
+	switch newStatus {
+	case fuse.OK:
+		defer a.release(targetIno)
+		// Preserve the requested spelling for a case-only rename of the
+		// same object. Otherwise replace the existing canonical target.
+		if !a.caseSensitive && targetIno != oldIno {
+			newName = canonicalNewName
 		}
-		switch newStatus {
-		case fuse.OK:
-			// Preserve the requested spelling for a case-only rename of the
-			// same object. Otherwise replace the existing canonical target.
-			if newIno != oldIno {
-				newName = canonicalNewName
-			}
-		case fuse.ENOENT:
-		default:
-			stage = "lookup destination"
-			return toWinErrno(newStatus)
-		}
+	case fuse.ENOENT:
+	default:
+		a.release(oldIno)
+		stage = "lookup destination"
+		return toWinErrno(newStatus)
 	}
 	oldKey, oldKeyed := a.childKey(oldParent, oldName)
 	newKey, newKeyed := a.childKey(newParent, newName)
@@ -655,6 +672,10 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 	}
 	stage = "core rename"
 	status := a.wfs.Rename(nil, &in, oldName, newName)
+	a.invalidateInode(oldIno)
+	if targetIno != 0 && targetIno != oldIno {
+		a.invalidateInode(targetIno)
+	}
 	a.forgetChildStat(oldParent, oldName)
 	a.forgetChildStat(newParent, newName)
 	if status == fuse.OK {
@@ -665,8 +686,11 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 		}
 		if newKeyed {
 			a.paths.purge(newKey, true)
+			a.paths.adopt(newKey, oldIno, oldDir, time.Now())
+			return toWinErrno(status)
 		}
 	}
+	a.release(oldIno)
 	return toWinErrno(status)
 }
 
@@ -737,7 +761,11 @@ func (a *winfspFS) Link(oldpath string, newpath string) int {
 	a.forgetInodeStat(oldIno)
 	a.forgetChildStat(parent, name)
 	if status == fuse.OK {
-		a.park(out.NodeId, false)
+		if key, keyed := a.childKey(parent, name); keyed {
+			a.paths.adopt(key, out.NodeId, false, time.Now())
+		} else {
+			a.park(out.NodeId, false)
+		}
 	}
 	return toWinErrno(status)
 }
@@ -852,6 +880,7 @@ func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
 	if status != fuse.OK {
 		return toWinErrno(status), invalidFh
 	}
+	a.invalidateInode(out.NodeId)
 	// Create grants a reference on the inode; the handle carries it.
 	a.retainHandle(a.fileHandle, out.Fh, out.NodeId)
 	return 0, out.Fh
@@ -979,9 +1008,9 @@ func (a *winfspFS) Release(path string, fh uint64) int {
 	if ino, ok := a.inodeFromFh(fh); ok {
 		in := fuse.ReleaseIn{InHeader: a.header(ino), Fh: fh}
 		a.wfs.Release(nil, &in)
-		a.readAhead.Release(fh)
 	}
 	if ino := a.releaseHandle(a.fileHandle, fh); ino != 0 {
+		a.readAhead.Release(fh)
 		// Whatever was cached before the open predates its writes.
 		a.forgetInodeStat(ino)
 		// WinFsp reports the path the handle was opened with, which a

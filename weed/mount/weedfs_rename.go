@@ -583,6 +583,9 @@ func (wfs *WFS) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamR
 		var sharedInode uint64
 		if len(replaced.HardLinkId) > 0 && replaced.HardLinkCounter > 1 {
 			sharedInode, _ = wfs.inodeToPath.GetInode(replacedPath)
+			if sharedInode == 0 && replaced.Attributes != nil {
+				sharedInode = replaced.Attributes.Inode
+			}
 		}
 		if err := wfs.applyLocalMetadataEvent(ctx, metadataEventFromRenameResponse(resp)); err != nil {
 			glog.Warningf("rename apply delete event: %v", err)

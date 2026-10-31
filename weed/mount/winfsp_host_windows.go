@@ -43,9 +43,6 @@ func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions, readOnly bool) *Wi
 				return
 			}
 		}
-		if inode, found := wfs.inodeToPath.GetInode(event.Path); found {
-			adapter.readAhead.Invalidate(inode)
-		}
 		action := winFspAppliedEventAction(event)
 		if action == winFspAppliedNone {
 			return

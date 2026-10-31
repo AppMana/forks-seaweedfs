@@ -166,7 +166,7 @@ func (c *winfspPathCache[S]) touch(key util.FullPath, now time.Time) {
 
 // purge drops key, and with prefix everything beneath it: a renamed or
 // removed directory takes its children's names with it.
-func (c *winfspPathCache[S]) purge(key util.FullPath, prefix bool) {
+func (c *winfspPathCache[S]) purge(key util.FullPath, prefix bool) []uint64 {
 	c.mu.Lock()
 	c.recordPurgeLocked(key, prefix)
 	var pending []uint64
@@ -183,6 +183,7 @@ func (c *winfspPathCache[S]) purge(key util.FullPath, prefix bool) {
 	}
 	c.mu.Unlock()
 	c.giveBack(pending)
+	return pending
 }
 
 // forgetStat drops the attributes cached for key, keeping its reference.

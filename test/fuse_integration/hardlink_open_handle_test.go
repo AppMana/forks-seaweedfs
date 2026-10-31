@@ -197,3 +197,24 @@ func TestSurvivingLinkCountFollowsRemoteUnlink(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond, "surviving link still reports the removed name in its link count")
 }
 
+// A file takes at most 1024 names, NTFS's limit, so what a mount records per
+// file stays bounded and Windows clients see the count they can represent.
+func TestHardLinkCountIsCapped(t *testing.T) {
+	fw := NewFuseTestFramework(t, DefaultTestConfig())
+	defer fw.Cleanup()
+	require.NoError(t, fw.Setup(DefaultTestConfig()))
+	dir := filepath.Join(fw.GetMountPoint(), "hardlink_cap")
+	require.NoError(t, os.Mkdir(dir, 0755))
+	first := filepath.Join(dir, "n0")
+	require.NoError(t, os.WriteFile(first, []byte("x"), 0644))
+	for i := 1; i < 1024; i++ {
+		require.NoError(t, os.Link(first, filepath.Join(dir, fmt.Sprintf("n%d", i))))
+	}
+	err := os.Link(first, filepath.Join(dir, "n1024"))
+	require.ErrorIs(t, err, unix.EMLINK)
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(first, &st))
+	require.EqualValues(t, 1024, st.Nlink)
+	require.NoError(t, os.Remove(filepath.Join(dir, "n1")))
+	require.NoError(t, os.Link(first, filepath.Join(dir, "n1024")), "a freed name can be linked again")
+}

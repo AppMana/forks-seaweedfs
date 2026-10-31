@@ -313,7 +313,9 @@ func (m *winfspModel) step(op, arg byte) {
 		next.Chunks = nil
 		desc = fmt.Sprintf("remote update %s mode %o size %d", p, next.Attributes.FileMode&0o777, len(next.Content))
 		// New content from another mount supersedes what an open handle holds.
-		if ino, found := m.wfs.inodeToPath.GetInode(util.FullPath(p)); found {
+		// A metadata-only change does not: the mount defers an open file's
+		// metadata to close, so its held chmod is flushed after this one.
+		if ino, found := m.wfs.inodeToPath.GetInode(util.FullPath(p)); found && string(src.Content) != string(next.Content) {
 			delete(m.pendingMode, ino)
 		}
 		m.fake.add(dir, proto.Clone(next).(*filer_pb.Entry))

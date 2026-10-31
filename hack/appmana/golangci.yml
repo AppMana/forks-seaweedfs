@@ -1,0 +1,19 @@
+# Lints only what a change adds (run with --new-from-rev): upstream code keeps
+# its own findings, and every fork change is held to these.
+version: "2"
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - nilerr
+    - staticcheck
+    - unused
+  settings:
+    staticcheck:
+      # Correctness and simplification checks; quick fixes and style are
+      # upstream's choice.
+      checks: ["all", "-QF*", "-ST*"]
+run:
+  build-tags: [5BytesOffset]

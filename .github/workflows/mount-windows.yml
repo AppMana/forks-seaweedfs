@@ -2,7 +2,7 @@ name: "mount: windows"
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/mount/**'
       - 'weed/command/mount*.go'
@@ -45,6 +45,11 @@ jobs:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
+
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
     - uses: actions/setup-go@v7
       with:

@@ -1396,6 +1396,15 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 	}
 	if contentChanged || !fh.dirtyMetadata {
 		fh.SetEntry(candidate)
+	} else {
+		// The kept attributes are the handle's; its links are the file's, and
+		// a flush without them would take the file out of the link.
+		fh.UpdateEntry(func(entry *filer_pb.Entry) {
+			if entry != nil {
+				entry.HardLinkId = candidate.HardLinkId
+				entry.HardLinkCounter = candidate.HardLinkCounter
+			}
+		})
 	}
 	fh.baseEntry.Store(proto.Clone(candidate).(*filer_pb.Entry))
 	fh.advanceEntryVersion(candidateTsNs, 0)

@@ -66,6 +66,13 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if !wfs.waitForPendingAsyncFlush(ctx, sourceInode) {
 		return fuse.EINTR
 	}
+	// A source still open with its create or attributes unflushed has them
+	// only here, so it is flushed first, as Rename does.
+	if fh, open := wfs.fhMap.FindFileHandle(sourceInode); open && fh.dirtyMetadata {
+		if status := wfs.doFlush(fh, in.Uid, in.Gid, false); status != fuse.OK {
+			return status
+		}
+	}
 	oldEntry, _, status := wfs.maybeLoadEntry(ctx, oldEntryPath)
 	if status != fuse.OK {
 		return status
@@ -208,6 +215,20 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
+
+	// A handle open on the source writes its entry back on flush, and the
+	// filer takes an entry without the link id as the file leaving the link,
+	// so the handle takes the id and count this link gave the file.
+	if fh, open := wfs.fhMap.FindFileHandle(sourceInode); open {
+		fhActiveLock := wfs.fhLockTable.AcquireLock("Link", fh.fh, util.ExclusiveLock)
+		fh.UpdateEntry(func(entry *filer_pb.Entry) {
+			if entry != nil {
+				entry.HardLinkId = oldEntry.HardLinkId
+				entry.HardLinkCounter = oldEntry.HardLinkCounter
+			}
+		})
+		wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	}
 
 	// Propagate the new HardLinkCounter to sibling cache entries and
 	// invalidate the kernel's inode attr cache. Without this, `stat` on any

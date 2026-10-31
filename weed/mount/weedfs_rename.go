@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -295,6 +296,13 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 				return code
 			}
 		}
+	}
+
+	// Two names of one file: POSIX rename does nothing. The Linux kernel
+	// answers this itself, but WinFsp passes it through, and the filer would
+	// drop the target name while writing the source's link count back.
+	if newEntry != nil && len(oldEntry.GetHardLinkId()) > 0 && bytes.Equal(oldEntry.HardLinkId, newEntry.HardLinkId) {
+		return fuse.OK
 	}
 
 	if wormEnforced, _ := wfs.wormEnforcedForEntry(oldPath, oldEntry); wormEnforced {

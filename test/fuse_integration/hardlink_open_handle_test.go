@@ -218,3 +218,36 @@ func TestHardLinkCountIsCapped(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(dir, "n1")))
 	require.NoError(t, os.Link(first, filepath.Join(dir, "n1024")), "a freed name can be linked again")
 }
+
+// Linking a file that a descriptor holds open from before it had a second
+// name: what the descriptor writes afterwards belongs to both names, and its
+// flush must not turn the file back into a single-name one.
+func TestOpenHandleBeforeFirstLinkWritesThroughBothNames(t *testing.T) {
+	fw := NewFuseTestFramework(t, DefaultTestConfig())
+	defer fw.Cleanup()
+	require.NoError(t, fw.Setup(DefaultTestConfig()))
+	dir := filepath.Join(fw.GetMountPoint(), "hardlink_first_link_open")
+	require.NoError(t, os.Mkdir(dir, 0755))
+	a, c := filepath.Join(dir, "a"), filepath.Join(dir, "c")
+	f, err := os.OpenFile(a, os.O_CREATE|os.O_RDWR, 0644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("one"))
+	require.NoError(t, err)
+	require.NoError(t, os.Link(a, c))
+	_, err = f.Write([]byte("two"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	for _, name := range []string{a, c} {
+		require.Eventually(t, func() bool {
+			got, err := os.ReadFile(name)
+			return err == nil && string(got) == "onetwo"
+		}, 5*time.Second, 50*time.Millisecond, "%s lost the write made after the link", name)
+		var st unix.Stat_t
+		require.NoError(t, unix.Stat(name, &st))
+		require.EqualValues(t, 2, st.Nlink, "%s link count", name)
+	}
+	require.NoError(t, os.Remove(a))
+	got, err := os.ReadFile(c)
+	require.NoError(t, err, "the last name lost the file")
+	require.Equal(t, "onetwo", string(got))
+}

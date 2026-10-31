@@ -61,6 +61,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 
 	ctx, cancelFunc := ctxFromCancel(cancel)
 	defer cancelFunc()
+	// A close under -writebackCache only queued the source's flush; the link
+	// copies the filer's entry, so that entry has to be there and current.
+	if !wfs.waitForPendingAsyncFlush(ctx, sourceInode) {
+		return fuse.EINTR
+	}
 	oldEntry, _, status := wfs.maybeLoadEntry(ctx, oldEntryPath)
 	if status != fuse.OK {
 		return status

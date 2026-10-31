@@ -461,3 +461,80 @@ func TestWinfspIdleMountExpiresReferences(t *testing.T) {
 	}
 	t.Fatal("idle mount retained an expired file reference without further traffic")
 }
+
+func TestWinfspRemoteDeleteOfHardLinkKeepsOtherName(t *testing.T) {
+	fake := newTreeFiler()
+	for _, name := range []string{"original", "alias"} {
+		entry := treeFile(name, 0o644)
+		entry.HardLinkId = []byte("shared")
+		entry.HardLinkCounter = 2
+		entry.Attributes.Inode = 4242
+		fake.add("/", entry)
+	}
+	wfs, a := newWinfspTreeWFS(t, fake)
+	var stat cgofuse.Stat_t
+	for _, name := range []string{"/original", "/alias"} {
+		if code := a.Getattr(name, &stat, invalidFh); code != 0 {
+			t.Fatal(code)
+		}
+	}
+	fake.remove("/", "original")
+	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
+		Directory: "/", TsNs: 1000, EventNotification: &filer_pb.EventNotification{OldEntry: treeFile("original", 0o644)},
+	}, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+		t.Fatal(err)
+	}
+	wfs.metaCache.WaitForEntryInvalidations()
+	if code := a.Getattr("/alias", &stat, invalidFh); code != 0 {
+		t.Fatalf("surviving hard link getattr = %d", code)
+	}
+	if code := a.Getattr("/original", &stat, invalidFh); code != -cgofuse.ENOENT {
+		t.Fatalf("deleted hard link getattr = %d", code)
+	}
+}
+
+func TestWinfspOpenReferenceSurvivesRemoteRenameAndDelete(t *testing.T) {
+	for _, rename := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rename=%v", rename), func(t *testing.T) {
+			fake := newTreeFiler()
+			old := treeFile("old", 0o644)
+			fake.add("/", old)
+			wfs, a := newWinfspTreeWFS(t, fake)
+			status, fh := a.Open("/old", cgofuse.O_RDONLY)
+			if status != 0 {
+				t.Fatal(status)
+			}
+			ino, _ := wfs.inodeToPath.GetInode("/old")
+			event := &filer_pb.EventNotification{OldEntry: old}
+			fake.remove("/", "old")
+			if rename {
+				next := proto.Clone(old).(*filer_pb.Entry)
+				next.Name = "new"
+				fake.add("/", next)
+				event.NewEntry, event.NewParentPath = next, "/"
+			}
+			if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{Directory: "/", TsNs: 1000, EventNotification: event}, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+				t.Fatal(err)
+			}
+			wfs.metaCache.WaitForEntryInvalidations()
+			a.expireReferences(time.Now().Add(time.Hour))
+			if !wfs.inodeToPath.HasInode(ino) {
+				t.Fatal("open handle lost inode")
+			}
+			if rename {
+				if path, status := wfs.inodeToPath.GetPath(ino); status != 0 || path != "/new" {
+					t.Fatalf("renamed inode = %q, %v", path, status)
+				}
+			}
+			buf := make([]byte, 1)
+			if n := a.Read("/old", buf, 0, fh); n != 1 || string(buf) != "x" {
+				t.Fatalf("open read = %d %q", n, buf)
+			}
+			a.Release("/old", fh)
+			a.expireReferences(time.Now().Add(2 * time.Hour))
+			if n := inodeTableSize(wfs.inodeToPath); n != 1 {
+				t.Fatalf("closed handles left %d inodes", n)
+			}
+		})
+	}
+}

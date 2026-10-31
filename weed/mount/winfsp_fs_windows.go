@@ -107,6 +107,9 @@ func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {
 	// names (a hard link's nlink and contents), and of the parent directory.
 	if ino, found := a.wfs.inodeToPath.GetInode(event.Path); found {
 		a.forgetInodeStat(ino)
+		if event.Deleted && event.Entry == nil && event.RenamedTo == "" {
+			a.wfs.inodeToPath.RemovePathForInode(event.Path, ino)
+		}
 	}
 	a.forgetStatWithParent(event.Path)
 	if event.RenamedTo != "" {

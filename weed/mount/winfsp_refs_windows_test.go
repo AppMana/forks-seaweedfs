@@ -786,3 +786,49 @@ func TestWinfspPathThroughAFileIsNotADirectory(t *testing.T) {
 		t.Fatalf("the filer gained entries under a file: %v", fake.dirs["/d/f"])
 	}
 }
+
+// Another mount's new content supersedes what an open handle held, its
+// unflushed chmod included, so a chmod that mount makes afterwards stands:
+// through the handle, and on the filer after the handle closes.
+func TestWinfspSupersededChmodYieldsToLaterRemoteChmod(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	fake.add("/d", treeFile("f", 0o644))
+	wfs, a := newWinfspTreeWFS(t, fake)
+	status, fh := a.Open("/d/f", cgofuse.O_RDONLY)
+	if status != 0 {
+		t.Fatal(status)
+	}
+	if code := a.Chmod("/d/f", 0o600); code != 0 {
+		t.Fatal(code)
+	}
+	remote := func(mode uint32, content string) {
+		old := proto.Clone(fake.dirs["/d"]["f"]).(*filer_pb.Entry)
+		next := proto.Clone(old).(*filer_pb.Entry)
+		next.Attributes.FileMode, next.Content, next.Attributes.FileSize = mode, []byte(content), uint64(len(content))
+		fake.add("/d", proto.Clone(next).(*filer_pb.Entry))
+		fake.mu.Lock()
+		fake.tsNs++
+		tsNs := fake.tsNs
+		fake.mu.Unlock()
+		if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
+			Directory: "/d", TsNs: tsNs, EventNotification: &filer_pb.EventNotification{OldEntry: old, NewEntry: next, NewParentPath: "/d", Signatures: []int32{2}},
+		}, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+			t.Fatal(err)
+		}
+		wfs.metaCache.WaitForEntryInvalidations()
+	}
+	remote(0o600, "y")
+	remote(0o644, "y")
+	var st cgofuse.Stat_t
+	if code := a.Getattr("/d/f", &st, invalidFh); code != 0 || st.Mode&0o777 != 0o644 {
+		t.Fatalf("getattr = %d mode %o, want the later remote 644", code, st.Mode&0o777)
+	}
+	a.Release("/d/f", fh)
+	fake.mu.Lock()
+	mode := fake.dirs["/d"]["f"].Attributes.FileMode & 0o777
+	fake.mu.Unlock()
+	if mode != 0o644 {
+		t.Fatalf("filer mode %o after close, want 644: the superseded chmod was flushed back", mode)
+	}
+}

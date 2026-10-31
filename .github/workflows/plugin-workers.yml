@@ -2,7 +2,7 @@ name: "Plugin Worker Integration Tests"
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/**'
       - 'test/plugin_workers/**'
@@ -10,7 +10,7 @@ on:
       - 'go.sum'
       - '.github/workflows/plugin-workers.yml'
   pull_request:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/**'
       - 'test/plugin_workers/**'
@@ -51,6 +51,11 @@ jobs:
 
       - name: Check out code into the Go module directory
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Run plugin worker tests
         run: go test -v ./${{ matrix.path }}

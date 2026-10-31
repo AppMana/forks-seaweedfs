@@ -2,7 +2,7 @@ name: "Kafka Gateway Tests"
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/mq/**'
       - 'weed/pb/mq_pb/**'
@@ -12,7 +12,7 @@ on:
       - 'go.sum'
       - '.github/workflows/kafka-tests.yml'
   pull_request:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/mq/**'
       - 'weed/pb/mq_pb/**'
@@ -60,6 +60,11 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v7
 
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
     - name: Setup Container Environment
       run: |
         apk add --no-cache git
@@ -106,6 +111,11 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v7
 
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
     - name: Setup Integration Container Environment
       run: |
         apk add --no-cache git procps
@@ -146,6 +156,11 @@ jobs:
     steps:
     - name: Check out code
       uses: actions/checkout@v7
+
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
     - name: Set up Go 1.x
       uses: actions/setup-go@v7
@@ -326,6 +341,11 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v7
 
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
     - name: Set up Go 1.x
       uses: actions/setup-go@v7
       with:
@@ -488,6 +508,11 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v7
 
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
     - name: Set up Go 1.x
       uses: actions/setup-go@v7
       with:
@@ -645,6 +670,11 @@ jobs:
     steps:
     - name: Check out code
       uses: actions/checkout@v7
+
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
     - name: Set up Go 1.x
       uses: actions/setup-go@v7
@@ -813,6 +843,11 @@ jobs:
 
     - name: Check out code
       uses: actions/checkout@v7
+
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
     - name: Setup Protocol Container Environment
       run: |

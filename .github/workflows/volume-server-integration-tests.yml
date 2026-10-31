@@ -2,7 +2,7 @@ name: "Volume Server Integration Tests"
 
 on:
   pull_request:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'test/volume_server/**'
       - 'weed/server/**'
@@ -11,7 +11,7 @@ on:
       - 'weed/pb/volume_server_pb/**'
       - '.github/workflows/volume-server-integration-tests.yml'
   push:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'test/volume_server/**'
       - 'weed/server/**'
@@ -41,6 +41,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -80,6 +85,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Set up Go
         uses: actions/setup-go@v7

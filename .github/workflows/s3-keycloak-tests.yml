@@ -8,7 +8,7 @@ on:
       - 'test/s3/iam/**'
       - '.github/workflows/s3-keycloak-tests.yml'
   push:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/iam/**'
       - 'weed/s3api/**'
@@ -36,6 +36,11 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Clean up stale FUSE mounts
         uses: ./.github/actions/cleanup-stale-fuse-mounts

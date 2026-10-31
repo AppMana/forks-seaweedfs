@@ -886,31 +886,35 @@ func TestSharedChunksConcurrentCopyAndDeleteOfTheSource(t *testing.T) {
 
 func TestSharedChunksConcurrentOverwriteAndCopyOfTheSource(t *testing.T) {
 	for round := 0; round < 20; round++ {
-		fs, _ := newSharedStore(t)
-		filers := []*filer.Filer{newSharedFiler(t, fs), newSharedFiler(t, fs)}
-		oldChunks := newChunks(2)
-		newChunkList := newChunks(1)
-		putObject(t, filers[0], "/buckets/bkt/src", oldChunks, nil)
+		// Each round is a subtest so its store is shut down when the round
+		// ends, not when all rounds have run.
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			fs, _ := newSharedStore(t)
+			filers := []*filer.Filer{newSharedFiler(t, fs), newSharedFiler(t, fs)}
+			oldChunks := newChunks(2)
+			newChunkList := newChunks(1)
+			putObject(t, filers[0], "/buckets/bkt/src", oldChunks, nil)
 
-		var wg sync.WaitGroup
-		var linked bool
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			linked, _ = link(filers[0], "/buckets/bkt/src", "/buckets/bkt/dst", 0)
-		}()
-		go func() {
-			defer wg.Done()
-			_ = createObject(filers[1], "/buckets/bkt/src", newChunkList, nil)
-		}()
-		wg.Wait()
+			var wg sync.WaitGroup
+			var linked bool
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				linked, _ = link(filers[0], "/buckets/bkt/src", "/buckets/bkt/dst", 0)
+			}()
+			go func() {
+				defer wg.Done()
+				_ = createObject(filers[1], "/buckets/bkt/src", newChunkList, nil)
+			}()
+			wg.Wait()
 
-		deleted := append(drainDeleted(filers[0]), drainDeleted(filers[1])...)
-		for _, p := range []string{"/buckets/bkt/src", "/buckets/bkt/dst"} {
-			if e, err := filers[0].FindEntry(testCtx(), util.FullPath(p)); err == nil {
-				assertNoneDeleted(t, deleted, fids(e.GetChunks()), fmt.Sprintf("round %d (linked=%v): %s", round, linked, p))
+			deleted := append(drainDeleted(filers[0]), drainDeleted(filers[1])...)
+			for _, p := range []string{"/buckets/bkt/src", "/buckets/bkt/dst"} {
+				if e, err := filers[0].FindEntry(testCtx(), util.FullPath(p)); err == nil {
+					assertNoneDeleted(t, deleted, fids(e.GetChunks()), fmt.Sprintf("round %d (linked=%v): %s", round, linked, p))
+				}
 			}
-		}
+		})
 	}
 }
 

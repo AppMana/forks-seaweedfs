@@ -21,7 +21,7 @@ func TestCacheSurvivesItsDirectoryBeingRemoved(t *testing.T) {
 	chunk := func(i int) (string, []byte) {
 		data := make([]byte, 2000) // layer 1: larger than one unit, at most four
 		rand.Read(data)
-		return fmt.Sprintf("1,%x%08x", i+1, 0xaabbccdd), data
+		return fmt.Sprintf("1,%x%08x", i+1, uint32(0xaabbccdd)), data
 	}
 
 	var fileIds []string

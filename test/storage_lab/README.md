@@ -230,10 +230,12 @@ and their `_COMMIT` values. See the reliability workflow for the build steps.
 
 A Linux VM runs `weed server`; Linux FUSE and Windows WinFsp mount the same
 namespace. The Windows guest clock is set from the controller first. The two
-clients rendezvous through the mount for seven phases: concurrent creation of
-24 files per OS, cross verification, overwrite and truncate of the other OS's
-files, verification, cross rename and delete, verification, and verification
-after remounting with fresh caches. Sizes include 0, 37, 4097 and 2 MiB + 103
+clients rendezvous through the mount for eight paired phases: concurrent
+creation of 24 files per OS, cross verification, cross-OS cache coherence of
+file contents, overwrite and truncate of the other OS's files, verification,
+cross rename and delete, verification, and verification after remounting with
+fresh caches. `SEAWEEDFS_MIXED_CACHE_COHERENCE=1` adds a ninth, the full
+cache-coherence phase; CI sets it. Sizes include 0, 37, 4097 and 2 MiB + 103
 bytes. Only the coordination waits retry; content checks do not.
 
 ```sh
@@ -243,12 +245,18 @@ SEAWEEDFS_MIXED_LIVE=1 \
 SEAWEEDFS_LINUX_WEED="$LAB_BUILD/weed-linux" SEAWEEDFS_WINDOWS_WEED="$LAB_BUILD/weed.exe" \
 SEAWEEDFS_MIXED_LINUX_WORKLOAD="$LAB_BUILD/mixed-linux" \
 SEAWEEDFS_MIXED_WINDOWS_WORKLOAD="$LAB_BUILD/mixed-windows.exe" \
-SEAWEEDFS_WINFSP_MSI=/abs/winfsp.msi SEAWEEDFS_WINDOWS_WINFSP_DLL=/abs/winfsp-x64.dll \
+SEAWEEDFS_WINFSP_MSI=/abs/winfsp.msi \
+SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL=/abs/winfsp-x64.dll SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL_SHA256=<sha256> \
 LABCONTAINERS_VM_IMAGE="$LINUX_IMAGE" LABCONTAINERS_WINDOWS_IMAGE="$WINDOWS_IMAGE" \
-go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=30m
+go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=40m
 ```
 
-The DLL needs its adjacent `.manifest.txt` and `.source.patch`. The oracle
+WinFsp takes the same three exclusive sources as the Windows mount lab: the
+released DLL pinned by SHA-256 (as CI runs it) against the stock driver from
+the MSI, a lab DLL (`SEAWEEDFS_WINDOWS_WINFSP_DLL`) with its adjacent
+`.manifest.txt` and `.source.patch`, or a native package. The guest checks
+that the mount loaded `C:\lab\winfsp-x64.dll`. `SEAWEEDFS_MIXED_TRACE=1`
+runs the Linux mount with `-v=4 -debug.fuse=true` and keeps its log tail. The oracle
 and its corruption, truncation, missing file and lost-delete controls run
 without VMs: `cd test/storage_lab/vm && GOWORK=off go test -race ./mixed_workload`.
 

@@ -23,6 +23,10 @@ on:
         description: 'Extra weed mount flags for the Windows mount lab, e.g. -writebackCache'
         type: string
         required: false
+      mixed_trace:
+        description: 'Run the mixed Linux/Windows mount lab with a verbose, FUSE-debug Linux mount'
+        type: boolean
+        default: false
       windows_access_baseline:
         description: 'Full commit SHA to compare Windows access latency against (hack/appmana/windows-access-regression.sh)'
         type: string
@@ -445,6 +449,47 @@ jobs:
             echo "PINNED_WINFSP_RELEASE_DLL=$dll_dir/winfsp-x64.dll"
             echo "PINNED_WINFSP_RELEASE_DLL_SHA256=$dll_sha"
           } >> "$GITHUB_ENV"
+      - name: Mixed Linux FUSE and Windows WinFsp mounts on one filer
+        env:
+          # The VM module needs the Labcontainers SDK's Go (vm/go.mod);
+          # setup-go exported GOTOOLCHAIN=local for the root module's.
+          GOTOOLCHAIN: auto
+          SEAWEEDFS_MIXED_LIVE: '1'
+          SEAWEEDFS_MIXED_CACHE_COHERENCE: '1'
+          SEAWEEDFS_MIXED_TRACE: ${{ inputs.mixed_trace && '1' || '0' }}
+          SEAWEEDFS_LINUX_WEED: ${{ runner.temp }}/weed-candidate-vm
+          SEAWEEDFS_WINDOWS_WEED: ${{ runner.temp }}/windows-weed.exe
+          SEAWEEDFS_MIXED_LINUX_WORKLOAD: ${{ runner.temp }}/mixed-linux
+          SEAWEEDFS_MIXED_WINDOWS_WORKLOAD: ${{ runner.temp }}/mixed-windows.exe
+          SEAWEEDFS_WINFSP_MSI: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_PATH || env.PINNED_WINFSP_MSI }}
+          WINFSP_MSI_SHA256: ${{ vars.SEAWEEDFS_RELIABILITY_WINFSP_MSI_SHA256 || env.PINNED_WINFSP_MSI_SHA256 }}
+          SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL: ${{ env.PINNED_WINFSP_RELEASE_DLL }}
+          SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL_SHA256: ${{ env.PINNED_WINFSP_RELEASE_DLL_SHA256 }}
+          LABCONTAINERS_LABD: ${{ github.workspace }}/labcontainers/bin/labd
+        run: |
+          set -euo pipefail
+          [[ "$WINFSP_MSI_SHA256" =~ ^[0-9a-f]{64}$ && "$SEAWEEDFS_WINFSP_MSI" = /* ]]
+          printf '%s  %s\n' "$WINFSP_MSI_SHA256" "$SEAWEEDFS_WINFSP_MSI" | sha256sum -c -
+          [[ "$LABCONTAINERS_WINDOWS_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]
+          docker image inspect "$LABCONTAINERS_WINDOWS_IMAGE" >/dev/null 2>&1 || docker pull "$LABCONTAINERS_WINDOWS_IMAGE"
+          candidate_sha=$(git rev-parse HEAD)
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "$STORAGE_BUILD_TAGS" -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$candidate_sha" -o "$SEAWEEDFS_WINDOWS_WEED" ./weed
+          (cd test/storage_lab/vm && GOWORK=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "$SEAWEEDFS_MIXED_LINUX_WORKLOAD" ./mixed_workload)
+          (cd test/storage_lab/vm && GOWORK=off GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o "$SEAWEEDFS_MIXED_WINDOWS_WORKLOAD" ./mixed_workload)
+          mixed_work=$(mktemp -d "$RUNNER_TEMP/mixed-mount-work.XXXXXXXX")
+          (cd "$mixed_work" && go work init "$GITHUB_WORKSPACE/seaweedfs/test/storage_lab/vm" "$GITHUB_WORKSPACE/labcontainers")
+          export GOWORK="$mixed_work/go.work"
+          go test ./test/storage_lab/vm -list '^TestMixedOSMountLab$' | grep -Fx TestMixedOSMountLab
+          go test ./test/storage_lab/vm -run '^TestMixedOSMountLab$' -count=1 -v -timeout=40m 2>&1 | tee "$RUNNER_TEMP/mixed-mount-test.log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: storage-reliability-mixed-mount-results
+          path: |
+            ${{ runner.temp }}/seaweedfs-mixed-results-*/
+            ${{ runner.temp }}/mixed-mount-test.log
+          if-no-files-found: warn
+          retention-days: 14
       - name: Isolated Windows WinFsp Git and LFS regressions
         env:
           # The VM module needs the Labcontainers SDK's Go (vm/go.mod);

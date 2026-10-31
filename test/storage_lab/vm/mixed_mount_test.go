@@ -54,12 +54,13 @@ func TestMixedOSMountLab(t *testing.T) {
 		"winfsp.msi":       os.Getenv("SEAWEEDFS_WINFSP_MSI"),
 	}
 	nativePackage := os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_NATIVE_PACKAGE")
-	if nativePackage == "" {
-		inputs["winfsp-x64.dll"] = os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL")
-		inputs["winfsp-x64.dll.manifest.txt"] = inputs["winfsp-x64.dll"] + ".manifest.txt"
-		inputs["winfsp-x64.dll.source.patch"] = inputs["winfsp-x64.dll"] + ".source.patch"
-	} else if os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL") != "" {
-		t.Fatal("native package selects a matched DLL; unset SEAWEEDFS_WINDOWS_WINFSP_DLL")
+	winfsp, err := selectMixedWinFsp(os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_DLL"), nativePackage,
+		os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL"), os.Getenv("SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL_SHA256"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range winfsp.inputs {
+		inputs[name] = path
 	}
 	artifacts := map[string][]byte{}
 	var provenance strings.Builder
@@ -90,11 +91,11 @@ func TestMixedOSMountLab(t *testing.T) {
 		artifacts[name] = b
 		fmt.Fprintf(&provenance, "%s %s sha256=%s\n", name, path, sha(b))
 	}
-	if nativePackage == "" {
-		if err := validateWinFspLabManifest(artifacts["winfsp-x64.dll.manifest.txt"], artifacts["winfsp-x64.dll"], artifacts["winfsp-x64.dll.source.patch"]); err != nil {
-			t.Fatal(err)
-		}
+	winfspProvenance, err := winfsp.verify(artifacts)
+	if err != nil {
+		t.Fatal(err)
 	}
+	provenance.WriteString(winfspProvenance)
 	linuxImage, windowsImage := os.Getenv("LABCONTAINERS_VM_IMAGE"), os.Getenv("LABCONTAINERS_WINDOWS_IMAGE")
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
@@ -322,6 +323,129 @@ inspect('after-3s')`
 	must(run("windows", "stop-mount", ps, "-NoProfile", "-Command", `$ErrorActionPreference='Stop'; $p=Get-Process -Id ([int](Get-Content C:\lab\mount.pid)); if($p.Path -ine 'C:\lab\weed.exe'){throw 'unexpected mount process'}; Stop-Process -Id $p.Id -Force; $p.WaitForExit(); Start-Sleep -Seconds 2; if(Test-Path C:\lab\mnt){throw 'owned junction survived mount termination'}`))
 	startMounts("second")
 	pair("verify-remount")
+}
+
+// mixedWinFsp is the WinFsp user-mode source for the Windows mount: a lab
+// built DLL with its build manifest and source patch, a released DLL pinned by
+// SHA256 that runs against the stock driver from the MSI, or a native package
+// staged by nativeWinFspInputs. inputs maps C:\lab names to host paths.
+type mixedWinFsp struct {
+	inputs        map[string]string
+	nativePackage string
+	releaseSHA    string
+}
+
+func selectMixedWinFsp(labDLL, nativePackage, releaseDLL, releasePin string) (mixedWinFsp, error) {
+	releaseDLL, releasePin, err := windowsReleaseDLL(releaseDLL, releasePin, labDLL, nativePackage)
+	if err != nil {
+		return mixedWinFsp{}, err
+	}
+	if releaseDLL != "" {
+		return mixedWinFsp{inputs: map[string]string{"winfsp-x64.dll": releaseDLL}, releaseSHA: releasePin}, nil
+	}
+	if nativePackage != "" {
+		if labDLL != "" {
+			return mixedWinFsp{}, fmt.Errorf("native package selects a matched DLL; unset SEAWEEDFS_WINDOWS_WINFSP_DLL")
+		}
+		return mixedWinFsp{inputs: map[string]string{}, nativePackage: nativePackage}, nil
+	}
+	if labDLL == "" {
+		return mixedWinFsp{}, fmt.Errorf("WinFsp DLL required: set SEAWEEDFS_WINDOWS_WINFSP_DLL, SEAWEEDFS_WINDOWS_WINFSP_RELEASE_DLL or SEAWEEDFS_WINDOWS_WINFSP_NATIVE_PACKAGE")
+	}
+	return mixedWinFsp{inputs: map[string]string{
+		"winfsp-x64.dll":              labDLL,
+		"winfsp-x64.dll.manifest.txt": labDLL + ".manifest.txt",
+		"winfsp-x64.dll.source.patch": labDLL + ".source.patch",
+	}}, nil
+}
+
+// verify checks the staged bytes against their evidence and returns the
+// provenance lines for the selected source.
+func (m mixedWinFsp) verify(artifacts map[string][]byte) (string, error) {
+	if m.nativePackage != "" {
+		return "", nil
+	}
+	if m.releaseSHA != "" {
+		// Beside weed.exe, so the mount loads it before the installed DLL;
+		// the stock MSI keeps providing the signed driver.
+		dll, ok := artifacts["winfsp-x64.dll"]
+		if !ok {
+			return "", fmt.Errorf("release WinFsp DLL not staged")
+		}
+		if got := sha(dll); got != m.releaseSHA {
+			return "", fmt.Errorf("release WinFsp DLL sha256 %s, pinned %s", got, m.releaseSHA)
+		}
+		return "release_winfsp_dll_sha256=" + m.releaseSHA + "\n", nil
+	}
+	if err := validateWinFspLabManifest(artifacts["winfsp-x64.dll.manifest.txt"], artifacts["winfsp-x64.dll"], artifacts["winfsp-x64.dll.source.patch"]); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
+func TestMixedWinFspSelection(t *testing.T) {
+	dll := []byte("released user-mode DLL")
+	pin := sha(dll)
+	release, err := selectMixedWinFsp("", "", "/in/winfsp-x64.dll", pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(release.inputs) != 1 || release.inputs["winfsp-x64.dll"] != "/in/winfsp-x64.dll" {
+		t.Fatalf("release DLL inputs %v", release.inputs)
+	}
+	provenance, err := release.verify(map[string][]byte{"winfsp-x64.dll": dll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(provenance, "release_winfsp_dll_sha256="+pin+"\n") {
+		t.Fatalf("release pin missing from provenance %q", provenance)
+	}
+	if _, err := release.verify(map[string][]byte{"winfsp-x64.dll": []byte("other DLL")}); err == nil {
+		t.Fatal("accepted a release DLL that does not match its pin")
+	}
+	if _, err := release.verify(map[string][]byte{}); err == nil {
+		t.Fatal("accepted a missing release DLL")
+	}
+
+	lab, err := selectMixedWinFsp("/lab/winfsp-x64.dll", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lab.inputs) != 3 || lab.inputs["winfsp-x64.dll"] != "/lab/winfsp-x64.dll" ||
+		lab.inputs["winfsp-x64.dll.manifest.txt"] != "/lab/winfsp-x64.dll.manifest.txt" ||
+		lab.inputs["winfsp-x64.dll.source.patch"] != "/lab/winfsp-x64.dll.source.patch" {
+		t.Fatalf("lab DLL inputs %v", lab.inputs)
+	}
+	manifest := fmt.Sprintf("source_revision=ddca7bd5481857a65ba552f643b8776fd070836f\nsource_mode=baseline\ndll_sha256=%s\nsource_patch_sha256=%s\nsource_date_epoch=1\nbuild_script_sha256=fixture\nbuild_shim_sha256=fixture\n", pin, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	if _, err := lab.verify(map[string][]byte{"winfsp-x64.dll": dll, "winfsp-x64.dll.manifest.txt": []byte(manifest), "winfsp-x64.dll.source.patch": nil}); err != nil {
+		t.Fatalf("lab DLL with matching manifest rejected: %v", err)
+	}
+	if _, err := lab.verify(map[string][]byte{"winfsp-x64.dll": dll}); err == nil {
+		t.Fatal("accepted a lab DLL without its manifest")
+	}
+
+	native, err := selectMixedWinFsp("", "/native", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(native.inputs) != 0 || native.nativePackage != "/native" {
+		t.Fatalf("native package selection %+v", native)
+	}
+
+	for _, c := range []struct{ lab, native, release, pin string }{
+		{"", "", "", ""},
+		{"/lab/winfsp-x64.dll", "/native", "", ""},
+		{"", "", "/in/winfsp-x64.dll", ""},
+		{"", "", "/in/winfsp-x64.dll", "E1403"},
+		{"", "", "", pin},
+		{"/lab/winfsp-x64.dll", "", "", pin},
+		{"/lab/winfsp-x64.dll", "", "/in/winfsp-x64.dll", pin},
+		{"", "/native", "/in/winfsp-x64.dll", pin},
+	} {
+		if _, err := selectMixedWinFsp(c.lab, c.native, c.release, c.pin); err == nil {
+			t.Fatalf("accepted %+v", c)
+		}
+	}
 }
 
 func validateMixedGuestClock(output string, before, after time.Time) error {

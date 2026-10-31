@@ -74,6 +74,7 @@ func winfspMountIdentity() (uint32, uint32, error) {
 }
 
 func (a *winfspFS) Init() {
+	a.startReferenceSweeper()
 	if !a.basicPermissions {
 		return
 	}

@@ -441,3 +441,23 @@ func TestWinfspConcurrentWalksReturnEveryReference(t *testing.T) {
 		t.Fatalf("inode table holds %d entries after concurrent walks: %v", size, trackedPaths(wfs))
 	}
 }
+
+func TestWinfspIdleMountExpiresReferences(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeFile("idle", 0o644))
+	wfs, a := newWinfspTreeWFS(t, fake)
+	a.Init()
+	defer a.Destroy()
+	var stat cgofuse.Stat_t
+	if code := a.Getattr("/idle", &stat, invalidFh); code != 0 {
+		t.Fatal(code)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if inodeTableSize(wfs.inodeToPath) == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("idle mount retained an expired file reference without further traffic")
+}

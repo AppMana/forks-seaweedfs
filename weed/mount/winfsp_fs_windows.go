@@ -47,6 +47,8 @@ type winfspFS struct {
 	handleMu   sync.Mutex
 	fileHandle map[uint64]*winfspHandleRef
 	dirHandle  map[uint64]*winfspHandleRef
+	sweepStop  chan struct{}
+	sweepDone  chan struct{}
 }
 
 // winfspHandleRef counts the opens a handle carries a reference for.
@@ -73,6 +75,27 @@ func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
 // before now.
 func (a *winfspFS) expireReferences(now time.Time) {
 	a.paths.sweep(now)
+}
+
+// startReferenceSweeper runs for the mounted filesystem's Init/Destroy lifetime.
+func (a *winfspFS) startReferenceSweeper() {
+	if a.sweepStop != nil {
+		return
+	}
+	a.sweepStop, a.sweepDone = make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(a.sweepDone)
+		ticker := time.NewTicker(winfspCacheTTL)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				a.expireReferences(now)
+			case <-a.sweepStop:
+				return
+			}
+		}
+	}()
 }
 
 // entryChanged applies a metadata event to the adapter's own caches. A name
@@ -413,7 +436,14 @@ func attrToStat(attr *fuse.Attr, st *cgofuse.Stat_t) {
 	st.Blocks = int64(attr.Blocks)
 }
 
-func (a *winfspFS) Destroy() { writeWinfspStatsTrace() }
+func (a *winfspFS) Destroy() {
+	if a.sweepStop != nil {
+		close(a.sweepStop)
+		<-a.sweepDone
+		a.sweepStop = nil
+	}
+	writeWinfspStatsTrace()
+}
 
 func (a *winfspFS) Statfs(path string, stat *cgofuse.Statfs_t) int {
 	defer track(opStatfs)()

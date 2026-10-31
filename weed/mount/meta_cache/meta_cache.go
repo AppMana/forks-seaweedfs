@@ -955,6 +955,7 @@ type EntryInvalidation struct {
 	TsNs          int64           // the event's filer log position; 0 for locally built events
 	Deleted       bool            // vacated by a delete, not a rename away — the file lives on elsewhere
 	DeletedInode  uint64          // inode in the deleted entry; zero when its identity is unknown
+	DeletedEntry  *filer_pb.Entry // the entry a delete removed; nil otherwise
 	// RenamedTo is the destination when a rename vacated this path: the file
 	// lives on there, so an open handle follows it rather than being orphaned.
 	RenamedTo util.FullPath
@@ -1490,7 +1491,7 @@ func collectEntryInvalidations(resp *filer_pb.SubscribeMetadataResponse) []Entry
 
 	if filer_pb.IsDelete(resp) && message.OldEntry != nil {
 		oldKey := util.NewFullPath(resp.Directory, message.OldEntry.Name)
-		invalidations = append(invalidations, EntryInvalidation{Path: oldKey, TsNs: resp.TsNs, Deleted: true, DeletedInode: message.OldEntry.GetAttributes().GetInode(), Signatures: signatures, WasDirectory: message.OldEntry.IsDirectory})
+		invalidations = append(invalidations, EntryInvalidation{Path: oldKey, TsNs: resp.TsNs, Deleted: true, DeletedInode: message.OldEntry.GetAttributes().GetInode(), DeletedEntry: message.OldEntry, Signatures: signatures, WasDirectory: message.OldEntry.IsDirectory})
 	}
 
 	return invalidations

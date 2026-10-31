@@ -1152,7 +1152,19 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 	// the handle's own path bookkeeping. This is for the rest: the kernel goes
 	// on addressing a moved inode by nodeid whether or not anything holds it
 	// open.
+	// The filer lowers a hard link's shared count without an event for the
+	// other names, so their cached entries are refreshed here, as a local
+	// unlink does. The inode is resolved before the deleted name detaches.
+	var survivingLinks uint64
+	if deleted := invalidation.DeletedEntry; invalidation.Deleted && len(deleted.GetHardLinkId()) > 0 && deleted.GetHardLinkCounter() > 1 {
+		survivingLinks, _ = wfs.inodeToPath.GetInode(invalidation.Path)
+	}
 	handled, replacedInode := wfs.invalidateOpenFileHandle(invalidation)
+	if survivingLinks != 0 {
+		decremented := proto.Clone(invalidation.DeletedEntry).(*filer_pb.Entry)
+		decremented.HardLinkCounter--
+		wfs.syncHardLinkSiblings(context.Background(), survivingLinks, decremented, invalidation.TsNs, invalidation.Path)
+	}
 	if !handled && invalidation.RenamedTo != "" {
 		_, replacedInode = wfs.inodeToPath.MovePath(invalidation.Path, invalidation.RenamedTo)
 	}

@@ -1152,7 +1152,19 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 	// the handle's own path bookkeeping. This is for the rest: the kernel goes
 	// on addressing a moved inode by nodeid whether or not anything holds it
 	// open.
+	// The filer lowers a hard link's shared count without an event for the
+	// other names, so their cached entries are refreshed here, as a local
+	// unlink does. The inode is resolved before the deleted name detaches.
+	var survivingLinks uint64
+	if deleted := invalidation.DeletedEntry; invalidation.Deleted && len(deleted.GetHardLinkId()) > 0 && deleted.GetHardLinkCounter() > 1 {
+		survivingLinks, _ = wfs.inodeToPath.GetInode(invalidation.Path)
+	}
 	handled, replacedInode := wfs.invalidateOpenFileHandle(invalidation)
+	if survivingLinks != 0 {
+		decremented := proto.Clone(invalidation.DeletedEntry).(*filer_pb.Entry)
+		decremented.HardLinkCounter--
+		wfs.syncHardLinkSiblings(context.Background(), survivingLinks, decremented, invalidation.TsNs, invalidation.Path)
+	}
 	if !handled && invalidation.RenamedTo != "" {
 		_, replacedInode = wfs.inodeToPath.MovePath(invalidation.Path, invalidation.RenamedTo)
 	}
@@ -1333,6 +1345,12 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 			candidate.Attributes.Uid, candidate.Attributes.Gid = wfs.option.UidGidMapper.FilerToLocal(candidate.Attributes.Uid, candidate.Attributes.Gid)
 		}
 	}
+	// A hard link's handle knows its file by the link id, so an entry at the
+	// path under another id is a file that took the name from this one.
+	vacated := invalidation.Deleted
+	if handleLinkId := fh.GetEntry().GetEntry().GetHardLinkId(); candidate != nil && len(handleLinkId) > 0 && !bytes.Equal(candidate.HardLinkId, handleLinkId) {
+		candidate, vacated = nil, true
+	}
 	if candidate == nil {
 		// Path vacated. A rename left the file alive at its new name, so the
 		// handle follows it — an open fd tracks the inode, and leaving it on
@@ -1340,12 +1358,14 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		// updating the renamed file. An actual delete instead marks the handle
 		// so no flush recreates the unlinked name. Either way the entry and
 		// dirty pages stay, so the open fd still reads its buffered writes.
-		if invalidation.Deleted {
-			fh.isDeleted = true
-			fh.deleteEpoch++
+		if vacated {
 			// A descriptor survives unlink, but a pathname must not resolve
 			// back to that descriptor (notably WinFsp's path-based Getattr).
 			wfs.inodeToPath.RemovePathForInode(filePath, inode)
+			if !wfs.followSurvivingLinkLocked(fh, inode, 0) {
+				fh.isDeleted = true
+				fh.deleteEpoch++
+			}
 		}
 		if !fh.dirtyMetadata {
 			fh.dirtyPages.Destroy()
@@ -1376,6 +1396,21 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 	}
 	if contentChanged || !fh.dirtyMetadata {
 		fh.SetEntry(candidate)
+		// Foreign content over a committed base took the handle's pages and
+		// attributes with it, so nothing is left for its flush to write back
+		// over what that mount does next.
+		if contentChanged && base != nil {
+			fh.dirtyMetadata = false
+		}
+	} else {
+		// The kept attributes are the handle's; its links are the file's, and
+		// a flush without them would take the file out of the link.
+		fh.UpdateEntry(func(entry *filer_pb.Entry) {
+			if entry != nil {
+				entry.HardLinkId = candidate.HardLinkId
+				entry.HardLinkCounter = candidate.HardLinkCounter
+			}
+		})
 	}
 	fh.baseEntry.Store(proto.Clone(candidate).(*filer_pb.Entry))
 	fh.advanceEntryVersion(candidateTsNs, 0)

@@ -42,6 +42,12 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 
 	entryFullPath := dirFullPath.Child(name)
 	var inode uint64
+	var lookupRef uint64
+	defer func() {
+		if code != fuse.OK && lookupRef != 0 {
+			wfs.Forget(lookupRef, 1)
+		}
+	}()
 
 	ctx, cancelFunc := ctxFromCancel(cancel)
 	defer cancelFunc()
@@ -56,6 +62,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return fuse.Status(syscall.EEXIST)
 		}
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
+		lookupRef = inode
 		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
@@ -105,6 +112,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return fuse.EIO
 		}
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
+		lookupRef = inode
 		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
@@ -127,6 +135,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		return code
 	} else {
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, false, inode, true)
+		lookupRef = inode
 	}
 
 	wfs.outputPbEntry(&out.EntryOut, inode, newEntry)
@@ -291,13 +300,23 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// before Unlink sets the flag).  By waiting here, any in-flight flush
 	// finishes first; even if it recreated the entry, the filer delete below
 	// will remove it again.
-	if inode, found := wfs.inodeToPath.GetInode(entryFullPath); found {
-		wfs.markHandleDeleted(inode)
-		wfs.waitForPendingAsyncFlush(context.Background(), inode)
-	} else if entry != nil && entry.Attributes != nil && entry.Attributes.Inode != 0 {
-		inodeFromEntry := entry.Attributes.Inode
-		wfs.markHandleDeleted(inodeFromEntry)
-		wfs.waitForPendingAsyncFlush(context.Background(), inodeFromEntry)
+	// A name of a hard link that keeps another drains first instead, as a
+	// rename's destination does: its queued flush belongs to the file, which
+	// lives on, and a flush that ran marked would be skipped.
+	isHardLink := entry != nil && entry.Attributes != nil && len(entry.HardLinkId) > 0 && entry.HardLinkCounter > 1
+	markedInode, found := wfs.inodeToPath.GetInode(entryFullPath)
+	if !found && entry != nil && entry.Attributes != nil {
+		markedInode = entry.Attributes.Inode
+	}
+	var deleteEpoch uint64
+	if markedInode != 0 {
+		if isHardLink {
+			wfs.waitForPendingAsyncFlush(context.Background(), markedInode)
+			deleteEpoch = wfs.markHandleDeleted(markedInode)
+		} else {
+			deleteEpoch = wfs.markHandleDeleted(markedInode)
+			wfs.waitForPendingAsyncFlush(context.Background(), markedInode)
+		}
 	}
 
 	// first, ensure the filer store can correctly delete
@@ -338,7 +357,6 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// to every sibling cache entry and invalidate the kernel attr cache
 	// so subsequent lstats on other links see the new nlink — pjdfstest
 	// link/00.t asserts this after `unlink n0` leaves n1/n2 behind.
-	isHardLink := entry != nil && entry.Attributes != nil && len(entry.HardLinkId) > 0 && entry.HardLinkCounter > 1
 	var sharedInode uint64
 	if isHardLink {
 		sharedInode = entry.Attributes.Inode
@@ -358,6 +376,9 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		decremented.Attributes.Ctime = now.Unix()
 		decremented.Attributes.CtimeNs = int32(now.Nanosecond())
 		wfs.syncHardLinkSiblings(ctx, sharedInode, decremented, event.GetTsNs(), entryFullPath)
+	}
+	if isHardLink {
+		wfs.followSurvivingLink(markedInode, deleteEpoch, entry.HardLinkCounter-1)
 	}
 
 	return fuse.OK
@@ -503,6 +524,56 @@ func (wfs *WFS) markHandleDeleted(inode uint64) uint64 {
 	epoch := fh.deleteEpoch
 	wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 	return epoch
+}
+
+// followSurvivingLink lifts the mark a removed name put on an open hard-linked
+// file this mount still knows by another name: the descriptor refers to the
+// file, not the name, so its later writes belong to the surviving link. Only
+// the mark's epoch is lifted, as in clearHandleDeleted. linkCount is the count
+// after the removal, or 0 to take one off the handle's own.
+func (wfs *WFS) followSurvivingLink(inode uint64, epoch uint64, linkCount int32) {
+	if epoch == 0 {
+		return
+	}
+	fh, found := wfs.fhMap.FindFileHandle(inode)
+	if !found {
+		return
+	}
+	fhActiveLock := wfs.fhLockTable.AcquireLock("followSurvivingLink", fh.fh, util.ExclusiveLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if fh.deleteEpoch == epoch && wfs.followSurvivingLinkLocked(fh, inode, linkCount) {
+		fh.isDeleted = false
+	}
+}
+
+// followSurvivingLinkLocked moves fh onto the inode's remaining name, under
+// fh's exclusive lock, reporting false when no name or link remains. A flush
+// writes the handle's link count into the shared link record, which decides
+// when the last name's delete frees the content, so the count goes down too.
+func (wfs *WFS) followSurvivingLinkLocked(fh *FileHandle, inode uint64, linkCount int32) bool {
+	entry := fh.GetEntry().GetEntry()
+	if entry == nil || len(entry.HardLinkId) == 0 {
+		return false
+	}
+	if linkCount == 0 {
+		linkCount = entry.HardLinkCounter - 1
+	}
+	if linkCount < 1 {
+		return false
+	}
+	survivor, status := wfs.inodeToPath.GetPath(inode)
+	if status != fuse.OK {
+		return false
+	}
+	fh.RememberPath(survivor)
+	_, name := survivor.DirAndName()
+	fh.UpdateEntry(func(entry *filer_pb.Entry) {
+		if entry != nil {
+			entry.Name = name
+			entry.HardLinkCounter = linkCount
+		}
+	})
+	return true
 }
 
 // clearHandleDeleted lifts a mark whose delete did not go through. Only the

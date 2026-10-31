@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -297,6 +298,13 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		}
 	}
 
+	// Two names of one file: POSIX rename does nothing. The Linux kernel
+	// answers this itself, but WinFsp passes it through, and the filer would
+	// drop the target name while writing the source's link count back.
+	if newEntry != nil && len(oldEntry.GetHardLinkId()) > 0 && bytes.Equal(oldEntry.HardLinkId, newEntry.HardLinkId) {
+		return fuse.OK
+	}
+
 	if wormEnforced, _ := wfs.wormEnforcedForEntry(oldPath, oldEntry); wormEnforced {
 		return fuse.EPERM
 	}
@@ -450,10 +458,13 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 			wfs.waitForPendingAsyncFlush(context.Background(), targetInode)
 			epoch := wfs.markHandleDeleted(targetInode)
 			// A rename that does not happen leaves the destination where it
-			// was, so its handle has to go back to writing that name.
+			// was, so its handle has to go back to writing that name. One that
+			// does takes only this name of a hard link with others.
 			defer func() {
 				if code != fuse.OK {
 					wfs.clearHandleDeleted(targetInode, epoch)
+				} else if newEntry != nil && len(newEntry.HardLinkId) > 0 && newEntry.HardLinkCounter > 1 {
+					wfs.followSurvivingLink(targetInode, epoch, newEntry.HardLinkCounter-1)
 				}
 			}()
 		}

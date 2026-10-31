@@ -42,6 +42,11 @@ type wasCachedEntry struct {
 	gen  uint64
 }
 
+// maxHardLinks is the most names a file takes, NTFS's limit. Link refuses
+// another, and the table records no more per inode, so what a file's names
+// cost here stays bounded whatever another client gave it.
+const maxHardLinks = 1024
+
 // InodeEntry exists per inode the kernel references. Directory cache state is
 // kept out in dirStates so a file entry stays in the 32-byte size class — the
 // dominant cost on a mount with millions of files. A hard link's extra paths
@@ -85,6 +90,16 @@ func (ie *InodeEntry) appendPaths(dst []util.FullPath) []util.FullPath {
 		dst = append(dst, *ie.extraPaths...)
 	}
 	return dst
+}
+
+func (ie *InodeEntry) pathCount() int {
+	if ie.path == "" {
+		return 0
+	}
+	if ie.extraPaths == nil {
+		return 1
+	}
+	return 1 + len(*ie.extraPaths)
 }
 
 func (ie *InodeEntry) addPath(p util.FullPath) {
@@ -199,13 +214,19 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 			}
 		}
 	}
-	i.path2inode[path] = inode
-
-	if _, found := i.inode2path[inode]; found {
+	if entry, entryFound := i.inode2path[inode]; entryFound {
+		if !found && entry.pathCount() < maxHardLinks {
+			// Another name of a hard-linked inode. Record it with the inode, or
+			// the last Forget leaves this name mapped to an inode that is gone.
+			// Past the cap the name is looked up each time instead.
+			i.path2inode[path] = inode
+			entry.addPath(path)
+		}
 		if isLookup {
-			i.inode2path[inode].nlookup++
+			entry.nlookup++
 		}
 	} else {
+		i.path2inode[path] = inode
 		nlookup := uint64(0)
 		if isLookup {
 			nlookup = 1
@@ -233,6 +254,24 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 	}
 	entry.nlookup++
 	return true
+}
+
+// AcquirePath takes one more reference on the inode path maps to, reporting
+// false when the table does not have the path. Checking and taking happen
+// under one lock, so a concurrent Forget cannot release the inode in between.
+func (i *InodeToPath) AcquirePath(path util.FullPath) (uint64, bool) {
+	i.Lock()
+	defer i.Unlock()
+	inode, found := i.path2inode[path]
+	if !found {
+		return 0, false
+	}
+	entry, found := i.inode2path[inode]
+	if !found {
+		return 0, false
+	}
+	entry.nlookup++
+	return inode, true
 }
 
 // InodeForListing returns the inode number a readdir should report for path
@@ -589,13 +628,18 @@ func (i *InodeToPath) CollectEvictableDirs(now time.Time, idle time.Duration) []
 func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 	i.Lock()
 	defer i.Unlock()
-	i.path2inode[path] = inode
-
 	ie, found := i.inode2path[inode]
 	if found {
-		ie.addPath(path)
+		if current, mapped := i.path2inode[path]; (!mapped || current != inode) && ie.pathCount() < maxHardLinks {
+			if mapped {
+				i.removePathFromInode2Path(current, path)
+			}
+			i.path2inode[path] = inode
+			ie.addPath(path)
+		}
 		ie.nlookup++
 	} else {
+		i.path2inode[path] = inode
 		i.inode2path[inode] = &InodeEntry{
 			path:    path,
 			nlookup: 1,

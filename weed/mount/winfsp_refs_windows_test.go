@@ -722,3 +722,25 @@ func TestWinfspLocalRenameAndUnlinkMaintainReferencesAndPaths(t *testing.T) {
 		t.Fatalf("inode table holds %d entries after expiry, want 1: %v", size, trackedPaths(wfs))
 	}
 }
+
+// Renaming one name of a file onto another name of the same file does
+// nothing (POSIX rename). The Linux kernel answers it itself; WinFsp passes it
+// through, and the filer would drop one name and keep the old link count.
+func TestWinfspRenameBetweenNamesOfOneFileKeepsBoth(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	fake.add("/d", treeFile("a", 0o644))
+	_, a := newWinfspTreeWFS(t, fake)
+	if code := a.Link("/d/a", "/d/c"); code != 0 {
+		t.Fatalf("link = %d", code)
+	}
+	if code := a.Rename("/d/a", "/d/c"); code != 0 {
+		t.Fatalf("rename = %d", code)
+	}
+	for _, path := range []string{"/d/a", "/d/c"} {
+		var st cgofuse.Stat_t
+		if code := a.Getattr(path, &st, invalidFh); code != 0 || st.Nlink != 2 {
+			t.Fatalf("getattr %s = %d nlink %d, want 0 nlink 2", path, code, st.Nlink)
+		}
+	}
+}

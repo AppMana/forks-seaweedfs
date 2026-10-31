@@ -464,12 +464,16 @@ func TestWinfspIdleMountExpiresReferences(t *testing.T) {
 
 func TestWinfspRemoteDeleteOfHardLinkKeepsOtherName(t *testing.T) {
 	fake := newTreeFiler()
+	var original *filer_pb.Entry
 	for _, name := range []string{"original", "alias"} {
 		entry := treeFile(name, 0o644)
 		entry.HardLinkId = []byte("shared")
 		entry.HardLinkCounter = 2
 		entry.Attributes.Inode = 4242
 		fake.add("/", entry)
+		if name == "original" {
+			original = entry
+		}
 	}
 	wfs, a := newWinfspTreeWFS(t, fake)
 	var stat cgofuse.Stat_t
@@ -480,7 +484,7 @@ func TestWinfspRemoteDeleteOfHardLinkKeepsOtherName(t *testing.T) {
 	}
 	fake.remove("/", "original")
 	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), &filer_pb.SubscribeMetadataResponse{
-		Directory: "/", TsNs: 1000, EventNotification: &filer_pb.EventNotification{OldEntry: treeFile("original", 0o644)},
+		Directory: "/", TsNs: 1000, EventNotification: &filer_pb.EventNotification{OldEntry: original},
 	}, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
 		t.Fatal(err)
 	}
@@ -536,5 +540,22 @@ func TestWinfspOpenReferenceSurvivesRemoteRenameAndDelete(t *testing.T) {
 				t.Fatalf("closed handles left %d inodes", n)
 			}
 		})
+	}
+}
+
+func TestWinfspDelayedDeleteKeepsReplacementPath(t *testing.T) {
+	fake := newTreeFiler()
+	replacement := treeFile("name", 0o644)
+	replacement.Attributes.Inode = 84
+	fake.add("/", replacement)
+	wfs, a := newWinfspTreeWFS(t, fake)
+	status, fh := a.Open("/name", cgofuse.O_RDONLY)
+	if status != 0 {
+		t.Fatal(status)
+	}
+	defer a.Release("/name", fh)
+	a.entryChanged(meta_cache.EntryInvalidation{Path: "/name", Deleted: true, DeletedInode: 42})
+	if path, status := wfs.inodeToPath.GetPath(84); status != 0 || path != "/name" {
+		t.Fatalf("delayed delete detached replacement: path=%q status=%v", path, status)
 	}
 }

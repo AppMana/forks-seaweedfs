@@ -1396,6 +1396,12 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 	}
 	if contentChanged || !fh.dirtyMetadata {
 		fh.SetEntry(candidate)
+		// Foreign content over a committed base took the handle's pages and
+		// attributes with it, so nothing is left for its flush to write back
+		// over what that mount does next.
+		if contentChanged && base != nil {
+			fh.dirtyMetadata = false
+		}
 	} else {
 		// The kept attributes are the handle's; its links are the file's, and
 		// a flush without them would take the file out of the link.

@@ -183,42 +183,62 @@ func (a *winfspFS) fullPath(path string) util.FullPath {
 // resolve walks a cgofuse path to its inode and takes a lookup reference on
 // it, which the caller returns with release. The root holds none.
 func (a *winfspFS) resolve(path string) (uint64, fuse.Status) {
-	ino, _, status := a.walk(strings.Trim(path, "/"))
+	ino, _, _, status := a.walk(strings.Trim(path, "/"))
 	return ino, status
 }
 
 // walk resolves rel, a path relative to the mount root without leading or
 // trailing separators, to a referenced inode and its canonical spelling. A
 // tracked path is taken as is; otherwise the parent is walked and the leaf
-// looked up, and the cache keeps the result for the next walk.
-func (a *winfspFS) walk(rel string) (uint64, string, fuse.Status) {
+// looked up, and the cache keeps the result for the next walk. It also
+// reports whether the inode is a directory: a path through a file is ENOTDIR.
+func (a *winfspFS) walk(rel string) (uint64, string, bool, fuse.Status) {
 	if rel == "" {
-		return 1, "", fuse.OK
+		return 1, "", true, fuse.OK
 	}
 	full := a.fullPath("/" + rel)
 	if ino, found := a.wfs.inodeToPath.AcquirePath(full); found {
 		a.paths.touch(full, time.Now())
-		return ino, rel, fuse.OK
+		dir, known := a.paths.isDir(full)
+		if !known {
+			dir = a.inodeIsDir(ino)
+		}
+		return ino, rel, dir, fuse.OK
 	}
 	parentRel, name := "", rel
 	if idx := strings.LastIndex(rel, "/"); idx >= 0 {
 		parentRel, name = rel[:idx], rel[idx+1:]
 	}
-	parent, parentCanonical, status := a.walk(parentRel)
+	parent, parentCanonical, parentDir, status := a.walk(parentRel)
 	if status != fuse.OK {
-		return 0, "", status
+		return 0, "", false, status
 	}
 	defer a.release(parent)
+	if !parentDir {
+		return 0, "", false, fuse.ENOTDIR
+	}
 	child, canonical, dir, status := a.lookupChild(parent, name)
 	if status != fuse.OK {
 		glog.V(1).Infof("winfsp resolve failed: path=%q parent_inode=%d component=%q status=%v", rel, parent, name, status)
-		return 0, "", status
+		return 0, "", false, status
 	}
 	if parentCanonical != "" {
 		canonical = parentCanonical + "/" + canonical
 	}
 	a.paths.hold(a.fullPath("/"+canonical), child, dir, time.Now())
-	return child, canonical, fuse.OK
+	return child, canonical, dir, fuse.OK
+}
+
+// inodeIsDir reads whether a tracked inode the path cache does not hold is a
+// directory. An inode whose attributes cannot be read is taken as one, so the
+// operation itself reports the failure.
+func (a *winfspFS) inodeIsDir(ino uint64) bool {
+	in := fuse.GetAttrIn{InHeader: a.header(ino)}
+	var out fuse.AttrOut
+	if a.wfs.GetAttr(nil, &in, &out) != fuse.OK {
+		return true
+	}
+	return out.Attr.Mode&cgofuse.S_IFMT == cgofuse.S_IFDIR
 }
 
 // release returns one lookup reference. The root never takes one.
@@ -321,7 +341,7 @@ func (a *winfspFS) Getpath(path string, _ uint64) (int, string) {
 	if _, found := a.wfs.inodeToPath.GetInode(a.fullPath(path)); found {
 		return 0, path
 	}
-	ino, canonical, status := a.walk(strings.Trim(path, "/"))
+	ino, canonical, _, status := a.walk(strings.Trim(path, "/"))
 	if status != fuse.OK {
 		return toWinErrno(status), ""
 	}
@@ -385,9 +405,13 @@ func (a *winfspFS) resolveParent(path string) (uint64, string, fuse.Status) {
 	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
 		dir, name = "/"+trimmed[:idx], trimmed[idx+1:]
 	}
-	parent, st := a.resolve(dir)
+	parent, _, isDir, st := a.walk(strings.Trim(dir, "/"))
 	if st != fuse.OK {
 		return 0, "", st
+	}
+	if !isDir {
+		a.release(parent)
+		return 0, "", fuse.ENOTDIR
 	}
 	return parent, name, fuse.OK
 }
@@ -519,7 +543,7 @@ func (a *winfspFS) Getattr(path string, st *cgofuse.Stat_t, fh uint64) int {
 		}
 	}
 	gen := a.paths.generation()
-	ino, canonical, status := a.walk(strings.Trim(path, "/"))
+	ino, canonical, _, status := a.walk(strings.Trim(path, "/"))
 	if status != fuse.OK {
 		return toWinErrno(status)
 	}

@@ -160,3 +160,49 @@ func TestWinfspLocalMutationsPurgeCachedAttributes(t *testing.T) {
 		t.Fatalf("creation time = %d after setcrtime, want 1600000000", crtime)
 	}
 }
+
+func TestWinfspHardLinkSiblingAndReadAheadInvalidation(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	fake.add("/d", treeFile("src", 0o644))
+	for _, name := range []string{"a", "b"} {
+		entry := treeFile(name, 0o644)
+		entry.HardLinkId = []byte("hl-stat")
+		entry.HardLinkCounter = 2
+		entry.Attributes.Inode = 5151
+		fake.add("/d", entry)
+	}
+	wfs, a := newWinfspTreeWFS(t, fake)
+	wfs.option.MountUid, wfs.option.MountGid = 0, 0
+
+	// Cache /d/b's attributes (Nlink=2), then overwrite its sibling /d/a via Rename.
+	var stat cgofuse.Stat_t
+	if code := a.Getattr("/d/b", &stat, invalidFh); code != 0 || stat.Nlink != 2 {
+		t.Fatalf("getattr /d/b before rename = %d nlink %d, want 0 nlink 2", code, stat.Nlink)
+	}
+	if code := a.Rename("/d/src", "/d/a"); code != 0 {
+		t.Fatalf("rename /d/src -> /d/a: %d", code)
+	}
+	if code := a.Getattr("/d/b", &stat, invalidFh); code != 0 || stat.Nlink != 1 {
+		t.Fatalf("getattr /d/b after rename replaced sibling /d/a = %d nlink %d, want 0 nlink 1", code, stat.Nlink)
+	}
+
+	// Populate read-ahead on /d/b, then truncate /d/b via Create(O_TRUNC).
+	code, fhRead := a.Open("/d/b", cgofuse.O_RDONLY)
+	if code != 0 {
+		t.Fatalf("open /d/b: %d", code)
+	}
+	defer a.Release("/d/b", fhRead)
+	buf := make([]byte, 1)
+	if n := a.Read("/d/b", buf, 0, fhRead); n != 1 {
+		t.Fatalf("initial read /d/b = %d, want 1", n)
+	}
+	code, fhTrunc := a.Create("/d/b", cgofuse.O_RDWR|cgofuse.O_TRUNC, 0o644)
+	if code != 0 {
+		t.Fatalf("create O_TRUNC /d/b: %d", code)
+	}
+	defer a.Release("/d/b", fhTrunc)
+	if n := a.Read("/d/b", buf, 0, fhRead); n != 0 {
+		t.Fatalf("read /d/b after Create(O_TRUNC) = %d, want 0 (read-ahead invalidated)", n)
+	}
+}

@@ -484,10 +484,18 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 // rollback of a failed fan-out.
 const cleanupJwtLookupTimeout = 10 * time.Second
 
+// cleanupDeleteTimeout bounds one holder even when an uploader was built with
+// a custom HTTP client that has no response timeout of its own.
+var cleanupDeleteTimeout = 30 * time.Second
+
 // deleteChunkFromHolders best-effort removes a needle from each holder it landed
 // on, using type=replicate so the volume drops only its local copy. A failed
 // delete falls back to vacuum reclaiming the orphan.
 func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt, opt *ChunkedUploadOption) {
+	deleteChunkFromHoldersWithClient(hosts, fid, jwt, opt, util_http.GetGlobalHttpClient())
+}
+
+func deleteChunkFromHoldersWithClient(hosts []string, fid string, jwt security.EncodedJwt, opt *ChunkedUploadOption, httpClient HTTPClient) {
 	// An unresponsive holder can stall the upload past the write JWT's expiry,
 	// so renew the token whenever a holder rejects the delete as unauthorized.
 	// Each holder's delete is retried at most once, and a slow holder that
@@ -495,14 +503,18 @@ func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt,
 	deleteJwt := jwt
 	for _, host := range hosts {
 		deleteUrl := fmt.Sprintf("http://%s/%s?type=replicate", host, fid)
-		body, status, err := util_http.DeleteProxied(deleteUrl, string(deleteJwt))
+		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), cleanupDeleteTimeout)
+		body, status, err := deleteWithClient(deleteCtx, httpClient, deleteUrl, deleteJwt)
+		deleteCancel()
 		if status == http.StatusUnauthorized && opt != nil && opt.LookupJwtFunc != nil {
 			lookupCtx, cancel := context.WithTimeout(context.Background(), cleanupJwtLookupTimeout)
 			token := opt.LookupJwtFunc(lookupCtx, fid)
 			cancel()
 			if token != "" {
 				deleteJwt = token
-				body, status, err = util_http.DeleteProxied(deleteUrl, string(deleteJwt))
+				deleteCtx, deleteCancel = context.WithTimeout(context.Background(), cleanupDeleteTimeout)
+				body, status, err = deleteWithClient(deleteCtx, httpClient, deleteUrl, deleteJwt)
+				deleteCancel()
 			}
 		}
 		if err != nil {
@@ -515,6 +527,26 @@ func deleteChunkFromHolders(hosts []string, fid string, jwt security.EncodedJwt,
 			glog.Warningf("replica fan-out cleanup: delete %s from %s: status %d: %s", fid, host, status, body)
 		}
 	}
+}
+
+func deleteWithClient(ctx context.Context, httpClient HTTPClient, deleteUrl string, jwt security.EncodedJwt) (body []byte, status int, err error) {
+	if httpClient == nil {
+		httpClient = util_http.GetGlobalHttpClient()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteUrl, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if jwt != "" {
+		req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err = io.ReadAll(resp.Body)
+	return body, resp.StatusCode, err
 }
 
 // DeleteChunkFromHolders best-effort removes the needle fid from each of

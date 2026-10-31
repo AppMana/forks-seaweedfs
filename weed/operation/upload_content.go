@@ -182,6 +182,10 @@ type HTTPClient interface {
 // Uploader
 type Uploader struct {
 	httpClient HTTPClient
+	// deleteAbandonedFileId is replaceable per uploader in tests.
+	deleteAbandonedFileId func(hosts []string, fid string, jwt security.EncodedJwt)
+	// scheduleCleanup runs an abandoned-write cleanup; tests make it synchronous.
+	scheduleCleanup func(abandonedCleanup)
 	// watchedHttpClient serves writes a ProgressWatch guards. It has no
 	// response-header timeout: the watch's response timeout replaces that
 	// absolute bound, and waits only while the peer acknowledges nothing.
@@ -215,18 +219,18 @@ func NewUploader() (*Uploader, error) {
 }
 
 func newUploader(httpClient HTTPClient) *Uploader {
-	return &Uploader{
-		httpClient: httpClient,
+	uploader := &Uploader{httpClient: httpClient}
+	uploader.deleteAbandonedFileId = func(hosts []string, fid string, jwt security.EncodedJwt) {
+		deleteChunkFromHoldersWithClient(hosts, fid, jwt, nil, uploader.httpClient)
 	}
+	return uploader
 }
 
 // NewUploaderWithHttpClient creates an Uploader that uses the provided HTTP
 // client instead of the global one. This is used by filer.sync to upload to
 // remote clusters that use different TLS certificates.
 func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
-	return &Uploader{
-		httpClient: httpClient,
-	}
+	return newUploader(httpClient)
 }
 
 // uploadAssignment is where one upload attempt writes: the file id, the host
@@ -237,13 +241,54 @@ type uploadAssignment struct {
 	host    string
 	auth    security.EncodedJwt
 	fsync   bool
-	servers []string
+	servers []string // topology identities used by stall avoidance
+	holders []string // client-reachable addresses used by cleanup
+}
+
+const (
+	abandonedCleanupWorkers = 4
+	abandonedCleanupBacklog = 64
+)
+
+type abandonedCleanup struct {
+	holders []string
+	fid     string
+	jwt     security.EncodedJwt
+	delete  func([]string, string, security.EncodedJwt)
+}
+
+var (
+	abandonedCleanupOnce  sync.Once
+	abandonedCleanupQueue chan abandonedCleanup
+)
+
+// queueAbandonedCleanup bounds both the workers and queued cleanups. When a
+// widespread outage fills the queue, failed writers apply backpressure rather
+// than creating an unlimited number of goroutines.
+func queueAbandonedCleanup(cleanup abandonedCleanup) {
+	abandonedCleanupOnce.Do(func() {
+		abandonedCleanupQueue = make(chan abandonedCleanup, abandonedCleanupBacklog)
+		for range abandonedCleanupWorkers {
+			go func() {
+				for task := range abandonedCleanupQueue {
+					task.delete(task.holders, task.fid, task.jwt)
+				}
+			}()
+		}
+	})
+	abandonedCleanupQueue <- cleanup
 }
 
 func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (uploadAssignment, error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+	stalledServers := uploadOption.StalledServers
+	if stalledServers == nil {
+		stalledServers = NewStalledServers(time.Minute)
+	}
 	doUploadFunc := func() error {
+		fileId = ""
+		uploadResult = nil
 		var a uploadAssignment
-		err = uploadOption.StalledServers.Pick(func(avoid []string) ([]string, error) {
+		err = stalledServers.Pick(func(avoid []string) ([]string, error) {
 			var assignErr error
 			a, assignErr = assignFn(avoid)
 			return a.servers, assignErr
@@ -251,7 +296,6 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 		if err != nil {
 			return err
 		}
-		fileId = a.fileId
 
 		genUrl := uploadOption.GenUploadUrl
 		if genUrl == nil {
@@ -262,7 +306,8 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 			uploadOption.UploadUrl = util_http.AppendQueryParameter(uploadOption.UploadUrl, "fsync", "true")
 		}
 		uploadOption.Jwt = a.auth
-		if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
+		proxied := util_http.IsProxyChunkUrl(uploadOption.UploadUrl)
+		if proxied {
 			// The request addresses the filer, which authorizes it and mints the
 			// volume credential itself. The AssignVolume token is not a filer
 			// credential and gets the caller nowhere here.
@@ -275,9 +320,41 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func(avoid []string) (upl
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
 		if err != nil {
-			uploadOption.StalledServers.NoteFailure(a.servers, err)
+			if !proxied {
+				stalledServers.NoteFailure(a.servers, err)
+				// The holders may have stored the needle before the write failed,
+				// including a holder whose response stalled after its commit. The
+				// retry writes under a new file id, so nothing will name this one.
+				holders := a.holders
+				if len(holders) == 0 {
+					holders = a.servers
+				}
+				if len(holders) == 0 && a.host != "" {
+					holders = []string{a.host}
+				}
+				if len(holders) > 0 {
+					cleanup := abandonedCleanup{
+						holders: append([]string(nil), holders...),
+						fid:     a.fileId,
+						jwt:     a.auth,
+						delete:  uploader.deleteAbandonedFileId,
+					}
+					if cleanup.delete == nil {
+						cleanup.delete = DeleteChunkFromHolders
+					}
+					// A stalled holder answers the delete no sooner than the write,
+					// so the retry does not wait for it.
+					schedule := uploader.scheduleCleanup
+					if schedule == nil {
+						schedule = queueAbandonedCleanup
+					}
+					schedule(cleanup)
+				}
+			}
+			return err
 		}
-		return err
+		fileId = a.fileId
+		return nil
 	}
 
 	if uploadOption.RetryForever {
@@ -343,8 +420,10 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 			loc := resp.Location
 			a.host = filerClient.AdjustedUrl(loc)
 			a.servers = append(a.servers, loc.GetUrl())
+			a.holders = append(a.holders, filerClient.AdjustedUrl(loc))
 			for _, replica := range resp.Replicas {
 				a.servers = append(a.servers, replica.GetUrl())
+				a.holders = append(a.holders, filerClient.AdjustedUrl(replica))
 			}
 
 			return nil

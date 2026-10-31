@@ -758,3 +758,31 @@ func TestWinfspRenameBetweenNamesOfOneFileKeepsBoth(t *testing.T) {
 		}
 	}
 }
+
+// A file is not a directory: a path through it names nothing and nothing can
+// be made under it. The Linux kernel never asks; WinFsp passes such paths on.
+func TestWinfspPathThroughAFileIsNotADirectory(t *testing.T) {
+	fake := newTreeFiler()
+	fake.add("/", treeDir("d"))
+	fake.add("/d", treeFile("f", 0o644))
+	_, a := newWinfspTreeWFS(t, fake)
+	var st cgofuse.Stat_t
+	if code := a.Getattr("/d/f", &st, invalidFh); code != 0 {
+		t.Fatalf("getattr /d/f = %d", code)
+	}
+	if code := a.Mkdir("/d/f/x", 0o755); code != -cgofuse.ENOTDIR {
+		t.Fatalf("mkdir under a file = %d, want %d", code, -cgofuse.ENOTDIR)
+	}
+	if code, fh := a.Create("/d/f/y", cgofuse.O_RDWR|cgofuse.O_CREAT, 0o644); code != -cgofuse.ENOTDIR {
+		a.Release("/d/f/y", fh)
+		t.Fatalf("create under a file = %d, want %d", code, -cgofuse.ENOTDIR)
+	}
+	if code := a.Getattr("/d/f/x", &st, invalidFh); code != -cgofuse.ENOTDIR {
+		t.Fatalf("getattr through a file = %d, want %d", code, -cgofuse.ENOTDIR)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.dirs["/d/f"]) != 0 {
+		t.Fatalf("the filer gained entries under a file: %v", fake.dirs["/d/f"])
+	}
+}

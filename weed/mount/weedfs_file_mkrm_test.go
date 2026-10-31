@@ -858,3 +858,21 @@ func TestCreateRegularFileValidatesParentUnderDefaultPermissions(t *testing.T) {
 		t.Fatal("createRegularFile returned OK for a missing parent directory")
 	}
 }
+
+func TestFailedCreateReturnsLookupReference(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	entry := &filer_pb.Entry{Name: "denied", Attributes: &filer_pb.FuseAttributes{
+		FileMode: 0, Inode: 202, Crtime: 1, Uid: 123, Gid: 456,
+	}}
+	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry), 0); err != nil {
+		t.Fatal(err)
+	}
+	var out fuse.CreateOut
+	status := wfs.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 999, Gid: 999}}}, Flags: syscall.O_WRONLY}, "denied", &out)
+	if status != fuse.EACCES {
+		t.Fatalf("Create = %v, want EACCES", status)
+	}
+	if wfs.inodeToPath.HasInode(202) {
+		t.Fatal("failed Create leaked its lookup reference")
+	}
+}

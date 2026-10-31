@@ -105,6 +105,10 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		oldEntry = fresh
 	}
 
+	if oldEntry.HardLinkCounter >= maxHardLinks {
+		return fuse.Status(syscall.EMLINK)
+	}
+
 	// update old file to hardlink mode
 	origHardLinkId := oldEntry.HardLinkId
 	origHardLinkCounter := oldEntry.HardLinkCounter

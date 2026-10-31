@@ -69,3 +69,24 @@ func TestInodeToPathConsistencyCheckCatchesDanglingNames(t *testing.T) {
 	}
 }
 
+// A file another client gave more names than a file may have still costs the
+// table a bounded number of them, and its last Forget takes every one along.
+func TestLookupRecordsAtMostMaxHardLinksNames(t *testing.T) {
+	table := NewInodeToPath("/", 0)
+	const names = 3 * maxHardLinks
+	for n := 0; n < names; n++ {
+		if got := table.Lookup(util.FullPath(fmt.Sprintf("/d/n%d", n)), 1, false, true, 42, true); got != 42 {
+			t.Fatalf("name %d resolved to inode %d", n, got)
+		}
+	}
+	if got := len(table.GetAllPaths(42)); got != maxHardLinks {
+		t.Fatalf("inode records %d names, want %d", got, maxHardLinks)
+	}
+	if err := table.checkConsistency(); err != nil {
+		t.Fatal(err)
+	}
+	table.Forget(42, names, nil, nil)
+	if len(table.inode2path) != 1 || len(table.path2inode) != 1 {
+		t.Fatalf("forget left %d inodes and %d names", len(table.inode2path), len(table.path2inode))
+	}
+}

@@ -167,3 +167,33 @@ func TestQueuedFlushReachesSurvivingLinkAfterUnlink(t *testing.T) {
 		waitForFileContent(t, b, payload, 10*time.Second)
 	}
 }
+
+// Another mount removing one name of a hard link lowers the link count every
+// remaining name reports here, as a local unlink does.
+func TestSurvivingLinkCountFollowsRemoteUnlink(t *testing.T) {
+	config := DefaultTestConfig()
+	fw := NewFuseTestFramework(t, config)
+	defer fw.Cleanup()
+	require.NoError(t, fw.Setup(config))
+	mountB, unmountB := fw.mountSecond(t, 0)
+	defer unmountB()
+	dirA := filepath.Join(fw.GetMountPoint(), "hardlink_remote_count")
+	dirB := filepath.Join(mountB, "hardlink_remote_count")
+	require.NoError(t, os.Mkdir(dirA, 0755))
+	a, b := filepath.Join(dirA, "a"), filepath.Join(dirA, "b")
+	require.NoError(t, os.WriteFile(a, []byte("shared"), 0644))
+	require.NoError(t, os.Link(a, b))
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(b, &st))
+	require.EqualValues(t, 2, st.Nlink)
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dirB, "a"))
+		return err == nil
+	}, 10*time.Second, 50*time.Millisecond)
+	require.NoError(t, os.Remove(filepath.Join(dirB, "a")))
+	require.Eventually(t, func() bool {
+		var st unix.Stat_t
+		return unix.Stat(b, &st) == nil && st.Nlink == 1
+	}, 10*time.Second, 100*time.Millisecond, "surviving link still reports the removed name in its link count")
+}
+

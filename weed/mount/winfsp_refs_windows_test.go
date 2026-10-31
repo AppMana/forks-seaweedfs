@@ -43,6 +43,20 @@ func (s *treeFiler) add(dir string, entry *filer_pb.Entry) {
 		s.dirs[dir] = map[string]*filer_pb.Entry{}
 	}
 	s.dirs[dir][entry.Name] = entry
+	// The filer keeps a hard link's attributes, content and count in one
+	// shared record, so every name reads what the last write through any of
+	// them stored.
+	if len(entry.HardLinkId) > 0 {
+		for d, entries := range s.dirs {
+			for name, e := range entries {
+				if string(e.HardLinkId) == string(entry.HardLinkId) && (d != dir || name != entry.Name) {
+					shared := proto.Clone(entry).(*filer_pb.Entry)
+					shared.Name = name
+					entries[name] = shared
+				}
+			}
+		}
+	}
 	if entry.IsDirectory {
 		child := string(util.FullPath(dir).Child(entry.Name))
 		if s.dirs[child] == nil {

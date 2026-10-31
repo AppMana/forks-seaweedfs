@@ -9,19 +9,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-const (
-	// winfspCacheTTL is how long the WinFsp adapter keeps a file's lookup
-	// reference after its last use, and how long cached attributes answer.
-	winfspCacheTTL = time.Second
-
-	// winfspMaxCachedPaths bounds the references the path cache holds.
-	winfspMaxCachedPaths = 64 << 10
-
-	// winfspMaxRecentPurges bounds the purges remembered for discarding
-	// attributes read before one. An older read is discarded outright,
-	// which only costs the next Getattr a miss.
-	winfspMaxRecentPurges = 128
-)
+// winfspMaxRecentPurges bounds the purges remembered for discarding
+// attributes read before one. An older read is discarded outright, which only
+// costs the next Getattr a miss.
+const winfspMaxRecentPurges = 128
 
 // winfspPathCache stands in for the dentry cache the kernel keeps for a FUSE
 // mount. WinFsp addresses every operation by path and never sends FORGET, so

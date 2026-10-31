@@ -19,6 +19,15 @@ import (
 // invalidFh is the cgofuse "no file handle" sentinel (~uint64(0)).
 const invalidFh = ^uint64(0)
 
+const (
+	// winfspCacheTTL is how long the WinFsp adapter keeps a file's lookup
+	// reference after its last use, and how long cached attributes answer.
+	winfspCacheTTL = time.Second
+
+	// winfspMaxCachedPaths bounds the references the path cache holds.
+	winfspMaxCachedPaths = 64 << 10
+)
+
 // winfspFS adapts the inode-based WFS raw handlers to cgofuse's
 // path-based FileSystemInterface, served by WinFsp on Windows. All
 // filesystem logic (chunk reads, dirty-page writes, rename streaming,

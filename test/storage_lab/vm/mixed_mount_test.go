@@ -28,6 +28,7 @@ func TestMixedOSMountLab(t *testing.T) {
 	}
 	t.Logf("retained results: %s", results)
 	completed := 0
+	var phaseResults []string
 	required := 8
 	if os.Getenv("SEAWEEDFS_MIXED_CACHE_COHERENCE") == "1" {
 		required++
@@ -37,7 +38,7 @@ func TestMixedOSMountLab(t *testing.T) {
 		if t.Failed() || completed != required {
 			status = "failed"
 		}
-		data, err := json.MarshalIndent(map[string]any{"status": status, "completed_paired_phases": completed, "required_paired_phases": required, "scope": "Linux filer with native Linux FUSE and Windows WinFsp mounts; not CSI, shared-file locking, or power loss"}, "", "  ")
+		data, err := json.MarshalIndent(map[string]any{"status": status, "completed_paired_phases": completed, "required_paired_phases": required, "phase_results": phaseResults, "scope": "Linux filer with native Linux FUSE and Windows WinFsp mounts; not CSI, shared-file locking, or power loss"}, "", "  ")
 		if err != nil {
 			t.Error(err)
 			return
@@ -284,9 +285,15 @@ Write-Output 'verified loaded candidate DLL';`))
 			// Diagnostics never change the failed verdict. Compare mounted reads
 			// with filer bytes, then observe whether the default 1s Linux attr
 			// cache converges. Keep this separate from the no-retry oracle.
-			diagnostic := `import hashlib,os,time,urllib.request
+			// The cache phases use their own files under .sync, so inspect
+			// those rather than the payload files.
+			names := []string{"linux-00.bin", "windows-00.bin"}
+			if strings.HasPrefix(action, "cache-coherence") {
+				names = []string{".sync/" + action + "-data-linux", ".sync/" + action + "-data-windows"}
+			}
+			diagnostic := `import hashlib,os,sys,time,urllib.request
 def inspect(label):
- for name in ('linux-00.bin','windows-00.bin'):
+ for name in sys.argv[1:]:
   for source in ('mount','filer'):
    try:
     if source=='mount':
@@ -296,16 +303,34 @@ def inspect(label):
     else:
      with urllib.request.urlopen('http://192.0.2.10:8888/'+name,timeout=3) as r: b=r.read()
      size=len(b)
-    print(label,source,name,'stat',size,'read',len(b),'sha256',hashlib.sha256(b).hexdigest(),flush=True)
+    print(label,source,name,'stat',size,'read',len(b),'first',b[:1].hex(),'sha256',hashlib.sha256(b).hexdigest(),flush=True)
    except Exception as e: print(label,source,name,repr(e),flush=True)
 inspect('immediate')
 time.sleep(3)
 inspect('after-3s')`
-			if err := run("linux", "failed-"+action+"-diagnostic", "python3", "-c", diagnostic); err != nil {
+			if err := run("linux", "failed-"+action+"-diagnostic", append([]string{"python3", "-c", diagnostic}, names...)...); err != nil {
 				t.Logf("auxiliary diagnostic: %v", err)
 			}
-			t.FailNow()
+			// The Windows view of the same files after the workload has
+			// exited and released its descriptor and mapping.
+			var windowsNames []string
+			for _, name := range names {
+				windowsNames = append(windowsNames, `'C:\lab\mnt\`+strings.ReplaceAll(name, "/", `\`)+`'`)
+			}
+			windowsDiagnostic := `$ErrorActionPreference='Continue'; foreach($label in 'immediate','after-3s'){ if($label -eq 'after-3s'){Start-Sleep -Seconds 3}; foreach($p in @(` + strings.Join(windowsNames, ",") + `)){ try { $b=[IO.File]::ReadAllBytes($p); $i=Get-Item -LiteralPath $p; $h=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($b)).Replace('-','').ToLowerInvariant(); $f=''; if($b.Length -gt 0){$f='{0:x2}' -f $b[0]}; Write-Output "$label mount $p stat $($i.Length) read $($b.Length) first $f mtime $($i.LastWriteTimeUtc.ToString('o')) sha256 $h" } catch { Write-Output "$label mount $p $($_.Exception.Message)" } } }`
+			if err := run("windows", "failed-"+action+"-diagnostic", ps, "-NoProfile", "-Command", windowsDiagnostic); err != nil {
+				t.Logf("auxiliary diagnostic: %v", err)
+			}
+			phaseResults = append(phaseResults, action+"=failed")
+			// A cache phase reads and writes only its own files, so the
+			// lifecycle phases after it still run and report; the verdict
+			// stays failed. A lifecycle failure leaves no state to continue on.
+			if !strings.HasPrefix(action, "cache-coherence") {
+				t.FailNow()
+			}
+			return
 		}
+		phaseResults = append(phaseResults, action+"=passed")
 		completed++
 	}
 	for _, action := range []string{"seed", "verify-seed", "rewrite", "verify-rewrite", "rename-delete", "verify-final"} {

@@ -37,13 +37,11 @@ func NewWinFspHost(wfs *WFS, caseSensitive, basicPermissions, readOnly bool) *Wi
 	host.SetCapReaddirPlus(true)
 	host.SetCapCaseInsensitive(winFspCaseInsensitive(caseSensitive))
 	wfs.SetEntryChangeListener(func(event meta_cache.EntryInvalidation) {
+		adapter.entryChanged(event)
 		for _, signature := range event.Signatures {
 			if signature == wfs.signature {
 				return
 			}
-		}
-		if inode, found := wfs.inodeToPath.GetInode(event.Path); found {
-			adapter.readAhead.Invalidate(inode)
 		}
 		action := winFspAppliedEventAction(event)
 		if action == winFspAppliedNone {

@@ -201,9 +201,14 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	}
 	i.path2inode[path] = inode
 
-	if _, found := i.inode2path[inode]; found {
+	if entry, entryFound := i.inode2path[inode]; entryFound {
+		if !found {
+			// Another name of a hard-linked inode. Record it with the inode, or
+			// the last Forget leaves this name mapped to an inode that is gone.
+			entry.addPath(path)
+		}
 		if isLookup {
-			i.inode2path[inode].nlookup++
+			entry.nlookup++
 		}
 	} else {
 		nlookup := uint64(0)
@@ -233,6 +238,24 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 	}
 	entry.nlookup++
 	return true
+}
+
+// AcquirePath takes one more reference on the inode path maps to, reporting
+// false when the table does not have the path. Checking and taking happen
+// under one lock, so a concurrent Forget cannot release the inode in between.
+func (i *InodeToPath) AcquirePath(path util.FullPath) (uint64, bool) {
+	i.Lock()
+	defer i.Unlock()
+	inode, found := i.path2inode[path]
+	if !found {
+		return 0, false
+	}
+	entry, found := i.inode2path[inode]
+	if !found {
+		return 0, false
+	}
+	entry.nlookup++
+	return inode, true
 }
 
 // InodeForListing returns the inode number a readdir should report for path

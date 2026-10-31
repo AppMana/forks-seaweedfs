@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: ['merge/**']
   workflow_dispatch:
+    inputs:
+      comparison_ref:
+        description: 'Optional full commit SHA for paired native mount benchmarks'
+        type: string
+        required: false
+      comparison_pairs:
+        description: 'Number of alternating baseline/candidate benchmark pairs'
+        type: number
+        default: 6
 
 permissions:
   contents: read
@@ -96,7 +105,10 @@ jobs:
           .\weed.exe version
       - name: Native windows unit tests (winfsp adapter, mount, command)
         working-directory: forks-seaweedfs
-        run: go test -count=1 -tags 5BytesOffset ./weed/mount/ ./weed/command/
+        # weed/mount/winfsp is upstream's adapter. The mount does not run it,
+        # but it builds against the fork's WFS, so its tests keep that WFS
+        # honest for upstream merges.
+        run: go test -count=1 -tags 5BytesOffset ./weed/mount/ ./weed/mount/winfsp/ ./weed/command/
       - name: Upload weed.exe
         uses: actions/upload-artifact@v4
         with:
@@ -216,3 +228,39 @@ jobs:
         run: ./hack/appmana/mount-bench.ps1 -WeedExe (Resolve-Path ./cgo1/weed.exe) -Label cgo-cached
       - name: Bench cgo, legacy options
         run: ./hack/appmana/mount-bench.ps1 -WeedExe (Resolve-Path ./cgo1/weed.exe) -Label cgo-legacy -WinfspOptions 'FileInfoTimeout=1000,DirInfoTimeout=1000'
+      - name: Check out comparison baseline
+        if: inputs.comparison_ref != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.comparison_ref }}
+          path: comparison/forks-seaweedfs
+      - name: Set up Go for comparison
+        if: inputs.comparison_ref != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: comparison/forks-seaweedfs/go.mod
+      - name: Build comparison baseline
+        if: inputs.comparison_ref != ''
+        run: |
+          git clone --depth 1 -b $env:GO_FUSE_BRANCH $env:GO_FUSE_REPO comparison/forks-go-fuse
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:CGO_ENABLED = '0'
+          Push-Location comparison/forks-seaweedfs
+          go build -tags 5BytesOffset -o ../../baseline.exe ./weed
+          $buildExit = $LASTEXITCODE
+          Pop-Location
+          if ($buildExit -ne 0) { exit $buildExit }
+      - name: Paired native mount benchmarks
+        if: inputs.comparison_ref != ''
+        env:
+          COMPARISON_PAIRS: ${{ inputs.comparison_pairs }}
+        run: |
+          $pairs = [int]$env:COMPARISON_PAIRS
+          if ($pairs -lt 2 -or $pairs -gt 20) { throw 'comparison_pairs must be between 2 and 20' }
+          $binaries = @{ baseline = (Resolve-Path ./baseline.exe); candidate = (Resolve-Path ./cgo0/weed.exe) }
+          for ($pair = 1; $pair -le $pairs; $pair++) {
+            $order = if ($pair % 2) { @('baseline', 'candidate') } else { @('candidate', 'baseline') }
+            foreach ($label in $order) {
+              ./hack/appmana/mount-bench.ps1 -WeedExe $binaries[$label] -Label "$label-pair-$pair"
+            }
+          }

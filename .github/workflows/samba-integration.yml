@@ -2,7 +2,7 @@ name: "Samba on FUSE Integration"
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'weed/mount/**'
       - 'weed/filer/**'
@@ -10,7 +10,7 @@ on:
       - 'test/samba/**'
       - '.github/workflows/samba-integration.yml'
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'weed/mount/**'
       - 'weed/filer/**'

@@ -2,14 +2,14 @@ name: "pjdfstest POSIX Compliance"
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'weed/mount/**'
       - 'weed/filer/**'
       - 'test/pjdfstest/**'
       - '.github/workflows/pjdfstest.yml'
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'weed/mount/**'
       - 'weed/filer/**'

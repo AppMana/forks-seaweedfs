@@ -336,9 +336,12 @@ func (c *winfspPathCache[S]) giveBack(inodes []uint64) {
 	for _, inode := range inodes {
 		if c.busy(inode) {
 			c.mu.Lock()
-			c.heldBack[inode]++
+			alreadyHeld := c.heldBack[inode] != 0
+			c.heldBack[inode] = 1
 			c.mu.Unlock()
-			continue
+			if !alreadyHeld {
+				continue
+			}
 		}
 		c.forget(inode)
 	}

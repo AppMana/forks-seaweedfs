@@ -204,11 +204,11 @@ func TestWinfspPathCacheHoldsBackReferencesOfBusyInodes(t *testing.T) {
 	refs.lookup(8)
 	c.adopt("/other", 8, false, now) // pushes /again out past capacity
 	c.sweep(now.Add(time.Hour))
-	if got := refs.count(7); got != 3 {
-		t.Fatalf("busy inode has %d references, want all 3 held back", got)
+	if got := refs.count(7); got != 1 {
+		t.Fatalf("busy inode has %d references, want one held back", got)
 	}
-	if c.size() != 3 {
-		t.Fatalf("cache owns %d references, want the 3 held back", c.size())
+	if c.size() != 1 {
+		t.Fatalf("cache owns %d references, want one held back", c.size())
 	}
 
 	refs.setBusy(7, false)
@@ -329,5 +329,23 @@ func TestWinfspPathCacheDiscardsAttributesReadBeforeAPurge(t *testing.T) {
 	c.setStat("/d/f", 5, false, 3, gen, now)
 	if _, _, ok := c.stat("/d/f", now); ok {
 		t.Fatal("a read older than the purge window was stored")
+	}
+}
+
+func TestWinfspBusyReferenceRetentionIsBounded(t *testing.T) {
+	refs := newFakeRefs()
+	c := newTestPathCache(refs, 16)
+	refs.setBusy(10, true)
+	for n := 0; n < 10000; n++ {
+		refs.lookup(10)
+		c.adopt("/busy", 10, false, time.Now())
+	}
+	if got := c.size(); got > 2 {
+		t.Fatalf("cache retains %d references for one busy inode, want at most two", got)
+	}
+	refs.setBusy(10, false)
+	c.sweep(time.Now().Add(time.Hour))
+	if got := refs.total(); got != 0 {
+		t.Fatalf("leaked %d references", got)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -30,7 +31,8 @@ func cacheCoherence(root, owner, peer, action string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	closeFile := sync.OnceValue(f.Close)
+	defer closeFile()
 	readFD := func(want []byte) error {
 		got := make([]byte, len(want))
 		n, err := f.ReadAt(got, 0)
@@ -42,18 +44,20 @@ func cacheCoherence(root, owner, peer, action string) error {
 	if err := readFD(before); err != nil {
 		return err
 	}
-	// Ordinary file coherence is mandatory. Keep the original strict probe
-	// (cache-coherence) requiring Windows mmap too; do not turn its known
-	// platform limitation into a silently passing test.
+	// Ordinary file coherence is mandatory. The strict probe
+	// (cache-coherence) maps the file on Windows too, and holds Windows to
+	// what it can guarantee while the mapping exists; see heldViews.
 	var mapped []byte
 	var immutableMapping []byte
+	unmapData := func() {}
 	if runtime.GOOS != "windows" || action == "cache-coherence" {
 		var unmap func()
 		mapped, unmap, err = mapReadOnly(f, len(before))
 		if err != nil {
 			return err
 		}
-		defer unmap()
+		unmapData = sync.OnceFunc(unmap)
+		defer unmapData()
 		if !bytes.Equal(mapped, before) {
 			return fmt.Errorf("initial mapping differs")
 		}
@@ -116,5 +120,33 @@ func cacheCoherence(root, owner, peer, action string) error {
 	if statErr == nil && (info.Size() != int64(len(after)) || !info.ModTime().Equal(stamp)) {
 		statErr = fmt.Errorf("rewrite did not preserve size/mtime: %v", info)
 	}
-	return errors.Join(fdErr, mapErr, reopenErr, statErr)
+	if heldViews(runtime.GOOS, action) {
+		return errors.Join(fdErr, mapErr, reopenErr, statErr)
+	}
+	// Windows shares one cache section among every open of a name and its
+	// mappings, and cannot purge it while a view is mapped, so the
+	// descriptor and mapping opened before the rewrite are not guaranteed
+	// to see it. Report them, then require what is guaranteed: an open
+	// after the rewrite reads it, and so does a read once both are gone.
+	fmt.Printf("windows views held across the peer rewrite: descriptor=%s mapping=%s\n", viewState(fdErr), viewState(mapErr))
+	unmapData()
+	closeErr := closeFile()
+	released, releasedErr := os.ReadFile(path)
+	if releasedErr == nil && !bytes.Equal(released, after) {
+		releasedErr = fmt.Errorf("file read after releasing the mapping has stale bytes")
+	}
+	return errors.Join(reopenErr, statErr, closeErr, releasedErr)
+}
+
+// heldViews reports whether a descriptor and mapping held across a peer's
+// rewrite are required to see it.
+func heldViews(goos, action string) bool {
+	return goos != "windows" || action != "cache-coherence"
+}
+
+func viewState(err error) string {
+	if err != nil {
+		return "stale"
+	}
+	return "current"
 }

@@ -235,7 +235,13 @@ creation of 24 files per OS, cross verification, cross-OS cache coherence of
 file contents, overwrite and truncate of the other OS's files, verification,
 cross rename and delete, verification, and verification after remounting with
 fresh caches. `SEAWEEDFS_MIXED_CACHE_COHERENCE=1` adds a ninth, the full
-cache-coherence phase; CI sets it. Sizes include 0, 37, 4097 and 2 MiB + 103
+cache-coherence phase; CI sets it. It keeps a descriptor and a read-only
+mapping open across the peer's same-size rewrite. Linux must see the rewrite
+through both. Windows cannot purge a cache section while a view of it is
+mapped, so there it reports both and requires a reopen during the mapping,
+and a read after releasing it, to see the rewrite. The reopen relies on the
+mount opening such files uncached, which needs a WinFsp DLL that honors
+FUSE `direct_io`. Sizes include 0, 37, 4097 and 2 MiB + 103
 bytes. Only the coordination waits retry; content checks do not.
 
 ```sh

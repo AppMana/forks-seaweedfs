@@ -7,6 +7,24 @@ import (
 	"testing"
 )
 
+// Only the strict Windows probe relaxes the views held across the rewrite;
+// every other platform and phase still requires them to see it.
+func TestHeldViewsRequiredExceptStrictWindowsProbe(t *testing.T) {
+	for _, tc := range []struct {
+		goos, action string
+		required     bool
+	}{
+		{"linux", "cache-coherence", true},
+		{"linux", "cache-coherence-files", true},
+		{"windows", "cache-coherence-files", true},
+		{"windows", "cache-coherence", false},
+	} {
+		if got := heldViews(tc.goos, tc.action); got != tc.required {
+			t.Errorf("heldViews(%s, %s) = %v, want %v", tc.goos, tc.action, got, tc.required)
+		}
+	}
+}
+
 func seeded(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

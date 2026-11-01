@@ -107,6 +107,7 @@ func (a *winfspFS) startReferenceSweeper() {
 // directory its subtree's. A name that appeared replaces whatever was cached
 // under it.
 func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {
+	a.noteRemoteChange(event)
 	// Every event outdates the attributes of its path, of the inode's other
 	// names (a hard link's nlink and contents), and of the parent directory.
 	if ino, found := a.wfs.inodeToPath.GetInode(event.Path); found {
@@ -135,6 +136,25 @@ func (a *winfspFS) entryChanged(event meta_cache.EntryInvalidation) {
 			a.invalidateInode(ino)
 		}
 	}
+}
+
+// noteRemoteChange marks the held names a change from another client
+// outdated. Windows saw this mount's own changes through its cache, and a
+// directory has no data section.
+func (a *winfspFS) noteRemoteChange(event meta_cache.EntryInvalidation) {
+	for _, signature := range event.Signatures {
+		if signature == a.wfs.signature {
+			return
+		}
+	}
+	if event.Entry.GetIsDirectory() || (event.Entry == nil && event.WasDirectory) {
+		return
+	}
+	var inode uint64
+	if ino, found := a.wfs.inodeToPath.GetInode(event.Path); found {
+		inode = ino
+	}
+	a.openNames.changed(inode, event.Path)
 }
 
 // forgetStatWithParent drops the attributes cached for key and for its

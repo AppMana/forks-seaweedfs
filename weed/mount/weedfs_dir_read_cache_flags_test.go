@@ -25,6 +25,7 @@ type positionFiler struct {
 	err        error
 	listed     []*filer_pb.Entry // served by ListEntries
 	calls      atomic.Int32
+	afterList  func() // called once a listing has been served
 }
 
 func (s *positionFiler) DirectoryChangePosition(ctx context.Context, req *filer_pb.DirectoryChangePositionRequest) (*filer_pb.DirectoryChangePositionResponse, error) {
@@ -41,6 +42,9 @@ func (s *positionFiler) ListEntries(req *filer_pb.ListEntriesRequest, stream fil
 		if err := stream.Send(&filer_pb.ListEntriesResponse{Entry: entry}); err != nil {
 			return err
 		}
+	}
+	if s.afterList != nil {
+		s.afterList()
 	}
 	return nil
 }
@@ -104,7 +108,7 @@ func TestOpenDirWaitsForAcknowledgedChange(t *testing.T) {
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 	openDir(t, wfs, dirInode)
 
-	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true}}
+	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true, ListedThroughNs: 5000}}
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), relayedCreate(dir, "mp_rank_03_model_states.pt", 11, 5000), meta_cache.SubscriberMetadataResponseApplyOptions)
@@ -147,7 +151,7 @@ func TestOpenDirRelistsWhenTheStreamDoesNotDeliver(t *testing.T) {
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 	openDir(t, wfs, dirInode)
 
-	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true}}
+	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true, ListedThroughNs: 5000}}
 	fake.listed = []*filer_pb.Entry{{Name: "late.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}}}
 	openDir(t, wfs, dirInode)
 	if entry, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child("late.pt")); err != nil || entry == nil {
@@ -228,7 +232,7 @@ func TestNegativeLookupWaitsForAcknowledgedCreate(t *testing.T) {
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 	openDir(t, wfs, dirInode)
 
-	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true}}
+	fake.filers = []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 5000, Remembered: true, ListedThroughNs: 5000}}
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), relayedCreate(dir, "mp_rank_03_model_states.pt", 11, 5000), meta_cache.SubscriberMetadataResponseApplyOptions)
@@ -276,7 +280,7 @@ func TestOpenDirWaitsForPeerFilerChangeBehindOwnChange(t *testing.T) {
 	fake.tsNs, fake.remembered = 200, true
 	fake.filers = []*filer_pb.FilerDirectoryPosition{
 		{FilerId: filerA, PositionNs: 0},
-		{FilerId: filerB, PositionNs: 100, Remembered: true},
+		{FilerId: filerB, PositionNs: 100, Remembered: true, ListedThroughNs: 100},
 	}
 	fake.listed = []*filer_pb.Entry{own, peer}
 
@@ -286,5 +290,50 @@ func TestOpenDirWaitsForPeerFilerChangeBehindOwnChange(t *testing.T) {
 	}
 	if got := fake.signature.Load(); got != wfs.signature {
 		t.Fatalf("position request carried signature %d, want the mount's %d", got, wfs.signature)
+	}
+}
+
+// A listing holds a peer filer's change only once the filer that served it has
+// replayed it, which trails the peer's own position by the relay. A relist
+// read before then does not pass the directory as current: the open waits for
+// the stream to bring the change.
+func TestRelistedOpenDirWaitsForAPeerChangeItsFilerHasNotReplayed(t *testing.T) {
+	saved := directoryCurrentWait
+	directoryCurrentWait = time.Second
+	t.Cleanup(func() { directoryCurrentWait = saved })
+
+	const filerA, filerB = 11, 22
+	dir := util.FullPath("/ckpt")
+	wfs := newBenchWFS(t, dir, 0)
+	fake := &positionFiler{filers: []*filer_pb.FilerDirectoryPosition{{FilerId: filerA}, {FilerId: filerB}}}
+	startFakeFiler(t, wfs, fake)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	openDir(t, wfs, dirInode)
+
+	// rank 1 closed its file through filer B at 100; filer A, which this
+	// mount lists through, has replayed B only through 50
+	const name = "mp_rank_01_model_states.pt"
+	fake.filers = []*filer_pb.FilerDirectoryPosition{
+		{FilerId: filerA},
+		{FilerId: filerB, PositionNs: 100, Remembered: true, ListedThroughNs: 50},
+	}
+	fake.listed = []*filer_pb.Entry{{Name: "mp_rank_00_model_states.pt", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644}}}
+	var relayed atomic.Bool
+	fake.afterList = func() {
+		if relayed.Swap(true) {
+			return
+		}
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			_ = wfs.metaCache.ApplyMetadataResponse(context.Background(), relayedCreate(dir, name, filerB, 100), meta_cache.SubscriberMetadataResponseApplyOptions)
+		}()
+	}
+
+	openDir(t, wfs, dirInode)
+	if !relayed.Load() {
+		t.Fatal("open did not relist the directory")
+	}
+	if entry, _, err := wfs.metaCache.FindEntry(context.Background(), dir.Child(name)); err != nil || entry == nil {
+		t.Fatalf("open passed a relisting without filer B's change as current: %v", err)
 	}
 }

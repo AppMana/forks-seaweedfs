@@ -25,13 +25,15 @@ const (
 	// the section they land in.
 	sectionHotThreshold = 64
 	sectionHotWindow    = 2 * time.Second
-	// sectionRefreshTimeout bounds how long a readdir waits on re-validating
-	// a section before serving the maintained-but-unverified cache instead.
-	sectionRefreshTimeout = 5 * time.Second
 	// sectionRefreshMaxEntries is the most one refresh will carry; a section
 	// grown past it is cheaper to re-tile with a full directory rebuild.
 	sectionRefreshMaxEntries = 4 * dirSectionSize
 )
+
+// SectionRefreshTimeout bounds how long a readdir waits on re-validating a
+// section before serving the maintained-but-unverified cache instead. A
+// variable so tests can shorten it.
+var SectionRefreshTimeout = 5 * time.Second
 
 // ErrRefreshRangeTooLarge reports a section that outgrew one refresh; the
 // caller should drop the directory cache so a full rebuild re-tiles it.
@@ -238,7 +240,7 @@ func EnsureListingFresh(ctx context.Context, mc *MetaCache, client filer_pb.File
 	if len(ranges) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, sectionRefreshTimeout)
+	ctx, cancel := context.WithTimeout(ctx, SectionRefreshTimeout)
 	defer cancel()
 	for _, r := range ranges {
 		if err := mc.refreshSection(ctx, client, dirPath, r.lo, r.hi); err != nil {
@@ -256,7 +258,7 @@ func EnsureNameFresh(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 	if !stale {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, sectionRefreshTimeout)
+	ctx, cancel := context.WithTimeout(ctx, SectionRefreshTimeout)
 	defer cancel()
 	return mc.refreshSection(ctx, client, dirPath, r.lo, r.hi)
 }
@@ -294,7 +296,7 @@ func (mc *MetaCache) refreshSection(ctx context.Context, client filer_pb.FilerCl
 		// Shared like the directory build: the requester that started this
 		// flight can leave mid-refresh, so re-apply the bound on a context it
 		// cannot cancel rather than failing every waiter on its cancellation.
-		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sectionRefreshTimeout)
+		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), SectionRefreshTimeout)
 		defer cancel()
 		entries, snapshotTsNs, err := mc.listFilerRange(flightCtx, client, dirPath, lo, hi)
 		if err != nil {
@@ -323,7 +325,7 @@ func (mc *MetaCache) listFilerRange(ctx context.Context, client filer_pb.FilerCl
 		var pageCount int
 		var last string
 		done := false
-		err = client.WithFilerClient(false, func(sc filer_pb.SeaweedFilerClient) error {
+		err = filer_pb.WithFilerClientContext(ctx, client, false, func(ctx context.Context, sc filer_pb.SeaweedFilerClient) error {
 			// reset in case a failover retry re-runs a partly streamed page
 			page, pageCount, last, done = nil, 0, "", false
 			ts, listErr := filer_pb.DoSeaweedListWithSnapshot(ctx, sc, dirPath, "", func(pbEntry *filer_pb.Entry, isLast bool) error {

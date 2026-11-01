@@ -694,6 +694,11 @@ message FilerDirectoryPosition {
     // it; otherwise a floor at or above every change it has forgotten.
     int64 position_ns = 2;
     bool remembered = 3;
+    // The answering filer's listing of the directory, read after this answer,
+    // holds this filer's changes through this position: its own changes
+    // through position_ns, a peer's through what it has replayed of the
+    // peer's log, which can trail the peer's position_ns.
+    int64 listed_through_ns = 4;
 }
 
 message PingRequest {

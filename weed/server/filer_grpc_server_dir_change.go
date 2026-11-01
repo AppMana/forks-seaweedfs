@@ -26,10 +26,13 @@ func (fs *FilerServer) DirectoryChangePosition(ctx context.Context, req *filer_p
 	tsNs, remembered := fs.filer.DirectoryChangePosition(dir)
 	resp := &filer_pb.DirectoryChangePositionResponse{TsNs: tsNs, Remembered: remembered}
 	positionNs, positionRemembered := fs.filer.DirectoryWriterPosition(dir, req.Signature)
+	// A filer stores a change before logging it, so its listing holds its
+	// own changes through any position it names.
 	resp.Filers = []*filer_pb.FilerDirectoryPosition{{
-		FilerId:    fs.filer.UniqueFilerId,
-		PositionNs: positionNs,
-		Remembered: positionRemembered,
+		FilerId:         fs.filer.UniqueFilerId,
+		PositionNs:      positionNs,
+		Remembered:      positionRemembered,
+		ListedThroughNs: positionNs,
 	}}
 	if req.LocalOnly || fs.filer.MetaAggregator == nil {
 		return resp, nil
@@ -59,6 +62,12 @@ func (fs *FilerServer) DirectoryChangePosition(ctx context.Context, req *filer_p
 				defer mu.Unlock()
 				if len(peerResp.Filers) == 0 {
 					incomplete = true
+				}
+				// This filer's listing holds the peer's changes only as far
+				// as it has replayed them, read after the peer answered.
+				replayedThroughNs := fs.filer.MetaAggregator.PeerReplayedThroughTsNs(peer)
+				for _, p := range peerResp.Filers {
+					p.ListedThroughNs = replayedThroughNs
 				}
 				resp.Filers = append(resp.Filers, peerResp.Filers...)
 				if peerResp.TsNs > resp.TsNs {

@@ -224,6 +224,15 @@ func (ma *MetaAggregator) PeerLowWatermarkTsNs() int64 {
 	return lowWatermarkOf(ma.peerWatermarks)
 }
 
+// PeerReplayedThroughTsNs returns how far this filer has received the peer's
+// log, in the peer's log positions: every change the peer logged at or below
+// it is in this filer's store. Zero for a peer not followed or not heard from.
+func (ma *MetaAggregator) PeerReplayedThroughTsNs(peer pb.ServerAddress) int64 {
+	ma.peerWatermarksLock.Lock()
+	defer ma.peerWatermarksLock.Unlock()
+	return ma.peerWatermarks[peer]
+}
+
 // DeliveryWatermarkAdvancedChan returns a channel closed the next time the
 // delivery low-watermark rises, which is what releases an in-memory read held
 // at it. PeerLowFlushWatermarkTsNs has FlushWatermarkAdvancedChan. Callers
@@ -630,6 +639,8 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 			}
 			f.onMetadataChangeEvent(event)
 			lastTsNs = peerTsNs
+			// Only after the replay: listing snapshots and directory
+			// positions take the watermark as what the store holds.
 			ma.advancePeerWatermark(peer, peerTsNs)
 			return nil
 		}

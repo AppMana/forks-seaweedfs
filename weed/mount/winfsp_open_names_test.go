@@ -10,7 +10,7 @@ import (
 // section until the last handle goes, so every open of it until then has to
 // bypass the cache; names nobody changed keep caching.
 func TestWinfspOpenNamesBypassCacheOnlyWhileAChangedNameIsHeld(t *testing.T) {
-	n := newWinfspOpenNames()
+	n := newWinfspOpenNames(true)
 	const data, other = util.FullPath("/d/data"), util.FullPath("/d/other")
 	if n.opened(10, 5, data) {
 		t.Fatal("first open of an unchanged name bypasses the cache")
@@ -36,9 +36,22 @@ func TestWinfspOpenNamesBypassCacheOnlyWhileAChangedNameIsHeld(t *testing.T) {
 	}
 }
 
+// A case-insensitive mount releases a handle under whatever spelling Windows
+// opened it with; that has to release the held name it spells.
+func TestWinfspOpenNamesReleaseMatchesSpellingOnCaseInsensitiveMounts(t *testing.T) {
+	n := newWinfspOpenNames(false)
+	n.opened(10, 5, "/d/a")
+	n.opened(10, 5, "/d/b")
+	n.changed(0, "/d/b")
+	n.released(10, "/D/B")
+	if n.opened(11, 5, "/d/b") {
+		t.Fatal("release under another spelling left the changed name held")
+	}
+}
+
 // A change to a name nobody holds leaves no section behind to go stale.
 func TestWinfspOpenNamesIgnoreChangesToNamesNotHeld(t *testing.T) {
-	n := newWinfspOpenNames()
+	n := newWinfspOpenNames(true)
 	n.changed(5, "/d/data")
 	if n.opened(10, 5, "/d/data") {
 		t.Fatal("a change made before the open bypasses the cache")
@@ -48,7 +61,7 @@ func TestWinfspOpenNamesIgnoreChangesToNamesNotHeld(t *testing.T) {
 // Windows holds a hard link's other name as its own file object; a change
 // reported under one name outdates every held name of the inode.
 func TestWinfspOpenNamesChangeReachesEveryHeldNameOfTheInode(t *testing.T) {
-	n := newWinfspOpenNames()
+	n := newWinfspOpenNames(true)
 	n.opened(10, 5, "/d/link")
 	n.changed(5, "/d/data")
 	if !n.opened(10, 5, "/d/link") {
@@ -59,7 +72,7 @@ func TestWinfspOpenNamesChangeReachesEveryHeldNameOfTheInode(t *testing.T) {
 // A replaced or vacated name is stale for the file object Windows still
 // holds under it, whichever inode the name now resolves to.
 func TestWinfspOpenNamesReplacementOfAHeldName(t *testing.T) {
-	n := newWinfspOpenNames()
+	n := newWinfspOpenNames(true)
 	n.opened(10, 5, "/d/data")
 	n.changed(9, "/d/data")
 	if !n.opened(11, 9, "/d/data") {
@@ -70,7 +83,7 @@ func TestWinfspOpenNamesReplacementOfAHeldName(t *testing.T) {
 // WinFsp renames the open file objects along with the name, and reports the
 // name a handle was opened under when it is released.
 func TestWinfspOpenNamesFollowLocalRenames(t *testing.T) {
-	n := newWinfspOpenNames()
+	n := newWinfspOpenNames(true)
 	n.opened(10, 5, "/d/data")
 	n.opened(11, 6, "/d/sub/file")
 	n.renamed("/d/data", "/d/moved")

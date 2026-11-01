@@ -51,7 +51,7 @@ type winfspFS struct {
 	// to bypass the Windows cache.
 	openNames *winfspOpenNames
 	sweepStop chan struct{}
-	sweepDone  chan struct{}
+	sweepDone chan struct{}
 }
 
 // winfspHandleRef counts the opens a handle carries a reference for.
@@ -67,7 +67,7 @@ func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
 		caseSensitive: caseSensitive,
 		fileHandle:    make(map[uint64]*winfspHandleRef),
 		dirHandle:     make(map[uint64]*winfspHandleRef),
-		openNames:     newWinfspOpenNames(),
+		openNames:     newWinfspOpenNames(caseSensitive),
 	}
 	a.paths = newWinfspPathCache[cgofuse.Stat_t](winfspCacheTTL, wfs.dirIdleEvict, winfspMaxCachedPaths,
 		func(inode uint64) bool { return wfs.inodeToPath.IncrementNlookup(inode) },

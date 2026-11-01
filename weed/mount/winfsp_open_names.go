@@ -18,6 +18,8 @@ import (
 // of such a name has to bypass the Windows cache until the last handle on it
 // is gone; every other open keeps it.
 type winfspOpenNames struct {
+	caseSensitive bool
+
 	mu sync.Mutex
 	// opens counts the opens each handle carries, by name: WFS reuses a
 	// handle for every open of the same inode, under any of its names.
@@ -30,12 +32,13 @@ type winfspOpenNames struct {
 	stale map[util.FullPath]struct{}
 }
 
-func newWinfspOpenNames() *winfspOpenNames {
+func newWinfspOpenNames(caseSensitive bool) *winfspOpenNames {
 	return &winfspOpenNames{
-		opens:  map[uint64]map[util.FullPath]int{},
-		inodes: map[uint64]uint64{},
-		held:   map[util.FullPath]int{},
-		stale:  map[util.FullPath]struct{}{},
+		caseSensitive: caseSensitive,
+		opens:         map[uint64]map[util.FullPath]int{},
+		inodes:        map[uint64]uint64{},
+		held:          map[util.FullPath]int{},
+		stale:         map[util.FullPath]struct{}{},
 	}
 }
 
@@ -57,8 +60,8 @@ func (n *winfspOpenNames) opened(fh, inode uint64, name util.FullPath) bool {
 }
 
 // released drops one open carried by fh. WinFsp reports the name the handle
-// was opened under, which a rename may have changed since; any other name the
-// handle carries stands in for it then.
+// was opened under, spelled as the opener spelled it, which a rename may have
+// changed since; any other name the handle carries stands in for it then.
 func (n *winfspOpenNames) released(fh uint64, name util.FullPath) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -67,8 +70,13 @@ func (n *winfspOpenNames) released(fh uint64, name util.FullPath) {
 		return
 	}
 	if names[name] == 0 {
+		spelled := name
 		name = ""
 		for candidate := range names {
+			if !n.caseSensitive && strings.EqualFold(string(candidate), string(spelled)) {
+				name = candidate
+				break
+			}
 			if name == "" || candidate < name {
 				name = candidate
 			}

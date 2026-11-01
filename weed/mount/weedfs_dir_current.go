@@ -75,7 +75,10 @@ func (wfs *WFS) directoryChangePosition(ctx context.Context, dir util.FullPath) 
 	}
 	resp, err := awaitFilerReply(ctx, "directory position "+string(dir), func() (*filer_pb.DirectoryChangePositionResponse, error) {
 		var resp *filer_pb.DirectoryChangePositionResponse
-		err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		// The call runs under the attempt's context: one the caller abandoned
+		// then ends as that attempt, not as a failure of the channel the
+		// mount's other calls share.
+		err := wfs.withFilerClient(ctx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 			var callErr error
 			resp, callErr = client.DirectoryChangePosition(ctx, &filer_pb.DirectoryChangePositionRequest{Directory: string(dir), Signature: wfs.signature})
 			return callErr
@@ -133,6 +136,12 @@ func (wfs *WFS) awaitDirectoryCurrent(ctx context.Context, dir util.FullPath) di
 	positionCtx, cancel := context.WithTimeout(ctx, directoryPositionTimeout)
 	resp, err := wfs.directoryChangePosition(positionCtx, dir)
 	cancel()
+	if err != nil && ctx.Err() != nil {
+		// The caller stopped waiting, an interrupted request among them,
+		// before the filers named a position: nothing is known about the
+		// listing, so it is not answered from.
+		return directoryCurrency{}
+	}
 	if errors.Is(err, errDirectoryPositionUnsupported) {
 		return directoryCurrency{cached: true, verified: true}
 	}

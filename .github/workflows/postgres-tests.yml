@@ -53,6 +53,18 @@ jobs:
       with:
         ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
+    # The go-fuse sibling is outside the Docker build context, so the images
+    # copy binaries built here.
+    - name: Build test binaries
+      env:
+        CGO_ENABLED: '0'
+        GOOS: linux
+      run: |
+        go build -tags 5BytesOffset -ldflags "-s -w" -o bin/weed ../../weed
+        go build -ldflags "-s -w" -o bin/weed-db ../../cmd/weed-db
+        go build -ldflags "-s -w" -o bin/client ./client.go
+        ./bin/weed version
+
     - name: Configure Docker Hub mirror
       run: |
         echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json

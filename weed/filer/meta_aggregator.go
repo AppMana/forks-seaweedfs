@@ -630,6 +630,8 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 			}
 			f.onMetadataChangeEvent(event)
 			lastTsNs = peerTsNs
+			// Only after the replay: listing snapshots and directory
+			// positions take the watermark as what the store holds.
 			ma.advancePeerWatermark(peer, peerTsNs)
 			return nil
 		}

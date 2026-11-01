@@ -238,6 +238,22 @@ func (f *Filer) LocalDeliveredThroughTsNs(nowNs int64) int64 {
 	return f.metaLogInflight.claimThrough(nowNs)
 }
 
+// ListingSnapshotTsNs is the metadata stream position a directory listing
+// read from this filer's store after the call is complete through: every
+// event this filer's stream delivers at or below it is in the store by then.
+// An event is stamped before its write lands, so a change still in flight caps
+// the snapshot below its stamp, and one stamped later is fenced above it. A
+// peer's event keeps the peer's stamp but reaches this store only when the
+// aggregator replays it, so the snapshot also stays at or below what every
+// peer has been replayed through.
+func (f *Filer) ListingSnapshotTsNs(nowNs int64) int64 {
+	snapshot := f.metaLogInflight.claimThrough(nowNs)
+	if ma := f.MetaAggregator; ma != nil && ma.HasRemotePeers() {
+		snapshot = min(snapshot, ma.PeerLowWatermarkTsNs())
+	}
+	return snapshot
+}
+
 // StampMetaLogInflightForTest and DoneMetaLogInflightForTest let tests in
 // other packages exercise the claim caps. Not for production use.
 func (f *Filer) StampMetaLogInflightForTest() int64 {

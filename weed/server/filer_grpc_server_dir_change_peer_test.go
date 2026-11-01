@@ -13,6 +13,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // relayingPeerFiler is a peer filer with its own store: it names its position
@@ -47,6 +48,32 @@ func (s *relayingPeerFiler) DirectoryChangePosition(ctx context.Context, req *fi
 	}}, nil
 }
 
+// startRelayingPeer serves fake as a peer filer and returns its address.
+func startRelayingPeer(t *testing.T, fake *relayingPeerFiler) pb.ServerAddress {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	server := pb.NewGrpcServer()
+	filer_pb.RegisterSeaweedFilerServer(server, fake)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	return pb.NewServerAddressWithGrpcPort("127.0.0.1:1", listener.Addr().(*net.TCPAddr).Port)
+}
+
+// newFilerFollowingPeer is a filer over store whose aggregator follows peer.
+func newFilerFollowingPeer(t *testing.T, store *renameTestStore, peer pb.ServerAddress) *filer.Filer {
+	t.Helper()
+	f := newRenameTestFiler(t, store)
+	f.Signature, f.UniqueFilerId = 42, 1234
+	f.MetaAggregator = filer.NewMetaAggregator(f, pb.ServerAddress("127.0.0.1:2"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	f.MetaAggregator.OnPeerUpdate(&master_pb.ClusterNodeUpdate{Address: string(peer), IsAdd: true}, time.Now())
+	t.Cleanup(f.MetaAggregator.Shutdown)
+	return f
+}
+
 // A filer's listing holds its own changes through the position it names, but
 // a peer's only through what it has replayed of the peer's log, which trails
 // the position the peer names while the peer's newest change is still being
@@ -55,24 +82,8 @@ func (s *relayingPeerFiler) DirectoryChangePosition(ctx context.Context, req *fi
 func TestDirectoryChangePositionNamesWhatThisFilersListingHoldsOfEachPeer(t *testing.T) {
 	peerPosition := time.Now().UnixNano()
 	peerFake := &relayingPeerFiler{filerId: 22, positionNs: peerPosition, deliveredNs: peerPosition - 1}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	peerServer := pb.NewGrpcServer()
-	filer_pb.RegisterSeaweedFilerServer(peerServer, peerFake)
-	go peerServer.Serve(listener)
-	t.Cleanup(peerServer.Stop)
-	peer := pb.NewServerAddressWithGrpcPort("127.0.0.1:1", listener.Addr().(*net.TCPAddr).Port)
-
+	f := newFilerFollowingPeer(t, newRenameTestStore(), startRelayingPeer(t, peerFake))
 	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
-	f := newRenameTestFiler(t, newRenameTestStore())
-	f.Signature, f.UniqueFilerId = 42, 1234
-	self := pb.ServerAddress("127.0.0.1:2")
-	f.MetaAggregator = filer.NewMetaAggregator(f, self, dialOption)
-	f.MetaAggregator.OnPeerUpdate(&master_pb.ClusterNodeUpdate{Address: string(peer), IsAdd: true}, time.Now())
-	t.Cleanup(f.MetaAggregator.Shutdown)
 	f.NotifyUpdateEvent(context.Background(), nil, &filer.Entry{FullPath: "/ckpt/mp_rank_00_model_states.pt"}, false, false, []int32{7})
 	ownPosition, _ := f.DirectoryWriterPosition("/ckpt", 0)
 	fs := &FilerServer{filer: f, grpcDialOption: dialOption}
@@ -101,5 +112,35 @@ func TestDirectoryChangePositionNamesWhatThisFilersListingHoldsOfEachPeer(t *tes
 	}
 	if p := got[f.UniqueFilerId]; p == nil || p.PositionNs != ownPosition || p.ListedThroughNs != ownPosition {
 		t.Fatalf("this filer: %+v, want listed through its own position %d", p, ownPosition)
+	}
+}
+
+// A lookup's LogTsNs claims every event at or below it is reflected in the
+// answer. A peer's change reaches this filer's store only when its aggregator
+// replays it, under the peer's stamp, so the fence stays at or below what
+// every peer has been replayed through; otherwise a mount fences the peer's
+// event out of the entry it read.
+func TestLookupFenceStaysAtOrBelowWhatPeersAreReplayedThrough(t *testing.T) {
+	peerFake := &relayingPeerFiler{filerId: 22, deliveredNs: time.Now().UnixNano()}
+	store := newRenameTestStore()
+	store.entries["/ckpt/mp_rank_00_model_states.pt"] = newFileEntry("/ckpt/mp_rank_00_model_states.pt", 1)
+	f := newFilerFollowingPeer(t, store, startRelayingPeer(t, peerFake))
+	fs := &FilerServer{filer: f, entryLockTable: util.NewLockTable[util.FullPath]()}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for f.MetaAggregator.PeerLowWatermarkTsNs() != peerFake.deliveredNs {
+		if time.Now().After(deadline) {
+			t.Fatalf("peer replayed through %d, want %d", f.MetaAggregator.PeerLowWatermarkTsNs(), peerFake.deliveredNs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, name := range []string{"mp_rank_00_model_states.pt", "mp_rank_01_model_states.pt"} {
+		resp, _ := fs.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{Directory: "/ckpt", Name: name})
+		if resp == nil {
+			t.Fatalf("lookup %s: no response", name)
+		}
+		if resp.LogTsNs > peerFake.deliveredNs {
+			t.Fatalf("lookup %s fenced at %d, past %d, what the peer's changes are replayed through", name, resp.LogTsNs, peerFake.deliveredNs)
+		}
 	}
 }

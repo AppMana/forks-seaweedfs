@@ -247,11 +247,17 @@ func (f *Filer) LocalDeliveredThroughTsNs(nowNs int64) int64 {
 // aggregator replays it, so the snapshot also stays at or below what every
 // peer has been replayed through.
 func (f *Filer) ListingSnapshotTsNs(nowNs int64) int64 {
-	snapshot := f.metaLogInflight.claimThrough(nowNs)
+	return f.PeersReplayedThroughTsNs(f.metaLogInflight.claimThrough(nowNs))
+}
+
+// PeersReplayedThroughTsNs caps a read's fence at what every peer has been
+// replayed through: a peer's event keeps the peer's stamp but reaches this
+// filer's store only when the aggregator replays it.
+func (f *Filer) PeersReplayedThroughTsNs(fenceTsNs int64) int64 {
 	if ma := f.MetaAggregator; ma != nil && ma.HasRemotePeers() {
-		snapshot = min(snapshot, ma.PeerLowWatermarkTsNs())
+		return min(fenceTsNs, ma.PeerLowWatermarkTsNs())
 	}
-	return snapshot
+	return fenceTsNs
 }
 
 // StampMetaLogInflightForTest and DoneMetaLogInflightForTest let tests in

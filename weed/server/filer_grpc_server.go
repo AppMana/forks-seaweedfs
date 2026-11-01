@@ -29,11 +29,13 @@ import (
 
 // fencedFindEntry reads an entry with an exact log-position fence: the stamp
 // and the read share the path lock mutations hold across write and notify, so
-// every event at or below the fence is in the entry and none above it are.
-// Any read whose result a client versions must go through here.
+// every event this filer logs at or below the fence is in the entry and none
+// above it are. A peer's events are replayed outside that lock, so the fence
+// also stays at or below what every peer has been replayed through. Any read
+// whose result a client versions must go through here.
 func (fs *FilerServer) fencedFindEntry(ctx context.Context, path util.FullPath) (entry *filer.Entry, logTsNs int64, err error) {
 	pathLock := fs.entryLockTable.AcquireLock("fencedFindEntry", path, util.SharedLock)
-	logTsNs = time.Now().UnixNano()
+	logTsNs = fs.filer.PeersReplayedThroughTsNs(time.Now().UnixNano())
 	entry, err = fs.filer.FindEntry(ctx, path)
 	fs.entryLockTable.ReleaseLock(path, pathLock)
 	return

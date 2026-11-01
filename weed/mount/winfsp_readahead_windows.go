@@ -7,12 +7,14 @@ import (
 
 // Per-handle sequential read-ahead for the WinFsp adapter.
 //
-// Without kernel data caching (FileInfoTimeout=-1 is unsafe on shared
-// volumes, see winfsp_host_windows.go), every application ReadFile
-// crosses kernel->user and walks the full WFS read path; at 4KB that
-// path dominates (~100µs/op, ~30 MB/s). Buffering one read-ahead window
-// per open handle turns 256 WFS traversals per MB into one; the per-op
-// cost becomes a memcpy.
+// The mount enables kernel data caching (FileInfoTimeout=-1, see
+// winFspCacheOptions), so the Windows cache manager absorbs repeated
+// reads. Every read it misses, every read on a handle opened without
+// buffering, and every read on a mount whose -winfspOptions set a finite
+// FileInfoTimeout still crosses kernel->user and walks the full WFS read
+// path; at 4KB that path dominates (~100µs/op, ~30 MB/s). Buffering one
+// read-ahead window per open handle turns 256 WFS traversals per MB into
+// one; the per-op cost becomes a memcpy.
 //
 // Consistency: the buffer lives only within one open handle and never
 // outlives it (close-to-open semantics unchanged). Writes, truncates

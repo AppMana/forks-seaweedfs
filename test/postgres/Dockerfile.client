@@ -1,19 +1,4 @@
-FROM golang:1.26-alpine AS builder
-
-# Set working directory
-WORKDIR /app
-
-# Copy go mod files first for better caching
-COPY go.mod go.sum ./
-RUN go mod download
-
-# Copy source code
-COPY . .
-
-# Build the client
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o client ./test/postgres/client.go
-
-# Final stage
+# Built on the host into bin/ like Dockerfile.seaweedfs.
 FROM alpine:latest
 
 # Install ca-certificates and netcat for health checks
@@ -21,8 +6,7 @@ RUN apk --no-cache add ca-certificates netcat-openbsd
 
 WORKDIR /root/
 
-# Copy the binary from builder stage
-COPY --from=builder /app/client .
+COPY bin/client .
 
 # Make it executable
 RUN chmod +x ./client

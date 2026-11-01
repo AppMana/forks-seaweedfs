@@ -67,6 +67,58 @@ impl<'a> Drop for InflightGuard<'a> {
     }
 }
 
+/// Go's tryReserveDataSize: atomically checks and charges a request. A single
+/// request larger than the limit is admitted only when nothing else is in
+/// flight, so a valid large object cannot deadlock while concurrency stays
+/// bounded. A limit of zero or less admits everything.
+fn try_reserve_data_size(counter: &std::sync::atomic::AtomicI64, limit: i64, size: i64) -> bool {
+    let size = size.max(0);
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if limit > 0 && (current > limit || (current != 0 && size > limit - current)) {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + size,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Go's reserveDataSize: try once, then retry on every release until the
+/// reservation fits or `timeout` passes. Returns false on timeout.
+async fn reserve_data_size(
+    counter: &std::sync::atomic::AtomicI64,
+    notify: &tokio::sync::Notify,
+    limit: i64,
+    size: i64,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // Register for the release notification before checking, so a release
+        // between the check and the wait is not missed.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if try_reserve_data_size(counter, limit, size) {
+            return true;
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return false;
+        }
+    }
+}
+
+/// ParseUpload caps an individual request at 256 MiB, so Go reserves that
+/// bound for a request whose Content-Length is missing or unusable.
+const UNKNOWN_UPLOAD_RESERVATION: i64 = 256 * 1024 * 1024;
+
 /// Body wrapper that tracks download inflight bytes and releases them when dropped.
 struct TrackedBody {
     data: Vec<u8>,
@@ -2647,6 +2699,52 @@ pub async fn post_handler(
     let query = request.uri().query().unwrap_or("").to_string();
     let method = request.method().clone();
     let headers = request.headers().clone();
+
+    // Go's handleUploadRequest admits every upload, replication included,
+    // against the upload budget before PostHandler parses anything. Excluding
+    // replication would let a repair storm bypass the memory guard exactly
+    // when the cluster is recovering from a failed server.
+    let reservation = match headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+    {
+        n if n <= 0 => UNKNOWN_UPLOAD_RESERVATION,
+        n => n,
+    };
+    if !reserve_data_size(
+        &state.inflight_upload_bytes,
+        &state.upload_notify,
+        state.concurrent_upload_limit,
+        reservation,
+        state.inflight_upload_data_timeout,
+    )
+    .await
+    {
+        metrics::HANDLER_COUNTER
+            .with_label_values(&[metrics::UPLOAD_LIMIT_COND])
+            .inc();
+        return json_error_with_query(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "upload needs {} bytes with inflight upload data {} and limit {}",
+                reservation,
+                state.inflight_upload_bytes.load(Ordering::Acquire),
+                state.concurrent_upload_limit
+            ),
+            Some(&query),
+        );
+    }
+    metrics::INFLIGHT_UPLOAD_SIZE.set(state.inflight_upload_bytes.load(Ordering::Acquire));
+    // Releases the reservation on every exit path.
+    let _upload_guard = InflightGuard {
+        counter: &state.inflight_upload_bytes,
+        bytes: reservation,
+        notify: &state.upload_notify,
+        metric: &metrics::INFLIGHT_UPLOAD_SIZE,
+    };
+
     let query_fields: Vec<(String, String)> = match serde_urlencoded::from_str(&query) {
         Ok(fields) => fields,
         Err(e) => {
@@ -2683,63 +2781,7 @@ pub async fn post_handler(
         return json_error_with_query(StatusCode::UNAUTHORIZED, "wrong jwt", Some(&query));
     }
 
-    // Upload throttling: check inflight bytes against limit
     let is_replicate = query.split('&').any(|p| p == "type=replicate");
-    let content_length = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
-
-    if !is_replicate && state.concurrent_upload_limit > 0 {
-        // Wait for inflight bytes to drop below limit, or timeout
-        let timeout = if state.inflight_upload_data_timeout.is_zero() {
-            std::time::Duration::from_secs(2)
-        } else {
-            state.inflight_upload_data_timeout
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let current = state.inflight_upload_bytes.load(Ordering::Relaxed);
-            if current <= state.concurrent_upload_limit {
-                break;
-            }
-            // Go increments UploadLimitCond on every loop iteration (L184),
-            // not just on timeout.
-            metrics::HANDLER_COUNTER
-                .with_label_values(&[metrics::UPLOAD_LIMIT_COND])
-                .inc();
-            // Wait for notification or timeout
-            if tokio::time::timeout_at(deadline, state.upload_notify.notified())
-                .await
-                .is_err()
-            {
-                return json_error_with_query(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "upload limit exceeded",
-                    Some(&query),
-                );
-            }
-        }
-        let new_val = state
-            .inflight_upload_bytes
-            .fetch_add(content_length, Ordering::Relaxed)
-            + content_length;
-        metrics::INFLIGHT_UPLOAD_SIZE.set(new_val);
-    }
-
-    // RAII guard to release upload throttle on any exit path
-    let _upload_guard = if !is_replicate && state.concurrent_upload_limit > 0 {
-        Some(InflightGuard {
-            counter: &state.inflight_upload_bytes,
-            bytes: content_length,
-            notify: &state.upload_notify,
-            metric: &metrics::INFLIGHT_UPLOAD_SIZE,
-        })
-    } else {
-        None
-    };
 
     let content_type_str = headers
         .get(header::CONTENT_TYPE)
@@ -5825,6 +5867,169 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    #[test]
+    fn test_try_reserve_data_size_is_atomic() {
+        use std::sync::atomic::{AtomicI64, AtomicUsize};
+        const LIMIT: i64 = 32;
+        let counter = Arc::new(AtomicI64::new(0));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(256));
+        let threads: Vec<_> = (0..256)
+            .map(|_| {
+                let (counter, admitted, barrier) =
+                    (counter.clone(), admitted.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if try_reserve_data_size(&counter, LIMIT, 1) {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), LIMIT);
+        assert_eq!(admitted.load(Ordering::Relaxed), LIMIT as usize);
+    }
+
+    #[test]
+    fn test_try_reserve_data_size_allows_one_oversized_request() {
+        let counter = std::sync::atomic::AtomicI64::new(0);
+        assert!(
+            try_reserve_data_size(&counter, 100, 150),
+            "a single oversized request is admitted to avoid deadlock"
+        );
+        assert!(
+            !try_reserve_data_size(&counter, 100, 1),
+            "nothing else is admitted while an oversized request is active"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 150);
+        assert!(
+            try_reserve_data_size(&counter, 0, 1 << 40),
+            "zero is unlimited"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reserve_data_size_admits_on_release_and_times_out() {
+        let counter = std::sync::atomic::AtomicI64::new(150);
+        let notify = tokio::sync::Notify::new();
+        assert!(
+            !reserve_data_size(
+                &counter,
+                &notify,
+                100,
+                1,
+                std::time::Duration::from_millis(20)
+            )
+            .await
+        );
+        let waiter = reserve_data_size(
+            &counter,
+            &notify,
+            100,
+            1,
+            std::time::Duration::from_secs(30),
+        );
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(InflightGuard {
+                counter: &counter,
+                bytes: 150,
+                notify: &notify,
+                metric: &metrics::INFLIGHT_UPLOAD_SIZE,
+            });
+        };
+        let (admitted, ()) = tokio::join!(waiter, release);
+        assert!(admitted, "a release admits the waiting request");
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    fn upload_limited_state(limit: i64) -> Arc<VolumeServerState> {
+        let mut state = streaming_test_state();
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.concurrent_upload_limit = limit;
+        s.inflight_upload_data_timeout = std::time::Duration::from_millis(50);
+        state
+    }
+
+    fn upload_request(uri: &str, body: &'static [u8], content_length: bool) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+        if content_length {
+            builder = builder.header(header::CONTENT_LENGTH, body.len());
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    /// Go's TestUploadLimitTimeoutIncludesReplication: a replica write waits on
+    /// the same upload budget as a client write, and a rejected one leaves no
+    /// reservation behind.
+    #[tokio::test]
+    async fn test_replica_upload_shares_upload_budget() {
+        const LIMIT: i64 = 1024 * 1024;
+        let state = upload_limited_state(LIMIT);
+        // An admitted upload larger than the limit is in flight.
+        state
+            .inflight_upload_bytes
+            .store(2 * LIMIT, Ordering::Relaxed);
+
+        for uri in ["/1,01637037d6?type=replicate", "/1,01637037d6"] {
+            let response = post_handler(
+                State(state.clone()),
+                upload_request(uri, b"replicate", true),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
+            assert_eq!(
+                state.inflight_upload_bytes.load(Ordering::Relaxed),
+                2 * LIMIT
+            );
+        }
+
+        state
+            .inflight_upload_bytes
+            .fetch_sub(2 * LIMIT, Ordering::Relaxed);
+        let response = post_handler(
+            State(state.clone()),
+            upload_request("/1,01637037d6?type=replicate", b"replicate", true),
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            state.inflight_upload_bytes.load(Ordering::Relaxed),
+            0,
+            "the admitted replica write released its reservation"
+        );
+    }
+
+    /// Without a Content-Length, Go reserves the 256 MiB ParseUpload cap.
+    #[tokio::test]
+    async fn test_upload_without_content_length_reserves_parse_cap() {
+        let state = upload_limited_state(1024 * 1024);
+        state.inflight_upload_bytes.store(1, Ordering::Relaxed);
+        let response = post_handler(
+            State(state.clone()),
+            upload_request("/1,01637037d6?type=replicate", b"chunked", false),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(&format!(
+                "upload needs {} bytes",
+                UNKNOWN_UPLOAD_RESERVATION
+            )),
+            "{text}"
+        );
     }
 
     fn streaming_test_state() -> Arc<VolumeServerState> {

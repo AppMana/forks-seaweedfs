@@ -2,7 +2,7 @@ name: "mount: windows"
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'weed/mount/**'
       - 'weed/command/mount*.go'
@@ -40,11 +40,19 @@ jobs:
       # cgo variant, which wants WinFsp's headers. The nocgo variant loads
       # winfsp-x64.dll at run time instead, which is how weed.exe is released.
       CGO_ENABLED: 0
+      # The filer limits names in UTF-8 bytes, Windows in UTF-16 units: 255
+      # units can take 1020 bytes. The mount still enforces the 255 units.
+      WEED_FILER_OPTIONS_MAX_FILE_NAME_LENGTH: 1020
 
     steps:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
+
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
     - uses: actions/setup-go@v7
       with:

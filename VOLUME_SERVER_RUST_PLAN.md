@@ -533,7 +533,7 @@ seaweed-volume/
    - Upload concurrency limit with `sync::Condvar` + timeout
    - Download concurrency limit with proxy fallback to replicas
    - HTTP 429 on timeout, 499 on client cancel
-   - Replication traffic bypasses upload limits
+   - Replication traffic shares the upload limit
 
 9.8. **Public port** — if configured, separate listener with read-only routes (GET/HEAD/OPTIONS only).
 

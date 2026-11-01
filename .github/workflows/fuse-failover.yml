@@ -12,7 +12,7 @@ on:
       - '.github/workflows/fuse-failover.yml'
       - '.github/actions/fix-fusermount-setuid/**'
   push:
-    branches: [master]
+    branches: [master, 'merge/**']
     paths:
       - 'weed/command/mount*.go'
       - 'weed/mount/**'

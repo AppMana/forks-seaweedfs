@@ -2,14 +2,14 @@ name: "FUSE Integration Tests"
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'weed/**'
       - 'test/fuse_integration/**'
       - '.github/workflows/fuse-integration.yml'
       - '.github/actions/fix-fusermount-setuid/**'
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'weed/**'
       - 'test/fuse_integration/**'
@@ -32,6 +32,11 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
+
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
     - name: Set up Go
       uses: actions/setup-go@v7

@@ -310,3 +310,8 @@ candidate defaults to the baseline's) and
 `SEAWEEDFS_WINDOWS_WINFSP_DLL`, then the baseline DLL). Keep
 `SEAWEEDFS_WINDOWS_DIAGNOSTIC_HOLD_SECONDS=0`, set `RUNNER_TEMP` to a
 persistent directory and run nothing else heavy on the host meanwhile.
+
+The reliability workflow runs the comparison on dispatch when
+`windows_access_baseline` names the baseline commit, against the
+candidate it builds. Its `windows_mount_options` input passes extra mount
+flags (for example `-writebackCache`) to every Windows mount lab run.

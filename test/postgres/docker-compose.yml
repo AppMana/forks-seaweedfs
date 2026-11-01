@@ -2,8 +2,8 @@ services:
   # SeaweedFS All-in-One Server (Custom Build with PostgreSQL support)
   seaweedfs:
     build:
-      context: ../..  # Build from project root
-      dockerfile: test/postgres/Dockerfile.seaweedfs
+      context: .
+      dockerfile: Dockerfile.seaweedfs
     container_name: seaweedfs-server
     ports:
       - "9333:9333"   # Master port
@@ -45,8 +45,8 @@ services:
   # Database Server (PostgreSQL Wire Protocol Compatible)
   postgres-server:
     build:
-      context: ../..  # Build from project root
-      dockerfile: test/postgres/Dockerfile.seaweedfs
+      context: .
+      dockerfile: Dockerfile.seaweedfs
     container_name: postgres-server
     ports:
       - "5432:5432"   # PostgreSQL port
@@ -90,8 +90,8 @@ services:
   # PostgreSQL Test Client
   postgres-client:
     build:
-      context: ../..  # Build from project root  
-      dockerfile: test/postgres/Dockerfile.client
+      context: .
+      dockerfile: Dockerfile.client
     container_name: postgres-client
     depends_on:
       postgres-server:

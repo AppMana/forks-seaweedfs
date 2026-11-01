@@ -2,7 +2,7 @@ name: "Rust Vector Tests"
 
 on:
   pull_request:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - 'seaweed-vector/**'
       - 'seaweed-volume/**'
@@ -16,7 +16,7 @@ on:
       - 'test/vectors/**'
       - '.github/workflows/rust-vector-tests.yml'
   push:
-    branches: [ master, main ]
+    branches: [ master, main, 'merge/**' ]
     paths:
       - 'seaweed-vector/**'
       - 'seaweed-volume/**'
@@ -102,6 +102,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

@@ -10,8 +10,9 @@ import (
 
 // winErrno maps go-fuse Status values (which wrap the Windows syscall
 // package's Errno values when built with GOOS=windows) to the negated
-// Linux-valued errno constants that cgofuse/WinFsp expect. The numeric
-// values differ between the two worlds, so statuses must never be
+// errno constants cgofuse and WinFsp's FUSE layer use, which follow the
+// MSVC errno.h numbering (ENODATA 120, ENOTSUP 129, ETIMEDOUT 138). The
+// numeric values differ between the two, so statuses must never be
 // passed through arithmetically.
 var winErrno map[fuse.Status]int
 

@@ -42,6 +42,12 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 
 	entryFullPath := dirFullPath.Child(name)
 	var inode uint64
+	var lookupRef uint64
+	defer func() {
+		if code != fuse.OK && lookupRef != 0 {
+			wfs.Forget(lookupRef, 1)
+		}
+	}()
 
 	ctx, cancelFunc := ctxFromCancel(cancel)
 	defer cancelFunc()
@@ -56,6 +62,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return fuse.Status(syscall.EEXIST)
 		}
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
+		lookupRef = inode
 		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
@@ -105,6 +112,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return fuse.EIO
 		}
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, len(newEntry.HardLinkId) > 0, newEntry.Attributes.Inode, true)
+		lookupRef = inode
 		fileHandle, openFh, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
@@ -127,6 +135,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		return code
 	} else {
 		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, false, inode, true)
+		lookupRef = inode
 	}
 
 	wfs.outputPbEntry(&out.EntryOut, inode, newEntry)

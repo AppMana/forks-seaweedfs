@@ -2,7 +2,7 @@ name: "Performance"
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, 'merge/**' ]
     paths:
       - '**/*.go'
       - 'go.mod'
@@ -62,6 +62,11 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -171,6 +176,11 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -324,6 +334,11 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v7
+
+      - name: Check out the go-fuse fork
+        uses: ./.github/actions/appmana-go-fuse
+        with:
+          ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
 
       - name: Set up Go
         uses: actions/setup-go@v7

@@ -2,8 +2,10 @@ name: Check out the go-fuse fork
 description: >
   go.mod replaces github.com/seaweedfs/go-fuse/v2 with ../forks-go-fuse, so any
   job that builds weed needs that sibling checkout next to the repository.
-  Clones AppMana/forks-go-fuse at the pinned SEAWEEDFS_RELIABILITY_GO_FUSE_REF.
-  Run it right after actions/checkout.
+  Checks out AppMana/forks-go-fuse at the pinned
+  SEAWEEDFS_RELIABILITY_GO_FUSE_REF. Run it right after actions/checkout.
+  actions/checkout does the fetch, so job containers without git or bash work
+  too; it only checks out under the workspace, so the tree is moved out after.
 
 inputs:
   ref:
@@ -13,15 +15,48 @@ inputs:
 runs:
   using: composite
   steps:
-    - shell: bash
+    - if: runner.os != 'Windows'
+      shell: sh
+      env:
+        GO_FUSE_REF: ${{ inputs.ref }}
+      run: |
+        set -eu
+        case "$GO_FUSE_REF" in
+          *[!0-9a-f]*|'') echo "::error::go-fuse ref must be a full commit SHA"; exit 1 ;;
+        esac
+        [ "${#GO_FUSE_REF}" -eq 40 ] || { echo "::error::go-fuse ref must be a full commit SHA"; exit 1; }
+    - if: runner.os == 'Windows'
+      shell: bash
       env:
         GO_FUSE_REF: ${{ inputs.ref }}
       run: |
         set -euo pipefail
         [[ "$GO_FUSE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::go-fuse ref must be a full commit SHA"; exit 1; }
+
+    - uses: actions/checkout@v7
+      with:
+        repository: AppMana/forks-go-fuse
+        ref: ${{ inputs.ref }}
+        path: .appmana-go-fuse
+        persist-credentials: false
+
+    - if: runner.os != 'Windows'
+      shell: sh
+      env:
+        GO_FUSE_REF: ${{ inputs.ref }}
+      run: |
+        set -eu
         dest="$GITHUB_WORKSPACE/../forks-go-fuse"
         rm -rf "$dest"
-        git init -q "$dest"
-        git -C "$dest" fetch -q --depth 1 https://github.com/AppMana/forks-go-fuse "$GO_FUSE_REF"
-        git -C "$dest" checkout -q FETCH_HEAD
-        git -C "$dest" log -1 --format='go-fuse %H'
+        mv "$GITHUB_WORKSPACE/.appmana-go-fuse" "$dest"
+        echo "go-fuse $GO_FUSE_REF at $dest"
+    - if: runner.os == 'Windows'
+      shell: bash
+      env:
+        GO_FUSE_REF: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        dest="$GITHUB_WORKSPACE/../forks-go-fuse"
+        rm -rf "$dest"
+        mv "$GITHUB_WORKSPACE/.appmana-go-fuse" "$dest"
+        echo "go-fuse $GO_FUSE_REF at $dest"

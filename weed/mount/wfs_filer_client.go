@@ -16,11 +16,20 @@ import (
 )
 
 var _ = filer_pb.FilerClient(&WFS{})
+var _ = filer_pb.ContextFilerClient(&WFS{})
 
 func (wfs *WFS) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) (err error) {
 	return wfs.withFilerClient(context.Background(), streamingMode, wfs.filerRPCWait(), func(_ context.Context, client filer_pb.SeaweedFilerClient) error {
 		return fn(client)
 	})
+}
+
+// WithFilerClientContext runs fn under each attempt's own context, derived
+// from ctx and bounded like any metadata call, so a call its caller abandons
+// or times out ends as that attempt and leaves the cached channel to the
+// mount's other calls.
+func (wfs *WFS) WithFilerClientContext(ctx context.Context, streamingMode bool, fn func(context.Context, filer_pb.SeaweedFilerClient) error) error {
+	return wfs.withFilerClient(ctx, streamingMode, wfs.filerRPCWait(), fn)
 }
 
 // withFilerClient walks the filer addresses until one answers fn. callWait

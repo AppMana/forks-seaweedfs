@@ -26,6 +26,25 @@ type FilerClient interface {
 	GetDataCenter() string
 }
 
+// ContextFilerClient is a FilerClient that runs a call under a context it
+// derives from the caller's for each attempt. A call the caller abandons then
+// ends as that attempt, not as a failure of the channel other calls share.
+type ContextFilerClient interface {
+	WithFilerClientContext(ctx context.Context, streamingMode bool, fn func(context.Context, SeaweedFilerClient) error) error
+}
+
+// WithFilerClientContext runs fn against filerClient under ctx: under each
+// attempt's own context when filerClient is a ContextFilerClient, otherwise
+// under ctx itself.
+func WithFilerClientContext(ctx context.Context, filerClient FilerClient, streamingMode bool, fn func(context.Context, SeaweedFilerClient) error) error {
+	if c, ok := filerClient.(ContextFilerClient); ok {
+		return c.WithFilerClientContext(ctx, streamingMode, fn)
+	}
+	return filerClient.WithFilerClient(streamingMode, func(client SeaweedFilerClient) error {
+		return fn(ctx, client)
+	})
+}
+
 // GetEntry returns the entry together with the log position the filer stamped
 // for it and the signature of the filer that stamped it — positions are only
 // comparable within one filer's clock. Both are zero against a filer that does
@@ -34,7 +53,7 @@ func GetEntry(ctx context.Context, filerClient FilerClient, fullFilePath util.Fu
 
 	dir, name := fullFilePath.DirAndName()
 
-	err = filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	err = WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 
 		request := &LookupDirectoryEntryRequest{
 			Directory: dir,
@@ -116,13 +135,13 @@ func ReadDirAllEntriesWithSnapshot(ctx context.Context, filerClient FilerClient,
 }
 
 func List(ctx context.Context, filerClient FilerClient, parentDirectoryPath, prefix string, fn EachEntryFunction, startFrom string, inclusive bool, limit uint32) (err error) {
-	return filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	return WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 		return doSeaweedList(ctx, client, util.FullPath(parentDirectoryPath), prefix, fn, startFrom, inclusive, limit)
 	})
 }
 
 func doListWithSnapshot(ctx context.Context, filerClient FilerClient, fullDirPath util.FullPath, prefix string, fn EachEntryFunction, startFrom string, inclusive bool, limit uint32, snapshotTsNs int64) (actualSnapshotTsNs int64, err error) {
-	err = filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	err = WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 		actualSnapshotTsNs, err = DoSeaweedListWithSnapshot(ctx, client, fullDirPath, prefix, fn, startFrom, inclusive, limit, snapshotTsNs)
 		return err
 	})
@@ -222,7 +241,7 @@ func DoSeaweedListWithSnapshot(ctx context.Context, client SeaweedFilerClient, f
 
 func Exists(ctx context.Context, filerClient FilerClient, parentDirectoryPath string, entryName string, isDirectory bool) (exists bool, err error) {
 
-	err = filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	err = WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 
 		request := &LookupDirectoryEntryRequest{
 			Directory: parentDirectoryPath,
@@ -249,7 +268,7 @@ func Exists(ctx context.Context, filerClient FilerClient, parentDirectoryPath st
 }
 
 func Mkdir(ctx context.Context, filerClient FilerClient, parentDirectoryPath string, dirName string, fn func(entry *Entry)) error {
-	return filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	return WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 		return DoMkdir(ctx, client, parentDirectoryPath, dirName, fn)
 	})
 }
@@ -260,7 +279,7 @@ func Mkdir(ctx context.Context, filerClient FilerClient, parentDirectoryPath str
 // callback error against the filer and retries on the next one.
 func MkdirExclusive(ctx context.Context, filerClient FilerClient, parentDirectoryPath string, dirName string, fn func(entry *Entry)) error {
 	var taken error
-	err := filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	err := WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 		err := doMkdir(ctx, client, parentDirectoryPath, dirName, true, fn)
 		if errors.Is(err, ErrEntryAlreadyExists) {
 			taken = err
@@ -311,7 +330,7 @@ func doMkdir(ctx context.Context, client SeaweedFilerClient, parentDirectoryPath
 }
 
 func MkFile(ctx context.Context, filerClient FilerClient, parentDirectoryPath string, fileName string, chunks []*FileChunk, fn func(entry *Entry)) error {
-	return filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	return WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 
 		entry := &Entry{
 			Name:        fileName,
@@ -357,7 +376,7 @@ func DoRemove(ctx context.Context, client SeaweedFilerClient, parentDirectoryPat
 
 func RemoveWithResponse(ctx context.Context, filerClient FilerClient, parentDirectoryPath, name string, isDeleteData, isRecursive, ignoreRecursiveErr, isFromOtherCluster bool, signatures []int32) (*DeleteEntryResponse, error) {
 	var resp *DeleteEntryResponse
-	err := filerClient.WithFilerClient(false, func(client SeaweedFilerClient) error {
+	err := WithFilerClientContext(ctx, filerClient, false, func(ctx context.Context, client SeaweedFilerClient) error {
 		var innerErr error
 		resp, innerErr = DoRemoveWithResponse(ctx, client, parentDirectoryPath, name, isDeleteData, isRecursive, ignoreRecursiveErr, isFromOtherCluster, signatures)
 		return innerErr

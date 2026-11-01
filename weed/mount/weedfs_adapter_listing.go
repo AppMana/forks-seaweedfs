@@ -67,7 +67,7 @@ func (wfs *WFS) listDirectoryPrefixForAdapter(ctx context.Context, dir util.Full
 		return err
 	}
 	stop := errors.New("adapter listing complete")
-	return wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	return wfs.WithFilerClientContext(ctx, false, func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 		err := filer_pb.SeaweedList(ctx, client, string(dir), prefix, func(pbEntry *filer_pb.Entry, _ bool) error {
 			if !wfs.option.IncludeSystemEntries && meta_cache.IsHiddenSystemEntry(string(dir), pbEntry.Name) {
 				return nil

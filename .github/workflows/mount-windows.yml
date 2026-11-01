@@ -22,6 +22,20 @@ on:
       - 'weed/storage/disk_location.go'
       - 'test/winfsp/**'
       - '.github/workflows/mount-windows.yml'
+  workflow_dispatch:
+    inputs:
+      winfsp_msi_url:
+        description: 'WinFsp MSI to install instead of the Chocolatey package'
+        type: string
+        required: false
+      winfsp_msi_sha256:
+        description: 'SHA-256 of winfsp_msi_url'
+        type: string
+        required: false
+      two_mount_tests:
+        description: 'Run only these ./test/winfsp tests (go test -run) against S: with a second mount of the same filer at T:'
+        type: string
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
@@ -46,6 +60,11 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
     - uses: actions/setup-go@v7
       with:
         go-version-file: 'go.mod'
@@ -54,7 +73,20 @@ jobs:
     # cgofuse loads winfsp-x64.dll at run time, so WinFsp is needed here but
     # not to build.
     - name: Install WinFsp
-      run: choco install winfsp -y --no-progress
+      shell: pwsh
+      env:
+        WINFSP_MSI_URL: ${{ inputs.winfsp_msi_url }}
+        WINFSP_MSI_SHA256: ${{ inputs.winfsp_msi_sha256 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not $env:WINFSP_MSI_URL) { choco install winfsp -y --no-progress; exit $LASTEXITCODE }
+        if ($env:WINFSP_MSI_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'winfsp_msi_sha256 must be a SHA-256' }
+        Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile winfsp.msi -UseBasicParsing
+        $hash = (Get-FileHash winfsp.msi -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne $env:WINFSP_MSI_SHA256) { throw "winfsp.msi sha256 $hash, pinned $env:WINFSP_MSI_SHA256" }
+        $p = Start-Process msiexec.exe -ArgumentList '/i','winfsp.msi','/qn','/norestart','INSTALLLEVEL=1000' -Wait -PassThru
+        if ($p.ExitCode -notin @(0, 3010)) { throw "installer exit $($p.ExitCode)" }
+        if (-not (Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue)) { throw 'WinFsp service absent' }
 
     - name: Build weed.exe
       run: go build -o weed.exe ./weed
@@ -64,6 +96,8 @@ jobs:
     # the cluster and the mount alive has to share a step.
     - name: Mount and exercise
       shell: pwsh
+      env:
+        TWO_MOUNT_TESTS: ${{ inputs.two_mount_tests }}
       run: |
         $ErrorActionPreference = 'Stop'
 
@@ -76,13 +110,13 @@ jobs:
           finally { $client.Dispose() }
         }
 
-        function Start-Mount($log) {
+        function Start-Mount($log, $drive = 'S:') {
           Start-Process -FilePath .\weed.exe `
-            -ArgumentList '-logtostderr','mount','-filer=127.0.0.1:8888','-dir=S:' `
+            -ArgumentList '-logtostderr','mount','-filer=127.0.0.1:8888',"-dir=$drive" `
             -RedirectStandardOutput "C:\$log.log" -RedirectStandardError "C:\$log.err.log"
           $deadline = (Get-Date).AddMinutes(2)
           while ((Get-Date) -lt $deadline) {
-            if (Test-Path S:\) { Write-Host "S: is mounted"; return }
+            if (Test-Path "$drive\") { Write-Host "$drive is mounted"; return }
             Start-Sleep -Seconds 2
           }
           Get-Content "C:\$log.log", "C:\$log.err.log" -ErrorAction SilentlyContinue
@@ -127,6 +161,18 @@ jobs:
         Write-Host "filer is up on http 8888 and grpc 18888"
 
         Start-Mount 'seaweed-mount'
+
+        if ($env:TWO_MOUNT_TESTS) {
+          Start-Mount 'seaweed-peer-mount' 'T:'
+          $code = 0
+          try {
+            Invoke-Tests 'two mounts' @('test','-v','-count=1','-timeout','10m','./test/winfsp','-run',$env:TWO_MOUNT_TESTS,'-mountpoint=S:\','-peer-mountpoint=T:\')
+          } catch { Write-Host "::error::$_"; $code = 1 }
+          Get-CimInstance Win32_Process -Filter "Name = 'weed.exe'" |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Start-Sleep -Seconds 3
+          exit $code
+        }
 
         Invoke-Tests 'exercise' @('test','-v','-timeout','20m','./test/winfsp','-mountpoint=S:\')
         Invoke-Tests 'persist-write' @('test','-v','-timeout','15m','./test/winfsp','-run','TestPersistence','-mountpoint=S:\','-phase=write','-filer=127.0.0.1:8888')
@@ -201,6 +247,6 @@ jobs:
       continue-on-error: true
       shell: pwsh
       run: |
-        foreach ($f in 'C:\seaweed-mount.log','C:\seaweed-mount.err.log','C:\seaweed-remount.log','C:\seaweed-remount.err.log','C:\seaweed-remount2.log','C:\seaweed-remount2.err.log','C:\seaweed-dirmount.log','C:\seaweed-dirmount.err.log','C:\seaweed-mini.log','C:\seaweed-mini.err.log') {
+        foreach ($f in 'C:\seaweed-mount.log','C:\seaweed-mount.err.log','C:\seaweed-peer-mount.log','C:\seaweed-peer-mount.err.log','C:\seaweed-remount.log','C:\seaweed-remount.err.log','C:\seaweed-remount2.log','C:\seaweed-remount2.err.log','C:\seaweed-dirmount.log','C:\seaweed-dirmount.err.log','C:\seaweed-mini.log','C:\seaweed-mini.err.log') {
           if (Test-Path $f) { Write-Host "===== $f"; Get-Content $f -Tail 200 }
         }

@@ -47,7 +47,10 @@ type winfspFS struct {
 	handleMu   sync.Mutex
 	fileHandle map[uint64]*winfspHandleRef
 	dirHandle  map[uint64]*winfspHandleRef
-	sweepStop  chan struct{}
+	// The names open file handles are held under, for the opens that have
+	// to bypass the Windows cache.
+	openNames *winfspOpenNames
+	sweepStop chan struct{}
 	sweepDone  chan struct{}
 }
 
@@ -64,6 +67,7 @@ func newWinfspFS(wfs *WFS, caseSensitive bool) *winfspFS {
 		caseSensitive: caseSensitive,
 		fileHandle:    make(map[uint64]*winfspHandleRef),
 		dirHandle:     make(map[uint64]*winfspHandleRef),
+		openNames:     newWinfspOpenNames(),
 	}
 	a.paths = newWinfspPathCache[cgofuse.Stat_t](winfspCacheTTL, wfs.dirIdleEvict, winfspMaxCachedPaths,
 		func(inode uint64) bool { return wfs.inodeToPath.IncrementNlookup(inode) },
@@ -716,6 +720,9 @@ func (a *winfspFS) Rename(oldpath string, newpath string) (result int) {
 		// have replaced whatever held the destination.
 		if oldKeyed {
 			a.paths.purge(oldKey, true)
+			if newKeyed {
+				a.openNames.renamed(oldKey, newKey)
+			}
 		}
 		if newKeyed {
 			a.paths.purge(newKey, true)
@@ -886,6 +893,20 @@ func (a *winfspFS) Access(path string, mask uint32) int {
 }
 
 func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	fi := cgofuse.FileInfo_t{Flags: flags}
+	code := a.CreateEx(path, mode, &fi)
+	return code, fi.Fh
+}
+
+// CreateEx creates and opens path. cgofuse calls it instead of Create so the
+// open can bypass the Windows cache; see winfspOpenNames.
+func (a *winfspFS) CreateEx(path string, mode uint32, fi *cgofuse.FileInfo_t) int {
+	code, fh := a.create(path, fi.Flags, mode, fi)
+	fi.Fh = fh
+	return code
+}
+
+func (a *winfspFS) create(path string, flags int, mode uint32, fi *cgofuse.FileInfo_t) (int, uint64) {
 	if a.readOnly {
 		return -cgofuse.EROFS, invalidFh
 	}
@@ -916,24 +937,41 @@ func (a *winfspFS) Create(path string, flags int, mode uint32) (int, uint64) {
 	a.invalidateInode(out.NodeId)
 	// Create grants a reference on the inode; the handle carries it.
 	a.retainHandle(a.fileHandle, out.Fh, out.NodeId)
+	if key, keyed := a.childKey(parent, name); keyed && out.Fh != invalidFh {
+		fi.DirectIo = a.openNames.opened(out.Fh, out.NodeId, key)
+	}
 	return 0, out.Fh
 }
 
 func (a *winfspFS) Open(path string, flags int) (int, uint64) {
+	fi := cgofuse.FileInfo_t{Flags: flags}
+	code := a.OpenEx(path, &fi)
+	return code, fi.Fh
+}
+
+// OpenEx opens path. cgofuse calls it instead of Open so the open can bypass
+// the Windows cache; see winfspOpenNames.
+func (a *winfspFS) OpenEx(path string, fi *cgofuse.FileInfo_t) int {
 	defer track(opOpen)()
-	ino, st := a.resolve(path)
+	fi.Fh = invalidFh
+	ino, canonical, st := a.walk(strings.Trim(path, "/"))
 	if st != fuse.OK {
-		return toWinErrno(st), invalidFh
+		return toWinErrno(st)
 	}
+	flags := fi.Flags
 	in := fuse.OpenIn{InHeader: a.header(ino), Flags: toGoOpenFlags(flags)}
 	var out fuse.OpenOut
 	if status := a.wfs.Open(nil, &in, &out); status != fuse.OK {
 		a.release(ino)
-		return toWinErrno(status), invalidFh
+		return toWinErrno(status)
 	}
 	// The resolve's reference stays with the handle until Release.
 	a.retainHandle(a.fileHandle, out.Fh, ino)
-	return 0, out.Fh
+	if out.Fh != invalidFh {
+		fi.DirectIo = a.openNames.opened(out.Fh, ino, a.fullPath("/"+canonical))
+	}
+	fi.Fh = out.Fh
+	return 0
 }
 
 func (a *winfspFS) Truncate(path string, size int64, fh uint64) int {
@@ -1041,6 +1079,9 @@ func (a *winfspFS) Release(path string, fh uint64) int {
 	if ino, ok := a.inodeFromFh(fh); ok {
 		in := fuse.ReleaseIn{InHeader: a.header(ino), Fh: fh}
 		a.wfs.Release(nil, &in)
+	}
+	if fh != invalidFh {
+		a.openNames.released(fh, a.fullPath(path))
 	}
 	if ino := a.releaseHandle(a.fileHandle, fh); ino != 0 {
 		a.readAhead.Release(fh)

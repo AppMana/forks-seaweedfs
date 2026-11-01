@@ -187,7 +187,7 @@ func TestEnsureVisitedPositionFnSurvivesOwnerRequestCancel(t *testing.T) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 500, Remembered: true}}, nil
+		return []*filer_pb.FilerDirectoryPosition{{FilerId: 11, PositionNs: 500, Remembered: true, ListedThroughNs: 500}}, nil
 	}
 
 	entered := make(chan struct{})

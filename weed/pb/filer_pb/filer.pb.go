@@ -4232,10 +4232,15 @@ type FilerDirectoryPosition struct {
 	FilerId int32                  `protobuf:"varint,1,opt,name=filer_id,json=filerId,proto3" json:"filer_id,omitempty"` // the filer process (UniqueFilerId)
 	// origin_position_ns of the newest such change while the filer remembers
 	// it; otherwise a floor at or above every change it has forgotten.
-	PositionNs    int64 `protobuf:"varint,2,opt,name=position_ns,json=positionNs,proto3" json:"position_ns,omitempty"`
-	Remembered    bool  `protobuf:"varint,3,opt,name=remembered,proto3" json:"remembered,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PositionNs int64 `protobuf:"varint,2,opt,name=position_ns,json=positionNs,proto3" json:"position_ns,omitempty"`
+	Remembered bool  `protobuf:"varint,3,opt,name=remembered,proto3" json:"remembered,omitempty"`
+	// The answering filer's listing of the directory, read after this answer,
+	// holds this filer's changes through this position: its own changes
+	// through position_ns, a peer's through what it has replayed of the
+	// peer's log, which can trail the peer's position_ns.
+	ListedThroughNs int64 `protobuf:"varint,4,opt,name=listed_through_ns,json=listedThroughNs,proto3" json:"listed_through_ns,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *FilerDirectoryPosition) Reset() {
@@ -4287,6 +4292,13 @@ func (x *FilerDirectoryPosition) GetRemembered() bool {
 		return x.Remembered
 	}
 	return false
+}
+
+func (x *FilerDirectoryPosition) GetListedThroughNs() int64 {
+	if x != nil {
+		return x.ListedThroughNs
+	}
+	return 0
 }
 
 type PingRequest struct {
@@ -8016,14 +8028,15 @@ const file_filer_proto_rawDesc = "" +
 	"\n" +
 	"remembered\x18\x02 \x01(\bR\n" +
 	"remembered\x128\n" +
-	"\x06filers\x18\x03 \x03(\v2 .filer_pb.FilerDirectoryPositionR\x06filers\"t\n" +
+	"\x06filers\x18\x03 \x03(\v2 .filer_pb.FilerDirectoryPositionR\x06filers\"\xa0\x01\n" +
 	"\x16FilerDirectoryPosition\x12\x19\n" +
 	"\bfiler_id\x18\x01 \x01(\x05R\afilerId\x12\x1f\n" +
 	"\vposition_ns\x18\x02 \x01(\x03R\n" +
 	"positionNs\x12\x1e\n" +
 	"\n" +
 	"remembered\x18\x03 \x01(\bR\n" +
-	"remembered\"F\n" +
+	"remembered\x12*\n" +
+	"\x11listed_through_ns\x18\x04 \x01(\x03R\x0flistedThroughNs\"F\n" +
 	"\vPingRequest\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\x12\x1f\n" +
 	"\vtarget_type\x18\x02 \x01(\tR\n" +

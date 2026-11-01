@@ -182,8 +182,11 @@ func (wfs *WFS) awaitDirectoryCurrent(ctx context.Context, dir util.FullPath) di
 }
 
 // relistDirectory rebuilds dir's cached listing from the filer. The listing is
-// read after the filers named positions, so it holds every change up to them.
-// A directory not cached again reads through.
+// read after the filers named positions, so it holds every change the
+// answering filer has of them: its own up to its position, a peer's as far as
+// it has replayed the peer's log. A peer's change still being relayed to it
+// comes by the metadata stream, and is waited for as before the relist. A
+// directory not cached again reads through.
 func (wfs *WFS) relistDirectory(ctx context.Context, dir util.FullPath, positions []*filer_pb.FilerDirectoryPosition) directoryCurrency {
 	wfs.inodeToPath.InvalidateChildrenCache(dir)
 	// The rebuild runs detached from ctx: a caller that stops waiting leaves it
@@ -206,5 +209,27 @@ func (wfs *WFS) relistDirectory(ctx context.Context, dir util.FullPath, position
 		return directoryCurrency{}
 	}
 	cached := wfs.metaCache.IsDirectoryCached(dir)
-	return directoryCurrency{cached: cached, verified: cached}
+	if !cached || len(positions) == 0 {
+		return directoryCurrency{cached: cached, verified: cached}
+	}
+	_, pending := wfs.metaCache.DirectoryPending(dir, positions)
+	if len(pending) == 0 {
+		return directoryCurrency{cached: true, verified: true}
+	}
+	for _, p := range pending {
+		if !p.Remembered {
+			// a floor names no event the stream will bring
+			return directoryCurrency{cached: true}
+		}
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, directoryCurrentWait)
+	current := wfs.metaCache.AwaitDirectoryPositions(waitCtx, dir, pending)
+	cancel()
+	if !current && ctx.Err() != nil {
+		return directoryCurrency{}
+	}
+	if !current {
+		glog.V(1).Infof("relisted %s, and the metadata stream has not brought it up to %v within %v", dir, pending, directoryCurrentWait)
+	}
+	return directoryCurrency{cached: true, verified: current}
 }

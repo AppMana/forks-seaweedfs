@@ -13,8 +13,10 @@ import (
 // order, and the metadata stream relays each filer's events in that order, so
 // a cache that has applied a filer's event at a position holds every change
 // that filer appended before it. A listing read after the filers named their
-// positions holds everything up to them too: a filer appends a change after
-// storing it. Positions of different filers say nothing about each other, and
+// positions holds the answering filer's own changes up to its position, since
+// a filer appends a change after storing it, and a peer's only as far as the
+// answering filer has replayed the peer's log, which it names with each
+// position. Positions of different filers say nothing about each other, and
 // a mount's own changes, which its stream never delivers, never move them.
 type directoryOrigins struct {
 	// basis: the positions include those named before the listing was read,
@@ -78,7 +80,9 @@ func (mc *MetaCache) noteChangesApplied(resp *filer_pb.SubscribeMetadataResponse
 }
 
 // NoteDirectoryBasis records that dir's cached listing was read after the
-// filers named positions: it holds every change up to each of them.
+// filers named positions: it holds each filer's changes through what the
+// answering filer said its listing holds of them, which for a peer whose
+// change is still being relayed trails the peer's own position.
 func (mc *MetaCache) NoteDirectoryBasis(dir util.FullPath, positions []*filer_pb.FilerDirectoryPosition) {
 	mc.Lock()
 	if !mc.isCachedFn(dir) {
@@ -88,8 +92,8 @@ func (mc *MetaCache) NoteDirectoryBasis(dir util.FullPath, positions []*filer_pb
 	o := mc.originsLocked(dir)
 	o.basis = true
 	for _, p := range positions {
-		if p.PositionNs > o.positions[p.FilerId] {
-			o.positions[p.FilerId] = p.PositionNs
+		if p.ListedThroughNs > o.positions[p.FilerId] {
+			o.positions[p.FilerId] = p.ListedThroughNs
 		}
 	}
 	mc.Unlock()

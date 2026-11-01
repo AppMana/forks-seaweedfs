@@ -31,8 +31,30 @@ func relayedEventAt(dir, name string, origin int32, positionNs int64) *filer_pb.
 	return event
 }
 
+// at is a position whose answering filer's listing holds everything up to it.
 func at(filerId int32, positionNs int64, remembered bool) *filer_pb.FilerDirectoryPosition {
-	return &filer_pb.FilerDirectoryPosition{FilerId: filerId, PositionNs: positionNs, Remembered: remembered}
+	return &filer_pb.FilerDirectoryPosition{FilerId: filerId, PositionNs: positionNs, Remembered: remembered, ListedThroughNs: positionNs}
+}
+
+// A listing holds a peer filer's changes only as far as the filer that served
+// it has replayed them, which can trail the position the peer itself names: a
+// listing read while the peer's change is still being relayed lacks it, and is
+// current through that position only once the stream brings the change.
+func TestListingBasisHoldsAPeerOnlyThroughWhatItsFilerReplayed(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true, "/dir": true})
+	defer mc.Shutdown()
+
+	peerChange := &filer_pb.FilerDirectoryPosition{FilerId: filerB, PositionNs: 100, Remembered: true, ListedThroughNs: 50}
+	mc.NoteDirectoryBasis("/dir", []*filer_pb.FilerDirectoryPosition{at(filerA, 0, false), peerChange})
+	if basis, pending := mc.DirectoryPending("/dir", []*filer_pb.FilerDirectoryPosition{peerChange}); !basis || len(pending) != 1 {
+		t.Fatalf("listing passed as holding filer B's change at 100 that its filer had replayed only through 50: basis=%v pending=%v", basis, pending)
+	}
+	if err := mc.ApplyMetadataResponse(context.Background(), relayedEventAt("/dir", "mp_rank_01_model_states.pt", filerB, 100), SubscriberMetadataResponseApplyOptions); err != nil {
+		t.Fatal(err)
+	}
+	if _, pending := mc.DirectoryPending("/dir", []*filer_pb.FilerDirectoryPosition{peerChange}); len(pending) != 0 {
+		t.Fatalf("relayed change applied, still pending: %v", pending)
+	}
 }
 
 // A listing is current through a filer's position once a relayed event of that

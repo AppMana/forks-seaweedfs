@@ -22,6 +22,16 @@ on:
       - 'weed/storage/disk_location.go'
       - 'test/winfsp-conformance/**'
       - '.github/workflows/mount-windows-conformance.yml'
+  workflow_dispatch:
+    inputs:
+      mount_options:
+        description: 'Extra weed mount flags, space separated, e.g. -winfspBasicPermissions'
+        type: string
+        required: false
+      test_names:
+        description: 'Comma separated winfsp-tests names to run instead of the whole suite'
+        type: string
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
@@ -46,6 +56,11 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Check out the go-fuse fork
+      uses: ./.github/actions/appmana-go-fuse
+      with:
+        ref: ${{ vars.SEAWEEDFS_RELIABILITY_GO_FUSE_REF }}
+
     - uses: actions/setup-go@v7
       with:
         go-version-file: 'go.mod'
@@ -64,6 +79,9 @@ jobs:
     # the cluster and the mount alive has to share a step.
     - name: Mount and run winfsp-tests
       shell: pwsh
+      env:
+        MOUNT_OPTIONS: ${{ inputs.mount_options }}
+        TEST_NAMES: ${{ inputs.test_names }}
       run: |
         $ErrorActionPreference = 'Stop'
 
@@ -77,8 +95,10 @@ jobs:
         }
 
         function Start-Mount($log) {
+          $mountArgs = @('-logtostderr','mount','-filer=127.0.0.1:8888','-dir=S:')
+          if ($env:MOUNT_OPTIONS) { $mountArgs += @($env:MOUNT_OPTIONS -split '\s+' | Where-Object { $_ }) }
           Start-Process -FilePath .\weed.exe `
-            -ArgumentList '-logtostderr','mount','-filer=127.0.0.1:8888','-dir=S:' `
+            -ArgumentList $mountArgs `
             -RedirectStandardOutput "C:\$log.log" -RedirectStandardError "C:\$log.err.log"
           $deadline = (Get-Date).AddMinutes(2)
           while ((Get-Date) -lt $deadline) {
@@ -111,7 +131,12 @@ jobs:
         Start-Mount 'seaweed-mount'
 
         Write-Host "::group::winfsp-tests"
-        & pwsh -File test/winfsp-conformance/run.ps1 -MountPoint S:\
+        if ($env:TEST_NAMES) {
+          $names = @($env:TEST_NAMES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          & pwsh -Command "& ./test/winfsp-conformance/run.ps1 -MountPoint 'S:\' -IncludeKnownFailures -TestNames $(($names | ForEach-Object { "'$_'" }) -join ','); exit `$LASTEXITCODE"
+        } else {
+          & pwsh -File test/winfsp-conformance/run.ps1 -MountPoint S:\
+        }
         $code = $LASTEXITCODE
         Write-Host "::endgroup::"
         if ($code -ne 0) { throw "winfsp-tests failed with exit $code" }

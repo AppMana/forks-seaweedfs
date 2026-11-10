@@ -97,7 +97,7 @@ jobs:
       - name: Race-tested production offset format
         run: >-
           go test -short -tags "$STORAGE_BUILD_TAGS" -race -count=1 -timeout="$STORAGE_UNIT_TEST_TIMEOUT"
-          ./weed/storage ./weed/storage/needle ./weed/util/memlimit ./weed/command
+          ./weed/util/chunk_cache ./weed/storage ./weed/storage/needle ./weed/util/memlimit ./weed/command
           ./weed/topology ./weed/shell ./weed/server
           ./weed/filer ./weed/filer/empty_folder_cleanup ./weed/mount ./weed/mount/page_writer ./weed/operation
       - name: Windows fault harness safety contracts

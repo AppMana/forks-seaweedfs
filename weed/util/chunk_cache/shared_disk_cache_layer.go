@@ -35,11 +35,19 @@ type SharedDiskCacheLayer struct {
 	scopeLimitBytes int64
 	wholeLimitBytes int64
 
-	mu              sync.Mutex
-	scopeEntries    map[string]*sharedChunkMeta
-	scopeUsedBytes  int64
-	wholeUsedBytes  int64
-	writesSinceScan int
+	mu                 sync.Mutex
+	scopeEntries       map[string]*sharedChunkMeta
+	scopeUsedBytes     int64
+	wholeUsedBytes     int64
+	reservedBytes      int64
+	writers            int
+	maintenancePending bool
+	maintenanceRunning bool
+	closed             bool
+	lastScan           time.Time
+	retryAfter         time.Time
+	work               sync.WaitGroup
+	readDir            func(string) ([]os.DirEntry, error)
 }
 
 func NewSharedDiskCacheLayer(dir string, scopeID string, scopeLimitBytes int64, wholeLimitBytes int64) *SharedDiskCacheLayer {
@@ -56,8 +64,10 @@ func NewSharedDiskCacheLayer(dir string, scopeID string, scopeLimitBytes int64, 
 		scopeLimitBytes: scopeLimitBytes,
 		wholeLimitBytes: wholeLimitBytes,
 		scopeEntries:    make(map[string]*sharedChunkMeta),
+		readDir:         os.ReadDir,
 	}
-	layer.scanWholeCacheLocked()
+	_, layer.wholeUsedBytes, _ = layer.diskEntries()
+	layer.lastScan = time.Now()
 	return layer
 }
 
@@ -176,6 +186,11 @@ func (l *SharedDiskCacheLayer) setChunk(fid *needle.FileId, dataWithHeader []byt
 		return
 	}
 
+	if !l.beginWrite(size) {
+		return
+	}
+	defer l.endWrite(size)
+
 	relPath := l.chunkRelPath(fid)
 	fullPath := filepath.Join(l.dir, relPath)
 	shardDir := filepath.Dir(fullPath)
@@ -213,79 +228,106 @@ func (l *SharedDiskCacheLayer) setChunk(fid *needle.FileId, dataWithHeader []byt
 	l.recordScopeEntry(relPath, size, time.Now(), true)
 }
 
+// Cache persistence is best effort while maintenance is pending. Reservations
+// bound concurrent writers without making readers wait for directory I/O.
+func (l *SharedDiskCacheLayer) beginWrite(size int64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || l.maintenancePending {
+		return false
+	}
+	if cacheAtLimit(l.scopeUsedBytes+l.reservedBytes, l.scopeLimitBytes) ||
+		cacheAtLimit(l.wholeUsedBytes+l.reservedBytes, l.wholeLimitBytes) {
+		l.requestMaintenanceLocked()
+		return false
+	}
+	l.writers++
+	l.reservedBytes += size
+	l.work.Add(1)
+	return true
+}
+
+func (l *SharedDiskCacheLayer) endWrite(size int64) {
+	l.mu.Lock()
+	l.writers--
+	l.reservedBytes -= size
+	l.startMaintenanceLocked()
+	l.mu.Unlock()
+	l.work.Done()
+}
+
 func (l *SharedDiskCacheLayer) recordScopeEntry(relPath string, size int64, now time.Time, newlyWritten bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	if prev, ok := l.scopeEntries[relPath]; ok {
 		l.scopeUsedBytes -= prev.size
 	} else if newlyWritten {
 		l.wholeUsedBytes += size
 	}
-	l.scopeEntries[relPath] = &sharedChunkMeta{
-		relPath:    relPath,
-		size:       size,
-		lastAccess: now,
-	}
+	l.scopeEntries[relPath] = &sharedChunkMeta{relPath: relPath, size: size, lastAccess: now}
 	l.scopeUsedBytes += size
-	l.writesSinceScan++
-
-	// Enforce per-scope quota first so a single noisy scope evicts its own
-	// oldest chunks before contending on the shared whole-cache space.
-	if l.scopeLimitBytes > 0 && l.scopeUsedBytes > l.scopeLimitBytes {
-		l.evictScopeLocked(l.scopeLimitBytes)
-	}
-
-	if l.wholeLimitBytes > 0 && (l.wholeUsedBytes > l.wholeLimitBytes || l.wholeLimitBytes < 64*1024*1024 || l.writesSinceScan >= 16) {
-		l.scanWholeCacheLocked()
-		if l.wholeUsedBytes > l.wholeLimitBytes {
-			l.evictWholeCacheLocked(l.wholeLimitBytes)
-		}
+	if cacheAtLimit(l.scopeUsedBytes, l.scopeLimitBytes) || cacheAtLimit(l.wholeUsedBytes, l.wholeLimitBytes) || time.Since(l.lastScan) >= 30*time.Second {
+		l.requestMaintenanceLocked()
 	}
 }
 
-func (l *SharedDiskCacheLayer) evictScopeLocked(targetBytes int64) {
-	if l.scopeUsedBytes <= targetBytes {
+func (l *SharedDiskCacheLayer) requestMaintenanceLocked() {
+	if l.closed || time.Now().Before(l.retryAfter) {
 		return
 	}
-	metas := make([]*sharedChunkMeta, 0, len(l.scopeEntries))
-	for _, m := range l.scopeEntries {
-		metas = append(metas, m)
-	}
-	slices.SortFunc(metas, func(a, b *sharedChunkMeta) int {
-		return a.lastAccess.Compare(b.lastAccess)
-	})
-	for _, m := range metas {
-		if l.scopeUsedBytes <= targetBytes {
-			break
-		}
-		fullPath := filepath.Join(l.dir, m.relPath)
-		if err := os.Remove(fullPath); err == nil || os.IsNotExist(err) {
-			delete(l.scopeEntries, m.relPath)
-			l.scopeUsedBytes -= m.size
-			l.wholeUsedBytes = max(0, l.wholeUsedBytes-m.size)
-		}
-	}
+	l.maintenancePending = true
+	l.startMaintenanceLocked()
 }
 
-func (l *SharedDiskCacheLayer) scanWholeCacheLocked() {
-	l.writesSinceScan = 0
+func (l *SharedDiskCacheLayer) startMaintenanceLocked() {
+	if l.closed || !l.maintenancePending || l.maintenanceRunning || l.writers != 0 {
+		return
+	}
+	l.maintenanceRunning = true
+	l.work.Add(1)
+	go func() {
+		defer l.work.Done()
+		err := l.maintain()
+		l.mu.Lock()
+		l.maintenancePending = false
+		l.maintenanceRunning = false
+		l.lastScan = time.Now()
+		if err != nil || cacheAtLimit(l.scopeUsedBytes, l.scopeLimitBytes) || cacheAtLimit(l.wholeUsedBytes, l.wholeLimitBytes) {
+			l.retryAfter = time.Now().Add(time.Second)
+		}
+		l.mu.Unlock()
+	}()
+}
+
+type sharedDiskEntry struct {
+	relPath string
+	size    int64
+	modTime time.Time
+}
+
+// One inventory supplies both accounting and eviction candidates. An incomplete
+// inventory must not replace the last known usage with an undercount.
+func (l *SharedDiskCacheLayer) diskEntries() ([]sharedDiskEntry, int64, error) {
+	var files []sharedDiskEntry
 	var total int64
-	shards, err := os.ReadDir(l.dir)
+	shards, err := l.readDir(l.dir)
 	if err != nil {
-		return
+		return nil, 0, err
 	}
 	for _, shard := range shards {
 		if !shard.IsDir() {
 			continue
 		}
 		shardPath := filepath.Join(l.dir, shard.Name())
-		entries, err := os.ReadDir(shardPath)
-		if err != nil {
+		entries, err := l.readDir(shardPath)
+		if os.IsNotExist(err) {
 			continue
 		}
+		if err != nil {
+			return nil, 0, err
+		}
 		for _, e := range entries {
-			if e.IsDir() {
+			if !e.Type().IsRegular() {
 				continue
 			}
 			name := e.Name()
@@ -298,76 +340,105 @@ func (l *SharedDiskCacheLayer) scanWholeCacheLocked() {
 			if !isManagedChunkPath(shard.Name(), name) {
 				continue
 			}
-			if info, err := e.Info(); err == nil {
-				total += info.Size()
-			}
-		}
-	}
-	l.wholeUsedBytes = total
-}
-
-func (l *SharedDiskCacheLayer) evictWholeCacheLocked(targetBytes int64) {
-	type diskFileEntry struct {
-		relPath string
-		size    int64
-		modTime time.Time
-	}
-	var allFiles []diskFileEntry
-	var total int64
-
-	shards, err := os.ReadDir(l.dir)
-	if err != nil {
-		return
-	}
-	for _, shard := range shards {
-		if !shard.IsDir() {
-			continue
-		}
-		shardPath := filepath.Join(l.dir, shard.Name())
-		entries, err := os.ReadDir(shardPath)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if e.IsDir() || !isManagedChunkPath(shard.Name(), e.Name()) {
-				continue
-			}
 			info, err := e.Info()
-			if err != nil {
+			if os.IsNotExist(err) {
 				continue
 			}
-			relPath := filepath.Join(shard.Name(), e.Name())
-			allFiles = append(allFiles, diskFileEntry{
-				relPath: relPath,
-				size:    info.Size(),
-				modTime: info.ModTime(),
-			})
+			if err != nil {
+				return nil, 0, err
+			}
+			files = append(files, sharedDiskEntry{filepath.Join(shard.Name(), name), info.Size(), info.ModTime()})
 			total += info.Size()
 		}
 	}
-	l.wholeUsedBytes = total
-	if l.wholeUsedBytes <= targetBytes {
-		return
-	}
+	return files, total, nil
+}
 
-	slices.SortFunc(allFiles, func(a, b diskFileEntry) int {
-		return a.modTime.Compare(b.modTime)
-	})
-	for _, f := range allFiles {
-		if l.wholeUsedBytes <= targetBytes {
-			break
+func cacheAtLimit(used, limit int64) bool { return limit > 0 && used >= limit }
+
+func cacheLowWatermark(limit int64) int64 { return limit - limit/10 }
+
+func (l *SharedDiskCacheLayer) maintain() error {
+	started := time.Now()
+	files, total, err := l.diskEntries()
+	if err != nil {
+		return err
+	}
+	present := make(map[string]int64, len(files))
+	for _, f := range files {
+		present[f.relPath] = f.size
+	}
+	l.mu.Lock()
+	l.wholeUsedBytes = total
+	var scope []sharedDiskEntry
+	l.scopeUsedBytes = 0
+	for path, meta := range l.scopeEntries {
+		if size, ok := present[path]; ok {
+			meta.size = size
+			l.scopeUsedBytes += size
+			scope = append(scope, sharedDiskEntry{path, size, meta.lastAccess})
+		} else {
+			delete(l.scopeEntries, path)
 		}
-		fullPath := filepath.Join(l.dir, f.relPath)
-		if err := os.Remove(fullPath); err == nil || os.IsNotExist(err) {
-			l.wholeUsedBytes = max(0, l.wholeUsedBytes-f.size)
-			if meta, ok := l.scopeEntries[f.relPath]; ok {
-				l.scopeUsedBytes = max(0, l.scopeUsedBytes-meta.size)
-				delete(l.scopeEntries, f.relPath)
-			}
+	}
+	scopeFull := cacheAtLimit(l.scopeUsedBytes, l.scopeLimitBytes)
+	wholeFull := cacheAtLimit(total, l.wholeLimitBytes)
+	l.mu.Unlock()
+	if scopeFull {
+		slices.SortFunc(scope, func(a, b sharedDiskEntry) int { return a.modTime.Compare(b.modTime) })
+		l.evict(scope, cacheLowWatermark(l.scopeLimitBytes), true, started)
+	}
+	if wholeFull {
+		slices.SortFunc(files, func(a, b sharedDiskEntry) int { return a.modTime.Compare(b.modTime) })
+		l.evict(files, cacheLowWatermark(l.wholeLimitBytes), false, started)
+	}
+	return nil
+}
+
+func (l *SharedDiskCacheLayer) evict(files []sharedDiskEntry, target int64, scopeOnly bool, started time.Time) {
+	for _, f := range files {
+		l.mu.Lock()
+		used := l.wholeUsedBytes
+		if scopeOnly {
+			used = l.scopeUsedBytes
 		}
+		meta := l.scopeEntries[f.relPath]
+		touched := meta != nil && meta.lastAccess.After(started)
+		l.mu.Unlock()
+		if used <= target {
+			return
+		}
+		if touched {
+			continue
+		}
+		path := filepath.Join(l.dir, f.relPath)
+		info, err := os.Stat(path)
+		if err == nil && (info.Size() != f.size || info.ModTime().After(f.modTime)) {
+			continue
+		}
+		if err != nil && !os.IsNotExist(err) {
+			continue
+		}
+		// A previous scope pass may already have removed this candidate.
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			continue
+		}
+		l.mu.Lock()
+		l.wholeUsedBytes = max(0, l.wholeUsedBytes-f.size)
+		if meta := l.scopeEntries[f.relPath]; meta != nil {
+			l.scopeUsedBytes = max(0, l.scopeUsedBytes-meta.size)
+			delete(l.scopeEntries, f.relPath)
+		}
+		l.mu.Unlock()
 	}
 }
 
 func (l *SharedDiskCacheLayer) shutdown() {
-	// Shared disk files persist across mounts/restarts; nothing to close.
+	l.mu.Lock()
+	l.closed = true
+	l.mu.Unlock()
+	l.work.Wait()
 }

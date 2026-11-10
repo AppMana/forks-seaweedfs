@@ -55,7 +55,7 @@ jobs:
         # (weed/filer), and the local-gRPC-socket TCP fallback that makes
         # `weed mini` work where AF_UNIX bind fails (weed/pb). Both live in
         # files upstream edits often, so they belong in the merge gate.
-        run: go test -count=1 -tags 5BytesOffset ./weed/mount/... ./weed/command/... ./weed/filer/... ./weed/pb/... ./weed/s3api/...
+        run: go test -count=1 -tags 5BytesOffset ./weed/util/chunk_cache ./weed/mount/... ./weed/command/... ./weed/filer/... ./weed/pb/... ./weed/s3api/...
 
   test-windows:
     runs-on: windows-2022
@@ -97,6 +97,9 @@ jobs:
       - name: Native windows unit tests (winfsp adapter, mount, command)
         working-directory: forks-seaweedfs
         run: go test -count=1 -tags 5BytesOffset ./weed/mount/ ./weed/command/
+      - name: Native shared chunk cache tests
+        working-directory: forks-seaweedfs
+        run: go test -count=1 -tags 5BytesOffset ./weed/util/chunk_cache -run '^TestShared'
       - name: Upload weed.exe
         uses: actions/upload-artifact@v4
         with:

@@ -56,6 +56,7 @@ func TestSharedTieredChunkCacheCrossMountAndTwoLevelScoping(t *testing.T) {
 	mountA.SetChunk(fid3, chunk3)
 	time.Sleep(10 * time.Millisecond)
 	mountA.SetChunk(fid4, chunk4)
+	mountA.sharedDisk.work.Wait()
 
 	if mountA.IsInCache(fid1, true) {
 		t.Fatalf("expected Mount A's oldest chunk fid1 to be evicted by Mount A's per-scope limit")
@@ -74,7 +75,11 @@ func TestSharedTieredChunkCacheCrossMountAndTwoLevelScoping(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	fid5 := fmt.Sprintf("5,%02x00000005", 5)
 	chunk5 := bytes.Repeat([]byte("E"), 900)
+	mountB.sharedDisk.mu.Lock()
+	mountB.sharedDisk.lastScan = time.Now().Add(-time.Minute)
+	mountB.sharedDisk.mu.Unlock()
 	mountB.SetChunk(fid5, chunk5)
+	mountB.sharedDisk.work.Wait()
 
 	if mountB.IsInCache(fid2, true) {
 		t.Fatalf("expected globally oldest chunk fid2 to be evicted by whole-cache limit")

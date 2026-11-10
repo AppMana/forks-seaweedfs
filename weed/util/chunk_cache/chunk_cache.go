@@ -287,11 +287,12 @@ func (c *TieredChunkCache) Shutdown() {
 	if c == nil {
 		return
 	}
-	c.Lock()
-	defer c.Unlock()
 	if c.sharedDisk != nil {
 		c.sharedDisk.shutdown()
+		return
 	}
+	c.Lock()
+	defer c.Unlock()
 	for _, diskCache := range c.diskCaches {
 		diskCache.shutdown()
 	}

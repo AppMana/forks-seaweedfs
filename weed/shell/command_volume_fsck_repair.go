@@ -3,6 +3,7 @@ package shell
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -14,6 +15,15 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func loadReplicaIdxPreservingDeleted(db *needle_map.MemDb, idxName string) error {
+	idxFile, err := os.OpenFile(idxName, os.O_RDONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer idxFile.Close()
+	return db.LoadFilterFromReaderAt(idxFile, true, false)
+}
 
 // repairMissingFromReplicas restores, on each replica, the filer-referenced
 // needles it lacks, copying the exact blob from a replica that holds the
@@ -64,7 +74,7 @@ func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsck
 	for i, r := range replicas {
 		dbs[i] = needle_map.NewMemDb()
 		defer dbs[i].Close()
-		if err = dbs[i].LoadFromIdx(getVolumeFileIdFile(c.tempFolder, r.dataNodeId, vid)); err != nil {
+		if err = loadReplicaIdxPreservingDeleted(dbs[i], getVolumeFileIdFile(c.tempFolder, r.dataNodeId, vid)); err != nil {
 			return repaired, lost, fmt.Errorf("load volume %d index of %s: %w", vid, r.dataNodeId, err)
 		}
 	}
@@ -72,46 +82,54 @@ func (c *commandVolumeFsck) repairVolumeFromReplicas(vid uint32, replicas []fsck
 		var source *needle_map.NeedleValue
 		var sourceServer pb.ServerAddress
 		var lacking []int
+		var tombstoned []int
 		for i, db := range dbs {
 			if value, found := db.Get(needleId); found {
-				if source == nil {
+				if value.Size.IsDeleted() {
+					tombstoned = append(tombstoned, i)
+				} else if source == nil {
 					source, sourceServer = value, replicas[i].info.server
 				}
 			} else {
 				lacking = append(lacking, i)
 			}
 		}
-		if len(lacking) == 0 {
-			return nil
-		}
 		if source == nil {
-			lost++
-			fmt.Fprintf(c.writer, "%d,%x %s: on no replica, cannot repair\n", vid, uint64(needleId), itemPath)
+			if len(lacking) > 0 || len(tombstoned) > 0 {
+				lost++
+				fmt.Fprintf(c.writer, "%d,%x %s: on no replica, cannot repair\n", vid, uint64(needleId), itemPath)
+			}
 			return nil
 		}
-		blob, readErr := c.readRepairBlob(sourceServer, vid, *source)
-		if readErr != nil {
-			return fmt.Errorf("read %d,%x from %s: %w", vid, uint64(needleId), sourceServer, readErr)
+		if len(lacking) > 0 {
+			blob, readErr := c.readRepairBlob(sourceServer, vid, *source)
+			if readErr != nil {
+				return fmt.Errorf("read %d,%x from %s: %w", vid, uint64(needleId), sourceServer, readErr)
+			}
+			for _, i := range lacking {
+				target := replicas[i]
+				if target.info.isReadOnly {
+					fmt.Fprintf(c.writer, "%d,%x %s: %s is read-only, not repaired\n", vid, uint64(needleId), itemPath, target.info.server)
+					continue
+				}
+				writeErr := c.writeRepairBlob(target.info.server, vid, *source, blob)
+				if status.Code(writeErr) == codes.AlreadyExists {
+					writeErr = nil
+				} else if writeErr != nil {
+					return fmt.Errorf("repair %d,%x on %s: %w", vid, uint64(needleId), target.info.server, writeErr)
+				} else {
+					repaired++
+					fmt.Fprintf(c.writer, "%d,%x %s: copied %s -> %s\n", vid, uint64(needleId), itemPath, sourceServer, target.info.server)
+				}
+				// A second reference to the same needle must not write it again.
+				if setErr := dbs[i].Set(needleId, source.Offset, source.Size); setErr != nil {
+					return setErr
+				}
+			}
 		}
-		for _, i := range lacking {
-			target := replicas[i]
-			if target.info.isReadOnly {
-				fmt.Fprintf(c.writer, "%d,%x %s: %s is read-only, not repaired\n", vid, uint64(needleId), itemPath, target.info.server)
-				continue
-			}
-			writeErr := c.writeRepairBlob(target.info.server, vid, *source, blob)
-			if status.Code(writeErr) == codes.AlreadyExists {
-				writeErr = nil
-			} else if writeErr != nil {
-				return fmt.Errorf("repair %d,%x on %s: %w", vid, uint64(needleId), target.info.server, writeErr)
-			} else {
-				repaired++
-				fmt.Fprintf(c.writer, "%d,%x %s: copied %s -> %s\n", vid, uint64(needleId), itemPath, sourceServer, target.info.server)
-			}
-			// A second reference to the same needle must not write it again.
-			if setErr := dbs[i].Set(needleId, source.Offset, source.Size); setErr != nil {
-				return setErr
-			}
+		for _, i := range tombstoned {
+			c.tombstonedReferenced++
+			fmt.Fprintf(c.writer, "%d,%x %s: tombstoned on %s while live on %s\n", vid, uint64(needleId), itemPath, replicas[i].info.server, sourceServer)
 		}
 		return nil
 	})

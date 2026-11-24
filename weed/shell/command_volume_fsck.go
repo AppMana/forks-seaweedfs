@@ -1231,8 +1231,8 @@ func (c *commandVolumeFsck) subtractFilerFileIdsFromIndex(dataNodeId string, vol
 				// This may be a stale index, but can also be an I/O or RPC
 				// failure. Finish collecting diagnostics, then fail closed.
 				staleNeedleCount++
-				if *c.verbose {
-					fmt.Fprintf(c.writer, "volume %d needle %d metadata unknown: %v\n", volumeId, n.Key, readErr)
+				if *c.verbose || staleNeedleCount <= 10 {
+					fmt.Fprintf(c.writer, "volume %d on %s needle %d metadata unknown at offset %d size %d: %v\n", volumeId, vinfo.server, n.Key, n.Offset.ToActualOffset(), n.Size, readErr)
 				}
 				return nil
 			}
